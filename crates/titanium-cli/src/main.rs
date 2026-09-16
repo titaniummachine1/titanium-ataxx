@@ -525,7 +525,7 @@ fn serve_cmd(tt_bits: usize) -> ExitCode {
                     }
                 })
                 .unwrap_or_else(|| "0000".to_string());
-            out_line("bestmove {reply}");
+            out_line(&format!("bestmove {reply}"));
         }
         // "stop" ignored: searches are synchronous.
     }
