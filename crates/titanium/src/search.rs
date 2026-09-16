@@ -57,6 +57,17 @@ const CONTACT_PEN: i32 = 15;
 /// Reverse futility pruning margins, index = depth-1 (autaxx, stone = 100).
 const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774];
 
+// Ordering tiers (titanium-engine pattern: compile-asserted bands so no
+// ordering signal can structurally leak into its neighbor).
+const ORD_TT: i32 = i32::MAX / 2;
+const ORD_KILLER: i32 = 100_000;
+const ORD_CAPTURE_UNIT: i32 = 1000; // per conversion, max 8
+const ORD_CLONE_BONUS: i32 = 500;
+const ORD_JUMP_PEN: i32 = 500;
+const ORD_HISTORY_MAX: i32 = 90_000;
+const _: () = assert!(ORD_HISTORY_MAX + 8 * ORD_CAPTURE_UNIT + ORD_CLONE_BONUS < ORD_KILLER);
+const _: () = assert!(ORD_KILLER < ORD_TT);
+
 /// Static eval from the side-to-move's perspective.
 pub fn evaluate(b: &Board) -> i32 {
     let mat = MATERIAL * (b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32);
@@ -359,6 +370,14 @@ impl Searcher {
         self.tt.clear();
     }
 
+    /// Full state reset between games (TT, killers, history) — prevents
+    /// cross-game leakage in long matches (titanium binary_match lesson).
+    pub fn reset_for_new_game(&mut self) {
+        self.tt.clear();
+        self.killers = Box::new([(0, 0); MAX_PLY]);
+        self.history = Box::new([[0; 49]; 2]);
+    }
+
     #[inline]
     fn check_stop(&mut self) {
         if let Some(nl) = self.node_limit {
@@ -394,18 +413,18 @@ impl Searcher {
                 list.set_score(i, i32::MAX / 2);
                 continue;
             }
-            let mut score = (opp & RING1[m.to as usize]).count_ones() as i32 * 1000;
+            let mut score = (opp & RING1[m.to as usize]).count_ones() as i32 * ORD_CAPTURE_UNIT;
             // Clone preference: a clone nets one more stone than a jump and
             // leaves the origin defended ("duplicate as much as you can").
             if m.is_clone() {
-                score += 500;
+                score += ORD_CLONE_BONUS;
             } else {
-                score -= 500;
+                score -= ORD_JUMP_PEN;
             }
             if packed == k1 || packed == k2 {
-                score += 100_000;
+                score += ORD_KILLER;
             }
-            score += hist[m.to as usize].min(90_000) as i32;
+            score += hist[m.to as usize].min(ORD_HISTORY_MAX) as i32;
             list.set_score(i, score);
         }
         if tt_index != usize::MAX && tt_index != 0 {
@@ -481,11 +500,12 @@ impl Searcher {
             return alpha;
         }
 
-        // Null-move pruning (autaxx + Moonbird hybrid): pass is a real move
-        // in Ataxx and there is no zugzwang to speak of. Gates: not right
-        // after another null, depth > 2, enough clone targets (mobility),
-        // board not too full (forced-pass danger zone). R = 3.
-        if null_allowed && depth > 2 {
+        // Null-move pruning (autaxx + Moonbird + titanium hybrid): pass is a
+        // real move in Ataxx and there is no zugzwang to speak of. Gates:
+        // not right after another null, depth > 2, static eval already at
+        // least beta (titanium), enough clone targets (mobility), board not
+        // too full (forced-pass danger zone). R = 3.
+        if null_allowed && depth > 2 && static_eval >= beta {
             let clone_targets = (dist_union(b.occ[b.turn as usize], 1) & b.empty()).count_ones();
             let fill = (b.piece_cnt[0] + b.piece_cnt[1]) as f64 / SQUARES as f64;
             if clone_targets >= 11 && fill < 0.54 {
@@ -719,7 +739,14 @@ impl Searcher {
             .time
             .map(|t| t.as_secs_f64() * 1000.0)
             .unwrap_or(f64::INFINITY);
+        // Iteration cost prediction (titanium-engine pattern): project the
+        // next iteration as the max of the last two completed iterations —
+        // beats growth multipliers on noisy trees.
+        let mut it_nodes: [f64; 2] = [0.0, 0.0];
+        let mut it_ms: [f64; 2] = [0.0, 0.0];
         for depth in 1..=limits.max_depth.max(1) {
+            let nodes_before = self.nodes;
+            let iter_start = self.elapsed_ms();
             let mut alpha = i32::MIN + 1;
             let mut best_this = None;
             let mut best_score = i32::MIN;
@@ -737,26 +764,45 @@ impl Searcher {
                     }
                 }
             }
-            // Discard partial iterations: scores from an aborted subtree are
-            // garbage (unwound searches return 0).
-            if self.stop {
-                break;
-            }
+            // Partial-iteration adoption (titanium/Lague): moves recorded in
+            // best_this completed their search before the stop, so their
+            // scores are valid — adopt instead of discarding.
             if let Some(m) = best_this {
                 result.best = Some(m);
-                result.score = best_score;
+                if best_score != i32::MIN {
+                    result.score = best_score;
+                }
                 result.depth = depth;
                 // Move best move to the front for the next iteration.
-                for i in 0..n_root {
-                    if stack.lists[0].move_at(i) == m {
-                        stack.lists[0].swap(i, 0);
-                        break;
+                if !self.stop {
+                    for i in 0..n_root {
+                        if stack.lists[0].move_at(i) == m {
+                            stack.lists[0].swap(i, 0);
+                            break;
+                        }
                     }
                 }
             }
-            // Don't start a new iteration we can't hope to finish.
-            if self.elapsed_ms() > budget_ms / 2.0 {
-                self.stop_reason = StopReason::Time;
+            if self.stop {
+                break;
+            }
+            // Predict the next iteration; skip it if it won't fit.
+            it_nodes[1] = it_nodes[0];
+            it_nodes[0] = (self.nodes - nodes_before) as f64;
+            it_ms[1] = it_ms[0];
+            it_ms[0] = self.elapsed_ms() - iter_start;
+            let proj_nodes = it_nodes[0].max(it_nodes[1]);
+            let proj_ms = it_ms[0].max(it_ms[1]);
+            let nodes_fit = match limits.max_nodes {
+                Some(nl) => (self.nodes as f64) + proj_nodes <= nl as f64,
+                None => true,
+            };
+            if !nodes_fit || self.elapsed_ms() + proj_ms > budget_ms {
+                self.stop_reason = if !nodes_fit {
+                    StopReason::Nodes
+                } else {
+                    StopReason::Time
+                };
                 break;
             }
         }
@@ -765,6 +811,8 @@ impl Searcher {
             result.stopped_by = Some(self.stop_reason);
         } else if result.depth >= limits.max_depth {
             result.stopped_by = Some(StopReason::Completed);
+        } else {
+            result.stopped_by = Some(self.stop_reason);
         }
         result.nodes = self.nodes;
         result.elapsed = self.elapsed();

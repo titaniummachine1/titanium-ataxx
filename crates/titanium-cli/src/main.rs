@@ -484,7 +484,7 @@ fn serve_cmd(tt_bits: usize) -> ExitCode {
         } else if t == "isready" {
             out_line("readyok");
         } else if t == "uainewgame" {
-            searcher.clear_tt();
+            searcher.reset_for_new_game();
         } else if t == "position startpos" {
             current = Some(Board::start());
         } else if let Some(fen) = t.strip_prefix("position fen ") {
