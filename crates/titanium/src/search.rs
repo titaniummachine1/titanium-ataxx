@@ -424,7 +424,7 @@ impl Searcher {
             if packed == k1 || packed == k2 {
                 score += ORD_KILLER;
             }
-            score += hist[m.to as usize].min(ORD_HISTORY_MAX) as i32;
+            score += (hist[m.to as usize] as i32).min(ORD_HISTORY_MAX);
             list.set_score(i, score);
         }
         if tt_index != usize::MAX && tt_index != 0 {
