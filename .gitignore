@@ -1,0 +1,16 @@
+# Build artifacts
+/target
+/web/pkg
+/web/dist
+node_modules/
+
+# Local scratch space (never pushed)
+/data
+/logs
+/scripts
+
+# Misc
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

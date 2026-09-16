@@ -1,0 +1,13 @@
+[package]
+name = "titanium-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Native binary for testing the Titanium Ataxx engine (perft, bench, selfplay, console play)"
+license = "MIT"
+
+[[bin]]
+name = "titanium-cli"
+path = "src/main.rs"
+
+[dependencies]
+titanium = { path = "../titanium" }

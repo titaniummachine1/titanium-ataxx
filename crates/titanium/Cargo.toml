@@ -1,0 +1,8 @@
+[package]
+name = "titanium"
+version = "0.1.0"
+edition = "2021"
+description = "Titanium Ataxx engine core: rules, movegen, alpha-beta search"
+license = "MIT"
+
+[dependencies]

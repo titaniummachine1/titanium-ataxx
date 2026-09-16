@@ -1,0 +1,15 @@
+{
+  "name": "titanium-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "wasm": "wasm-pack build ../crates/titanium-wasm --target web --out-dir ../../web/pkg --out-name titanium",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^7.1.0"
+  }
+}

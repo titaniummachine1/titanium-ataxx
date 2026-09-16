@@ -1,0 +1,13 @@
+[package]
+name = "titanium-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "WebAssembly bindings for the Titanium Ataxx engine"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+titanium = { path = "../titanium" }

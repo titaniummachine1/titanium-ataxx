@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TITANIUM &mdash; Ataxx</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="layout">
+    <section class="board-wrap">
+      <h1><span class="titanium">TITANIUM</span> <span class="ataxx">ataxx</span></h1>
+      <canvas id="board" width="500" height="500" aria-label="Ataxx board"></canvas>
+      <p class="hint">Click one of your pieces, then a highlighted square. Clone = dot, jump = ring. Landing converts adjacent enemy pieces.</p>
+    </section>
+
+    <aside class="panel">
+      <div id="status" class="status">Loading engine&hellip;</div>
+
+      <div class="counts">
+        <div class="count"><span class="disc black"></span><span id="count-black">2</span></div>
+        <div class="count"><span class="disc white"></span><span id="count-white">2</span></div>
+      </div>
+
+      <label class="row">
+        <span>Opponent strength</span>
+        <select id="difficulty">
+          <option value="150,3">Easy</option>
+          <option value="600,8" selected>Normal</option>
+          <option value="1500,12">Hard</option>
+          <option value="4000,20">Titanium</option>
+        </select>
+      </label>
+
+      <label class="row">
+        <span>Your color</span>
+        <select id="side">
+          <option value="0" selected>Black (first)</option>
+          <option value="1">White (second)</option>
+        </select>
+      </label>
+
+      <div class="buttons">
+        <button id="new-game">New game</button>
+        <button id="undo" disabled>Undo</button>
+      </div>
+
+      <div id="search-info" class="search-info"></div>
+
+      <h2>Moves</h2>
+      <ol id="move-list" class="move-list"></ol>
+    </aside>
+  </main>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>

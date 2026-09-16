@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/titanium",
+    "crates/titanium-cli",
+    "crates/titanium-wasm",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
