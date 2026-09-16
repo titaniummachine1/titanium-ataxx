@@ -569,23 +569,20 @@ impl Searcher {
             self.score_into(b, list, tt_mv, ply);
         }
         if stack.lists[ply as usize].is_empty() {
-            // E5b trap deductions (user insight, free at this node): we are
+            // E5c trap deductions (user insight, free at this node): we are
             // permanently stuck (empties never regrow), opponent is not
-            // (game_over was checked). Majority math is already decided in
-            // two of the three cases.
+            // (game_over was checked). SOUND cases only: while we are
+            // stuck, their count never decreases and ours never increases
+            // (their landings can convert our stones!).
             let my = b.occ[b.turn as usize].count_ones();
             let opp = b.occ[1 - b.turn as usize].count_ones();
             if opp > my {
-                return -CERT_WIN; // they expand freely, burying us
+                return -CERT_WIN; // they only grow, we only shrink
             }
-            if opp == my {
-                // They must gain a stone to win; frozen equality = draw.
-                let they_clone =
-                    (dist_union(b.occ[1 - b.turn as usize], 1) & b.empty()) != 0;
-                return if they_clone { -CERT_WIN } else { 0 };
-            }
-            if opp + b.empty().count_ones() < my {
-                return CERT_WIN; // they can never catch up
+            if opp == my
+                && (dist_union(b.occ[1 - b.turn as usize], 1) & b.empty()) != 0
+            {
+                return -CERT_WIN; // one clone breaks the tie for good
             }
             // Opponent not stuck is guaranteed: double-stuck ends via passes >= 2.
             return -self.negamax(
