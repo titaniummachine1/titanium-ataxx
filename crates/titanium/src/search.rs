@@ -500,12 +500,11 @@ impl Searcher {
             return alpha;
         }
 
-        // Null-move pruning (autaxx + Moonbird + titanium hybrid): pass is a
-        // real move in Ataxx and there is no zugzwang to speak of. Gates:
-        // not right after another null, depth > 2, static eval already at
-        // least beta (titanium), enough clone targets (mobility), board not
-        // too full (forced-pass danger zone). R = 3.
-        if null_allowed && depth > 2 && static_eval >= beta {
+        // Null-move pruning (autaxx + Moonbird hybrid): pass is a real move
+        // in Ataxx and there is no zugzwang to speak of. Gates: not right
+        // after another null, depth > 2, enough clone targets (mobility),
+        // board not too full (forced-pass danger zone). R = 3.
+        if null_allowed && depth > 2 {
             let clone_targets = (dist_union(b.occ[b.turn as usize], 1) & b.empty()).count_ones();
             let fill = (b.piece_cnt[0] + b.piece_cnt[1]) as f64 / SQUARES as f64;
             if clone_targets >= 11 && fill < 0.54 {
@@ -786,23 +785,14 @@ impl Searcher {
             if self.stop {
                 break;
             }
-            // Predict the next iteration; skip it if it won't fit.
-            it_nodes[1] = it_nodes[0];
-            it_nodes[0] = (self.nodes - nodes_before) as f64;
+            // Predict the next iteration by TIME only: a node budget should
+            // always be fully consumed (aborted-iteration work is already
+            // counted and its completed moves adopted).
             it_ms[1] = it_ms[0];
             it_ms[0] = self.elapsed_ms() - iter_start;
-            let proj_nodes = it_nodes[0].max(it_nodes[1]);
             let proj_ms = it_ms[0].max(it_ms[1]);
-            let nodes_fit = match limits.max_nodes {
-                Some(nl) => (self.nodes as f64) + proj_nodes <= nl as f64,
-                None => true,
-            };
-            if !nodes_fit || self.elapsed_ms() + proj_ms > budget_ms {
-                self.stop_reason = if !nodes_fit {
-                    StopReason::Nodes
-                } else {
-                    StopReason::Time
-                };
+            if self.elapsed_ms() + proj_ms > budget_ms {
+                self.stop_reason = StopReason::Time;
                 break;
             }
         }
