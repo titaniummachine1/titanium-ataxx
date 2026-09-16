@@ -50,6 +50,10 @@ const PST: [i32; 49] = [
 /// it. Static replacement for qsearch in Ataxx.
 const HOLE_PEN: [i32; 9] = [-17, 4, -28, -88, -125, -200, -322, -446, -534];
 
+/// Contact penalty per ENDANGERED stone (E2, "virus strategy"): stones the
+/// enemy can infect right now. Avoid contact early, mass-clone first.
+const CONTACT_PEN: i32 = 15;
+
 /// Reverse futility pruning margins, index = depth-1 (autaxx, stone = 100).
 const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774];
 
@@ -68,7 +72,11 @@ pub fn evaluate(b: &Board) -> i32 {
     }
     let holes_black = holes_penalty(b, 0);
     let holes_white = holes_penalty(b, 1);
-    let mut score = mat + pst - holes_black + holes_white;
+    let contact_black = endangered_count(b, 0);
+    let contact_white = endangered_count(b, 1);
+    let mut score = mat + pst - holes_black + holes_white
+        - CONTACT_PEN * contact_black as i32
+        + CONTACT_PEN * contact_white as i32;
     if b.turn == 0 {
         score += TEMPO;
     } else {
@@ -79,6 +87,15 @@ pub fn evaluate(b: &Board) -> i32 {
     } else {
         -score
     }
+}
+
+/// E2 "virus strategy": stones of `side` the enemy can currently convert —
+/// empty landing squares within their reach, ring-1 of a landing touches us.
+fn endangered_count(b: &Board, side: u8) -> u32 {
+    let them = b.occ[1 - side as usize];
+    let us = b.occ[side as usize];
+    let landings = b.empty() & (dist_union(them, 1) | jump_union(them));
+    (us & dist_union(landings, 1)).count_ones()
 }
 
 /// autaxx hole risk: empty squares adjacent to `side`'s stones that the
@@ -378,6 +395,13 @@ impl Searcher {
                 continue;
             }
             let mut score = (opp & RING1[m.to as usize]).count_ones() as i32 * 1000;
+            // Clone preference: a clone nets one more stone than a jump and
+            // leaves the origin defended ("duplicate as much as you can").
+            if m.is_clone() {
+                score += 500;
+            } else {
+                score -= 500;
+            }
             if packed == k1 || packed == k2 {
                 score += 100_000;
             }
