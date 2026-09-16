@@ -77,26 +77,18 @@ Search speed log:
 
 ## Benchmarks vs competitors
 
-Gates (user rule: NEVER cap depth for opponents — node or time limits only;
-`--opp-nodes N` sends Moonbird `go nodes N` so both sides get equal compute):
+**Fishtest protocol (established 2026-09-16):** every experiment = branch +
+binary snapshot; A/B vs `main` at BOTH gates (5k nodes = equal compute,
+100ms/10ms = equal strength); merge only on a win; **Moonbird runs only after
+a proven self-play win**. Full history in `LEDGER.md`.
 
-- **Gate A — equal compute**: both engines 5000 nodes/move.
-- **Gate B — equal strength**: both engines 100 ms/move.
-- 8 parallel match shards × 4 games = 32 games per gate; a full gate finishes
-  in <1 minute. Games log incrementally (interrupt-safe).
+Gate results timeline (all 32 games, 8 shards, <2 min per gate):
 
-Results (2026-09-16, engine v0.2: TT+killers+history+eval-cache, material eval):
-
-| gate | result |
-|---|---|
-| 5000 nodes vs 5000 nodes | **titanium 0 - 32 Moonbird** |
-| 100 ms vs 100 ms | **titanium 0 - 32 Moonbird** |
-| 1000 ms vs 1000 ms (pre-TT baseline, 50 games) | titanium 1 - 49 Moonbird |
-
-Reading: Moonbird wins at EQUAL node counts too — the gap is eval + pruning
-quality (its tuned eval, LMR, null-move, aspiration), not speed. Our nps is
-comparable; our node *efficiency* is not. Strength work = better per-node
-decisions, in the order listed under "Next levers".
+| engine state | vs Moonbird 5k nodes | vs Moonbird 100ms |
+|---|---|---|
+| E0 baseline | 0–32 | 0–32 |
+| E0 baseline | — | 0–32 (1s gate: 1–49) |
+| after E2+E3b+E4 merged (~+700 self-play Elo) | 0–32 | 0–32 |
 
 Opponent: **Moonbird 1.1.0** (tsoj, prebuilt exe, UAI, "superhuman" classical
 AB), `scripts/moonbird/`. Backup: Ciekce/sanctaphraxx (Rust/cargo/UAI/NNUE).
@@ -105,35 +97,34 @@ not a peer.
 
 ## Fast iteration protocol (4c/8t)
 
-Short gates only: **5000 nodes/move** (equal-compute) and **100 ms/move**
-(equal-strength). 8 parallel shards, 4 games each, both engines on the same
-gate. Example shard:
+Short gates only: **5000 nodes/move** (equal-compute) and **10–100 ms/move**
+(equal-strength). 8 parallel shards, 4 games each. `--opp-nodes` for
+Moonbird's `go nodes N`. `--start-game` balances colors. Games append to the
+log immediately (interrupt-safe). A/B between own binaries:
+`--opp "scripts\bench\titanium_main.exe serve"` (UAI). NOTE:
+`Start-Process -ArgumentList` does NOT quote elements with spaces on PS 5.1 —
+embed quotes manually: `$oppQ = "`"$m serve`""`.
 
-```powershell
-Start-Process target\release\titanium-cli.exe -ArgumentList "match","--games","4",
-  "--nodes","5000","--opp","scripts\moonbird\Moonbird-1.1.0-windows-amd64.exe",
-  "--opp-nodes","5000","--start-game","$sg",
-  "--out","logs\gateA_shard$i.txt" -WindowStyle Hidden
-```
+## Experiment log (see LEDGER.md for full detail)
 
-`--start-game` balances colors across shards (game index parity decides
-color). 20000-node budgets for self-play regression checks (self-play
-@ 20k nodes: 8 - 8 over 16 games — no color bias).
-
-## Data retention (training)
-
-`logs/*.txt` keeps every played game: header, per-game result + full move
-list (space-separated, `e2e3`/`pass`). Never delete. When we train a learned
-eval, parse logs for positions+results; `data/` is the designated export
-target (both gitignored).
+- E1 autaxx-style overhaul — retained (architecture), no match gain.
+- E2 **virus-strategy eval** (user): endangered-stone contact −15/stone,
+  clone/jump ordering — **+190 Elo. MERGED.**
+- E3 tuning bundle — REJECTED (node-budget prediction under-consumes budget).
+- E3b adoption-only — **+190 Elo. MERGED.** (partial-iteration adoption =
+  real Elo at node gates)
+- E4 **multi-capture exposure** (user): −20 per extra stone convertible in
+  one enemy landing — **+330 Elo. MERGED.**
+- Cumulative ~+700 self-play Elo; Moonbird still 0–32 at both gates.
 
 ## Next levers (in the order we'd take them)
 
-1. Quiescence search (captures-only at depth 0) — biggest strength gap vs
-   Moonbird-class engines.
-2. Null-move pruning + LMR (needs care with Ataxx zugzwang — test via sperft
-   node counts + selfplay).
-3. Aspiration windows at root.
-4. Mobility re-enabled + piece-square/edge-correction eval terms.
-5. SEE-style exchange eval for infection chains (probably overkill: Ataxx
-   conversions are not sequential like chess captures).
+1. **Eval weight tuning loop** — automate: parameter sweep over CONTACT_PEN,
+   MULTICAP_PEN, TEMPO, HOLE_PEN curve with the gate harness (their Elo came
+   from self-tuning, ours are hand-guessed).
+2. **2×2 structure pattern eval** (Moonbird's biggest feature): per-square
+   2×2-neighborhood index, needs the tuning loop first.
+3. Correction history keyed by occupancy-hash bucket (titanium pattern).
+4. Aspiration windows (ladder ±50/±200/±800 from depth 3, autaxx).
+5. LazySMP with TOTAL node budget across workers (Arc<AtomicU64> counter —
+   titanium commit 8a0399d pattern) — we have 4c/8t idle during gates.
