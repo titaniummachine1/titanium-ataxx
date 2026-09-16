@@ -457,6 +457,13 @@ fn play_cmd(time_ms: u64) -> ExitCode {
 
 /// Minimal UAI engine loop so any titanium build (main/candidate snapshots)
 /// can be driven by `match --opp "path\to\titanium-cli.exe serve"`.
+fn out_line(s: &str) {
+    use std::io::Write;
+    let mut o = io::stdout().lock();
+    let _ = writeln!(o, "{s}");
+    let _ = o.flush();
+}
+
 fn serve_cmd(tt_bits: usize) -> ExitCode {
     let stdin = io::stdin();
     let mut searcher = Searcher::with_tt_bits(tt_bits);
@@ -471,11 +478,11 @@ fn serve_cmd(tt_bits: usize) -> ExitCode {
             break;
         }
         if t == "uai" {
-            println!("id name Titanium Ataxx");
-            println!("id author titaniummachine1");
-            println!("uaiok");
+            out_line("id name Titanium Ataxx");
+            out_line("id author titaniummachine1");
+            out_line("uaiok");
         } else if t == "isready" {
-            println!("readyok");
+            out_line("readyok");
         } else if t == "uainewgame" {
             searcher.clear_tt();
         } else if t == "position startpos" {
@@ -518,7 +525,7 @@ fn serve_cmd(tt_bits: usize) -> ExitCode {
                     }
                 })
                 .unwrap_or_else(|| "0000".to_string());
-            println!("bestmove {reply}");
+            out_line(&format!("bestmove {reply}"));
         }
         // "stop" ignored: searches are synchronous.
     }
