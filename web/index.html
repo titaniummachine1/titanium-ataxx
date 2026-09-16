@@ -23,26 +23,40 @@
       </div>
 
       <label class="row">
-        <span>Opponent strength</span>
-        <select id="difficulty">
-          <option value="150,3">Easy</option>
-          <option value="600,8" selected>Normal</option>
-          <option value="1500,12">Hard</option>
-          <option value="4000,20">Titanium</option>
+        <span>Mode</span>
+        <select id="mode">
+          <option value="hvai" selected>Human vs AI</option>
+          <option value="aivai">AI vs AI (watch)</option>
         </select>
       </label>
 
       <label class="row">
-        <span>Your color</span>
+        <span>Your color (Human vs AI)</span>
         <select id="side">
           <option value="0" selected>Black (first)</option>
           <option value="1">White (second)</option>
         </select>
       </label>
 
+      <label class="row">
+        <span>Black think time (ms)</span>
+        <input id="black-ms" type="number" min="1" max="10000" step="50" value="600" />
+      </label>
+
+      <label class="row">
+        <span>White think time (ms)</span>
+        <input id="white-ms" type="number" min="1" max="10000" step="50" value="600" />
+      </label>
+
+      <label class="row">
+        <span>Max depth (0 = auto)</span>
+        <input id="max-depth" type="number" min="0" max="30" value="0" />
+      </label>
+
       <div class="buttons">
         <button id="new-game">New game</button>
         <button id="undo" disabled>Undo</button>
+        <button id="pause" disabled>Pause</button>
       </div>
 
       <div id="search-info" class="search-info"></div>

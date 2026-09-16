@@ -15,18 +15,24 @@ const infoEl = document.getElementById("search-info");
 const listEl = document.getElementById("move-list");
 const newBtn = document.getElementById("new-game");
 const undoBtn = document.getElementById("undo");
-const diffSel = document.getElementById("difficulty");
+const pauseBtn = document.getElementById("pause");
+const modeSel = document.getElementById("mode");
 const sideSel = document.getElementById("side");
+const blackMs = document.getElementById("black-ms");
+const whiteMs = document.getElementById("white-ms");
+const depthIn = document.getElementById("max-depth");
 
 let game = null;
-let human = 0;        // 0 black, 1 white
-let busy = true;      // engine thinking / animating
+let human = 0;        // 0 black, 1 white (Human vs AI)
+let mode = "hvai";    // 'hvai' | 'aivai'
+let paused = false;
+let busy = true;
 let selected = -1;
 let hover = -1;
-let legal = [];       // packed moves (from << 8) | to for side to move
-let moves = [];       // packed moves as played (0xffff = pass)
+let legal = [];
+let moves = [];
 let session = 0;      // invalidates stale async callbacks
-let lastPacked = 0;   // for last-move highlight + pop animation
+let lastPacked = 0;
 
 const sqName = (sq) => COLS[sq % 7] + (7 - Math.floor(sq / 7));
 const fmtNodes = (n) =>
@@ -45,24 +51,52 @@ function sqAt(px, py) {
   return row * SIZE + col;
 }
 
-// ---------- game flow ----------
+// ---------- settings ----------
 
-function applyDifficulty() {
-  const [t, d] = diffSel.value.split(",").map(Number);
-  game.set_difficulty(t, d);
+function timeFor(side) {
+  return (side === 0 ? Number(blackMs.value) : Number(whiteMs.value)) || 600;
 }
+
+function applySettings() {
+  const d = Number(depthIn.value) || 0;
+  game.set_max_depth(d > 0 ? d : 24);
+  game.set_side_time(0, timeFor(0));
+  game.set_side_time(1, timeFor(1));
+}
+
+// ---------- game flow ----------
 
 function newGame() {
   session++;
   game = new Game();
+  mode = modeSel.value;
   human = Number(sideSel.value);
-  applyDifficulty();
+  paused = false;
+  pauseBtn.textContent = "Pause";
+  pauseBtn.disabled = mode !== "aivai";
+  applySettings();
   selected = -1;
   hover = -1;
   moves = [];
   lastPacked = 0;
   listEl.replaceChildren();
   infoEl.textContent = "";
+  update();
+}
+
+// Undo: revert back to YOUR last decision point — your move AND the
+// engine's reply disappear together (pass plies included).
+function undo() {
+  if (busy || mode !== "hvai" || game.history_len() <= 1) return;
+  let popped = 0;
+  do {
+    if (!game.undo()) break;
+    popped++;
+  } while (game.history_len() > 1 && game.turn() !== human);
+  moves = moves.slice(0, moves.length - popped);
+  lastPacked = moves.length ? moves[moves.length - 1] : 0;
+  [...listEl.children].slice(moves.length).forEach((li) => li.remove());
+  selected = -1;
   update();
 }
 
@@ -80,29 +114,13 @@ function pushMove(packed) {
   lastPacked = packed;
 }
 
-function undo() {
-  if (busy || game.history_len() <= 1) return;
-  let popped = 0;
-  do {
-    if (!game.undo()) break;
-    popped++;
-  } while (game.history_len() > 1 && game.turn() !== human);
-  moves = moves.slice(0, moves.length - popped);
-  lastPacked = moves.length ? moves[moves.length - 1] : 0;
-  listEl.querySelectorAll("li").forEach((li, i) => {
-    if (i >= moves.length) li.remove();
-  });
-  selected = -1;
-  update();
-}
-
 function update() {
   const mySession = session;
   legal = game.legal_moves();
   const [b, w] = game.counts();
   countB.textContent = b;
   countW.textContent = w;
-  undoBtn.disabled = busy || game.history_len() <= 1;
+  undoBtn.disabled = busy || mode !== "hvai" || game.history_len() <= 1;
 
   if (game.over()) {
     busy = false;
@@ -116,7 +134,26 @@ function update() {
     return;
   }
 
-  if (game.turn() === human) {
+  const engineMoves = () => {
+    busy = true;
+    const s = session;
+    setTimeout(() => {
+      if (s !== session || (mode === "aivai" && paused)) return;
+      const packed = game.ai_move();
+      if (packed !== null && packed !== undefined) pushMove(packed);
+      else pushMove(0xffff);
+      const [d, n, ms] = game.search_info();
+      infoEl.textContent = d
+        ? `depth ${d} \u00b7 ${fmtNodes(n)} nodes \u00b7 ${(ms / 1000).toFixed(1)}s`
+        : "";
+      update();
+    }, mode === "aivai" ? 120 : 30);
+  };
+
+  if (mode === "aivai") {
+    statusEl.textContent = game.turn() === 0 ? "Engine (Black) thinking\u2026" : "Engine (White) thinking\u2026";
+    engineMoves();
+  } else if (game.turn() === human) {
     if (!game.has_moves()) {
       busy = true;
       statusEl.textContent = "You have no moves \u2014 passing\u2026";
@@ -126,25 +163,14 @@ function update() {
         game.pass();
         pushMove(0xffff);
         update();
-      }, 600);
+      }, 500);
     } else {
       busy = false;
       statusEl.textContent = human === 0 ? "Your move \u2014 Black" : "Your move \u2014 White";
     }
   } else {
-    busy = true;
     statusEl.textContent = "Engine thinking\u2026";
-    const s = session;
-    setTimeout(() => {
-      if (s !== session) return;
-      const packed = game.ai_move();
-      pushMove(packed === null || packed === undefined ? 0xffff : packed);
-      const [d, n, ms] = game.search_info();
-      infoEl.textContent = d
-        ? `depth ${d} \u00b7 ${fmtNodes(n)} nodes \u00b7 ${(ms / 1000).toFixed(1)}s`
-        : "";
-      update();
-    }, 30);
+    engineMoves();
   }
   render();
 }
@@ -176,7 +202,7 @@ function render(scaleP = 1) {
       ctx.fillStyle = "rgba(55, 200, 195, 0.16)";
       ctx.fillRect(x, y, CELL, CELL);
     }
-    if (sq === hover && game.piece(sq) === human + 1 && !busy && game.turn() === human) {
+    if (sq === hover && mode === "hvai" && game.piece(sq) === human + 1 && !busy && game.turn() === human) {
       ctx.fillStyle = "rgba(255, 255, 255, 0.06)";
       ctx.fillRect(x, y, CELL, CELL);
     }
@@ -191,8 +217,7 @@ function render(scaleP = 1) {
     ctx.strokeRect(x + 0.5, y + 0.5, CELL - 1, CELL - 1);
   }
 
-  // legal targets for the selected piece
-  if (!busy && selected >= 0) {
+  if (!busy && mode === "hvai" && selected >= 0) {
     for (const packed of legal) {
       if ((packed >> 8) !== selected) continue;
       const to = packed & 0xff;
@@ -202,7 +227,6 @@ function render(scaleP = 1) {
     }
   }
 
-  // pieces
   for (let sq = 0; sq < SIZE * SIZE; sq++) {
     const p = game.piece(sq);
     if (p === 0 || p === 3) continue;
@@ -211,7 +235,6 @@ function render(scaleP = 1) {
     drawPiece(sq, p === 1 ? "black" : "white", scale);
   }
 
-  // coordinates
   ctx.fillStyle = "#7f8ea6";
   ctx.font = "11px Consolas, monospace";
   for (let i = 0; i < SIZE; i++) {
@@ -271,7 +294,7 @@ function drawPiece(sq, color, scale = 1) {
 // ---------- input ----------
 
 canvas.addEventListener("mousemove", (e) => {
-  if (busy || game.turn() !== human || game.over()) { hover = -1; return; }
+  if (busy || mode !== "hvai" || game.turn() !== human || game.over()) { hover = -1; return; }
   const rect = canvas.getBoundingClientRect();
   const scale = CANVAS / rect.width;
   hover = sqAt((e.clientX - rect.left) * scale, (e.clientY - rect.top) * scale);
@@ -282,7 +305,7 @@ canvas.addEventListener("mousemove", (e) => {
 canvas.addEventListener("mouseleave", () => { hover = -1; });
 
 canvas.addEventListener("click", (e) => {
-  if (busy || game.over() || game.turn() !== human) return;
+  if (busy || mode !== "hvai" || game.over() || game.turn() !== human) return;
   const rect = canvas.getBoundingClientRect();
   const scale = CANVAS / rect.width;
   const sq = sqAt((e.clientX - rect.left) * scale, (e.clientY - rect.top) * scale);
@@ -304,7 +327,17 @@ canvas.addEventListener("click", (e) => {
 
 newBtn.addEventListener("click", newGame);
 undoBtn.addEventListener("click", undo);
-diffSel.addEventListener("change", applyDifficulty);
+pauseBtn.addEventListener("click", () => {
+  if (mode !== "aivai") return;
+  paused = !paused;
+  pauseBtn.textContent = paused ? "Resume" : "Pause";
+  if (!paused && !game.over()) update();
+});
+modeSel.addEventListener("change", () => {});
+sideSel.addEventListener("change", () => {});
+blackMs.addEventListener("change", () => { if (game) game.set_side_time(0, timeFor(0)); });
+whiteMs.addEventListener("change", () => { if (game) game.set_side_time(1, timeFor(1)); });
+depthIn.addEventListener("change", () => { if (game) applySettings(); });
 
 // ---------- boot ----------
 

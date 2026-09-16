@@ -34,10 +34,7 @@ fn main() -> ExitCode {
         "play" => play_cmd(flag_int(&args, "--time").unwrap_or(1000) as u64),
         "show" => show_cmd(),
         "genbench" => genbench_cmd(flag_int(&args, "--iters").unwrap_or(200_000) as u64),
-        "serve" => serve_cmd(
-            flag_int(&args, "--time").unwrap_or(1000) as u64,
-            flag_int(&args, "--nodes").map(|n| n as u64),
-        ),
+        "serve" => serve_cmd(flag_int(&args, "--tt-bits").unwrap_or(20) as usize),
         "match" => match_cmd(
             flag_int(&args, "--games").unwrap_or(20) as u32,
             flag_int(&args, "--time").unwrap_or(1000) as u64,
@@ -455,51 +452,75 @@ fn play_cmd(time_ms: u64) -> ExitCode {
 
 // ---------- serve ----------
 
-/// Line protocol: each stdin line is a board (`"<49 chars> <b|w>"`, our
-/// compact format); stdout gets one reply line whose FIRST token is the move.
-fn serve_cmd(time_ms: u64, max_nodes: Option<u64>) -> ExitCode {
+
+// ---------- serve (UAI) ----------
+
+/// Minimal UAI engine loop so any titanium build (main/candidate snapshots)
+/// can be driven by `match --opp "path\to\titanium-cli.exe serve"`.
+fn serve_cmd(tt_bits: usize) -> ExitCode {
     let stdin = io::stdin();
-    let mut searcher = Searcher::new();
-    println!("titanium serve ready");
+    let mut searcher = Searcher::with_tt_bits(tt_bits);
+    let mut current: Option<Board> = None;
     for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        let line = line.trim();
-        if line.is_empty() {
+        let Ok(line) = line else { break };
+        let t = line.trim().to_string();
+        if t.is_empty() {
             continue;
         }
-        if line == "quit" {
+        if t == "quit" {
             break;
         }
-        let Some(b) = Board::from_str(line) else {
-            println!("err parse");
-            continue;
-        };
-        if b.game_over() {
-            println!("over");
-            continue;
+        if t == "uai" {
+            println!("id name Titanium Ataxx");
+            println!("id author titaniummachine1");
+            println!("uaiok");
+        } else if t == "isready" {
+            println!("readyok");
+        } else if t == "uainewgame" {
+            searcher.clear_tt();
+        } else if t == "position startpos" {
+            current = Some(Board::start());
+        } else if let Some(fen) = t.strip_prefix("position fen ") {
+            current = Board::from_ataxx_fen(fen.trim());
+        } else if t.starts_with("go") {
+            let mut nodes = None;
+            let mut movetime = None;
+            let mut depth = None;
+            let toks: Vec<&str> = t.split_whitespace().collect();
+            for (i, k) in toks.iter().enumerate() {
+                match *k {
+                    "nodes" => nodes = toks.get(i + 1).and_then(|v| v.parse().ok()),
+                    "movetime" => movetime = toks.get(i + 1).and_then(|v| v.parse().ok()),
+                    "depth" => depth = toks.get(i + 1).and_then(|v| v.parse().ok()),
+                    _ => {}
+                }
+            }
+            let reply = current
+                .as_ref()
+                .map(|b| {
+                    if b.game_over() || !b.has_moves(b.turn) {
+                        return "0000".to_string();
+                    }
+                    let limits = SearchLimits {
+                        time: movetime.filter(|ms| *ms > 0).map(Duration::from_millis),
+                        max_nodes: nodes,
+                        max_depth: depth.unwrap_or(24),
+                    };
+                    match searcher.search(b, &limits).best {
+                        Some(m) => {
+                            if m.is_clone() {
+                                Board::sq_name(m.to)
+                            } else {
+                                format!("{}{}", Board::sq_name(m.from), Board::sq_name(m.to))
+                            }
+                        }
+                        None => "0000".to_string(),
+                    }
+                })
+                .unwrap_or_else(|| "0000".to_string());
+            println!("bestmove {reply}");
         }
-        if !b.has_moves(b.turn) {
-            println!("pass");
-            continue;
-        }
-        let limits = SearchLimits {
-            time: if time_ms == 0 { None } else { Some(Duration::from_millis(time_ms)) },
-            max_nodes,
-            max_depth: 24,
-        };
-        let r = searcher.search(&b, &limits);
-        match r.best {
-            Some(m) => println!(
-                "{} depth {} nodes {}",
-                move_str(Some(m)),
-                r.depth,
-                r.nodes
-            ),
-            None => println!("pass"),
-        }
+        // "stop" ignored: searches are synchronous.
     }
     ExitCode::SUCCESS
 }

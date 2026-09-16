@@ -14,7 +14,7 @@ pub struct Game {
     hist: Vec<Board>,
     /// Move that led to `hist[i]` (`Move::PASS` for pass entries).
     moves: Vec<Move>,
-    time_ms: u32,
+    time_ms: [u32; 2],
     max_depth: u32,
     last_depth: u32,
     last_nodes: u32,
@@ -32,7 +32,7 @@ impl Game {
         Game {
             hist: vec![Board::start()],
             moves: vec![Move::PASS],
-            time_ms: 600,
+            time_ms: [600, 600],
             max_depth: 12,
             last_depth: 0,
             last_nodes: 0,
@@ -41,8 +41,12 @@ impl Game {
         }
     }
 
-    pub fn set_difficulty(&mut self, time_ms: u32, max_depth: u32) {
-        self.time_ms = time_ms.max(10);
+    /// Per-side think time (ms): 0 = black, 1 = white.
+    pub fn set_side_time(&mut self, side: u8, time_ms: u32) {
+        self.time_ms[(side as usize) & 1] = time_ms.max(1);
+    }
+
+    pub fn set_max_depth(&mut self, max_depth: u32) {
         self.max_depth = max_depth.clamp(1, 30);
     }
 
@@ -109,7 +113,7 @@ impl Game {
             return None;
         }
         let limits = SearchLimits {
-            time: Some(Duration::from_millis(self.time_ms as u64)),
+            time: Some(Duration::from_millis(self.time_ms[self.cur().turn as usize] as u64)),
             max_nodes: None,
             max_depth: self.max_depth,
         };
