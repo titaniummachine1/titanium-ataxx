@@ -985,14 +985,14 @@ mod tests {
         let board = ".......
                      .xxxxx.
                      .xxxxx.
-                     .xxxox.
+                     .xxoxx.
                      .xxxxx.
                      .xxxxx.
                      ....... b";
         let b = Board::from_str(board).unwrap();
         assert!(!b.has_moves(1), "white must be trapped");
         let r = best_move(&b, &no_time(2));
-        assert!(r.score >= 80_000, "certificate score, got {}", r.score);
+        assert!(r.score >= 80_000, "certificate score, got {} depth {} nodes {} best {:?}", r.score, r.depth, r.nodes, r.best.map(|m| m.to_u32()));
     }
 
     #[test]
@@ -1022,3 +1022,4 @@ mod tests {
         }
     }
 }
+
