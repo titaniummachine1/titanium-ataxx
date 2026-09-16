@@ -62,6 +62,10 @@ const MULTICAP_PEN: i32 = 20;
 /// Reverse futility pruning margins, index = depth-1 (autaxx, stone = 100).
 const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774];
 
+/// E5 proven-win certificate score: above every heuristic eval (±~3000),
+/// below MATE_BOUND so TT mate adjustments never touch it.
+const CERT_WIN: i32 = 90_000;
+
 // Ordering tiers (titanium-engine pattern: compile-asserted bands so no
 // ordering signal can structurally leak into its neighbor).
 const ORD_TT: i32 = i32::MAX / 2;
@@ -680,9 +684,35 @@ impl Searcher {
                 return e.score;
             }
         }
-        let ev = evaluate(b);
+        let ev = self.evaluate_with_certificate(b);
         self.tt.store(b.hash, 0, ev, 0, FLAG_EXACT);
         ev
+    }
+
+    /// E5 trap certificate (user insight): once the opponent has NO legal
+    /// move they can NEVER regain one — landing squares are `empty ∩
+    /// ball2(them)` and empties only shrink. If we also have moves and our
+    /// count >= theirs (or is about to exceed it via a clone), the game is a
+    /// forced majority win: expand (or fill) until the end. Proven win, no
+    /// search needed. Only valid when the game is not already over (callers
+    /// check `game_over()` first — if we were ALSO stuck, it would be).
+    fn evaluate_with_certificate(&mut self, b: &Board) -> i32 {
+        let us = b.turn;
+        let them = 1 - us;
+        if !b.has_moves(them) {
+            let my = b.occ[us as usize].count_ones();
+            let their = b.occ[them as usize].count_ones();
+            if my > their {
+                return CERT_WIN;
+            }
+            // Equal counts: a single clone breaks the tie permanently.
+            if my == their && (dist_union(b.occ[us as usize], 1) & b.empty()) != 0 {
+                return CERT_WIN;
+            }
+            // Behind or no clone room: opponent frozen, board fills — the
+            // normal eval already knows the material picture.
+        }
+        evaluate(b)
     }
 
     /// Killer/history bookkeeping on a beta cutoff.
@@ -944,6 +974,25 @@ mod tests {
         let r = best_move(&b, &limits);
         assert!(r.nodes < 3000, "nodes {}", r.nodes);
         assert!(r.best.is_some());
+    }
+
+    #[test]
+    fn trap_certificate_is_proven_win() {
+        // White d4 fully sealed in by a 24-stone black ring (no empty square
+        // within white's reach — permanently stuck). Black to move, 24 > 1,
+        // black can still expand: forced majority win, search must see it
+        // instantly at any depth.
+        let board = ".......
+                     .xxxxx.
+                     .xxxxx.
+                     .xxxox.
+                     .xxxxx.
+                     .xxxxx.
+                     ....... b";
+        let b = Board::from_str(board).unwrap();
+        assert!(!b.has_moves(1), "white must be trapped");
+        let r = best_move(&b, &no_time(2));
+        assert!(r.score >= 80_000, "certificate score, got {}", r.score);
     }
 
     #[test]
