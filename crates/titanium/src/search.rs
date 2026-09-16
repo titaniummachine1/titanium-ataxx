@@ -569,6 +569,24 @@ impl Searcher {
             self.score_into(b, list, tt_mv, ply);
         }
         if stack.lists[ply as usize].is_empty() {
+            // E5b trap deductions (user insight, free at this node): we are
+            // permanently stuck (empties never regrow), opponent is not
+            // (game_over was checked). Majority math is already decided in
+            // two of the three cases.
+            let my = b.occ[b.turn as usize].count_ones();
+            let opp = b.occ[1 - b.turn as usize].count_ones();
+            if opp > my {
+                return -CERT_WIN; // they expand freely, burying us
+            }
+            if opp == my {
+                // They must gain a stone to win; frozen equality = draw.
+                let they_clone =
+                    (dist_union(b.occ[1 - b.turn as usize], 1) & b.empty()) != 0;
+                return if they_clone { -CERT_WIN } else { 0 };
+            }
+            if opp + b.empty().count_ones() < my {
+                return CERT_WIN; // they can never catch up
+            }
             // Opponent not stuck is guaranteed: double-stuck ends via passes >= 2.
             return -self.negamax(
                 &b.make_pass(),
@@ -684,35 +702,9 @@ impl Searcher {
                 return e.score;
             }
         }
-        let ev = self.evaluate_with_certificate(b);
+        let ev = evaluate(b);
         self.tt.store(b.hash, 0, ev, 0, FLAG_EXACT);
         ev
-    }
-
-    /// E5 trap certificate (user insight): once the opponent has NO legal
-    /// move they can NEVER regain one — landing squares are `empty ∩
-    /// ball2(them)` and empties only shrink. If we also have moves and our
-    /// count >= theirs (or is about to exceed it via a clone), the game is a
-    /// forced majority win: expand (or fill) until the end. Proven win, no
-    /// search needed. Only valid when the game is not already over (callers
-    /// check `game_over()` first — if we were ALSO stuck, it would be).
-    fn evaluate_with_certificate(&mut self, b: &Board) -> i32 {
-        let us = b.turn;
-        let them = 1 - us;
-        if !b.has_moves(them) {
-            let my = b.occ[us as usize].count_ones();
-            let their = b.occ[them as usize].count_ones();
-            if my > their {
-                return CERT_WIN;
-            }
-            // Equal counts: a single clone breaks the tie permanently.
-            if my == their && (dist_union(b.occ[us as usize], 1) & b.empty()) != 0 {
-                return CERT_WIN;
-            }
-            // Behind or no clone room: opponent frozen, board fills — the
-            // normal eval already knows the material picture.
-        }
-        evaluate(b)
     }
 
     /// Killer/history bookkeeping on a beta cutoff.
