@@ -77,34 +77,68 @@ const ORD_HISTORY_MAX: i32 = 90_000;
 const _: () = assert!(ORD_HISTORY_MAX + 8 * ORD_CAPTURE_UNIT + ORD_CLONE_BONUS < ORD_KILLER);
 const _: () = assert!(ORD_KILLER < ORD_TT);
 
+/// Ablation mask bits for `evaluate_masked` (see E-ablation report).
+/// Each bit enables one eval input; clearing it zeroes that term.
+pub const MASK_MATERIAL: u32 = 1;
+pub const MASK_PST: u32 = 2;
+pub const MASK_HOLES: u32 = 4;
+pub const MASK_CONTACT: u32 = 8;
+pub const MASK_MULTICAP: u32 = 16;
+pub const MASK_TEMPO: u32 = 32;
+pub const MASK_ALL: u32 =
+    MASK_MATERIAL | MASK_PST | MASK_HOLES | MASK_CONTACT | MASK_MULTICAP | MASK_TEMPO;
+
 /// Static eval from the side-to-move's perspective.
 pub fn evaluate(b: &Board) -> i32 {
-    let mat = MATERIAL * (b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32);
+    evaluate_masked(b, MASK_ALL)
+}
+
+/// Masked static eval: any cleared input contributes zero. Used by the
+/// ablation harness (`match --mask/--opp-mask`); production uses MASK_ALL.
+pub fn evaluate_masked(b: &Board, mask: u32) -> i32 {
+    let mat = if mask & MASK_MATERIAL != 0 {
+        MATERIAL * (b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32)
+    } else {
+        0
+    };
     let mut pst = 0i32;
-    for c in 0..2 {
-        let sign = if c == 0 { 1 } else { -1 };
-        let mut bb = b.occ[c];
-        while bb != 0 {
-            let sq = bb.trailing_zeros() as usize;
-            bb &= bb - 1;
-            pst += sign * PST[sq];
+    if mask & MASK_PST != 0 {
+        for c in 0..2 {
+            let sign = if c == 0 { 1 } else { -1 };
+            let mut bb = b.occ[c];
+            while bb != 0 {
+                let sq = bb.trailing_zeros() as usize;
+                bb &= bb - 1;
+                pst += sign * PST[sq];
+            }
         }
     }
-    let holes_black = holes_penalty(b, 0);
-    let holes_white = holes_penalty(b, 1);
-    let contact_black = endangered_count(b, 0);
-    let contact_white = endangered_count(b, 1);
-    let multicap_black = multicapture_penalty(b, 0);
-    let multicap_white = multicapture_penalty(b, 1);
+    let (holes_black, holes_white) = if mask & MASK_HOLES != 0 {
+        (holes_penalty(b, 0), holes_penalty(b, 1))
+    } else {
+        (0, 0)
+    };
+    let (contact_black, contact_white) = if mask & MASK_CONTACT != 0 {
+        (endangered_count(b, 0), endangered_count(b, 1))
+    } else {
+        (0, 0)
+    };
+    let (multicap_black, multicap_white) = if mask & MASK_MULTICAP != 0 {
+        (multicapture_penalty(b, 0), multicapture_penalty(b, 1))
+    } else {
+        (0, 0)
+    };
     let mut score = mat + pst - holes_black + holes_white
         - CONTACT_PEN * contact_black as i32
         + CONTACT_PEN * contact_white as i32
         - multicap_black
         + multicap_white;
-    if b.turn == 0 {
-        score += TEMPO;
-    } else {
-        score -= TEMPO;
+    if mask & MASK_TEMPO != 0 {
+        if b.turn == 0 {
+            score += TEMPO;
+        } else {
+            score -= TEMPO;
+        }
     }
     if b.turn == 0 {
         score
@@ -351,6 +385,9 @@ pub struct Searcher {
     killers: Box<[(u32, u32); MAX_PLY]>,
     /// History heuristic: [mover][to] cutoff counters, aged per search.
     history: Box<[[u32; 49]; 2]>,
+    /// Eval ablation mask (MASK_ALL = production). Lets `--opp self` run
+    /// with a different eval on one side for E-ablation matches.
+    eval_mask: u32,
 }
 
 /// Monotonic milliseconds since process start (native default time source).
@@ -386,7 +423,17 @@ impl Searcher {
             ordering: Ordering::Lazy,
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[0; 49]; 2]),
+            eval_mask: MASK_ALL,
         }
+    }
+
+    /// Eval ablation mask for this searcher (default MASK_ALL).
+    pub fn set_eval_mask(&mut self, mask: u32) {
+        self.eval_mask = mask;
+    }
+
+    pub fn eval_mask(&self) -> u32 {
+        self.eval_mask
     }
 
     /// Select the move ordering strategy (for sperft A/B benchmarks).
@@ -694,6 +741,10 @@ impl Searcher {
     /// Eval with the TT as cache (depth-0 EXACT entries).
     #[inline]
     fn eval_cached(&mut self, b: &Board) -> i32 {
+        // Masked evals bypass the cache: TT depth-0 entries are full-eval.
+        if self.eval_mask != MASK_ALL {
+            return evaluate_masked(b, self.eval_mask);
+        }
         if let Some(e) = self.tt.probe(b.hash) {
             if e.flag == FLAG_EXACT && e.depth == 0 {
                 return e.score;

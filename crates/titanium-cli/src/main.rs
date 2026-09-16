@@ -15,6 +15,29 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use titanium::{best_move, Board, Move, SearchLimits, Searcher, RING1, StopReason};
+use titanium::{MASK_ALL, MASK_CONTACT, MASK_HOLES, MASK_MATERIAL, MASK_MULTICAP, MASK_PST, MASK_TEMPO};
+
+/// Parse an eval ablation mask: "all" (default) or comma list of inputs to
+/// REMOVE, e.g. `--opp-mask noholes` / `--opp-mask nopst,notempo`.
+fn parse_mask(s: Option<String>) -> u32 {
+    let Some(s) = s else { return MASK_ALL };
+    if s.trim().eq_ignore_ascii_case("all") {
+        return MASK_ALL;
+    }
+    let mut mask = MASK_ALL;
+    for tok in s.split(',') {
+        match tok.trim().to_ascii_lowercase().as_str() {
+            "nomaterial" | "nomat" => mask &= !MASK_MATERIAL,
+            "nopst" => mask &= !MASK_PST,
+            "noholes" | "nohole" => mask &= !MASK_HOLES,
+            "nocontact" => mask &= !MASK_CONTACT,
+            "nomulticap" | "nomulti" => mask &= !MASK_MULTICAP,
+            "notempo" => mask &= !MASK_TEMPO,
+            other => eprintln!("match: unknown mask token '{other}' (use nomaterial,nopst,noholes,nocontact,nomulticap,notempo)"),
+        }
+    }
+    mask
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -45,6 +68,8 @@ fn main() -> ExitCode {
             flag_int(&args, "--nodes").map(|n| n as u64),
             flag_int(&args, "--start-game").unwrap_or(1) as u32,
             flag_str(&args, "--out"),
+            parse_mask(flag_str(&args, "--mask")),
+            parse_mask(flag_str(&args, "--opp-mask")),
         ),
         "sperft" => sperft_cmd(
             flag_int(&args, "--depth").unwrap_or(8) as u32,
@@ -660,6 +685,8 @@ fn match_cmd(
     max_nodes: Option<u64>,
     start_game: u32,
     out: Option<String>,
+    mask: u32,
+    opp_mask: u32,
 ) -> ExitCode {
     // "self" = titanium vs titanium in-process (no external process).
     let mut opp = if opp_cmd.as_deref() == Some("self") {
@@ -713,8 +740,29 @@ fn match_cmd(
 
     for game in start_game..start_game + games {
         let mut b = Board::start();
+        // Seed-varied LEGAL book: game number picks which outward clone each
+        // side plays (3x3 corner options), so node-limited deterministic
+        // search yields distinct games without early wipes.
+        {
+            let mut seed = game as u64 * 0x9E3779B97F4A7C15 + 0x243F6A8885A308D3;
+            let black_opts = ["b2", "a2", "b1"];
+            let white_opts = ["f6", "g6", "f7"];
+            for i in 0..10 {
+                let opts = if b.turn == 0 { black_opts } else { white_opts };
+                let sq = opts[(rng_next(&mut seed) % 3) as usize];
+                let to = Board::parse_sq(sq).unwrap();
+                let clones = b.occ[b.turn as usize] & RING1[to as usize];
+                if clones == 0 || !b.has_moves(b.turn) || b.game_over() {
+                    break;
+                }
+                b = b.make(Move { from: clones.trailing_zeros() as u8, to });
+                let _ = i;
+            }
+        }
         let mut searcher = Searcher::new(); // fresh TT per game
+        searcher.set_eval_mask(mask);
         let mut opp_searcher = Searcher::new(); // for --opp self
+        opp_searcher.set_eval_mask(opp_mask);
         let titanium_is_black = game % 2 == 1;
         let mut log = String::new();
         let mut result = None;
@@ -896,6 +944,14 @@ fn sperft_cmd(depth: u32, positions: usize, ordering: Option<String>) -> ExitCod
 // ---------- genbench ----------
 
 struct Rng(u64);
+
+#[allow(dead_code)]
+fn rng_next(rng: &mut u64) -> u64 {
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 7;
+    *rng ^= *rng << 17;
+    *rng
+}
 
 impl Rng {
     fn next(&mut self) -> u64 {

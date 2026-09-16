@@ -19,3 +19,4 @@ pub use board::{
 #[cfg(target_arch = "x86_64")]
 pub use board::extract8_pext;
 pub use search::{best_move, Ordering, SearchLimits, SearchResult, Searcher, StopReason};
+pub use search::{evaluate_masked, MASK_ALL, MASK_CONTACT, MASK_HOLES, MASK_MATERIAL, MASK_MULTICAP, MASK_PST, MASK_TEMPO};
