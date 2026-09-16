@@ -53,6 +53,11 @@ const HOLE_PEN: [i32; 9] = [-17, 4, -28, -88, -125, -200, -322, -446, -534];
 /// Contact penalty per ENDANGERED stone (E2, "virus strategy"): stones the
 /// enemy can infect right now. Avoid contact early, mass-clone first.
 const CONTACT_PEN: i32 = 15;
+/// Multi-capture exposure (E4, user idea): for every empty landing square
+/// the enemy can reach, each of our stones BEYOND THE FIRST that one enemy
+/// landing would convert costs this much — a 3-stone cluster next to an
+/// enemy-reachable hole is a pending 2-stone loss in a single move.
+const MULTICAP_PEN: i32 = 20;
 
 /// Reverse futility pruning margins, index = depth-1 (autaxx, stone = 100).
 const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774];
@@ -85,9 +90,13 @@ pub fn evaluate(b: &Board) -> i32 {
     let holes_white = holes_penalty(b, 1);
     let contact_black = endangered_count(b, 0);
     let contact_white = endangered_count(b, 1);
+    let multicap_black = multicapture_penalty(b, 0);
+    let multicap_white = multicapture_penalty(b, 1);
     let mut score = mat + pst - holes_black + holes_white
         - CONTACT_PEN * contact_black as i32
-        + CONTACT_PEN * contact_white as i32;
+        + CONTACT_PEN * contact_white as i32
+        - multicap_black
+        + multicap_white;
     if b.turn == 0 {
         score += TEMPO;
     } else {
@@ -107,6 +116,26 @@ fn endangered_count(b: &Board, side: u8) -> u32 {
     let us = b.occ[side as usize];
     let landings = b.empty() & (dist_union(them, 1) | jump_union(them));
     (us & dist_union(landings, 1)).count_ones()
+}
+
+/// E4 multi-capture exposure: for each enemy-reachable empty landing square,
+/// our stones there beyond the first (each extra one = a stone lost in the
+/// same single enemy move).
+fn multicapture_penalty(b: &Board, side: u8) -> i32 {
+    let them = b.occ[1 - side as usize];
+    let us = b.occ[side as usize];
+    let landings = b.empty() & (dist_union(them, 1) | jump_union(them));
+    let mut pen = 0i32;
+    let mut ls = landings;
+    while ls != 0 {
+        let sq = ls.trailing_zeros() as usize;
+        ls &= ls - 1;
+        let n = (RING1[sq] & us).count_ones() as i32;
+        if n >= 2 {
+            pen += (n - 1) * MULTICAP_PEN;
+        }
+    }
+    pen
 }
 
 /// autaxx hole risk: empty squares adjacent to `side`'s stones that the
