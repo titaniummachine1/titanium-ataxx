@@ -122,17 +122,28 @@ embed quotes manually: `$oppQ = "`"$m serve`""`.
   no-holes now (MASK_HOLES out of MASK_ALL).
 - ASP1 aspiration 8cp×1.9 (Moonbird) — REJECTED 3–29 @5k, 15–17 @100ms.
   Thrashes on quantized eval.
-- ASP1b ladder 50/200/800 (autaxx bounds + Quoridor 4× widening) — PARKED:
+- ASP1b ladder 50/200/800 (autaxx bounds + Quoridor 4x widening) — PARKED:
   13–19 @5k / 20–12 @100ms, pooled 33–31 ≈ +7. Window buys nothing with
   quantized eval; smoothness must come from NNUE. BUG LESSON: mate scores
   saturate fixed window ceilings → infinite research; saturated bounds MUST
   accept (guard in `search.rs` root loop).
+- DAG1 fold — COMMITTED (dagfold cmd + Board PartialEq, fcff86b): shard0
+  339k lines → 195k nodes / 42% dedup / edges, 23.8MB db. DB feeds Net0.
+- NET0-plan: NO GPU on box → torch-cpu trainer for 28k params. Eval-first
+  CONFIRMED (ASP proved search can't win quantized; Moonbird 13x slower/node
+  still 0–32 on eval quality). Net0 before more search work.
+- A2 LazySMP phase 1 (private TTs, `search_smp`, --threads) — REJECTED:
+  11–21 @5k TOTAL / 17–15 @100ms. Helpers tax shared budget. Phase 2
+  (shared atomic TT) or drop — USER DECISION (recorded 2026-09-17).
 
 ## Session state 2026-09-17 (READ FIRST if session starts cold)
 
 Branches (`titanium-ataxx` repo): `main` (E2+E3b+E4), `ablation/eval-inputs`
 @f089f37 (harness + no-holes + nnue.rs + datagen), `exp/ataxx-aspiration`
-(latest: ASP1b ladder, PARKED — do not merge without new evidence).
+(ASP1b PARKED), `exp/ataxx-lazysmp` (A2 REJECTED — do not merge).
+`titanium_smp4_cand.exe` = A2 candidate (REJECTED); `titanium_abl_base.exe` =
+f089f37 baseline for all A-gates. A2 logs: `logs/a2_smp_5k.txt` (11–21),
+`logs/a2_smp_t100.txt` (17–15). Gate scripts `scripts/bench/a{1,1b,2}_*.ps1`.
 Binaries in `scripts/bench/` (gitignored, rebuild if missing):
 `titanium_abl_base.exe` = f089f37 baseline, `titanium_asp_cand.exe` = 8cp
 REJECTED, `titanium_asp100_cand.exe` = ladder PARKED.
@@ -167,5 +178,4 @@ Quoridor_best_AI/LEDGER.md 2026-09-17 entry.
    2×2-neighborhood index, needs the tuning loop first.
 3. Correction history keyed by occupancy-hash bucket (titanium pattern).
 4. ~~Aspiration windows~~ DONE 2026-09-17: 8cp REJECTED, ladder 50/200/800 PARKED (pooled +7). Dead until eval is smooth (NNUE).
-5. LazySMP with TOTAL node budget across workers (Arc<AtomicU64> counter —
-   titanium commit 8a0399d pattern) — we have 4c/8t idle during gates.
+5. ~~LazySMP phase 1 (private TTs)~~ DONE 2026-09-17: REJECTED 11–21 @5k TOTAL / 17–15 @100ms. Phase 2 = shared atomic TT (real Quoridor pattern) or drop — USER DECISION PENDING. Next otherwise: Net0 torch-cpu trainer on DAG db.
