@@ -63,6 +63,14 @@ const MULTICAP_PEN: i32 = 20;
 /// Reverse futility pruning margins, index = depth-1 (autaxx, stone = 100).
 const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774];
 
+/// Aspiration window (Moonbird-tuned for Ataxx): root iterations after the
+/// first search [prev-w, prev+w] instead of wide open. Scores are cp-like
+/// (100/stone), same units as Moonbird's 8cp x1.9.
+const ASPIRATION_INIT: i32 = 8;
+const ASPIRATION_MULT: f64 = 1.9;
+/// Window clamp: keeps mate/cert scores reachable after widening.
+const ASPIRATION_CAP: i32 = MATE - 2000;
+
 /// E5 proven-win certificate score: above every heuristic eval (±~3000),
 /// below MATE_BOUND so TT mate adjustments never touch it.
 const CERT_WIN: i32 = 90_000;
@@ -868,22 +876,55 @@ impl Searcher {
         for depth in 1..=limits.max_depth.max(1) {
             let nodes_before = self.nodes;
             let iter_start = self.elapsed_ms();
-            let mut alpha = i32::MIN + 1;
-            let mut best_this = None;
-            let mut best_score = i32::MIN;
-            for i in 0..n_root {
-                let m = stack.lists[0].move_at(i);
-                let score = -self.negamax(&b.make(m), &mut stack, -i32::MAX, -alpha, depth - 1, 1, true);
-                if self.stop {
-                    break;
+            // Aspiration (Moonbird 8cp x1.9): depth 1 is wide open to seed
+            // prev_score; later iterations research a narrow window,
+            // widening on fail-low/high without advancing depth.
+            let mut w = ASPIRATION_INIT;
+            let (mut best_this, mut best_score) = (None, i32::MIN);
+            loop {
+                let wide = result.depth == 0;
+                let mut alpha = i32::MIN + 1;
+                let mut beta = i32::MAX;
+                if !wide {
+                    alpha = result.score.saturating_sub(w).max(-ASPIRATION_CAP);
+                    beta = result.score.saturating_add(w).min(ASPIRATION_CAP);
                 }
-                if score > best_score {
-                    best_score = score;
-                    best_this = Some(m);
-                    if score > alpha {
-                        alpha = score;
+                if alpha >= beta {
+                    // Mate-score neighborhood: window math breaks, go wide.
+                    alpha = i32::MIN + 1;
+                    beta = i32::MAX;
+                }
+                let (alpha_orig, beta_orig) = (alpha, beta);
+                best_this = None;
+                best_score = i32::MIN;
+                for i in 0..n_root {
+                    let m = stack.lists[0].move_at(i);
+                    let score =
+                        -self.negamax(&b.make(m), &mut stack, -beta, -alpha, depth - 1, 1, true);
+                    if self.stop {
+                        break;
+                    }
+                    if score > best_score {
+                        best_score = score;
+                        best_this = Some(m);
+                        if score > alpha {
+                            alpha = score;
+                        }
                     }
                 }
+                if self.stop || wide {
+                    break;
+                }
+                // Fail-low/high only if the window can actually widen: mate
+                // scores saturate at +/-ASPIRATION_CAP, and researching an
+                // unwidenable window loops forever. Saturated bounds accept.
+                let fail_lo = best_score <= alpha_orig && alpha_orig > -ASPIRATION_CAP;
+                let fail_hi = best_score >= beta_orig && beta_orig < ASPIRATION_CAP;
+                if !fail_lo && !fail_hi {
+                    break;
+                }
+                // Fail-low/high inside a bounded window: widen and research.
+                w = ((w as f64 * ASPIRATION_MULT) as i32).max(w + 1);
             }
             // Partial-iteration adoption (titanium/Lague): moves recorded in
             // best_this completed their search before the stop, so their
