@@ -63,13 +63,14 @@ const MULTICAP_PEN: i32 = 20;
 /// Reverse futility pruning margins, index = depth-1 (autaxx, stone = 100).
 const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774];
 
-/// Aspiration window (Moonbird-tuned for Ataxx): root iterations after the
-/// first search [prev-w, prev+w] instead of wide open. Scores are cp-like
-/// (100/stone), same units as Moonbird's 8cp x1.9.
-const ASPIRATION_INIT: i32 = 8;
-const ASPIRATION_MULT: f64 = 1.9;
-/// Window clamp: keeps mate/cert scores reachable after widening.
-const ASPIRATION_CAP: i32 = MATE - 2000;
+/// Aspiration ladder (autaxx-proven for Ataxx): depths 1-2 wide open to
+/// seed the score, then [prev-w, prev+w] with INDEPENDENT fail counters —
+/// first fail on a side widens that side by 4x re-centred on the fail
+/// score, second fail on the same side opens it fully. Quoridor Titanium
+/// uses the same 4x shape (their window is 75 on pawn-distance eval).
+const ASPIRATION_FROM_DEPTH: u32 = 3;
+const ASPIRATION_INIT: i32 = 50;
+const ASPIRATION_WIDEN_MULT: i32 = 4;
 
 /// E5 proven-win certificate score: above every heuristic eval (±~3000),
 /// below MATE_BOUND so TT mate adjustments never touch it.
@@ -876,25 +877,18 @@ impl Searcher {
         for depth in 1..=limits.max_depth.max(1) {
             let nodes_before = self.nodes;
             let iter_start = self.elapsed_ms();
-            // Aspiration (Moonbird 8cp x1.9): depth 1 is wide open to seed
-            // prev_score; later iterations research a narrow window,
-            // widening on fail-low/high without advancing depth.
-            let mut w = ASPIRATION_INIT;
+            // Aspiration ladder (autaxx-proven): below ASPIRATION_FROM_DEPTH
+            // the window is wide open (seeds result.score); at/above it each
+            // side fails independently — 1st fail widens that side 4x
+            // re-centred on the fail score, 2nd fail on the same side opens.
+            let wide = result.depth + 1 < ASPIRATION_FROM_DEPTH || depth < ASPIRATION_FROM_DEPTH;
+            let mut lo = result.score.saturating_sub(ASPIRATION_INIT);
+            let mut hi = result.score.saturating_add(ASPIRATION_INIT);
+            let mut low_fails = 0u32;
+            let mut high_fails = 0u32;
             let (mut best_this, mut best_score) = (None, i32::MIN);
             loop {
-                let wide = result.depth == 0;
-                let mut alpha = i32::MIN + 1;
-                let mut beta = i32::MAX;
-                if !wide {
-                    alpha = result.score.saturating_sub(w).max(-ASPIRATION_CAP);
-                    beta = result.score.saturating_add(w).min(ASPIRATION_CAP);
-                }
-                if alpha >= beta {
-                    // Mate-score neighborhood: window math breaks, go wide.
-                    alpha = i32::MIN + 1;
-                    beta = i32::MAX;
-                }
-                let (alpha_orig, beta_orig) = (alpha, beta);
+                let (beta, mut alpha) = if wide { (i32::MAX, i32::MIN + 1) } else { (hi, lo) };
                 best_this = None;
                 best_score = i32::MIN;
                 for i in 0..n_root {
@@ -915,16 +909,25 @@ impl Searcher {
                 if self.stop || wide {
                     break;
                 }
-                // Fail-low/high only if the window can actually widen: mate
-                // scores saturate at +/-ASPIRATION_CAP, and researching an
-                // unwidenable window loops forever. Saturated bounds accept.
-                let fail_lo = best_score <= alpha_orig && alpha_orig > -ASPIRATION_CAP;
-                let fail_hi = best_score >= beta_orig && beta_orig < ASPIRATION_CAP;
-                if !fail_lo && !fail_hi {
-                    break;
+                if best_score <= lo {
+                    low_fails += 1;
+                    if low_fails >= 2 {
+                        lo = i32::MIN + 1;
+                    } else {
+                        lo = best_score.saturating_sub(ASPIRATION_WIDEN_MULT * ASPIRATION_INIT);
+                    }
+                    continue;
                 }
-                // Fail-low/high inside a bounded window: widen and research.
-                w = ((w as f64 * ASPIRATION_MULT) as i32).max(w + 1);
+                if best_score >= hi {
+                    high_fails += 1;
+                    if high_fails >= 2 {
+                        hi = i32::MAX;
+                    } else {
+                        hi = best_score.saturating_add(ASPIRATION_WIDEN_MULT * ASPIRATION_INIT);
+                    }
+                    continue;
+                }
+                break;
             }
             // Partial-iteration adoption (titanium/Lague): moves recorded in
             // best_this completed their search before the stop, so their
