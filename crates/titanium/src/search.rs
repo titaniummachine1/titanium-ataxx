@@ -409,6 +409,8 @@ pub struct Searcher {
     /// Monotonic milliseconds. Native builds use `Instant`; wasm builds
     /// inject `performance.now()` (std time does not exist on wasm32).
     time_src: fn() -> f64,
+    /// TT size in bits (helpers in `search_smp` match it).
+    tt_bits: usize,
     /// Transposition table (persists across searches in the same Searcher).
     tt: Tt,
     /// Move ordering strategy (benchmarkable switch).
@@ -420,6 +422,38 @@ pub struct Searcher {
     /// Eval ablation mask (MASK_ALL = production). Lets `--opp self` run
     /// with a different eval on one side for E-ablation matches.
     eval_mask: u32,
+    /// LazySMP shared state. `None` = single-threaded (wasm, tests, and the
+    /// main thread's own view). Helpers hold a clone of the Arc and their
+    /// own Searcher (private TT); the node counter is TOTAL across workers
+    /// (Quoridor titanium 8a0399d semantics: `go nodes N` is one budget).
+    smp: Option<std::sync::Arc<SmpShared>>,
+}
+
+/// Shared LazySMP state (A2, Quoridor-titanium pattern): TOTAL node budget
+/// across workers (not per-worker), one stop flag. Workers hold PRIVATE
+/// Searchers (private TTs — no shared table yet); the main thread's result
+/// is authoritative, helper partials adopted only when main has no
+/// completed move. Single-threaded path (`threads <= 1`) is untouched.
+/// Lock-free: workers check `stop` every node (Relaxed atomic, ~ns) and
+/// count into `nodes`.
+pub struct SmpShared {
+    /// Total nodes searched by ALL workers (TOTAL budget semantics: a
+    /// t-thread search at N nodes costs N, not t*N — the E3-gate lesson).
+    pub nodes: std::sync::atomic::AtomicU64,
+    pub stop: std::sync::atomic::AtomicBool,
+    pub node_limit: Option<u64>,
+    pub deadline_ms: Option<f64>,
+}
+
+impl SmpShared {
+    pub fn new(node_limit: Option<u64>, deadline_ms: Option<f64>) -> SmpShared {
+        SmpShared {
+            nodes: std::sync::atomic::AtomicU64::new(0),
+            stop: std::sync::atomic::AtomicBool::new(false),
+            node_limit,
+            deadline_ms,
+        }
+    }
 }
 
 /// Monotonic milliseconds since process start (native default time source).
@@ -451,12 +485,115 @@ impl Searcher {
             stop_reason: StopReason::Completed,
             node_limit: None,
             time_src: native_now_ms,
+            tt_bits: bits,
             tt: Tt::new(bits),
             ordering: Ordering::Lazy,
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[0; 49]; 2]),
             eval_mask: MASK_ALL,
+            smp: None,
         }
+    }
+
+    /// Attach LazySMP shared state (helpers + main share TOTAL budget/stop).
+    pub fn set_smp(&mut self, smp: std::sync::Arc<SmpShared>) {
+        self.smp = Some(smp);
+    }
+
+    /// Detach shared state (after an SMP search; keeps single-threaded
+    /// behavior identical across repeated `search` calls).
+    pub fn clear_smp(&mut self) {
+        self.smp = None;
+    }
+
+    /// LazySMP root (A2, Quoridor-titanium pattern): `threads` workers over
+    /// the same position sharing one TOTAL node budget + stop flag. Main =
+    /// `self` (PERSISTENT TT across moves); helpers = fresh Searchers with
+    /// private TTs, diversified by start depth (helper k skips the first k
+    /// depths, capped at 3). Main result authoritative; helper partial adopted
+    /// only when main has NO completed move (Quoridor `lazy_smp_helper_partial`
+    /// rule). No shared TT yet: gains come from diversification + coverage.
+    /// threads <= 1 behaves exactly like `search`. Native only (no threads on
+    /// wasm32).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn search_smp(
+        &mut self,
+        b: &Board,
+        limits: &SearchLimits,
+        threads: usize,
+    ) -> SearchResult {
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::Arc;
+
+        if threads <= 1 {
+            return self.search(b, limits);
+        }
+        // Shared deadline on THIS clock (matches `search` semantics).
+        let start_ms = (self.time_src)();
+        let shared = Arc::new(SmpShared::new(
+            limits.max_nodes,
+            limits.time.map(|t| start_ms + t.as_secs_f64() * 1000.0),
+        ));
+        // Workers run unbounded privately; the SHARED state stops them
+        // (TOTAL budget + shared deadline).
+        let worker_limits = SearchLimits {
+            time: None,
+            max_nodes: None,
+            max_depth: limits.max_depth,
+        };
+        let mask = self.eval_mask;
+        let bits = self.tt_bits;
+        let threads = threads.min(8);
+        let helper_results: Vec<(u32, SearchResult)> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(threads - 1);
+            for k in 1..threads {
+                let shared = Arc::clone(&shared);
+                let b = *b;
+                let worker_limits = SearchLimits {
+                    time: None,
+                    max_nodes: None,
+                    max_depth: limits.max_depth,
+                };
+                handles.push(s.spawn(move || {
+                    let mut h = Searcher::with_tt_bits(bits);
+                    h.set_smp(shared);
+                    h.set_eval_mask(mask);
+                    let r = h.search_depth_from(&b, &worker_limits, 1 + (k as u32).min(3));
+                    (k as u32, r)
+                }));
+            }
+            // Main runs in-scope on `self` (persistent TT, depth from 1).
+            self.set_smp(Arc::clone(&shared));
+            let main_r = self.search_depth_from(b, &worker_limits, 1);
+            self.clear_smp();
+            let mut out = vec![(0u32, main_r)];
+            for h in handles {
+                out.push(h.join().unwrap());
+            }
+            out
+        });
+        // Main authoritative; deepest helper partial iff main empty.
+        let mut main_r: Option<SearchResult> = None;
+        let mut helper_best: Option<SearchResult> = None;
+        for (k, r) in helper_results {
+            if k == 0 {
+                main_r = Some(r);
+            } else if r.depth > 0
+                && r.best.is_some()
+                && helper_best
+                    .as_ref()
+                    .map(|h: &SearchResult| r.depth > h.depth)
+                    .unwrap_or(true)
+            {
+                helper_best = Some(r);
+            }
+        }
+        let mut out = main_r.unwrap_or_default();
+        if (out.depth == 0 || out.best.is_none()) && helper_best.is_some() {
+            out = helper_best.unwrap();
+        }
+        out.nodes = shared.nodes.load(Relaxed);
+        out
     }
 
     /// Eval ablation mask for this searcher (default MASK_ALL).
@@ -492,6 +629,34 @@ impl Searcher {
 
     #[inline]
     fn check_stop(&mut self) {
+        if let Some(shared) = &self.smp {
+            // LazySMP worker: TOTAL budget + shared stop, checked on the
+            // same cadence as the single-threaded path (atomic ops are
+            // ~ns; Relaxed is enough for a stop flag and a counter).
+            use std::sync::atomic::Ordering::Relaxed;
+            if shared.stop.load(Relaxed) {
+                self.stop = true;
+                return;
+            }
+            if let Some(nl) = shared.node_limit {
+                if shared.nodes.load(Relaxed) >= nl {
+                    self.stop = true;
+                    self.stop_reason = StopReason::Nodes;
+                    shared.stop.store(true, Relaxed);
+                    return;
+                }
+            }
+            if self.nodes & 2047 == 0 {
+                if let Some(dl) = shared.deadline_ms {
+                    if (self.time_src)() >= dl {
+                        self.stop = true;
+                        self.stop_reason = StopReason::Time;
+                        shared.stop.store(true, Relaxed);
+                    }
+                }
+            }
+            return;
+        }
         if let Some(nl) = self.node_limit {
             if self.nodes >= nl {
                 self.stop = true;
@@ -555,6 +720,14 @@ impl Searcher {
         null_allowed: bool,
     ) -> i32 {
         self.nodes += 1;
+        // LazySMP: count into the shared TOTAL (Relaxed: exact sum unneeded,
+        // stop decision tolerates single-node overshoot — same granularity
+        // Quoridor titanium uses).
+        if let Some(shared) = &self.smp {
+            shared
+                .nodes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.check_stop();
         if self.stop {
             return 0;
@@ -829,6 +1002,22 @@ impl Searcher {
     /// Whichever limit hits first (nodes / time / depth) stops the search;
     /// partial iterations are discarded, the last completed depth decides.
     pub fn search(&mut self, b: &Board, limits: &SearchLimits) -> SearchResult {
+        self.search_depth_from(b, limits, 1)
+    }
+
+    /// Root search starting at `start_depth` (LazySMP helpers skip shallow
+    /// iterations to diversify; single-threaded callers use start_depth=1).
+    /// Stop arbitration: a searcher WITHOUT shared state (wasm, tests, plain
+    /// `search`) behaves exactly as before — private limits in `check_stop`,
+    /// private node counter. A searcher WITH shared state (attached via
+    /// `set_smp` by `best_move_smp`) counts into the TOTAL and stops on the
+    /// shared flag. The two modes never mix inside one search.
+    pub fn search_depth_from(
+        &mut self,
+        b: &Board,
+        limits: &SearchLimits,
+        start_depth: u32,
+    ) -> SearchResult {
         self.start_ms = (self.time_src)();
         self.nodes = 0;
         self.stop = false;
@@ -874,7 +1063,7 @@ impl Searcher {
         // beats growth multipliers on noisy trees.
         let mut it_nodes: [f64; 2] = [0.0, 0.0];
         let mut it_ms: [f64; 2] = [0.0, 0.0];
-        for depth in 1..=limits.max_depth.max(1) {
+        for depth in start_depth.max(1)..=limits.max_depth.max(1) {
             let nodes_before = self.nodes;
             let iter_start = self.elapsed_ms();
             // Aspiration ladder (autaxx-proven): below ASPIRATION_FROM_DEPTH
@@ -1081,6 +1270,35 @@ mod tests {
         let r = best_move(&b, &limits);
         assert!(r.nodes < 3000, "nodes {}", r.nodes);
         assert!(r.best.is_some());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn smp_total_budget_and_legal_move() {
+        // 4-thread SMP: must terminate, return a legal move, and respect
+        // the TOTAL node budget (all workers share one counter — overshoot
+        // bounded by in-flight expansions, not multiplied by threads).
+        let b = Board::start();
+        let limits = SearchLimits {
+            time: None,
+            max_nodes: Some(20000),
+            max_depth: 20,
+        };
+        let mut s = Searcher::new();
+        let r = s.search_smp(&b, &limits, 4);
+        assert!(r.best.is_some(), "smp must return a move");
+        assert!(
+            b.legal_moves().contains(&r.best.unwrap()),
+            "smp move must be legal"
+        );
+        assert!(
+            r.nodes < 20000 + 8 * 2048,
+            "TOTAL budget violated: {} nodes for 20000 budget",
+            r.nodes
+        );
+        // Single-threaded path still clean after SMP use (smp detached).
+        let r2 = s.search(&b, &limits);
+        assert!(r2.best.is_some());
     }
 
     #[test]

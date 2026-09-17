@@ -80,6 +80,7 @@ fn main() -> ExitCode {
             flag_str(&args, "--out"),
             parse_mask(flag_str(&args, "--mask")),
             parse_mask(flag_str(&args, "--opp-mask")),
+            flag_int(&args, "--threads").unwrap_or(1) as usize,
         ),
         "sperft" => sperft_cmd(
             flag_int(&args, "--depth").unwrap_or(8) as u32,
@@ -798,6 +799,7 @@ fn match_cmd(
     out: Option<String>,
     mask: u32,
     opp_mask: u32,
+    threads: usize,
 ) -> ExitCode {
     // "self" = titanium vs titanium in-process (no external process).
     let mut opp = if opp_cmd.as_deref() == Some("self") {
@@ -895,7 +897,15 @@ fn match_cmd(
                 continue;
             }
             let mv = if titanium_moves {
-                searcher.search(&b, &titanium_limits).best
+                // A2 gate: --threads N runs the driver side SMP (TOTAL node
+                // budget shared). Sequential match play means one side sleeps
+                // while the other thinks: max N active threads, no
+                // oversubscription on 4c/8t. Opp side stays single-threaded.
+                if threads > 1 {
+                    searcher.search_smp(&b, &titanium_limits, threads).best
+                } else {
+                    searcher.search(&b, &titanium_limits).best
+                }
             } else {
                 match &mut opp {
                     Some(o) => {
