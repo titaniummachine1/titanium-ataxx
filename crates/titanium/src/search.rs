@@ -4,7 +4,7 @@
 //! (TT move > killers > captures*W + history) -> ordering strategy
 //! (lazy selection / insertion sort / LSD radix) -> alpha-beta.
 
-use crate::board::{dist_union, jump_union, Board, Move, MoveList, RING1, SQUARES};
+use crate::board::{dist_union, jump_union, Board, Move, MoveList, REACH, RING1, SQUARES};
 use std::time::Duration;
 
 pub const MATE: i32 = 100_000;
@@ -45,10 +45,11 @@ const PST: [i32; 49] = [
     20, 10, 10, 5, 10, 10, 20, //
     30, 20, 10, 10, 10, 20, 30,
 ];
-/// Hole-risk penalties (autaxx): for every EMPTY square adjacent to our
-/// stones and reachable by the enemy, penalize by own-stone density around
-/// it. Static replacement for qsearch in Ataxx.
-const HOLE_PEN: [i32; 9] = [-17, 4, -28, -88, -125, -200, -322, -446, -534];
+/// E6 weakness weight per (converted-stone x attacker) unit: for every empty
+/// landing square the enemy can reach, each of our stones it would convert
+/// costs WEAK_PEN — scaled by how many enemy stones can play that landing
+/// (more attackers = more variants that realize the same harm).
+const WEAK_PEN: i32 = 4;
 
 /// Contact penalty per ENDANGERED stone (E2, "virus strategy"): stones the
 /// enemy can infect right now. Avoid contact early, mass-clone first.
@@ -113,8 +114,8 @@ pub fn evaluate_masked(b: &Board, mask: u32) -> i32 {
             }
         }
     }
-    let (holes_black, holes_white) = if mask & MASK_HOLES != 0 {
-        (holes_penalty(b, 0), holes_penalty(b, 1))
+    let (weak_black, weak_white) = if mask & MASK_HOLES != 0 {
+        (weakness_penalty(b, 0), weakness_penalty(b, 1))
     } else {
         (0, 0)
     };
@@ -128,7 +129,7 @@ pub fn evaluate_masked(b: &Board, mask: u32) -> i32 {
     } else {
         (0, 0)
     };
-    let mut score = mat + pst - holes_black + holes_white
+    let mut score = mat + pst - weak_black + weak_white
         - CONTACT_PEN * contact_black as i32
         + CONTACT_PEN * contact_white as i32
         - multicap_black
@@ -176,19 +177,25 @@ fn multicapture_penalty(b: &Board, side: u8) -> i32 {
     pen
 }
 
-/// autaxx hole risk: empty squares adjacent to `side`'s stones that the
-/// enemy can land on, weighted by own-stone density around them.
-fn holes_penalty(b: &Board, side: u8) -> i32 {
-    let us = b.occ[side as usize];
+/// E6 weakness (replaces autaxx holes): for each enemy-reachable empty
+/// landing square, `conv` = our stones it would convert, `atk` = enemy
+/// stones that can play it. Contribution `conv * atk`: a square converting
+/// nothing scores 0 no matter the control; more harm AND more variants
+/// realizing it both scale the penalty.
+fn weakness_penalty(b: &Board, side: u8) -> i32 {
     let them = b.occ[1 - side as usize];
-    let holes = b.empty() & dist_union(us, 1) & (dist_union(them, 1) | jump_union(them));
+    let us = b.occ[side as usize];
+    let landings = b.empty() & (dist_union(them, 1) | jump_union(them));
     let mut pen = 0i32;
-    let mut hs = holes;
-    while hs != 0 {
-        let sq = hs.trailing_zeros() as usize;
-        hs &= hs - 1;
-        let n = (RING1[sq] & us).count_ones() as usize;
-        pen += HOLE_PEN[n];
+    let mut ls = landings;
+    while ls != 0 {
+        let sq = ls.trailing_zeros() as usize;
+        ls &= ls - 1;
+        let conv = (RING1[sq] & us).count_ones() as i32;
+        if conv != 0 {
+            let atk = (REACH[sq] & them).count_ones() as i32;
+            pen += conv * atk * WEAK_PEN;
+        }
     }
     pen
 }
@@ -1014,6 +1021,34 @@ mod tests {
         let r = best_move(&b, &limits);
         assert!(r.nodes < 3000, "nodes {}", r.nodes);
         assert!(r.best.is_some());
+    }
+
+    #[test]
+    fn weakness_scales_with_harm_and_variants() {
+        // Single white stone c4; black attackers adjacent. Each landing's
+        // contribution is conv x atk: adding a second attacker to the same
+        // landing must raise the penalty, and a landing converting nothing
+        // contributes zero.
+        let one = ".......
+                     .......
+                     .......
+                     ...o...
+                     ..x....
+                     .......
+                     ....... b";
+        let two = ".......
+                     .......
+                     .......
+                     ...o...
+                     ..xx...
+                     .......
+                     ....... b";
+        let b1 = Board::from_str(one).unwrap();
+        let b2 = Board::from_str(two).unwrap();
+        let w1 = weakness_penalty(&b1, 1);
+        let w2 = weakness_penalty(&b2, 1);
+        assert!(w1 > 0, "threatened stone must score, got {w1}");
+        assert!(w2 > w1, "second attacker must scale harm: {w2} vs {w1}");
     }
 
     #[test]
