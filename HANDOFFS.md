@@ -116,6 +116,47 @@ embed quotes manually: `$oppQ = "`"$m serve`""`.
 - E4 **multi-capture exposure** (user): −20 per extra stone convertible in
   one enemy landing — **+330 Elo. MERGED.**
 - Cumulative ~+700 self-play Elo; Moonbird still 0–32 at both gates.
+- E6 weakness (user: `conv × attackers` per enemy-reachable landing) —
+  REJECTED as classical term (4–28 vs no-holes; 14–18 at WEAK_PEN=1), kept as
+  NNUE dense feature (`weakness_features`, 8 scalars/record). Prod eval is
+  no-holes now (MASK_HOLES out of MASK_ALL).
+- ASP1 aspiration 8cp×1.9 (Moonbird) — REJECTED 3–29 @5k, 15–17 @100ms.
+  Thrashes on quantized eval.
+- ASP1b ladder 50/200/800 (autaxx bounds + Quoridor 4× widening) — PARKED:
+  13–19 @5k / 20–12 @100ms, pooled 33–31 ≈ +7. Window buys nothing with
+  quantized eval; smoothness must come from NNUE. BUG LESSON: mate scores
+  saturate fixed window ceilings → infinite research; saturated bounds MUST
+  accept (guard in `search.rs` root loop).
+
+## Session state 2026-09-17 (READ FIRST if session starts cold)
+
+Branches (`titanium-ataxx` repo): `main` (E2+E3b+E4), `ablation/eval-inputs`
+@f089f37 (harness + no-holes + nnue.rs + datagen), `exp/ataxx-aspiration`
+(latest: ASP1b ladder, PARKED — do not merge without new evidence).
+Binaries in `scripts/bench/` (gitignored, rebuild if missing):
+`titanium_abl_base.exe` = f089f37 baseline, `titanium_asp_cand.exe` = 8cp
+REJECTED, `titanium_asp100_cand.exe` = ladder PARKED.
+Game logs `logs/a1_asp_5k.txt` (3–29), `logs/a1_asp_t100.txt` (15–17),
+`logs/a1b_asp100_5k.txt` (13–19), `logs/a1b_asp100_t100.txt` (20–12).
+Datagen: `datagen --games 2000 --nodes 5000 --seed 2000+N --opening-plies 8
+--out data/nnue/datagen_v2_shardN.txt` (4-field records with weakness
+scalars) + old 3-field `datagen_shardN.txt` (~190k pos, Net0-usable).
+Quoridor side: engine-submodule branches `exp-ataxx-iir` (gating),
+`exp-ataxx-nmp-gate`, `exp-ataxx-lazy-order` (chained); see
+Quoridor_best_AI/LEDGER.md 2026-09-17 entry.
+
+## OPERATING RULES (learned 2026-09-17, do not re-derive)
+
+1. Tool-call timeouts TREE-KILL the shell including `Start-Process` children.
+   Long jobs MUST spawn via WMI `Win32_Process.Create` (fully detached).
+   Reboot kills everything: after any restart relaunch datagen + gate chains
+   (builds skip if binary present, datagen appends — all resumable).
+2. Ataxx node gates REQUIRE `--opp-nodes N`: without it the serve side plays
+   `movetime 1000ms` default while the driver is node-capped (silent unfair
+   gate; burned one 32-game run before catching).
+3. 32-game gates ≈ ±45 Elo CIs (50-game ≈ ±40): only large effects decidable;
+   20–30 range needs expansion, never merge on it.
+4. Gate scripts live in `scripts/bench/a1*.ps1` (gitignored, on disk only).
 
 ## Next levers (in the order we'd take them)
 
@@ -125,6 +166,6 @@ embed quotes manually: `$oppQ = "`"$m serve`""`.
 2. **2×2 structure pattern eval** (Moonbird's biggest feature): per-square
    2×2-neighborhood index, needs the tuning loop first.
 3. Correction history keyed by occupancy-hash bucket (titanium pattern).
-4. Aspiration windows (ladder ±50/±200/±800 from depth 3, autaxx).
+4. ~~Aspiration windows~~ DONE 2026-09-17: 8cp REJECTED, ladder 50/200/800 PARKED (pooled +7). Dead until eval is smooth (NNUE).
 5. LazySMP with TOTAL node budget across workers (Arc<AtomicU64> counter —
    titanium commit 8a0399d pattern) — we have 4c/8t idle during gates.
