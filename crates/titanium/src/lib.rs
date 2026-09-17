@@ -9,6 +9,7 @@
 //!   board is full, the game ends and the majority wins.
 
 pub mod board;
+pub mod nnue;
 pub mod search;
 
 pub use board::{

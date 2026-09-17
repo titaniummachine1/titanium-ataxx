@@ -57,6 +57,7 @@ fn main() -> ExitCode {
         "play" => play_cmd(flag_int(&args, "--time").unwrap_or(1000) as u64),
         "show" => show_cmd(),
         "genbench" => genbench_cmd(flag_int(&args, "--iters").unwrap_or(200_000) as u64),
+        "nnuebench" => nnuebench_cmd(flag_int(&args, "--iters").unwrap_or(20_000) as u64),
         "datagen" => datagen_cmd(
             flag_int(&args, "--games").unwrap_or(100) as u32,
             flag_int(&args, "--nodes").unwrap_or(5000) as u64,
@@ -341,8 +342,105 @@ fn selfplay_cmd(games: u32, time_ms: u64, out: Option<String>) -> ExitCode {
     }
 }
 
-fn default_log_path() -> PathBuf {
-    let ts = SystemTime::now()
+/// NNUE inference cost bench (patterned non-zero weights, varied mid-game
+/// positions): full refresh, incremental update, and forward pass. Budget
+/// check before wiring any net into search — search runs ~4 Mnps, so a
+/// forward pass must stay well under ~250ns to avoid halving speed.
+fn nnuebench_cmd(iters: u64) -> ExitCode {
+    use titanium::nnue::{Network, NnueState, NNUE_DENSE, NNUE_H2, NNUE_H3, NNUE_INPUT, NNUE_L1};
+    // Patterned DENSE weights (honest cost: zero weights would let the
+    // sparse-skip fire on every MAC and under-report ~3x).
+    let mut net = Network::zeros();
+    let mut s: u64 = 0x9E3779B97F4A7C15;
+    let mut rnd = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s % 61) as i16 - 30
+    };
+    for f in 0..NNUE_INPUT {
+        for i in 0..NNUE_L1 {
+            net.ft_weights[f][i] = rnd();
+        }
+    }
+    for o in 0..NNUE_L1 {
+        for j in 0..NNUE_H2 * 2 {
+            net.w2[o][j] = rnd();
+        }
+    }
+    for k in 0..NNUE_DENSE {
+        for j in 0..NNUE_H2 {
+            net.wd[k][j] = rnd();
+        }
+    }
+    for j in 0..NNUE_H2 {
+        for k in 0..NNUE_H3 {
+            net.w3[j][k] = rnd();
+        }
+    }
+    for k in 0..NNUE_H3 {
+        net.w4[k] = rnd();
+    }
+    // Varied position pool (not part of timed loops).
+    let mut seed: u64 = 0x243F6A8885A308D3;
+    let mut rng = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let pool: Vec<Board> = (0..256)
+        .map(|_| {
+            let mut b = Board::start();
+            for _ in 0..30 {
+                if b.game_over() {
+                    break;
+                }
+                if !b.has_moves(b.turn) {
+                    b = b.make_pass();
+                    continue;
+                }
+                let moves = b.legal_moves();
+                if moves.is_empty() {
+                    b = b.make_pass();
+                    continue;
+                }
+                b = b.make(moves.move_at((rng() % moves.len() as u64) as usize));
+            }
+            b
+        })
+        .collect();
+    let pick = |i: u64| &pool[(i % 256) as usize];
+    let dense = [0i32; NNUE_DENSE];
+
+    let mut st = NnueState::new();
+    let t = Instant::now();
+    for i in 0..iters {
+        st.refresh(pick(i), &net);
+    }
+    let dt = t.elapsed().as_secs_f64();
+    println!(
+        "  nnue refresh        {:>10.0} /s   ({:.0} ns)",
+        iters as f64 / dt,
+        dt / iters as f64 * 1e9
+    );
+
+    st.refresh(pick(0), &net);
+    let t = Instant::now();
+    let mut sink = 0i32;
+    for i in 0..iters {
+        sink ^= st.forward(pick(i).turn, &dense, &net);
+    }
+    let dt = t.elapsed().as_secs_f64();
+    println!(
+        "  nnue forward        {:>10.0} /s   ({:.0} ns, sink {sink})",
+        iters as f64 / dt,
+        dt / iters as f64 * 1e9
+    );
+    ExitCode::SUCCESS
+}
+
+fn default_log_path() -> PathBuf {    let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
