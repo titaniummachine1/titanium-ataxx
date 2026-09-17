@@ -87,7 +87,10 @@ pub const MASK_CONTACT: u32 = 8;
 pub const MASK_MULTICAP: u32 = 16;
 pub const MASK_TEMPO: u32 = 32;
 pub const MASK_ALL: u32 =
-    MASK_MATERIAL | MASK_PST | MASK_HOLES | MASK_CONTACT | MASK_MULTICAP | MASK_TEMPO;
+    MASK_MATERIAL | MASK_PST | MASK_CONTACT | MASK_MULTICAP | MASK_TEMPO;
+/// MASK_HOLES is excluded from production: gated 4-28 @5k / 14-18 @100ms
+/// vs no-holes (E6). The term survives only as an NNUE dense feature
+/// (`weakness_features`) and for `--opp-mask` experiments.
 
 /// Static eval from the side-to-move's perspective.
 pub fn evaluate(b: &Board) -> i32 {
@@ -177,16 +180,21 @@ fn multicapture_penalty(b: &Board, side: u8) -> i32 {
     pen
 }
 
-/// E6 weakness (replaces autaxx holes): for each enemy-reachable empty
-/// landing square, `conv` = our stones it would convert, `atk` = enemy
-/// stones that can play it. Contribution `conv * atk`: a square converting
-/// nothing scores 0 no matter the control; more harm AND more variants
-/// realizing it both scale the penalty.
-fn weakness_penalty(b: &Board, side: u8) -> i32 {
+/// E6 weakness (EXCLUDED from prod eval — see MASK_ALL — kept as the NNUE
+/// dense-feature function): for each enemy-reachable empty landing square,
+/// `conv` = our stones it would convert, `atk` = enemy stones that can play
+/// it. Contribution `conv * atk`: a square converting nothing scores 0 no
+/// matter the control; more harm AND more variants realizing it both scale.
+/// Raw weakness components for `side`: (sum_conv, sum_conv_atk, max_conv,
+/// endangered). Public so datagen can emit them as NNUE dense features —
+/// the net learns the weights, no hand scale baked in.
+pub fn weakness_features(b: &Board, side: u8) -> (i32, i32, i32, u32) {
     let them = b.occ[1 - side as usize];
     let us = b.occ[side as usize];
     let landings = b.empty() & (dist_union(them, 1) | jump_union(them));
-    let mut pen = 0i32;
+    let mut sum_conv = 0i32;
+    let mut sum_conv_atk = 0i32;
+    let mut max_conv = 0i32;
     let mut ls = landings;
     while ls != 0 {
         let sq = ls.trailing_zeros() as usize;
@@ -194,10 +202,18 @@ fn weakness_penalty(b: &Board, side: u8) -> i32 {
         let conv = (RING1[sq] & us).count_ones() as i32;
         if conv != 0 {
             let atk = (REACH[sq] & them).count_ones() as i32;
-            pen += conv * atk * WEAK_PEN;
+            sum_conv += conv;
+            sum_conv_atk += conv * atk;
+            if conv > max_conv {
+                max_conv = conv;
+            }
         }
     }
-    pen
+    (sum_conv, sum_conv_atk, max_conv, endangered_count(b, side))
+}
+
+fn weakness_penalty(b: &Board, side: u8) -> i32 {
+    weakness_features(b, side).1 * WEAK_PEN
 }
 
 /// Terminal score from the side-to-move's perspective.

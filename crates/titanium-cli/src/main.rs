@@ -57,6 +57,13 @@ fn main() -> ExitCode {
         "play" => play_cmd(flag_int(&args, "--time").unwrap_or(1000) as u64),
         "show" => show_cmd(),
         "genbench" => genbench_cmd(flag_int(&args, "--iters").unwrap_or(200_000) as u64),
+        "datagen" => datagen_cmd(
+            flag_int(&args, "--games").unwrap_or(100) as u32,
+            flag_int(&args, "--nodes").unwrap_or(5000) as u64,
+            flag_int(&args, "--seed").unwrap_or(1) as u64,
+            flag_int(&args, "--opening-plies").unwrap_or(8) as u32,
+            flag_str(&args, "--out").unwrap_or_else(|| "data/nnue/datagen.txt".into()),
+        ),
         "serve" => serve_cmd(flag_int(&args, "--tt-bits").unwrap_or(20) as usize),
         "match" => match_cmd(
             flag_int(&args, "--games").unwrap_or(20) as u32,
@@ -711,7 +718,7 @@ fn match_cmd(
         Some(o) => o.name.clone(),
         None => "titanium".to_string(),
     };
-    println!("titanium vs {opp_name} — {games} games");
+    println!("titanium vs {opp_name} â€” {games} games");
 
     let mut tally = (0u32, 0u32, 0u32); // titanium wins, opp wins, draws
     let limits_desc = format!(
@@ -723,14 +730,14 @@ fn match_cmd(
     );
     let mut report = String::new();
     report.push_str(&format!(
-        "Match: titanium vs {opp_name} — games {start_game}..{} — {limits_desc}, opp {}\n===\n",
+        "Match: titanium vs {opp_name} â€” games {start_game}..{} â€” {limits_desc}, opp {}\n===\n",
         start_game + games - 1,
         opp_depth
             .map(|d| format!("depth {d}"))
             .unwrap_or_else(|| format!("movetime {opp_time} ms"))
     ));
 
-    // Incremental log: header first, then append per game — played games
+    // Incremental log: header first, then append per game â€” played games
     // are never lost, even if the run is killed.
     let path: PathBuf = out.map(PathBuf::from).unwrap_or_else(default_log_path);
     if let Some(parent) = path.parent() {
@@ -861,7 +868,7 @@ fn match_cmd(
     ));
     let _ = fs::write(&path, &report);
     println!(
-        "total: titanium {} - {opp_name} {}, draws {} — log: {}",
+        "total: titanium {} - {opp_name} {}, draws {} â€” log: {}",
         tally.0,
         tally.1,
         tally.2,
@@ -1072,5 +1079,159 @@ fn genbench_cmd(iters: u64) -> ExitCode {
         nodes as f64 / dt / 1000.0
     );
 
+    ExitCode::SUCCESS
+}
+
+fn datagen_cmd(
+    games: u32,
+    nodes_per_move: u64,
+    seed: u64,
+    opening_plies: u32,
+    out_path: String,
+) -> ExitCode {
+    use std::io::BufWriter;
+
+    if let Some(parent) = std::path::Path::new(&out_path).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&out_path)
+        .expect("open datagen output");
+    let mut out = BufWriter::new(file);
+
+    let mut rng: u64 = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+    let mut next = move || -> u64 {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+
+    let limits = SearchLimits {
+        time: None,
+        max_nodes: Some(nodes_per_move),
+        max_depth: 20,
+    };
+
+    let mut total_positions = 0u64;
+    let mut wins = [0u32; 2];
+    let mut draws = 0u32;
+    let started = Instant::now();
+
+    for game in 1..=games {
+        let mut b = Board::start();
+        let mut searcher = Searcher::with_tt_bits(16);
+        let mut opening = 0u32;
+        while opening < opening_plies && !b.game_over() {
+            let mut list = b.legal_moves();
+            if list.is_empty() {
+                b = b.make_pass();
+            } else {
+                let idx = (next() % list.len() as u64) as usize;
+                let mv = list.move_at(idx);
+                b = b.make(mv);
+            }
+            opening += 1;
+        }
+        if b.game_over() {
+            continue;
+        }
+
+        let mut records: Vec<(String, i32, u8, [i32; 8])> = Vec::with_capacity(96);
+        let mut hot_plies = 0u32;
+        let mut quiet_plies = 0u32;
+        let mut adjudicated: Option<u8> = None;
+        let mut ply = 0u32;
+
+        loop {
+            if b.game_over() {
+                break;
+            }
+            if ply >= 300 {
+                adjudicated = Some(2);
+                break;
+            }
+            let r = searcher.search(&b, &limits);
+            // Dense NNUE features, stm-relative: weakness of side to move,
+            // then weakness of enemy. Net learns the weights.
+            let (sc, sca, mc, en) = titanium::weakness_features(&b, b.turn);
+            let (oc, oca, omc, oen) = titanium::weakness_features(&b, 1 - b.turn);
+            records.push((
+                b.to_ataxx_fen(),
+                r.score.clamp(-2000, 2000),
+                b.turn,
+                [sc, sca, mc, en as i32, oc, oca, omc, oen as i32],
+            ));
+            let s = r.score;
+            if s.abs() > 2500 {
+                quiet_plies = 0;
+                hot_plies += 1;
+                if hot_plies >= 5 {
+                    adjudicated = Some(if s > 0 { b.turn } else { 1 - b.turn });
+                    break;
+                }
+            } else {
+                hot_plies = 0;
+                quiet_plies += 1;
+                if quiet_plies >= 10 && ply >= 60 {
+                    adjudicated = Some(2);
+                    break;
+                }
+            }
+            let mv = match r.best {
+                Some(m) => m,
+                None => Move::PASS,
+            };
+            b = if mv.is_pass() { b.make_pass() } else { b.make(mv) };
+            ply += 1;
+        }
+
+        let result = match adjudicated {
+            Some(0) => 0,
+            Some(1) => 1,
+            _ => b.winner(),
+        };
+        match result {
+            0 => wins[0] += 1,
+            1 => wins[1] += 1,
+            _ => draws += 1,
+        }
+        for (fen, score, turn, w) in &records {
+            let res = match (result, *turn) {
+                (2, _) => 0.5,
+                (w, side) => {
+                    if w == side {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+            };
+            let _ = writeln!(
+                out,
+                "{fen}|{score}|{res:.1}|{},{},{},{},{},{},{},{}",
+                w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]
+            );
+            total_positions += 1;
+        }
+        out.flush().ok();
+
+        if game % 10 == 0 {
+            println!(
+                "datagen {seed}: game {game}/{games} pos {total_positions} W{}/L{}/D{} ({:.0}s)",
+                wins[0],
+                wins[1],
+                draws,
+                started.elapsed().as_secs_f32()
+            );
+            out.flush().ok();
+        }
+    }
+    let _ = out.flush();
+    println!(
+        "datagen {seed} done: {games} games, {total_positions} positions -> {out_path}"
+    );
     ExitCode::SUCCESS
 }
