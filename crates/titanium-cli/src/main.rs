@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod dagfold;
+
 use titanium::{best_move, Board, Move, SearchLimits, Searcher, RING1, StopReason};
 use titanium::{MASK_ALL, MASK_CONTACT, MASK_HOLES, MASK_MATERIAL, MASK_MULTICAP, MASK_PST, MASK_TEMPO};
 
@@ -83,6 +85,10 @@ fn main() -> ExitCode {
             flag_int(&args, "--depth").unwrap_or(8) as u32,
             flag_int(&args, "--games").unwrap_or(8) as usize,
             flag_str(&args, "--ordering"),
+        ),
+        "dagfold" => dagfold::dagfold_cmd(
+            &flag_str(&args, "--db").unwrap_or_else(|| "data/nnue/dag.db".into()),
+            &flag_str(&args, "--inputs").unwrap_or_default(),
         ),
         _ => {
             print_help();

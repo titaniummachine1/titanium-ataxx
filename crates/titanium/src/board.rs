@@ -625,7 +625,7 @@ impl MoveList {
 }
 
 /// Immutable board; `make` is copy-make (cheap, ~40 bytes).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Board {
     /// `[black, white]` occupancy bitboards.
     pub occ: [u64; 2],
@@ -939,8 +939,10 @@ impl Board {
 
     /// libataxx-style FEN (rows top->bottom, digit runs, then side and two
     /// counters) for talking UAI to other engines: `6o/7/7/7/7/7/x6 x 0 1`.
-    pub fn to_ataxx_fen(&self) -> String {
-        let mut rows = Vec::with_capacity(7);
+    /// NOTE: transpositions collapse here — pass-count and halfmove clock are
+    /// NOT part of the string, so the SAME fen from different paths is the
+    /// SAME DAG node. dagfold exploits exactly this: dedup is structural.
+    pub fn to_ataxx_fen(&self) -> String {        let mut rows = Vec::with_capacity(7);
         for r in 0..SIZE {
             let mut row = String::with_capacity(SIZE);
             let mut gap = 0u32;
