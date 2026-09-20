@@ -3,8 +3,8 @@
 //! v3 arch: 147 inputs (own49/enemy49/gap49, per-perspective), FT L1=64
 //! Clip(255) INCREMENTAL (unchanged, still cheap), head 128 -> H2=16 ReLU ->
 //! 1 (was single 128->1 linear). cp = out * 400/16320 (out_b in head units).
-//! Weights: data/nnue/own_v3.s1 (26KB, gitignored, stays local).
-//! Legacy 128->1 blobs (sancta_w.s1) load with zero H2 (exact fallback).
+//! Weights: data/nnue/own_v3.s1 (23KB, gitignored, stays local).
+//! v1 19202B blobs REJECTED (linear-vs-relu math differs, no exact map).
 //!
 //! SCOPE: load + full refresh + SIMD forward ONLY. No per-ply stack, no
 //! do/unmake, no S4Undo, no PROF, no Box/Arc in hot path. The lazy
@@ -35,8 +35,7 @@ pub struct S1Net {
     pub ft_w: Box<[[i16; S1_L1]; S1_INPUT]>,
     pub ft_b: [i16; S1_L1],
     /// v3 head: W1 [128][16] row-major over (crelu(ours)++crelu(theirs)),
-    /// b1[16], w2[16], b2 scalar. Legacy v1 blobs: W1/w2 zero, b2 = old
-    /// out_b (exact same math as before).
+    /// b1[16], w2[16], b2 scalar. i16-direct quant, no hidden rescale.
     pub w1: Box<[[i16; S1_H2]; S1_L1 * 2]>,
     pub b1: [i32; S1_H2],
     pub w2: [i16; S1_H2],
