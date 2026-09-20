@@ -493,70 +493,10 @@ impl MoveList {
         self.moves[..self.len].contains(m)
     }
 
-    /// Remove the move at `i` (swap-with-last). O(1), order not preserved.
-    #[inline]
-    pub fn remove_swap(&mut self, i: usize) {
-        debug_assert!(i < self.len);
-        self.len -= 1;
-        self.moves[i] = self.moves[self.len];
-        self.scores[i] = self.scores[self.len];
-    }
-
-    /// Shrink to `n` moves (drops the tail of a sorted list).
-    #[inline]
-    pub fn truncate(&mut self, n: usize) {
-        if self.len > n {
-            self.len = n;
-        }
-    }
-
-    /// True if any generated move converts an enemy piece.
-    pub fn captures_exist(&self, b: &Board) -> bool {
-        let opp = b.opp();
-        for i in 0..self.len {
-            if opp & RING1[self.moves[i].to as usize] != 0 {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Drop quiet (non-converting) moves beyond `after` moves. Call only
-    /// when at least one capture exists (autaxx LMP).
-    pub fn lmp_quiets(&mut self, after: usize, opp: u64) {
-        if self.len <= after {
-            return;
-        }
-        let mut i = after;
-        while i < self.len {
-            if opp & RING1[self.moves[i].to as usize] == 0 {
-                self.remove_swap(i);
-            } else {
-                i += 1;
-            }
-        }
-    }
-
     #[inline]
     pub fn swap(&mut self, i: usize, j: usize) {
         self.moves.swap(i, j);
         self.scores.swap(i, j);
-    }
-
-    /// Insertion sort, highest score first (lists are tiny and mostly sorted).
-    pub fn sort_by_score(&mut self) {
-        for i in 1..self.len {
-            let m = self.moves[i];
-            let s = self.scores[i];
-            let mut j = i;
-            while j > 0 && self.scores[j - 1] < s {
-                self.moves[j] = self.moves[j - 1];
-                self.scores[j] = self.scores[j - 1];
-                j -= 1;
-            }
-            self.moves[j] = m;
-            self.scores[j] = s;
-        }
     }
 
     /// Lazily extract the highest-scored remaining move (swap-with-last).
@@ -578,49 +518,6 @@ impl MoveList {
         self.moves[best_i] = self.moves[self.len];
         self.scores[best_i] = self.scores[self.len];
         m
-    }
-
-    /// LSD radix sort, descending by the score bytes (scores are
-    /// non-negative and fit in 24 bits: 3 passes over 256 buckets).
-    /// O(n) regardless of presortedness — the experiment vs insertion sort
-    /// and lazy selection lives in the search benchmarks.
-    pub fn sort_radix_desc(&mut self, scratch: &mut MoveList) {
-        let n = self.len;
-        if n < 2 {
-            return;
-        }
-        for pass in 0..3 {
-            let shift = pass * 8;
-            let mut counts = [0usize; 256];
-            for i in 0..n {
-                let byte = ((self.scores[i] >> shift) & 0xFF) as usize;
-                counts[byte] += 1;
-            }
-            // Descending: bucket b starts after all higher bytes.
-            let mut offsets = [0usize; 256];
-            let mut pos = 0usize;
-            for b in (0..256).rev() {
-                offsets[b] = pos;
-                pos += counts[b];
-            }
-            for i in 0..n {
-                let byte = ((self.scores[i] >> shift) & 0xFF) as usize;
-                let pos = offsets[byte];
-                scratch.moves[pos] = self.moves[i];
-                scratch.scores[pos] = self.scores[i];
-                offsets[byte] += 1;
-            }
-            self.moves[..n].copy_from_slice(&scratch.moves[..n]);
-            self.scores[..n].copy_from_slice(&scratch.scores[..n]);
-        }
-    }
-
-    pub fn scores_dbg(&self) -> &[i32] {
-        &self.scores
-    }
-
-    pub fn moves_dbg(&self) -> &[Move] {
-        &self.moves
     }
 }
 

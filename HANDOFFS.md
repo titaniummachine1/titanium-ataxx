@@ -97,6 +97,11 @@ not a peer.
 
 ## Fast iteration protocol (4c/8t)
 
+**MAIN IS UNTOUCHABLE (user law, Quoridor/Stockfish rule).** All work on
+`exp/*` branches off `main`. Merge only when a branch decisively beats main
+with no doubt it is stronger. Session corrupts ~every 5 min — LEDGER.md,
+HANDOFFS.md, BEHAVIOR.md updated in real time so no state lives in chat only.
+
 Short gates only: **5000 nodes/move** (equal-compute) and **10–100 ms/move**
 (equal-strength). 8 parallel shards, 4 games each. `--opp-nodes` for
 Moonbird's `go nodes N`. `--start-game` balances colors. Games append to the
@@ -116,6 +121,12 @@ embed quotes manually: `$oppQ = "`"$m serve`""`.
 - E4 **multi-capture exposure** (user): −20 per extra stone convertible in
   one enemy landing — **+330 Elo. MERGED.**
 - Cumulative ~+700 self-play Elo; Moonbird still 0–32 at both gates.
+- S1 **slim-eval-speed** (branch `exp/slim-eval-speed`, 2026-09-20, SPEED
+  ONLY): eval = material+PST+tempo; Ordering enum / radix / insertion /
+  LMP / LUT-infect paths deleted (−307/+41 lines). Sperft 4.11 vs
+  main-lazy 2.40 Mnps (+71%). Bench d8 noisy (4.6–8.0M vs 4.5–4.8M =
+  jitter). Strength UNTESTED — slim eval will lose knowledge (no
+  virus/contact/multicap). Main untouched.
 
 ## Next levers (in the order we'd take them)
 

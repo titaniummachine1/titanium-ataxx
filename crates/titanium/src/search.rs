@@ -1,10 +1,9 @@
 //! Evaluation and iterative-deepening alpha-beta (negamax) search.
 //!
 //! Search order: TT probe -> eval cache (depth 0) -> move scoring
-//! (TT move > killers > captures*W + history) -> ordering strategy
-//! (lazy selection / insertion sort / LSD radix) -> alpha-beta.
+//! (TT move > killers > captures*W + history) -> lazy selection -> alpha-beta.
 
-use crate::board::{dist_union, jump_union, Board, Move, MoveList, RING1, SQUARES};
+use crate::board::{dist_union, Board, Move, MoveList, RING1, SQUARES};
 use std::time::Duration;
 
 pub const MATE: i32 = 100_000;
@@ -15,17 +14,15 @@ const MATE_BOUND: i32 = MATE - 2000;
 const MAX_PLY: usize = 40;
 
 /// Per-ply move buffers allocated once per search: nodes only reset `len`,
-/// they never re-initialize the arrays. `scratch` backs the radix sort.
+/// they never re-initialize the arrays.
 struct MoveStack {
     lists: Box<[MoveList; MAX_PLY]>,
-    scratch: Box<[MoveList; MAX_PLY]>,
 }
 
 impl MoveStack {
     fn new() -> MoveStack {
         MoveStack {
             lists: Box::new([MoveList::new(); MAX_PLY]),
-            scratch: Box::new([MoveList::new(); MAX_PLY]),
         }
     }
 }
@@ -45,20 +42,6 @@ const PST: [i32; 49] = [
     20, 10, 10, 5, 10, 10, 20, //
     30, 20, 10, 10, 10, 20, 30,
 ];
-/// Hole-risk penalties (autaxx): for every EMPTY square adjacent to our
-/// stones and reachable by the enemy, penalize by own-stone density around
-/// it. Static replacement for qsearch in Ataxx.
-const HOLE_PEN: [i32; 9] = [-17, 4, -28, -88, -125, -200, -322, -446, -534];
-
-/// Contact penalty per ENDANGERED stone (E2, "virus strategy"): stones the
-/// enemy can infect right now. Avoid contact early, mass-clone first.
-const CONTACT_PEN: i32 = 15;
-/// Multi-capture exposure (E4, user idea): for every empty landing square
-/// the enemy can reach, each of our stones BEYOND THE FIRST that one enemy
-/// landing would convert costs this much — a 3-stone cluster next to an
-/// enemy-reachable hole is a pending 2-stone loss in a single move.
-const MULTICAP_PEN: i32 = 20;
-
 /// Reverse futility pruning margins, index = depth-1 (autaxx, stone = 100).
 const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774];
 
@@ -74,6 +57,8 @@ const _: () = assert!(ORD_HISTORY_MAX + 8 * ORD_CAPTURE_UNIT + ORD_CLONE_BONUS <
 const _: () = assert!(ORD_KILLER < ORD_TT);
 
 /// Static eval from the side-to-move's perspective.
+/// EXP slim-eval-speed: material + PST + tempo ONLY. Holes/contact/multicap
+/// stripped to measure eval-cost ceiling (speed only, strength be damned).
 pub fn evaluate(b: &Board) -> i32 {
     let mat = MATERIAL * (b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32);
     let mut pst = 0i32;
@@ -86,17 +71,7 @@ pub fn evaluate(b: &Board) -> i32 {
             pst += sign * PST[sq];
         }
     }
-    let holes_black = holes_penalty(b, 0);
-    let holes_white = holes_penalty(b, 1);
-    let contact_black = endangered_count(b, 0);
-    let contact_white = endangered_count(b, 1);
-    let multicap_black = multicapture_penalty(b, 0);
-    let multicap_white = multicapture_penalty(b, 1);
-    let mut score = mat + pst - holes_black + holes_white
-        - CONTACT_PEN * contact_black as i32
-        + CONTACT_PEN * contact_white as i32
-        - multicap_black
-        + multicap_white;
+    let mut score = mat + pst;
     if b.turn == 0 {
         score += TEMPO;
     } else {
@@ -107,52 +82,6 @@ pub fn evaluate(b: &Board) -> i32 {
     } else {
         -score
     }
-}
-
-/// E2 "virus strategy": stones of `side` the enemy can currently convert —
-/// empty landing squares within their reach, ring-1 of a landing touches us.
-fn endangered_count(b: &Board, side: u8) -> u32 {
-    let them = b.occ[1 - side as usize];
-    let us = b.occ[side as usize];
-    let landings = b.empty() & (dist_union(them, 1) | jump_union(them));
-    (us & dist_union(landings, 1)).count_ones()
-}
-
-/// E4 multi-capture exposure: for each enemy-reachable empty landing square,
-/// our stones there beyond the first (each extra one = a stone lost in the
-/// same single enemy move).
-fn multicapture_penalty(b: &Board, side: u8) -> i32 {
-    let them = b.occ[1 - side as usize];
-    let us = b.occ[side as usize];
-    let landings = b.empty() & (dist_union(them, 1) | jump_union(them));
-    let mut pen = 0i32;
-    let mut ls = landings;
-    while ls != 0 {
-        let sq = ls.trailing_zeros() as usize;
-        ls &= ls - 1;
-        let n = (RING1[sq] & us).count_ones() as i32;
-        if n >= 2 {
-            pen += (n - 1) * MULTICAP_PEN;
-        }
-    }
-    pen
-}
-
-/// autaxx hole risk: empty squares adjacent to `side`'s stones that the
-/// enemy can land on, weighted by own-stone density around them.
-fn holes_penalty(b: &Board, side: u8) -> i32 {
-    let us = b.occ[side as usize];
-    let them = b.occ[1 - side as usize];
-    let holes = b.empty() & dist_union(us, 1) & (dist_union(them, 1) | jump_union(them));
-    let mut pen = 0i32;
-    let mut hs = holes;
-    while hs != 0 {
-        let sq = hs.trailing_zeros() as usize;
-        hs &= hs - 1;
-        let n = (RING1[sq] & us).count_ones() as usize;
-        pen += HOLE_PEN[n];
-    }
-    pen
 }
 
 /// Terminal score from the side-to-move's perspective.
@@ -167,27 +96,8 @@ fn terminal_score(b: &Board, ply: u32) -> i32 {
     }
 }
 
-/// Move ordering strategy. All variants share the same move scoring
-/// (TT move > killers > captures*W + history); they differ in HOW the
-/// scored list is consumed. Switchable so sperft can A/B them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Ordering {
-    /// Repeated argmax extraction — O(n) per pick, only pays for the moves
-    /// actually examined before a cutoff. Zero extra memory.
-    Lazy,
-    /// Full insertion sort up front — better locality for PV nodes where
-    /// every move is searched anyway ("nearly sorted" friendly).
-    Insertion,
-    /// LSD radix sort (least significant digit first, 3 x 8-bit passes,
-    /// descending-stable) — O(n) regardless of presortedness.
-    Radix,
-}
-
-impl Default for Ordering {
-    fn default() -> Self {
-        Ordering::Lazy
-    }
-}
+/// Move scoring is fixed: TT move > killers > captures*W + history, consumed
+/// lazily (repeated argmax — only pays for moves examined before a cutoff).
 
 /// Transposition table entry (24 bytes with padding).
 #[derive(Clone, Copy)]
@@ -341,8 +251,6 @@ pub struct Searcher {
     time_src: fn() -> f64,
     /// Transposition table (persists across searches in the same Searcher).
     tt: Tt,
-    /// Move ordering strategy (benchmarkable switch).
-    ordering: Ordering,
     /// Two killer moves per ply (packed u32 moves), refreshed on cutoffs.
     killers: Box<[(u32, u32); MAX_PLY]>,
     /// History heuristic: [mover][to] cutoff counters, aged per search.
@@ -379,15 +287,9 @@ impl Searcher {
             node_limit: None,
             time_src: native_now_ms,
             tt: Tt::new(bits),
-            ordering: Ordering::Lazy,
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[0; 49]; 2]),
         }
-    }
-
-    /// Select the move ordering strategy (for sperft A/B benchmarks).
-    pub fn set_ordering(&mut self, ordering: Ordering) {
-        self.ordering = ordering;
     }
 
     /// Override the clock (wasm builds inject `performance.now()`).
@@ -564,55 +466,16 @@ impl Searcher {
             let list = &mut stack.lists[ply as usize];
             self.score_into(b, list, tt_mv, ply);
         }
-        if stack.lists[ply as usize].is_empty() {
-            // Opponent not stuck is guaranteed: double-stuck ends via passes >= 2.
-            return -self.negamax(
-                &b.make_pass(),
-                stack,
-                -beta,
-                -alpha,
-                depth - 1,
-                ply + 1,
-                true,
-            );
-        }
-
-        // Late move pruning (autaxx): once captures exist for us, drop all
-        // remaining quiet moves past move 27.
-        let has_capture =
-            stack.lists[ply as usize].captures_exist(b);
-        if has_capture {
-            let opp = b.opp();
-            stack.lists[ply as usize].lmp_quiets(27, opp);
-        }
-
-        let n_moves = stack.lists[ply as usize].len();
-        let ordered = !matches!(self.ordering, Ordering::Lazy);
-        if ordered {
-            if self.ordering == Ordering::Insertion {
-                stack.lists[ply as usize].sort_by_score();
-            } else {
-                stack.lists[ply as usize]
-                    .sort_radix_desc(&mut stack.scratch[ply as usize]);
-            }
-        }
 
         let mut best = i32::MIN;
         let mut best_mv: u32 = 0xFFFF;
         let mut move_idx = 0usize;
         loop {
-            let m = if ordered {
-                if move_idx >= n_moves {
-                    break;
-                }
-                stack.lists[ply as usize].move_at(move_idx)
-            } else {
-                let list = &mut stack.lists[ply as usize];
-                if list.is_empty() {
-                    break;
-                }
-                list.pop_best()
-            };
+            let list = &mut stack.lists[ply as usize];
+            if list.is_empty() {
+                break;
+            }
+            let m = list.pop_best();
 
             // PVS + universal LMR (autaxx): first move full window full
             // depth; every later move scouts with a null window at a reduced
@@ -745,10 +608,11 @@ impl Searcher {
             }
         }
         {
+            // Root ordering: score once, drain by pop_best into a fixed
+            // array (best-first). Each iteration reorders the array.
             let root = &mut stack.lists[0];
             let tt_mv = self.tt.probe(b.hash).map(|e| e.mv).unwrap_or(0);
             self.score_into(b, root, tt_mv, 0);
-            root.sort_by_score();
         }
         let n_root = stack.lists[0].len();
         if n_root == 0 {
@@ -761,25 +625,30 @@ impl Searcher {
             result.nodes = self.nodes;
             return result; // caller must handle pass / game over
         }
-        result.best = Some(stack.lists[0].move_at(0));
+        // Root best-so-far: drained best-first into a fixed array.
+        let mut root_moves = [Move::PASS; 256];
+        {
+            let root = &mut stack.lists[0];
+            for i in 0..n_root {
+                root_moves[i] = root.pop_best();
+            }
+        }
+        result.best = Some(root_moves[0]);
 
         let budget_ms = limits
             .time
             .map(|t| t.as_secs_f64() * 1000.0)
             .unwrap_or(f64::INFINITY);
-        // Iteration cost prediction (titanium-engine pattern): project the
-        // next iteration as the max of the last two completed iterations —
-        // beats growth multipliers on noisy trees.
-        let mut it_nodes: [f64; 2] = [0.0, 0.0];
+        // Iteration cost prediction: project the next iteration as the max
+        // of the last two completed iterations.
         let mut it_ms: [f64; 2] = [0.0, 0.0];
         for depth in 1..=limits.max_depth.max(1) {
-            let nodes_before = self.nodes;
             let iter_start = self.elapsed_ms();
             let mut alpha = i32::MIN + 1;
             let mut best_this = None;
             let mut best_score = i32::MIN;
             for i in 0..n_root {
-                let m = stack.lists[0].move_at(i);
+                let m = root_moves[i];
                 let score = -self.negamax(&b.make(m), &mut stack, -i32::MAX, -alpha, depth - 1, 1, true);
                 if self.stop {
                     break;
@@ -803,20 +672,16 @@ impl Searcher {
                 result.depth = depth;
                 // Move best move to the front for the next iteration.
                 if !self.stop {
-                    for i in 0..n_root {
-                        if stack.lists[0].move_at(i) == m {
-                            stack.lists[0].swap(i, 0);
-                            break;
-                        }
+                    if let Some(pos) = (0..n_root).find(|&i| root_moves[i] == m) {
+                        root_moves[pos] = root_moves[0];
+                        root_moves[0] = m;
                     }
                 }
             }
             if self.stop {
                 break;
             }
-            // Predict the next iteration by TIME only: a node budget should
-            // always be fully consumed (aborted-iteration work is already
-            // counted and its completed moves adopted).
+            // Predict the next iteration by TIME only.
             it_ms[1] = it_ms[0];
             it_ms[0] = self.elapsed_ms() - iter_start;
             let proj_ms = it_ms[0].max(it_ms[1]);
@@ -947,29 +812,12 @@ mod tests {
     }
 
     #[test]
-    fn all_orderings_find_valid_moves() {
-        // Every ordering strategy must return some legal move from the start.
+    fn lazy_ordering_finds_valid_move() {
+        // Lazy selection must return some legal move from the start.
         let b = Board::start();
-        for ordering in [Ordering::Lazy, Ordering::Insertion, Ordering::Radix] {
-            let mut s = Searcher::with_tt_bits(16);
-            s.set_ordering(ordering);
-            let r = s.search(&b, &no_time(5));
-            let m = match r.best {
-                Some(m) => m,
-                None => panic!(
-                    "{ordering:?} None sb={:?} sc={} d={}",
-                    r.stopped_by, r.score, r.depth
-                ),
-            };
-            assert!(b.legal_moves().contains(&m), "{:?} illegal", m);
-        }
-    }
-
-    fn ordering_debug(o: Ordering) -> &'static str {
-        match o {
-            Ordering::Lazy => "lazy",
-            Ordering::Insertion => "insertion",
-            Ordering::Radix => "radix",
-        }
+        let mut s = Searcher::with_tt_bits(16);
+        let r = s.search(&b, &no_time(5));
+        let m = r.best.expect("lazy ordering must find a move");
+        assert!(b.legal_moves().contains(&m), "{m:?} illegal");
     }
 }

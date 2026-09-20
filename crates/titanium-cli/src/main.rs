@@ -848,29 +848,18 @@ fn sperft_positions(n: usize) -> Vec<Board> {
 /// Search-throughput benchmark ("perft for the search"): fixed depth, no
 /// time limit, deterministic position suite. Node counts are reproducible,
 /// nps tracks search optimizations (TT, ordering, eval).
-fn sperft_cmd(depth: u32, positions: usize, ordering: Option<String>) -> ExitCode {
-    let orderings: Vec<(titanium::Ordering, &str)> = match ordering.as_deref() {
-        Some("lazy") => vec![(titanium::Ordering::Lazy, "lazy")],
-        Some("insertion") => vec![(titanium::Ordering::Insertion, "insertion")],
-        Some("radix") => vec![(titanium::Ordering::Radix, "radix")],
-        _ => vec![
-            (titanium::Ordering::Lazy, "lazy"),
-            (titanium::Ordering::Insertion, "insertion"),
-            (titanium::Ordering::Radix, "radix"),
-        ],
-    };
+fn sperft_cmd(depth: u32, positions: usize, _ordering: Option<String>) -> ExitCode {
     let suite = sperft_positions(positions);
     println!(
         "Search benchmark: fixed depth {depth}, {} positions, 1M-entry TT\n",
         suite.len()
     );
 
-    for (ord, name) in &orderings {
+    {
         let mut total_nodes = 0u64;
         let mut total_time = 0.0f64;
         for (i, b) in suite.iter().enumerate() {
             let mut searcher = Searcher::with_tt_bits(20);
-            searcher.set_ordering(*ord);
             let limits = SearchLimits {
                 time: None,
                 max_nodes: None,
@@ -884,7 +873,7 @@ fn sperft_cmd(depth: u32, positions: usize, ordering: Option<String>) -> ExitCod
             let _ = i;
         }
         println!(
-            "  {name:<10} {:>12} nodes  {:>8.2} s  {:>8.2} Mnps",
+            "  {:>12} nodes  {:>8.2} s  {:>8.2} Mnps",
             total_nodes,
             total_time,
             total_nodes as f64 / total_time / 1_000_000.0
