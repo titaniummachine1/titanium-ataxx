@@ -121,11 +121,17 @@ embed quotes manually: `$oppQ = "`"$m serve`""`.
 - E4 **multi-capture exposure** (user): −20 per extra stone convertible in
   one enemy landing — **+330 Elo. MERGED.**
 - Cumulative ~+700 self-play Elo; Moonbird still 0–32 at both gates.
-- S1 **slim-eval-speed** (branch `exp/slim-eval-speed`, 2026-09-20): eval =
-  material+PST+tempo; Ordering/radix/insertion/LMP/LUT paths deleted
-  (−307/+41). Sperft 4.11 vs main-lazy 2.40 (+71%). **100-game @100ms gate:
-  slim 73 – main 15 – 12 draws = +230 Elo. NO REGRESSION.** Merge-ready.
-  Main still untouched pending user merge order.
+- S1 **slim-eval-speed** (2026-09-20): eval = material+PST+tempo;
+  Ordering/radix/insertion/LMP/LUT paths deleted (−307/+41). Sperft 4.11
+  vs old-lazy 2.40 (+71%). 100g@100ms 73–15–12 (+230). **MERGED to main
+  `7ab844e`, pushed.** Main now = slim, sperft 4.29 Mnps.
+- S2 sancta lazy-incr (branch `exp/sancta-incr`, off new main): minimal
+  sancta.rs (load+refresh+SIMD forward, no S4Undo/PROF), root refresh once,
+  child acc = parent acc + diffs at make(). OFF zero-cost (sperft 4.22 vs
+  4.29). ON 5.0–5.2M NPS (swap ~free). 5k-node gate 10–20 (−140); 100ms
+  gate 14–16 (≈parity — speed compensates). Sign double-negation bug
+  found+fixed. NOT merged. Next: retune RFP/LMR for net scale OR saturate
+  own net — user decision.
 
 ## Next levers (in the order we'd take them)
 

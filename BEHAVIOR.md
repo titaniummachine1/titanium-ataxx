@@ -39,8 +39,11 @@ real memory. Update them the moment something happens, not at the end.
 ## Checkpoints (save tokens: doc at end of each TA block, then answer short)
 
 - 2026-09-20 S1: purge done (−307/+41), sperft +71%, 100g@100ms 73–15–12
-  (+230, no regression). Committed 7fbc538, pushed exp/slim-eval-speed.
-  Gate logs gate_A/B.txt. Main untouched.
+  (+230). MERGED to main 7ab844e, pushed.
+- 2026-09-20 S2: sign double-negation bug (forward_ready already
+  stm-relative; extra negate = 0-50). Fixed → 5k-node 10–20 (−140),
+  100ms 14–16 (≈parity). Eval swap ~free (5.0–5.2M vs 5.6–8.4M).
+  NOT merged. Awaiting user: retune search vs saturate own net.
 
 ## Protocol
 

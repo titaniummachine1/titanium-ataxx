@@ -181,6 +181,24 @@ fn perft_cmd(depth: u32) -> ExitCode {
 // ---------- bench ----------
 
 fn bench_cmd(depth: u32) -> ExitCode {
+    // TITANIUM_EVAL_MODE=sancta -> attach data/nnue/sancta_w.s1 for the run.
+    let sancta = std::env::var("TITANIUM_EVAL_MODE")
+        .map(|v| v == "sancta")
+        .unwrap_or(false);
+    let net = if sancta {
+        match titanium::S1Net::load("data/nnue/sancta_w.s1") {
+            Some(n) => {
+                println!("Bench: sancta eval ON (sancta_w.s1)");
+                Some(std::sync::Arc::new(n))
+            }
+            None => {
+                eprintln!("Bench: TITANIUM_EVAL_MODE=sancta but data/nnue/sancta_w.s1 missing");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     let b = Board::start();
     println!("Bench: start position, fixed depth {depth} (no time limit)");
     let limits = SearchLimits {
@@ -188,7 +206,9 @@ fn bench_cmd(depth: u32) -> ExitCode {
         max_nodes: None,
         max_depth: depth,
     };
-    let r = best_move(&b, &limits);
+    let mut searcher = Searcher::new();
+    searcher.set_sancta(net);
+    let r = searcher.search(&b, &limits);
     let secs = r.elapsed.as_secs_f64();
     println!(
         "  best {}  score {}  depth {}  nodes {}  nps {:.0}",
@@ -467,6 +487,17 @@ fn out_line(s: &str) {
 fn serve_cmd(tt_bits: usize) -> ExitCode {
     let stdin = io::stdin();
     let mut searcher = Searcher::with_tt_bits(tt_bits);
+    // Same env flag as bench: TITANIUM_EVAL_MODE=sancta serves the net.
+    // Env inherits into UAI children spawned by match, so gates work.
+    if std::env::var("TITANIUM_EVAL_MODE").map(|v| v == "sancta").unwrap_or(false) {
+        match titanium::S1Net::load("data/nnue/sancta_w.s1") {
+            Some(n) => searcher.set_sancta(Some(std::sync::Arc::new(n))),
+            None => {
+                eprintln!("serve: TITANIUM_EVAL_MODE=sancta but data/nnue/sancta_w.s1 missing");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let mut current: Option<Board> = None;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };

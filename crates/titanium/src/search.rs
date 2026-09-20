@@ -4,6 +4,8 @@
 //! (TT move > killers > captures*W + history) -> lazy selection -> alpha-beta.
 
 use crate::board::{dist_union, Board, Move, MoveList, RING1, SQUARES};
+use crate::sancta::{S1Acc, S1Net};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const MATE: i32 = 100_000;
@@ -14,15 +16,18 @@ const MATE_BOUND: i32 = MATE - 2000;
 const MAX_PLY: usize = 40;
 
 /// Per-ply move buffers allocated once per search: nodes only reset `len`,
-/// they never re-initialize the arrays.
+/// they never re-initialize the arrays. `acc` carries the lazy sancta
+/// accumulator per ply (parent acc + bitboard diffs, zero-cost when OFF).
 struct MoveStack {
     lists: Box<[MoveList; MAX_PLY]>,
+    acc: Box<[S1Acc; MAX_PLY]>,
 }
 
 impl MoveStack {
     fn new() -> MoveStack {
         MoveStack {
             lists: Box::new([MoveList::new(); MAX_PLY]),
+            acc: Box::new([[[0; 64]; 2]; MAX_PLY]),
         }
     }
 }
@@ -255,6 +260,9 @@ pub struct Searcher {
     killers: Box<[(u32, u32); MAX_PLY]>,
     /// History heuristic: [mover][to] cutoff counters, aged per search.
     history: Box<[[u32; 49]; 2]>,
+    /// Optional sancta net (None = classical slim eval). Arc so clones
+    /// share weights; set once via set_sancta, read-only in the tree.
+    sancta: Option<Arc<S1Net>>,
 }
 
 /// Monotonic milliseconds since process start (native default time source).
@@ -289,7 +297,13 @@ impl Searcher {
             tt: Tt::new(bits),
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[0; 49]; 2]),
+            sancta: None,
         }
+    }
+
+    /// Attach a sancta net (None = classical). Single flag, zero-cost OFF.
+    pub fn set_sancta(&mut self, net: Option<Arc<S1Net>>) {
+        self.sancta = net;
     }
 
     /// Override the clock (wasm builds inject `performance.now()`).
@@ -307,6 +321,11 @@ impl Searcher {
         self.tt.clear();
         self.killers = Box::new([(0, 0); MAX_PLY]);
         self.history = Box::new([[0; 49]; 2]);
+    }
+
+    /// Is a sancta net attached (eval swap active)?
+    pub fn has_sancta(&self) -> bool {
+        self.sancta.is_some()
     }
 
     #[inline]
@@ -418,7 +437,16 @@ impl Searcher {
         }
         let _ = tt_hit;
 
-        let static_eval = self.eval_cached(b);
+        // Lazy incremental sancta: root refreshed once in search(); every
+        // child acc = parent acc + bitboard diffs at make() time (below).
+        // OFF = single branch to classical, zero-cost.
+        // forward_ready(acc, stm) is ALREADY stm-relative (like evaluate) —
+        // no negation (that was the 0-50 bug: double-negated white nodes).
+        let static_eval = if let Some(net) = &self.sancta {
+            net.forward_ready(&stack.acc[ply as usize], b.turn)
+        } else {
+            self.eval_cached(b)
+        };
 
         // Reverse futility pruning (autaxx, exact form): standing pat is so
         // far below alpha that even a generous error margin cannot recover
@@ -440,6 +468,9 @@ impl Searcher {
             let fill = (b.piece_cnt[0] + b.piece_cnt[1]) as f64 / SQUARES as f64;
             if clone_targets >= 11 && fill < 0.54 {
                 let child = b.make_pass();
+                // NMP pass flips stm: sancta acc is color-relative so it
+                // stays valid — just forward the other perspective.
+                // (pass: no stones change, no diff update needed.)
                 let score = -self.negamax(
                     &child,
                     stack,
@@ -481,9 +512,22 @@ impl Searcher {
             // depth; every later move scouts with a null window at a reduced
             // depth (r = 2, or 3 from the 10th move), re-searching full
             // window + full depth only when the scout beats alpha.
+            // Lazy sancta: child acc = parent acc + diffs BEFORE recursing.
+            // NOTE: snet cloned ONCE per node (Arc bump), not per move.
+            let child = b.make(m);
+            if let Some(net) = &self.sancta.clone() {
+                let (par, ch) = if (ply as usize) < MAX_PLY - 1 {
+                    let (a, z) = stack.acc.split_at_mut(ply as usize + 1);
+                    (&a[ply as usize], &mut z[0])
+                } else {
+                    let (a, z) = stack.acc.split_at_mut(ply as usize);
+                    (&z[0], &mut a[0])
+                };
+                net.update_child(par, ch, b, &child);
+            }
             let mut score;
             if move_idx == 0 {
-                score = -self.negamax(&b.make(m), stack, -beta, -alpha, depth - 1, ply + 1, true);
+                score = -self.negamax(&child, stack, -beta, -alpha, depth - 1, ply + 1, true);
                 if self.stop {
                     return 0;
                 }
@@ -491,7 +535,7 @@ impl Searcher {
                 let r: u32 = if move_idx < 9 { 2 } else { 3 };
                 let reduced = depth.saturating_sub(1 + r);
                 score = -self.negamax(
-                    &b.make(m),
+                    &child,
                     stack,
                     -alpha - 1,
                     -alpha,
@@ -503,8 +547,10 @@ impl Searcher {
                     return 0;
                 }
                 if score > alpha && reduced < depth - 1 {
+                    // Re-search: scout already wrote child acc in place
+                    // (same parent+child), so it is still valid. No rebuild.
                     score = -self.negamax(
-                        &b.make(m),
+                        &child,
                         stack,
                         -beta,
                         -alpha,
@@ -626,12 +672,16 @@ impl Searcher {
             return result; // caller must handle pass / game over
         }
         // Root best-so-far: drained best-first into a fixed array.
+        // Root acc refreshed once (sancta lazy path: children diff from it).
         let mut root_moves = [Move::PASS; 256];
         {
             let root = &mut stack.lists[0];
             for i in 0..n_root {
                 root_moves[i] = root.pop_best();
             }
+        }
+        if let Some(net) = &self.sancta.clone() {
+            net.refresh_root(b, &mut stack.acc[0]);
         }
         result.best = Some(root_moves[0]);
 
@@ -649,7 +699,13 @@ impl Searcher {
             let mut best_score = i32::MIN;
             for i in 0..n_root {
                 let m = root_moves[i];
-                let score = -self.negamax(&b.make(m), &mut stack, -i32::MAX, -alpha, depth - 1, 1, true);
+                let child = b.make(m);
+                // Root children: acc[1] = acc[0] + diffs (sancta lazy path).
+                if let Some(net) = &self.sancta.clone() {
+                    let (a, z) = stack.acc.split_at_mut(1);
+                    net.update_child(&a[0], &mut z[0], b, &child);
+                }
+                let score = -self.negamax(&child, &mut stack, -i32::MAX, -alpha, depth - 1, 1, true);
                 if self.stop {
                     break;
                 }
