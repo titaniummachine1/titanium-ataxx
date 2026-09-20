@@ -181,18 +181,21 @@ fn perft_cmd(depth: u32) -> ExitCode {
 // ---------- bench ----------
 
 fn bench_cmd(depth: u32) -> ExitCode {
-    // TITANIUM_EVAL_MODE=sancta -> attach data/nnue/sancta_w.s1 for the run.
+    // TITANIUM_EVAL_MODE=sancta -> attach the net file (TITANIUM_SANCTA_FILE
+    // or data/nnue/sancta_w.s1 legacy) for the run.
     let sancta = std::env::var("TITANIUM_EVAL_MODE")
         .map(|v| v == "sancta")
         .unwrap_or(false);
     let net = if sancta {
-        match titanium::S1Net::load("data/nnue/sancta_w.s1") {
+        let path = std::env::var("TITANIUM_SANCTA_FILE")
+            .unwrap_or_else(|_| "data/nnue/sancta_w.s1".into());
+        match titanium::S1Net::load(&path) {
             Some(n) => {
-                println!("Bench: sancta eval ON (sancta_w.s1)");
+                println!("Bench: sancta eval ON ({path})");
                 Some(std::sync::Arc::new(n))
             }
             None => {
-                eprintln!("Bench: TITANIUM_EVAL_MODE=sancta but data/nnue/sancta_w.s1 missing");
+                eprintln!("Bench: TITANIUM_EVAL_MODE=sancta but {path} missing");
                 return ExitCode::FAILURE;
             }
         }
@@ -490,10 +493,12 @@ fn serve_cmd(tt_bits: usize) -> ExitCode {
     // Same env flag as bench: TITANIUM_EVAL_MODE=sancta serves the net.
     // Env inherits into UAI children spawned by match, so gates work.
     if std::env::var("TITANIUM_EVAL_MODE").map(|v| v == "sancta").unwrap_or(false) {
-        match titanium::S1Net::load("data/nnue/sancta_w.s1") {
+        let path = std::env::var("TITANIUM_SANCTA_FILE")
+            .unwrap_or_else(|_| "data/nnue/sancta_w.s1".into());
+        match titanium::S1Net::load(&path) {
             Some(n) => searcher.set_sancta(Some(std::sync::Arc::new(n))),
             None => {
-                eprintln!("serve: TITANIUM_EVAL_MODE=sancta but data/nnue/sancta_w.s1 missing");
+                eprintln!("serve: TITANIUM_EVAL_MODE=sancta but {path} missing");
                 return ExitCode::FAILURE;
             }
         }
