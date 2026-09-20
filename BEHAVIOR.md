@@ -43,7 +43,10 @@ real memory. Update them the moment something happens, not at the end.
 - 2026-09-20 S2: sign double-negation bug (forward_ready already
   stm-relative; extra negate = 0-50). Fixed → 5k-node 10–20 (−140),
   100ms 14–16 (≈parity). Eval swap ~free (5.0–5.2M vs 5.6–8.4M).
-  NOT merged. Awaiting user: retune search vs saturate own net.
+  NOT merged.
+- 2026-09-20 S3: slim vs owner 19-0-1 (his tree is weak), vs Moonbird
+  0-20 (wall stands). Data: dag.db 8.7M nodes/167 folds, torch CPU-only
+  (no GPU). Decision: saturate own 147x64 net on CPU, then gate.
 
 ## Protocol
 
