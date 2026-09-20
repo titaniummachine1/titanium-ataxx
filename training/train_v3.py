@@ -381,6 +381,7 @@ def main():
         return tot / cnt, to / cnt, ts / cnt
 
     for ep in range(1, a.epochs + 1):
+        t0 = time.time()
         tr_loss, tr_o, tr_s = run_epoch(trl, True)
         with torch.no_grad():
             va_loss, va_o, va_s = run_epoch(vall, False)
