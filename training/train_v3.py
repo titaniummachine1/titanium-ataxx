@@ -92,15 +92,16 @@ class V3(nn.Module):
         self.w2 = nn.Linear(H2, 1)
 
     def forward_dual(self, ours_ids, theirs_ids):
-        """Batched manual gather (CPU-friendly): list-of-lists active ids."""
-        B = len(ours_ids)
+        """Vectorized: padded id matrices + mask, one embedding lookup each.
+        ours_pad/theirs_pad: (B,K) long, masks (B,K) float. No python loop."""
+        return None  # unused: run_epoch uses forward_padded directly
+
+    def forward_padded(self, o_pad, o_mask, t_pad, t_mask):
+        B = o_pad.shape[0]
         acc_o = self._bias.unsqueeze(0).expand(B, L1).clone()
         acc_t = self._bias.unsqueeze(0).expand(B, L1).clone()
-        for b in range(B):
-            if ours_ids[b]:
-                acc_o[b] += self.ft(torch.tensor(ours_ids[b])).sum(0)
-            if theirs_ids[b]:
-                acc_t[b] += self.ft(torch.tensor(theirs_ids[b])).sum(0)
+        acc_o += (self.ft(o_pad) * o_mask.unsqueeze(-1)).sum(1)
+        acc_t += (self.ft(t_pad) * t_mask.unsqueeze(-1)).sum(1)
         feat = torch.cat([acc_o.clamp(0, CLIP), acc_t.clamp(0, CLIP)], dim=1)
         h = torch.relu(self.w1(feat))
         return self.w2(h)
@@ -137,22 +138,28 @@ def export_v3_blob(path, ft_w, ft_b, w1, b1, w2, b2):
 # ---------------- dataset: full-data wsum-weighted ----------------
 
 class DagDS(torch.utils.data.Dataset):
-    def __init__(self, db, limit=None, score_only=False, min_margin=True):
+    def __init__(self, db, limit=None, score_only=False, min_margin=True, top_by_wsum=0):
         con = sqlite3.connect(db)
         con.execute('pragma journal_mode=off')
-        q = ('select fen, stm, visits, sum_outcome, best_score, wsum from nodes '
-             'where margin_n>0' if min_margin else
-             'select fen, stm, visits, sum_outcome, best_score, wsum from nodes')
-        if limit:
-            q += ' limit %d' % limit
+        base = ('select fen, stm, visits, sum_outcome, best_score, wsum from nodes '
+                'where margin_n>0' if min_margin else
+                'select fen, stm, visits, sum_outcome, best_score, wsum from nodes')
+        if top_by_wsum and not limit:
+            # Top-N by search mass: the informative slice that fits in RAM.
+            # Full 7.6M rows cannot fetchall() into Python (OOM/stall).
+            q = base + ' order by wsum desc limit %d' % top_by_wsum
+        else:
+            q = base
+            if limit:
+                q += ' limit %d' % limit
         rows = con.execute(q).fetchall()
         con.close()
         self.rows = rows
         self.score_only = score_only
         # sampling weights: wsum (search mass), fallback visits+1
-        import math
         self.w = [max(1.0, r[5] if r[5] and r[5] > 0 else (r[2] + 1)) for r in rows]
-        print('dataset rows: %d (margin>0)' % len(rows), flush=True)
+        print('dataset rows: %d (margin>0%s)' % (
+            len(rows), ', top-%d by wsum' % top_by_wsum if top_by_wsum and not limit else ''), flush=True)
 
     def __len__(self):
         return len(self.rows)
@@ -164,7 +171,21 @@ class DagDS(torch.utils.data.Dataset):
         out_t = s_out / max(1, vis)
         out_t = max(-1.0, min(1.0, out_t))
         sc = max(-2000.0, min(2000.0, best)) / 2000.0
-        return o_ids, t_ids, torch.tensor([out_t]), torch.tensor([sc])
+        return (torch.tensor(o_ids, dtype=torch.long),
+                torch.tensor(t_ids, dtype=torch.long),
+                torch.tensor([out_t]), torch.tensor([sc]))
+
+
+def collate_dual(batch):
+    """Pad ours/theirs id lists separately -> fully vectorized, no per-id python loop."""
+    F = torch.nn.functional.pad
+    maxo = max(b[0].numel() for b in batch)
+    maxt = max(b[1].numel() for b in batch)
+    o_ids = torch.stack([F(b[0], (0, maxo - b[0].numel())) for b in batch])
+    o_m = torch.stack([F(torch.ones(b[0].numel()), (0, maxo - b[0].numel())) for b in batch])
+    t_ids = torch.stack([F(b[1], (0, maxt - b[1].numel())) for b in batch])
+    t_m = torch.stack([F(torch.ones(b[1].numel()), (0, maxt - b[1].numel())) for b in batch])
+    return o_ids, o_m, t_ids, t_m, torch.stack([b[2] for b in batch]), torch.stack([b[3] for b in batch])
 
 # ---------------- train ----------------
 
@@ -176,6 +197,7 @@ def main():
     ap.add_argument('--batch', type=int, default=2048)
     ap.add_argument('--lr', type=float, default=0.02)
     ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--top-wsum', type=int, default=400000)
     ap.add_argument('--score-only', action='store_true')
     ap.add_argument('--out', default='data/nnue/own_v3.s1')
     a = ap.parse_args()
@@ -195,7 +217,7 @@ def main():
         nn.init.zeros_(model.w2.bias)
     model.train()
 
-    ds = DagDS(a.db, a.limit or None, a.score_only)
+    ds = DagDS(a.db, a.limit or None, a.score_only, True, a.top_wsum if not a.limit else 0)
     n = len(ds)
     nval = max(2000, n // 20)  # 5% val on full data (still huge)
     ntr = n - nval
@@ -203,23 +225,27 @@ def main():
     # weighted sampler: wsum mass, not uniform over thin rows
     w = torch.tensor(ds.w, dtype=torch.double)
     samp = torch.utils.data.WeightedRandomSampler(w[tr.indices], num_samples=len(tr.indices), replacement=True)
-    trl = torch.utils.data.DataLoader(tr, batch_size=a.batch, sampler=samp,
-                                      collate_fn=lambda b: ([x[0] for x in b], [x[1] for x in b],
-                                                             torch.stack([x[2] for x in b]),
-                                                             torch.stack([x[3] for x in b])))
-    vall = torch.utils.data.DataLoader(va, batch_size=a.batch,
-                                       collate_fn=lambda b: ([x[0] for x in b], [x[1] for x in b],
-                                                              torch.stack([x[2] for x in b]),
-                                                              torch.stack([x[3] for x in b])))
+    def collate_ids(batch):
+        # batch: list of (o_ids, t_ids, out_t, sc_t); pad both views.
+        maxo = max(len(x[0]) for x in batch)
+        maxt = max(len(x[1]) for x in batch)
+        o_pad = torch.stack([torch.nn.functional.pad(torch.tensor(x[0]), (0, maxo - len(x[0]))) for x in batch])
+        o_mask = torch.stack([torch.nn.functional.pad(torch.ones(len(x[0])), (0, maxo - len(x[0]))) for x in batch])
+        t_pad = torch.stack([torch.nn.functional.pad(torch.tensor(x[1]), (0, maxt - len(x[1]))) for x in batch])
+        t_mask = torch.stack([torch.nn.functional.pad(torch.ones(len(x[1])), (0, maxt - len(x[1]))) for x in batch])
+        return o_pad, o_mask, t_pad, t_mask, torch.stack([x[2] for x in batch]), torch.stack([x[3] for x in batch])
+
+    trl = torch.utils.data.DataLoader(tr, batch_size=a.batch, sampler=samp, collate_fn=collate_ids)
+    vall = torch.utils.data.DataLoader(va, batch_size=a.batch, collate_fn=collate_ids)
 
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs * max(1, len(trl)))
 
     def run_epoch(loader, train):
         tot, to, ts, cnt = 0.0, 0.0, 0.0, 0
-        for o_ids, t_ids, out_t, sc_t in loader:
-            B = len(o_ids)
-            pred = model.forward_dual(o_ids, t_ids)
+        for o_pad, o_mask, t_pad, t_mask, out_t, sc_t in loader:
+            B = o_pad.shape[0]
+            pred = model.forward_padded(o_pad, o_mask, t_pad, t_mask)
             # Head units: engine out = (b2+w2.relu)*400/16320 must land in
             # cp-ish hundreds. Trainer maps: pred_out = tanh(pred/12)
             # (≈ outcome), pred_sc = pred/40 (≈ score/2000 * 40 = cp/50...).
