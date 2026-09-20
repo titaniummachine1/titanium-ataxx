@@ -236,21 +236,28 @@ def main():
     nval = max(2000, n // 20)  # 5% val on full data (still huge)
     ntr = n - nval
     tr, va = torch.utils.data.random_split(ds, [ntr, nval], generator=torch.Generator().manual_seed(7))
+    print('split: %d train / %d val; precomputing tensors...' % (ntr, nval), flush=True)
+    t0 = time.time()
+    # PRECOMPUTE once: lists of python ints -> padded tensors per sample.
+    # The old path ran parse_fen/active_ids per sample PER EPOCH in the
+    # worker loop (getattr + FEN parse x25) — that was the stall, not torch.
+    pre_o, pre_t, pre_out, pre_sc = [], [], [], []
+    for i in range(n):
+        o, t, ou, sc = ds[i]
+        pre_o.append(o)
+        pre_t.append(t)
+        pre_out.append(ou)
+        pre_sc.append(sc)
+    print('precomputed %d samples in %.0fs' % (n, time.time() - t0), flush=True)
+    pre_tr = ([pre_o[i] for i in tr.indices], [pre_t[i] for i in tr.indices],
+              torch.stack([pre_out[i] for i in tr.indices]), torch.stack([pre_sc[i] for i in tr.indices]))
+    pre_va = ([pre_o[i] for i in va.indices], [pre_t[i] for i in va.indices],
+              torch.stack([pre_out[i] for i in va.indices]), torch.stack([pre_sc[i] for i in va.indices]))
+    del pre_o, pre_t, pre_out, pre_sc, ds
     # weighted sampler: wsum mass, not uniform over thin rows
-    w = torch.tensor(ds.w, dtype=torch.double)
-    samp = torch.utils.data.WeightedRandomSampler(w[tr.indices], num_samples=len(tr.indices), replacement=True)
-    def collate_ids(batch):
-        # batch: list of (o_ids, t_ids, out_t, sc_t); pad both views.
-        maxo = max(len(x[0]) for x in batch)
-        maxt = max(len(x[1]) for x in batch)
-        o_pad = torch.stack([torch.nn.functional.pad(torch.tensor(x[0]), (0, maxo - len(x[0]))) for x in batch])
-        o_mask = torch.stack([torch.nn.functional.pad(torch.ones(len(x[0])), (0, maxo - len(x[0]))) for x in batch])
-        t_pad = torch.stack([torch.nn.functional.pad(torch.tensor(x[1]), (0, maxt - len(x[1]))) for x in batch])
-        t_mask = torch.stack([torch.nn.functional.pad(torch.ones(len(x[1])), (0, maxt - len(x[1]))) for x in batch])
-        return o_pad, o_mask, t_pad, t_mask, torch.stack([x[2] for x in batch]), torch.stack([x[3] for x in batch])
-
-    trl = torch.utils.data.DataLoader(tr, batch_size=a.batch, sampler=samp, collate_fn=collate_ids)
-    vall = torch.utils.data.DataLoader(va, batch_size=a.batch, collate_fn=collate_ids)
+    # (top-wsum slice is ALREADY the informative mass — uniform is correct.)
+    trl = torch.utils.data.DataLoader(list(zip(*pre_tr)), batch_size=a.batch, shuffle=True, collate_fn=collate_dual)
+    vall = torch.utils.data.DataLoader(list(zip(*pre_va)), batch_size=a.batch, collate_fn=collate_dual)
 
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs * max(1, len(trl)))
