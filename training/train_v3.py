@@ -342,21 +342,10 @@ def main():
         for o_pad, o_mask, t_pad, t_mask, out_t, sc_t in loader:
             B = o_pad.shape[0]
             pred = model.forward_padded(o_pad, o_mask, t_pad, t_mask)
-            # Head units = engine pre-scale units (engine applies *400/16320
-            # at the end, same as v1). sc_t = best/2000, so head target =
-            # best*4 = sc_t*8000. Outcome branch: tanh(pred/8000) vs outcome.
-            # NORMALIZED targets (both O(1)): outcome + score/2000.
-            # pred_out = tanh(pred/8000): outcome head 8000*outcome.
-            # pred_sc = pred/8000 vs sc_t = best/2000?? MISMATCH: best=2000
-            # -> sc_t=1 -> pred must be 8000 = full head range for MID
-            # scores. The score signal is COMPRESSED into [-1,1] while pred
-            # roams thousands. FIX: score branch in CP units: pred_cp =
-            # pred*400/16320 (engine math, differentiable), tgt_cp = best.
-            # Both branches now live where the ENGINE lives.
-            # NORMALIZED (both O(1)): outcome + score/2000.
-            # outcome: tanh(pred/8000) vs out_t (head 8000 ~= 200cp).
-            # score: pred/81600 vs sc_t (pred head -> engine cp -> /2000:
-            # cp=pred*400/16320, /2000 = pred/81600. best=2000 -> 1.0).
+            # EXACT-v1-distill loss: predict the v1 teacher's head output.
+            # out=head h; outcome branch tanh(h/8000) vs out_t; score branch
+            # h/81600 vs sc_t. Same math as smoke (proven sane a1c2/-41).
+            # NOTE log columns: out = outcome-MSE, sc = score-MSE (both O(1)).
             sc_pred = pred / 81600.0
             tgt_cp = sc_t
             pred_out = torch.tanh(pred / 8000.0)
