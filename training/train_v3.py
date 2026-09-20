@@ -138,28 +138,42 @@ def export_v3_blob(path, ft_w, ft_b, w1, b1, w2, b2):
 # ---------------- dataset: full-data wsum-weighted ----------------
 
 class DagDS(torch.utils.data.Dataset):
-    def __init__(self, db, limit=None, score_only=False, min_margin=True, top_by_wsum=0):
-        con = sqlite3.connect(db)
-        con.execute('pragma journal_mode=off')
-        base = ('select fen, stm, visits, sum_outcome, best_score, wsum from nodes '
-                'where margin_n>0' if min_margin else
-                'select fen, stm, visits, sum_outcome, best_score, wsum from nodes')
-        if top_by_wsum and not limit:
-            # Top-N by search mass: the informative slice that fits in RAM.
-            # Full 7.6M rows cannot fetchall() into Python (OOM/stall).
-            q = base + ' order by wsum desc limit %d' % top_by_wsum
-        else:
-            q = base
-            if limit:
-                q += ' limit %d' % limit
-        rows = con.execute(q).fetchall()
-        con.close()
-        self.rows = rows
+    def __init__(self, db, limit=None, score_only=False, min_margin=True, top_by_wsum=0,
+                 preload=True):
         self.score_only = score_only
-        # sampling weights: wsum (search mass), fallback visits+1
-        self.w = [max(1.0, r[5] if r[5] and r[5] > 0 else (r[2] + 1)) for r in rows]
-        print('dataset rows: %d (margin>0%s)' % (
-            len(rows), ', top-%d by wsum' % top_by_wsum if top_by_wsum and not limit else ''), flush=True)
+        if preload:
+            con = sqlite3.connect(db)
+            con.execute('pragma journal_mode=off')
+            base = ('select fen, stm, visits, sum_outcome, best_score, wsum from nodes '
+                    'where margin_n>0' if min_margin else
+                    'select fen, stm, visits, sum_outcome, best_score, wsum from nodes')
+            if top_by_wsum and not limit:
+                # Top-N by search mass: the informative slice that fits in RAM.
+                # Full 7.6M rows cannot fetchall() into Python (OOM/stall).
+                q = base + ' order by wsum desc limit %d' % top_by_wsum
+            else:
+                q = base
+                if limit:
+                    q += ' limit %d' % limit
+            t0 = time.time()
+            rows = con.execute(q).fetchall()
+            con.close()
+            print('fetched %d rows in %.0fs' % (len(rows), time.time() - t0), flush=True)
+            self.rows = rows
+            # sampling weights: wsum (search mass), fallback visits+1
+            self.w = [max(1.0, r[5] if r[5] and r[5] > 0 else (r[2] + 1)) for r in rows]
+            print('dataset rows: %d (margin>0%s)' % (
+                len(rows), ', top-%d by wsum' % top_by_wsum if top_by_wsum and not limit else ''), flush=True)
+        else:
+            # Streamed mode: count only, pages fetched per epoch (see main).
+            con = sqlite3.connect(db)
+            base = ('select count(*) from nodes where margin_n>0' if min_margin else
+                    'select count(*) from nodes')
+            self.n = con.execute(base).fetchone()[0]
+            con.close()
+            self.rows = None
+            self.w = None
+            print('dataset rows: %d (streamed, margin>0)' % self.n, flush=True)
 
     def __len__(self):
         return len(self.rows)
