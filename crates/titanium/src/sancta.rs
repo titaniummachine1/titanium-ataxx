@@ -156,16 +156,18 @@ impl S1Net {
             w1[i].copy_from_slice(&w[o..o + S1_H2]);
             o += S1_H2;
         }
-        // b1 stored i16 quantized, widen to i32 head units.
+        // b1/b2 stored i16 DIRECT (no hidden x256): engine head units ==
+        // trainer float units. Output scale folded into w2/b2 at export
+        // (v1-style): cp = (b2 + w2.relu(b1 + W1.crelu)) * 400/16320.
         let mut b1 = [0i32; S1_H2];
         for j in 0..S1_H2 {
-            b1[j] = w[o + j] as i32 * 256;
+            b1[j] = w[o + j] as i32;
         }
         o += S1_H2;
         let mut w2 = [0i16; S1_H2];
         w2.copy_from_slice(&w[o..o + S1_H2]);
         o += S1_H2;
-        let b2 = w[o] as i32 * 256;
+        let b2 = w[o] as i32;
         Some(S1Net { ft_w, ft_b, w1, b1, w2, b2 })
     }
 

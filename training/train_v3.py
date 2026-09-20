@@ -84,12 +84,13 @@ def active_ids(own, enemy, gap):
 # ---------------- model: 147x64 FT + 128->16->1 head ----------------
 
 class V3(nn.Module):
-    def __init__(self):
+    def __init__(self, head_gain=0.05):
         super().__init__()
         self.ft = nn.Embedding(NFEAT, L1)
         self._bias = nn.Parameter(torch.zeros(L1))
         self.w1 = nn.Linear(2 * L1, H2)
         self.w2 = nn.Linear(H2, 1)
+        self.head_gain = head_gain
 
     def forward_dual(self, ours_ids, theirs_ids):
         """Vectorized: padded id matrices + mask, one embedding lookup each.
@@ -119,18 +120,18 @@ def load_v1_blob(path):
 
 
 def export_v3_blob(path, ft_w, ft_b, w1, b1, w2, b2):
-    """Quant: FT/bias i16 direct; W1 i16 direct; b1 i32 = f32*256;
-    w2 i16 direct; b2 i32 = f32*256. Matches sancta.rs from_bytes."""
+    """Quant: ALL i16 direct (FT, bias, W1, b1, w2, b2). Engine units ==
+    trainer float units; output scale 400/16320 applied once at the end
+    in forward_head. Matches sancta.rs from_bytes (no hidden x256)."""
     vals = []
     for f in range(NFEAT):
         vals += [int(max(-32768, min(32767, round(v)))) for v in ft_w[f]]
     vals += [int(max(-32768, min(32767, round(v)))) for v in ft_b]
     for i in range(2 * L1):
         vals += [int(max(-32768, min(32767, round(v)))) for v in w1[i]]
-    b1q = [int(v * 256) for v in b1]
-    vals += b1q  # stored i16 range check below
+    vals += [int(max(-32768, min(32767, round(v)))) for v in b1]
     vals += [int(max(-32768, min(32767, round(v)))) for v in w2]
-    vals += [int(b2 * 256)]
+    vals += [int(max(-32768, min(32767, round(b2))))]
     assert len(vals) == S1N_V3 // 2, len(vals)
     with open(path, 'wb') as f:
         f.write(struct.pack('<%dh' % len(vals), *[max(-32768, min(32767, v)) for v in vals]))
@@ -213,8 +214,11 @@ def main():
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--top-wsum', type=int, default=400000)
     ap.add_argument('--score-only', action='store_true')
+    ap.add_argument('--cache', default='')
     ap.add_argument('--out', default='data/nnue/own_v3.s1')
     a = ap.parse_args()
+
+    import numpy as np
 
     torch.set_num_threads(max(1, os.cpu_count() or 4))
     print('threads:', torch.get_num_threads(), flush=True)
@@ -224,36 +228,107 @@ def main():
     with torch.no_grad():
         model.ft.weight.copy_(torch.tensor(ft_w0, dtype=torch.float32))
         model._bias.copy_(torch.tensor(ft_b0, dtype=torch.float32))
-        # head random (Kaiming): v1 linear weights have no exact v3 mapping
-        nn.init.kaiming_uniform_(model.w1.weight, nonlinearity='relu')
-        nn.init.zeros_(model.w1.bias)
-        nn.init.kaiming_uniform_(model.w2.weight, nonlinearity='linear')
+    # Load v1 head for distillation seeding:
+    import struct as _st
+    _d = open(a.init, 'rb').read()
+    assert len(_d) == S1N_V1, len(_d)
+    _w = _st.unpack('<%dh' % (len(_d) // 2), _d)
+    _o = NFEAT * L1 + L1
+    _out_w = torch.tensor(_w[_o:_o + 2 * L1], dtype=torch.float32)
+    _out_b = float(_w[_o + 2 * L1])
+    with torch.no_grad():
+        # EXACT v1 distill (identity decomposition, no approximation):
+        # out = relu(v1) - relu(-v1) = v1 for ALL v1 (both signs).
+        # h0 = relu(out_w.acc + out_b), w2[0] = +1;
+        # h1 = relu(-out_w.acc - out_b), w2[1] = -1.
+        # Hiddens 2..15 = small random (x0.01 guard: can't hijack output
+        # before h0/h1 converge). b2 = 0. First forward == v1 EXACTLY.
+        model.w1.weight.zero_()
+        model.w1.bias.zero_()
+        model.w1.weight[0].copy_(_out_w)
+        model.w1.bias[0] = _out_b
+        model.w1.weight[1].copy_(-_out_w)
+        model.w1.bias[1] = -_out_b
+        nn.init.kaiming_uniform_(model.w1.weight[2:], nonlinearity='relu')
+        with torch.no_grad():
+            model.w1.weight[2:].mul_(0.01)
+            model.w1.bias[2:].zero_()
+        model.w2.weight.zero_()
+        model.w2.weight[0, 0] = 1.0
+        model.w2.weight[0, 1] = -1.0
+        nn.init.kaiming_uniform_(model.w2.weight[:, 2:], nonlinearity='linear')
+        with torch.no_grad():
+            model.w2.weight[:, 2:].mul_(0.01)
         nn.init.zeros_(model.w2.bias)
     model.train()
 
-    ds = DagDS(a.db, a.limit or None, a.score_only, True, a.top_wsum if not a.limit else 0)
-    n = len(ds)
-    nval = max(2000, n // 20)  # 5% val on full data (still huge)
-    ntr = n - nval
-    tr, va = torch.utils.data.random_split(ds, [ntr, nval], generator=torch.Generator().manual_seed(7))
-    print('split: %d train / %d val; precomputing tensors...' % (ntr, nval), flush=True)
-    t0 = time.time()
-    # PRECOMPUTE once: lists of python ints -> padded tensors per sample.
-    # The old path ran parse_fen/active_ids per sample PER EPOCH in the
-    # worker loop (getattr + FEN parse x25) — that was the stall, not torch.
-    pre_o, pre_t, pre_out, pre_sc = [], [], [], []
-    for i in range(n):
-        o, t, ou, sc = ds[i]
-        pre_o.append(o)
-        pre_t.append(t)
-        pre_out.append(ou)
-        pre_sc.append(sc)
-    print('precomputed %d samples in %.0fs' % (n, time.time() - t0), flush=True)
-    pre_tr = ([pre_o[i] for i in tr.indices], [pre_t[i] for i in tr.indices],
-              torch.stack([pre_out[i] for i in tr.indices]), torch.stack([pre_sc[i] for i in tr.indices]))
-    pre_va = ([pre_o[i] for i in va.indices], [pre_t[i] for i in va.indices],
-              torch.stack([pre_out[i] for i in va.indices]), torch.stack([pre_sc[i] for i in va.indices]))
-    del pre_o, pre_t, pre_out, pre_sc, ds
+    if a.cache:
+        # Binary cache path: bitboards + targets, zero parsing, zero sqlite.
+        # ours/theirs ids derived vectorized from u64s (bit ops, no FEN).
+        t0 = time.time()
+        d = np.load(a.cache)
+        occ0 = torch.from_numpy(d['occ0'].astype(np.int64))
+        occ1 = torch.from_numpy(d['occ1'].astype(np.int64))
+        blk = torch.from_numpy(d['blk'].astype(np.int64))
+        stm = torch.from_numpy(d['stm'].astype(np.int64))
+        out_all = torch.from_numpy(d['out'])
+        sc_all = torch.from_numpy(d['sc'])
+        n = occ0.shape[0]
+        print('cache %s: %d rows in %.0fs (no parse, no sqlite)' % (a.cache, n, time.time() - t0), flush=True)
+        # sq_idx LUT: our sq -> sancta feature base
+        sq2f = torch.tensor([(6 - (sq // 7)) * 7 + (sq % 7) for sq in range(49)], dtype=torch.long)
+        bits = torch.arange(49, dtype=torch.long)
+        m0 = ((occ0.unsqueeze(1) >> bits) & 1).bool()  # (N,49) black stones
+        m1 = ((occ1.unsqueeze(1) >> bits) & 1).bool()  # white stones
+        mb = ((blk.unsqueeze(1) >> bits) & 1).bool()   # gaps
+        is_b = (stm == 0)
+        own = torch.where(is_b.unsqueeze(1), m0, m1)    # stm-relative
+        ene = torch.where(is_b.unsqueeze(1), m1, m0)
+        fbase = sq2f.unsqueeze(0).expand(n, 49)
+        pre_o = [torch.masked_select(fbase[i], own[i]).tolist() for i in range(n)]
+        pre_t = [torch.masked_select(fbase[i] + 49, ene[i]).tolist() for i in range(n)]
+        gap_f = (fbase + 98)
+        for i in range(n):
+            g = torch.masked_select(gap_f[i], mb[i]).tolist()
+            pre_o[i] += g
+            pre_t[i] += g
+        pre_o = [torch.tensor(x, dtype=torch.long) for x in pre_o]
+        pre_t = [torch.tensor(x, dtype=torch.long) for x in pre_t]
+        print('ids derived in %.0fs' % (time.time() - t0), flush=True)
+        nval = max(2000, n // 20)
+        ntr = n - nval
+        gen = torch.Generator().manual_seed(7)
+        perm = torch.randperm(n, generator=gen).tolist()
+        tri, vai = perm[:ntr], perm[ntr:]
+        pre_tr = ([pre_o[i] for i in tri], [pre_t[i] for i in tri],
+                  torch.stack([out_all[i] for i in tri]), torch.stack([sc_all[i] for i in tri]))
+        pre_va = ([pre_o[i] for i in vai], [pre_t[i] for i in vai],
+                  torch.stack([out_all[i] for i in vai]), torch.stack([sc_all[i] for i in vai]))
+        del pre_o, pre_t
+    else:
+        ds = DagDS(a.db, a.limit or None, a.score_only, True, a.top_wsum if not a.limit else 0)
+        n = len(ds)
+        nval = max(2000, n // 20)  # 5% val on full data (still huge)
+        ntr = n - nval
+        tr, va = torch.utils.data.random_split(ds, [ntr, nval], generator=torch.Generator().manual_seed(7))
+        print('split: %d train / %d val; precomputing tensors...' % (ntr, nval), flush=True)
+        t0 = time.time()
+        # PRECOMPUTE once: lists of python ints -> padded tensors per sample.
+        # The old path ran parse_fen/active_ids per sample PER EPOCH in the
+        # worker loop (getattr + FEN parse x25) — that was the stall, not torch.
+        pre_o, pre_t, pre_out, pre_sc = [], [], [], []
+        for i in range(n):
+            o, t, ou, sc = ds[i]
+            pre_o.append(o)
+            pre_t.append(t)
+            pre_out.append(ou)
+            pre_sc.append(sc)
+        print('precomputed %d samples in %.0fs' % (n, time.time() - t0), flush=True)
+        pre_tr = ([pre_o[i] for i in tr.indices], [pre_t[i] for i in tr.indices],
+                  torch.stack([pre_out[i] for i in tr.indices]), torch.stack([pre_sc[i] for i in tr.indices]))
+        pre_va = ([pre_o[i] for i in va.indices], [pre_t[i] for i in va.indices],
+                  torch.stack([pre_out[i] for i in va.indices]), torch.stack([pre_sc[i] for i in va.indices]))
+        del pre_o, pre_t, pre_out, pre_sc, ds
     # weighted sampler: wsum mass, not uniform over thin rows
     # (top-wsum slice is ALREADY the informative mass — uniform is correct.)
     trl = torch.utils.data.DataLoader(list(zip(*pre_tr)), batch_size=a.batch, shuffle=True, collate_fn=collate_dual)
@@ -267,18 +342,32 @@ def main():
         for o_pad, o_mask, t_pad, t_mask, out_t, sc_t in loader:
             B = o_pad.shape[0]
             pred = model.forward_padded(o_pad, o_mask, t_pad, t_mask)
-            # Head units: engine out = (b2+w2.relu)*400/16320 must land in
-            # cp-ish hundreds. Trainer maps: pred_out = tanh(pred/12)
-            # (≈ outcome), pred_sc = pred/40 (≈ score/2000 * 40 = cp/50...).
-            # Calibrate: v1 start pos scores |v|<200cp => head out ~ +/-8000.
-            # So train pred in head units: outcome head ≈ 8000*tanh target,
-            # score head ≈ best/2000*8000 = best*4.
+            # Head units = engine pre-scale units (engine applies *400/16320
+            # at the end, same as v1). sc_t = best/2000, so head target =
+            # best*4 = sc_t*8000. Outcome branch: tanh(pred/8000) vs outcome.
+            # NORMALIZED targets (both O(1)): outcome + score/2000.
+            # pred_out = tanh(pred/8000): outcome head 8000*outcome.
+            # pred_sc = pred/8000 vs sc_t = best/2000?? MISMATCH: best=2000
+            # -> sc_t=1 -> pred must be 8000 = full head range for MID
+            # scores. The score signal is COMPRESSED into [-1,1] while pred
+            # roams thousands. FIX: score branch in CP units: pred_cp =
+            # pred*400/16320 (engine math, differentiable), tgt_cp = best.
+            # Both branches now live where the ENGINE lives.
+            # NORMALIZED (both O(1)): outcome + score/2000.
+            # outcome: tanh(pred/8000) vs out_t (head 8000 ~= 200cp).
+            # score: pred/81600 vs sc_t (pred head -> engine cp -> /2000:
+            # cp=pred*400/16320, /2000 = pred/81600. best=2000 -> 1.0).
+            sc_pred = pred / 81600.0
+            tgt_cp = sc_t
             pred_out = torch.tanh(pred / 8000.0)
-            pred_sc = pred / 8000.0
+            if train and cnt == 0:
+                print('pred mean/max %.1f/%.1f sc_t mean/max %.3f/%.3f' % (
+                    pred.mean().item(), pred.abs().max().item(),
+                    tgt_cp.mean().item(), tgt_cp.abs().max().item()), flush=True)
             if a.score_only:
-                loss = (pred_sc - sc_t).pow(2).mean()
+                loss = (sc_pred - tgt_cp).pow(2).mean()
             else:
-                loss = (pred_out - out_t).pow(2).mean() + 0.5 * (pred_sc - sc_t).pow(2).mean()
+                loss = (pred_out - out_t).pow(2).mean() + 0.5 * (sc_pred - tgt_cp).pow(2).mean()
             if train:
                 opt.zero_grad()
                 loss.backward()
@@ -287,12 +376,11 @@ def main():
                 sched.step()
             tot += loss.item() * B
             to += (pred_out - out_t).pow(2).sum().item()
-            ts += (pred_sc - sc_t).pow(2).sum().item()
+            ts += ((sc_pred - tgt_cp).pow(2)).sum().item()
             cnt += B
         return tot / cnt, to / cnt, ts / cnt
 
     for ep in range(1, a.epochs + 1):
-        t0 = time.time()
         tr_loss, tr_o, tr_s = run_epoch(trl, True)
         with torch.no_grad():
             va_loss, va_o, va_s = run_epoch(vall, False)
