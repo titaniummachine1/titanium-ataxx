@@ -1,12 +1,16 @@
 //! Titanium CLI - native testing harness for the engine.
 //!
-//! Commands:
-//!   perft [depth]                      movegen node counts (mirror cross-checked)
-//!   bench [--depth N]                  search speed from the start position
-//!   selfplay [--games N] [--time MS]   engine vs engine, logs to logs/
-//!   bestmove ["<49 chars> b"] [--time MS]
-//!   play [--time MS]                   console game vs the engine
-//!   show                               print the start position
+//! Commands (all take --net <file.s1|none> = eval preset, no env vars):
+//!   bench [--depth N] [--net F]      search speed from the start position
+//!   serve [--net F]                  UAI engine (match children use this)
+//!   match --games N [--time MS | --nodes N] [--net F] [--opp CMD] [--opp-net F]
+//!                                    [--opp-time M | --opp-nodes N] [--out F]
+//!   perft [depth]                    movegen node counts (mirror cross-checked)
+//!   selfplay [--games N] [--time MS] engine vs engine, logs to logs/
+//!   sperft ...                       speed truth suite
+//!
+//! Presets: --net none (classical) or path to .s1 (default data/nnue/sancta_w.s1
+//! when --net is passed bare). scripts/gate.ps1 wraps the two standard gates.
 
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
@@ -21,7 +25,10 @@ fn main() -> ExitCode {
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     match cmd {
         "perft" => perft_cmd(first_int(&args).unwrap_or(4) as u32),
-        "bench" => bench_cmd(flag_int(&args, "--depth").unwrap_or(8) as u32),
+        "bench" => bench_cmd(
+            flag_int(&args, "--depth").unwrap_or(8) as u32,
+            flag_str(&args, "--net"),
+        ),
         "selfplay" => selfplay_cmd(
             flag_int(&args, "--games").unwrap_or(2) as u32,
             flag_int(&args, "--time").unwrap_or(300) as u64,
@@ -34,11 +41,16 @@ fn main() -> ExitCode {
         "play" => play_cmd(flag_int(&args, "--time").unwrap_or(1000) as u64),
         "show" => show_cmd(),
         "genbench" => genbench_cmd(flag_int(&args, "--iters").unwrap_or(200_000) as u64),
-        "serve" => serve_cmd(flag_int(&args, "--tt-bits").unwrap_or(20) as usize),
+        "serve" => serve_cmd(
+            flag_int(&args, "--tt-bits").unwrap_or(20) as usize,
+            flag_str(&args, "--net"),
+        ),
         "match" => match_cmd(
             flag_int(&args, "--games").unwrap_or(20) as u32,
             flag_int(&args, "--time").unwrap_or(1000) as u64,
             flag_str(&args, "--opp"),
+            flag_str(&args, "--net"),
+            flag_str(&args, "--opp-net"),
             flag_int(&args, "--opp-time").unwrap_or(1000) as u64,
             flag_int(&args, "--opp-depth").map(|d| d as u32),
             flag_int(&args, "--opp-nodes").map(|n| n as u64),
@@ -62,18 +74,16 @@ fn print_help() {
     println!(
         "titanium-cli - Ataxx engine test harness\n\
          \n\
-         USAGE:\n\
-         \x20 titanium-cli perft [depth]                    movegen node counts\n\
-         \x20 titanium-cli bench [--depth N]                search speed benchmark\n\
+         USAGE (eval preset = --net <file.s1|none>; NO env vars):\n\
+         \x20 titanium-cli bench [--depth N] [--net F]    search speed benchmark\n\
+         \x20 titanium-cli serve [--net F]                UAI engine (match child)\n\
+         \x20 titanium-cli match --games N --opp \"CMD\" [--net F] [--opp-net F]\n\
+         \x20             [--time MS --opp-time MS | --nodes N --opp-nodes N]\n\
+         \x20             [--out F]                       colors alternate\n\
          \x20 titanium-cli selfplay [--games N] [--time MS] engine vs engine into logs/\n\
-         \x20 titanium-cli bestmove [\"<49 chars> b\"] [--time MS]\n\
-         \x20 titanium-cli play [--time MS]                 console game vs engine\n\
-         \x20 titanium-cli serve [--time MS]                  line-protocol engine (one board per line)\n\
-         \x20 titanium-cli match --games N --time MS --opp \"CMD\"\n\
-         \x20                                                 UAI opponent, colors alternate\n\
-         \x20                                 [--nodes N] [--opp-time MS] [--opp-depth N]\n\
-         \x20 titanium-cli sperft [--depth N] [--games N]     search throughput suite\n\
-         \x20 titanium-cli show                             show start position\n\
+         \x20 titanium-cli sperft [--depth N] [--games N]   search throughput suite\n\
+         \n\
+         Scripts: scripts/gate.ps1 <games> <net.s1|none>  (5k + 100ms vs classical)\n\
          \n\
          Board string: 49 chars, rows top->bottom, chars . x o # then side b|w.\n\
          Squares: a1 = bottom-left, g7 = top-right. Moves like e2e3 or e2-e3."
@@ -180,27 +190,45 @@ fn perft_cmd(depth: u32) -> ExitCode {
 
 // ---------- bench ----------
 
-fn bench_cmd(depth: u32) -> ExitCode {
-    // TITANIUM_EVAL_MODE=sancta -> attach the net file (TITANIUM_SANCTA_FILE
-    // or data/nnue/sancta_w.s1 legacy) for the run.
-    let sancta = std::env::var("TITANIUM_EVAL_MODE")
-        .map(|v| v == "sancta")
-        .unwrap_or(false);
-    let net = if sancta {
-        let path = std::env::var("TITANIUM_SANCTA_FILE")
-            .unwrap_or_else(|_| "data/nnue/sancta_w.s1".into());
-        match titanium::S1Net::load(&path) {
-            Some(n) => {
-                println!("Bench: sancta eval ON ({path})");
-                Some(std::sync::Arc::new(n))
-            }
-            None => {
-                eprintln!("Bench: TITANIUM_EVAL_MODE=sancta but {path} missing");
-                return ExitCode::FAILURE;
+fn load_net_preset(spec: &Option<String>) -> Result<Option<std::sync::Arc<titanium::S1Net>>, String> {
+    // --net none (or flag absent) = classical. --net <path> = that .s1.
+    // Bare --net (empty value) = default data/nnue/sancta_w.s1.
+    match spec {
+        None => Ok(None),
+        Some(s) if s == "none" || s.is_empty() => Ok(None),
+        Some(s) => {
+            let path = if s == "default" { "data/nnue/sancta_w.s1".into() } else { s.clone() };
+            match titanium::S1Net::load(&path) {
+                Some(n) => Ok(Some(std::sync::Arc::new(n))),
+                None => Err(format!("net file missing: {path}")),
             }
         }
-    } else {
-        None
+    }
+}
+
+fn net_flag_str(spec: &Option<String>) -> String {
+    // Re-emit for match children: --net <spec> flows to the opp serve child
+    // as --opp-net; same binary, no env inheritance games.
+    match spec {
+        None => "--net none".to_string(),
+        Some(s) if s == "none" || s.is_empty() => "--net none".to_string(),
+        Some(s) => format!("--net {s}"),
+    }
+}
+
+fn bench_cmd(depth: u32, net_spec: Option<String>) -> ExitCode {
+    let net = match load_net_preset(&net_spec) {
+        Ok(n) => {
+            match &net_spec {
+                Some(s) if s != "none" && !s.is_empty() => println!("Bench: net ON ({s})"),
+                _ => println!("Bench: classical (no net)"),
+            }
+            n
+        }
+        Err(e) => {
+            eprintln!("Bench: {e}");
+            return ExitCode::FAILURE;
+        }
     };
     let b = Board::start();
     println!("Bench: start position, fixed depth {depth} (no time limit)");
@@ -487,20 +515,16 @@ fn out_line(s: &str) {
     let _ = o.flush();
 }
 
-fn serve_cmd(tt_bits: usize) -> ExitCode {
+fn serve_cmd(tt_bits: usize, net_spec: Option<String>) -> ExitCode {
     let stdin = io::stdin();
     let mut searcher = Searcher::with_tt_bits(tt_bits);
-    // Same env flag as bench: TITANIUM_EVAL_MODE=sancta serves the net.
-    // Env inherits into UAI children spawned by match, so gates work.
-    if std::env::var("TITANIUM_EVAL_MODE").map(|v| v == "sancta").unwrap_or(false) {
-        let path = std::env::var("TITANIUM_SANCTA_FILE")
-            .unwrap_or_else(|_| "data/nnue/sancta_w.s1".into());
-        match titanium::S1Net::load(&path) {
-            Some(n) => searcher.set_sancta(Some(std::sync::Arc::new(n))),
-            None => {
-                eprintln!("serve: TITANIUM_EVAL_MODE=sancta but {path} missing");
-                return ExitCode::FAILURE;
-            }
+    // Eval preset comes from --net ONLY. No env vars: match spawns the opp
+    // child with an explicit --opp-net flag, so both sides are unambiguous.
+    match load_net_preset(&net_spec) {
+        Ok(n) => searcher.set_sancta(n),
+        Err(e) => {
+            eprintln!("serve: {e}");
+            return ExitCode::FAILURE;
         }
     }
     let mut current: Option<Board> = None;
@@ -690,6 +714,8 @@ fn match_cmd(
     games: u32,
     time_ms: u64,
     opp_cmd: Option<String>,
+    net_spec: Option<String>,
+    opp_net_spec: Option<String>,
     opp_time: u64,
     opp_depth: Option<u32>,
     opp_nodes: Option<u64>,
@@ -697,12 +723,40 @@ fn match_cmd(
     start_game: u32,
     out: Option<String>,
 ) -> ExitCode {
+    // Eval presets, explicit per side — no env vars anywhere:
+    // --net = OUR side (in-process), --opp-net = child side (appended to the
+    // opp serve command). --opp self = both in-process (opp side gets opp-net).
+    let net = match load_net_preset(&net_spec) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("match: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let opp_net = match load_net_preset(&opp_net_spec) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("match: opp {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     // "self" = titanium vs titanium in-process (no external process).
+    // External opp: auto-append the opp preset to "<exe> serve" commands so
+    // one flag controls the child, no 50-line powershell, no env games.
     let mut opp = if opp_cmd.as_deref() == Some("self") {
         None
     } else {
         let cmd = match opp_cmd {
-            Some(c) => c,
+            Some(c) => {
+                let with_net = if c.trim_end().ends_with("serve")
+                    && !c.contains("--net")
+                {
+                    format!("{c} {}", net_flag_str(&opp_net_spec))
+                } else {
+                    c
+                };
+                with_net
+            }
             None => {
                 eprintln!("match: --opp \"<UAI engine command>\" or \"self\" is required");
                 return ExitCode::FAILURE;
@@ -724,11 +778,13 @@ fn match_cmd(
 
     let mut tally = (0u32, 0u32, 0u32); // titanium wins, opp wins, draws
     let limits_desc = format!(
-        "titanium limits: {}",
+        "titanium limits: {}, net: {} vs {}",
         match max_nodes {
             Some(n) => format!("{n} nodes"),
             None => format!("{time_ms} ms"),
-        }
+        },
+        net_spec.as_deref().unwrap_or("none"),
+        opp_net_spec.as_deref().unwrap_or("none"),
     );
     let mut report = String::new();
     report.push_str(&format!(
@@ -750,7 +806,9 @@ fn match_cmd(
     for game in start_game..start_game + games {
         let mut b = Board::start();
         let mut searcher = Searcher::new(); // fresh TT per game
+        searcher.set_sancta(net.clone());
         let mut opp_searcher = Searcher::new(); // for --opp self
+        opp_searcher.set_sancta(opp_net.clone());
         let titanium_is_black = game % 2 == 1;
         let mut log = String::new();
         let mut result = None;

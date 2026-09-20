@@ -342,21 +342,21 @@ def main():
         for o_pad, o_mask, t_pad, t_mask, out_t, sc_t in loader:
             B = o_pad.shape[0]
             pred = model.forward_padded(o_pad, o_mask, t_pad, t_mask)
-            # EXACT-v1-distill loss: predict the v1 teacher's head output.
-            # out=head h; outcome branch tanh(h/8000) vs out_t; score branch
-            # h/81600 vs sc_t. Same math as smoke (proven sane a1c2/-41).
-            # NOTE log columns: out = outcome-MSE, sc = score-MSE (both O(1)).
-            sc_pred = pred / 81600.0
-            tgt_cp = sc_t
-            pred_out = torch.tanh(pred / 8000.0)
+            # SCORE-ONLY in ENGINE CP units (both sides live where the engine
+            # lives): pred_cp = pred*400/16320 (differentiable engine math),
+            # tgt_cp = best score clamped to +/-2000 (NOT /2000).
+            # The old dual loss (tanh(pred/8000) vs outcome + pred/81600 vs
+            # score/2000) compressed the score signal into [-1,1] while pred
+            # roams thousands: grads ~1/81600, net frozen from ep0.
+            # S4v3e proved: e1 0-20, e5 0-20 — never strong, not overfit.
+            pred_cp = pred * (400.0 / 16320.0)
+            tgt_cp = sc_t * 2000.0
             if train and cnt == 0:
-                print('pred mean/max %.1f/%.1f sc_t mean/max %.3f/%.3f' % (
-                    pred.mean().item(), pred.abs().max().item(),
+                print('pred_cp mean/max %.1f/%.1f tgt_cp mean/max %.1f/%.1f' % (
+                    pred_cp.mean().item(), pred_cp.abs().max().item(),
                     tgt_cp.mean().item(), tgt_cp.abs().max().item()), flush=True)
-            if a.score_only:
-                loss = (sc_pred - tgt_cp).pow(2).mean()
-            else:
-                loss = (pred_out - out_t).pow(2).mean() + 0.5 * (sc_pred - tgt_cp).pow(2).mean()
+            # MSE in cp^2, normalized by 2000^2 so logs stay O(1)-readable.
+            loss = ((pred_cp - tgt_cp) / 2000.0).pow(2).mean()
             if train:
                 opt.zero_grad()
                 loss.backward()
@@ -364,8 +364,8 @@ def main():
                 opt.step()
                 sched.step()
             tot += loss.item() * B
-            to += (pred_out - out_t).pow(2).sum().item()
-            ts += ((sc_pred - tgt_cp).pow(2)).sum().item()
+            to += (((pred_cp - tgt_cp) / 2000.0).pow(2)).sum().item()
+            ts += (((pred_cp - tgt_cp) / 2000.0).pow(2)).sum().item()
             cnt += B
         return tot / cnt, to / cnt, ts / cnt
 
