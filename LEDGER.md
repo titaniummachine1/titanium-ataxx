@@ -46,3 +46,6 @@ Gate definitions (both engines on the same limit, never depth-capped):
 | S2time | 2026-09-20 | same | classical | 100ms | 30 | 14–16 (sancta–classical) | ≈−13 | Time gate ≈ parity: speed compensates. Supports user log-law (depth beats precision). |
 | S3owner | 2026-09-20 | slim(main) vs sanctaphraxx owner (titanium_sancta.exe) | sanctaphraxx | 100ms | 20 | 19–0–1 (slim–owner) | ≈+400 | Owner's brain loses to our tree: his ~300-line PVS+TT has no NMP/LMR/RFP/clone-dedup. Eval steal + our search > his search + his eval. |
 | S3moon | 2026-09-20 | slim(main) vs Moonbird 1.1.0 | Moonbird | 100ms | 20 | 0–20 | — | Moonbird still untouched: tuned 2x2-structure eval + deep search. The wall. Own-net saturation is the attack. |
+| S3moon1s | 2026-09-20 | slim vs Moonbird 1.1.0 | Moonbird | 1s/move | 8 | 0–8 | — | NOT a TC artifact: more time doesn't save us. Knowledge gap, not speed gap. |
+| S4own1 | 2026-09-20 | own-net v1 (single-view, theirs=0) 25ep on 34k rows | classical | 5k nodes | 30 | 0–30 | — | FAILED: single-view can't learn enemy. Bench sane (a1a3/-45, 5.6M). Archived own_ep25.s1. |
+| S4own2 | 2026-09-20 | own-net v2 (dual-view) 25ep, val out .1337/sc .0650 | classical | 5k nodes | 30 | 0–30 | — | FAILED: val loss improved (.19→.16) but gate 0–30. 34k rows too thin OR dag targets too noisy. Need: full 8.7M rows + wsum-weighting + score-only head. |
