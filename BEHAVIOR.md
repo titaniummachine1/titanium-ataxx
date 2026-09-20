@@ -36,6 +36,12 @@ real memory. Update them the moment something happens, not at the end.
 - General: if basic git/bench ops fail, the code is hyper-unmaintainable and
   I pay for it — purge, don't patch. Simplicity is the metric.
 
+## Checkpoints (save tokens: doc at end of each TA block, then answer short)
+
+- 2026-09-20 S1: purge done (−307/+41), sperft +71%, 100g@100ms 73–15–12
+  (+230, no regression). Committed 7fbc538, pushed exp/slim-eval-speed.
+  Gate logs gate_A/B.txt. Main untouched.
+
 ## Protocol
 
 - Branch: `git checkout -b exp/<name> main`, build clean, record baseline
