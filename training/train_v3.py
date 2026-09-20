@@ -220,8 +220,14 @@ def main():
         for o_ids, t_ids, out_t, sc_t in loader:
             B = len(o_ids)
             pred = model.forward_dual(o_ids, t_ids)
-            pred_out = torch.tanh(pred / 500.0)
-            pred_sc = pred / 2000.0
+            # Head units: engine out = (b2+w2.relu)*400/16320 must land in
+            # cp-ish hundreds. Trainer maps: pred_out = tanh(pred/12)
+            # (≈ outcome), pred_sc = pred/40 (≈ score/2000 * 40 = cp/50...).
+            # Calibrate: v1 start pos scores |v|<200cp => head out ~ +/-8000.
+            # So train pred in head units: outcome head ≈ 8000*tanh target,
+            # score head ≈ best/2000*8000 = best*4.
+            pred_out = torch.tanh(pred / 8000.0)
+            pred_sc = pred / 8000.0
             if a.score_only:
                 loss = (pred_sc - sc_t).pow(2).mean()
             else:
@@ -254,13 +260,10 @@ def main():
             b1 = model.w1.bias.detach().tolist()
             w2 = model.w2.weight.detach()[0].tolist()
             b2 = float(model.w2.bias.detach()[0])
-            # unfold output scale: trainer predicts cp directly; sancta
-            # applies *400/16320 at the end, so divide weights by that scale
-            s = S1_NUM / S1_DIV
-            w1t = [[v / s for v in row] for row in w1t]
-            b1 = [v / s for v in b1]
-            w2 = [v / s for v in w2]
-            b2 = b2 / s
+            # NO output-scale folding: trainer predicts in HEAD units and the
+            # engine applies *400/16320 at the end (same as v1). Targets are
+            # outcome (-1..1) + score/2000, so head outputs stay O(1)-O(40):
+            # w2,b2 in head units directly. i16 quant handles it.
             export_v3_blob(a.out, ft_w, ft_b, w1t, b1, w2, b2)
             torch.save(model.state_dict(), 'data/nnue/v3_ckpt_e%d.pt' % ep)
         print('exported', a.out, flush=True)
