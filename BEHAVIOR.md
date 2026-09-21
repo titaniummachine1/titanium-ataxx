@@ -149,6 +149,8 @@ real memory. Update them the moment something happens, not at the end.
 
 - 2026-09-21 S22: teacher depth does NOT distill past student capacity (parity 17-15); rows dominate (+125 needs 2M). Lessons: (1) CAPACITY-WALL - 29k shared pairs saturate; distill gaps need architecture bumps per round; (2) RUN-IT-BEATS-BOTTLE-IT - search strength is runtime process, SMP > distillation for the unbottleable fraction; (3) ladder discipline - measure fitness-vs-search before buying label-compute.
 
+- 2026-09-21 ORPHAN-WRITES (S22 2M relabel corrupted): timed-out cmd leaves CHILD exe alive; my liveness check used the WRONG process name (titanium-cli vs tune_tuple) so 8 orphans + 4 resume workers double-wrote outputs (332k vs 250k rows). Rules: (1) check the EXACT binary name; (2) kill orphans BEFORE resume; (3) NEVER append-resume into shared files - fresh outputs + exact python pre-splits + count-verify before join; (4) corruption signal: output rows != input rows. Redoing clean.
+
 ## Protocol
 
 - Branch: `git checkout -b exp/<name> main`, build clean, record baseline
