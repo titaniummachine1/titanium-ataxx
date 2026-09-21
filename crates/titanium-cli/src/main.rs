@@ -40,6 +40,11 @@ fn main() -> ExitCode {
             positional_str(&args).or_else(|| Some(Board::start().to_string())),
             flag_int(&args, "--time").map(|ms| ms as u64),
         ),
+        "label" => label_cmd(
+            flag_int(&args, "--nodes").unwrap_or(20000) as u64,
+            flag_str(&args, "--tuple"),
+            args.iter().any(|x| x == "--tuple-native"),
+        ),
         "play" => play_cmd(flag_int(&args, "--time").unwrap_or(1000) as u64),
         "show" => show_cmd(),
         "genbench" => genbench_cmd(flag_int(&args, "--iters").unwrap_or(200_000) as u64),
@@ -402,6 +407,55 @@ fn default_log_path() -> PathBuf {
         .unwrap_or_default()
         .as_secs();
     PathBuf::from(format!("logs/selfplay_{ts}.txt"))
+}
+
+// ---------- label ----------
+// Batch teacher-labeling for bootstrap training (S22): stdin lines of
+// "<49-char board> <b|w>" (Board::from_str format), one "<score> <depth>
+// <nodes>" per line on stdout, progress on stderr. ONE Searcher, NO reset
+// between rows: TT entries are hash-verified so cross-row hits are
+// impossible (different positions = different keys); the shared table just
+// caches transpositions across rows. Killers/history carry as ordering
+// hints only (matched moves are always legal here or ignored).
+fn label_cmd(nodes: u64, tup_spec: Option<String>, tup_native: bool) -> ExitCode {
+    let tup = match load_tuple_preset(&tup_spec) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("label: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut searcher = Searcher::new();
+    searcher.set_tuple(tup.as_ref());
+    searcher.set_tuple_native(tup_native && tup.is_some());
+    let stdin = io::stdin();
+    let mut out = io::stdout().lock();
+    let mut n = 0u64;
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let Some(b) = Board::from_str(t) else {
+            eprintln!("label: bad board line {n}");
+            return ExitCode::FAILURE;
+        };
+        let limits = SearchLimits {
+            time: None,
+            max_nodes: Some(nodes),
+            max_depth: 30,
+        };
+        let r = searcher.search(&b, &limits);
+        use std::io::Write as _;
+        let _ = writeln!(out, "{} {} {}", r.score, r.depth, r.nodes);
+        n += 1;
+        if n % 20000 == 0 {
+            eprintln!("label: {n} rows");
+        }
+    }
+    eprintln!("label: done {n} rows");
+    ExitCode::SUCCESS
 }
 
 // ---------- bestmove ----------
