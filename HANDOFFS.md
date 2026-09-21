@@ -151,6 +151,12 @@ embed quotes manually: `$oppQ = "`"$m serve`""`.
   from 535k), bench d8 classical 17034/6.9M, self-check 10–10.
   S6score ep25 gated: 20–0 classical @5k (real games, not wipes).
 
+## STATE FOR NEW SESSION (2026-09-21 S21 SHELVED)
+
+- Branch exp/tuple-eval: full campaign done, SHELVED unmerged. Shipped infra (geometry/loader/forward/flags/native-mode, all tested+committed) + trainer (base ports, wsum, TUP4-i8). Weights local only (data/nnue/tupS21*.tup, gitignored): best = tupS21hvW.tup (H+V wsum, +125@5k). Proved: pairs carry +125-family knowledge (x5 runs); cost floor -44pct (splat+i8+L1+s kips, lookups dominate); time gates unwinnable (-55..-66); singles flat; outcome-columns poison.
+- main = 1a27b92. Shelved branches: search-retune, corrhist, countermove, singular, search-tweaks, tuple-eval.
+- NEXT (recommended): LazySMP - 8 idle threads, discontinuous throughput (~6-7x => +2+ plies => +200+), multiplies ALL banked knowledge; re-gate tuples at depth after (knowledge compounds with depth per S13 pattern). Then Moonbird re-gate, then SPSA.
+
 ## STATE FOR NEW SESSION (2026-09-21 S13 MERGED)
 
 - main = S13contact MERGED (merge commit, pushed): eval = material+PST+tempo+E2contact+E4multicap. tune_contact.exe == new main baseline (sperft ~4.3M, bench d8 a1b1/100 13252n). Logs logs/s13_* (gitignored).

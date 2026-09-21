@@ -141,6 +141,8 @@ real memory. Update them the moment something happens, not at the end.
 
 - 2026-09-21 S13contact MERGED: E2+E4 back, +163/+150/+270 across 5k/100ms/200ms (96 games). -34pct NPS did not matter. Lesson: KNOWLEDGE-BEATS-SPEED-AT-34PCT. User law upgrade: per-node information is capped (S6big +25 Elo wall) -> future intelligence from NODE RELATIONSHIPS (correction history, singular ext, countermove, SPSA-from-outcomes), not bigger nodes.
 
+- 2026-09-21 S20/S21 TUPLES shelved: pairs +125-family @5k (x5 runs) but -44pct cost floor kills time (-55..-66). Lessons: (1) LOOKUPS-DOMINATE - branchless splat only +14pct, cache class (L1 via i8) is the real lever; (2) OUT-COLUMN-POISON - never train on unproven-semantics columns (-400 in one run); (3) VAL-NEVER-CROWNS redux - 2M data better val (42.8k) but worse play than wsum-400k; (4) SCALE-MATCHES-KNOWLEDGE - 2x2 flat (S13 already owns that scale), 8-cell pairs carry it, diagonals add noise (H+V > full).
+
 ## Protocol
 
 - Branch: `git checkout -b exp/<name> main`, build clean, record baseline
