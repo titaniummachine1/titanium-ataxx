@@ -97,6 +97,13 @@ real memory. Update them the moment something happens, not at the end.
   Verdict: revert S7 OR re-tune RFP/LMR around aspiration before any net
   capacity work.
 
+- 2026-09-21 S8incrpst MERGED to main `293d94b` (pushed): gates vs old
+  main 20-12 @5k + 27-5 @100ms, decisive both. main now = slim +
+  incremental PST (O(1) eval) + zero-cost-OFF sancta machinery +
+  --net/--opp-net harness + training/ scripts. exp/sancta-incr continues
+  for next experiments (score_into popcounts, NMP dist_union,
+  incremental CONTACT/MULTICAP).
+
 - 2026-09-21 SESSION CLOSE (handoff for new chat): branch
   exp/sancta-incr = 3 commits past main 7ab844e (f8b98b5 v3-loss,
   4271d6b harness+S6, 2a0a0ba S7quality). S7quality = REGRESSION both
