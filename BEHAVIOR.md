@@ -139,6 +139,8 @@ real memory. Update them the moment something happens, not at the end.
   (c) NMP dist_union per node; (d) then incremental CONTACT/MULTICAP
   (E2/E4 knowledge back, per-move delta not per-node loop).
 
+- 2026-09-21 S13contact MERGED: E2+E4 back, +163/+150/+270 across 5k/100ms/200ms (96 games). -34pct NPS did not matter. Lesson: KNOWLEDGE-BEATS-SPEED-AT-34PCT. User law upgrade: per-node information is capped (S6big +25 Elo wall) -> future intelligence from NODE RELATIONSHIPS (correction history, singular ext, countermove, SPSA-from-outcomes), not bigger nodes.
+
 ## Protocol
 
 - Branch: `git checkout -b exp/<name> main`, build clean, record baseline
