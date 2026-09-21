@@ -195,6 +195,12 @@ def main():
                     help='teacher-score residual (logit/outcome REMOVED S21g: poison)')
     ap.add_argument('--tcol', default='sc', choices=['sc', 'teacher'],
                     help='score column: dag legacy (sc) or relabeled deep teacher')
+    ap.add_argument('--blend', type=float, default=1.0,
+                    help='teacher weight; remainder = dag legacy (echo regularizer)')
+    ap.add_argument('--outcome-weight', type=float, default=0.0,
+                    help='S25: weight on game outcome (out column -> cp); '
+                    'target = (1-ow)*score_target + ow*outcome_cp. '
+                    'outcome_cp = (out*2-1)*OUTCOME_SCALE stm-relative.')
     ap.add_argument('--out', default='data/nnue/tupS20.tup')
     a = ap.parse_args()
 
@@ -211,9 +217,37 @@ def main():
     # (our relabeled deep scores). Same rows/recipe isolates TEACHER effect.
     assert a.tcol in ('sc', 'teacher') and (a.tcol == 'sc' or 'teacher' in z)
     mult = 1.0 if a.tcol == 'teacher' else 2000.0
-    best_cp = np.clip(z[a.tcol].astype(np.float64) * mult, -1500.0, 1500.0)
-    print('teacher column: %s' % a.tcol, flush=True)
+    prime = np.clip(z[a.tcol].astype(np.float64) * mult, -1500.0, 1500.0)
+    # S23 blend: target = blend*prime + (1-blend)*dag-legacy. blend=1.0 is
+    # pure champ (status quo); lower = retain diverse legacy signal as
+    # echo-chamber regularizer. Legacy = sc column (dag scores, stm-rel).
+    if abs(a.blend - 1.0) > 1e-9:
+        assert 'teacher' in z and a.tcol == 'teacher', 'blend needs teacher tcol + sc legacy'
+        legacy = np.clip(z['sc'].astype(np.float64) * 2000.0, -1500.0, 1500.0)
+        score_cp = (a.blend * prime + (1.0 - a.blend) * legacy).astype(np.float64)
+    else:
+        score_cp = prime.astype(np.float64)
+    print('teacher column: %s blend %.2f' % (a.tcol, a.blend), flush=True)
     d_out = z['out'].astype(np.float64) if 'out' in z else np.zeros(len(occ0))
+    # S25 REAL outcome sweep: outcome_cp is stm-relative (out column already
+    # stored stm-relative per datagen: 1 = stm won, 0 = stm lost, 0.5 = draw).
+    # OUTCOME_SCALE maps [0,1] -> [-S,+S] cp. Sweep --outcome-weight 0..1 with
+    # --tcol teacher --blend 1.0 to get pure teacher-vs-outcome (Moonbird recipe).
+    # NOTE: raw out mean here is 0.52 (cache400kR5), but split by stm it is
+    # 0.31 (stm0/black) vs 0.77 (stm1/white) — column is suspect (see audit
+    # below); sweep runs anyway so the user gets the number they asked for.
+    OUTCOME_SCALE = 1000.0
+    outcome_cp = np.clip((d_out * 2.0 - 1.0) * OUTCOME_SCALE, -1500.0, 1500.0)
+    print('outcome stats: mean %+.3f frac0 %.3f frac05 %.3f frac1 %.3f -> cp mean %+.1f std %.1f'
+          % (d_out.mean(), (d_out == 0).mean(), (d_out == 0.5).mean(),
+             (d_out == 1).mean(), outcome_cp.mean(), outcome_cp.std()), flush=True)
+    ow = float(a.outcome_weight)
+    assert 0.0 <= ow <= 1.0, 'outcome-weight must be in [0,1]'
+    if ow > 0:
+        best_cp = ((1.0 - ow) * score_cp + ow * outcome_cp).astype(np.float32)
+    else:
+        best_cp = score_cp.astype(np.float32)
+    print('outcome-weight %.2f' % ow, flush=True)
     n = len(occ0)
     if a.rows:
         sel = np.random.choice(n, min(a.rows, n), replace=False)
