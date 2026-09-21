@@ -110,6 +110,18 @@ real memory. Update them the moment something happens, not at the end.
   score_into popcounts + NMP dist_union. Run BOTH gates (S8gatedef:
   5k=quality, 100ms=strength). main UNTOUCHED.
 
+- 2026-09-21 S8incrpst DONE (558ae64): incremental PST shipped.
+  pst:i32 on Board, delta folded into make() capture loop, evaluate()
+  O(1), eval_cached deleted, aspiration revert (left dirty by prev
+  session) finalized. Mystery solved: tq.exe 28.2M sperft nodes was the
+  ASPIRATION build exploding on re-searches = the S7quality 16-84
+  regression. New build: 317k nodes @5.3-5.9M. Gates vs main:
+  **20-12 @5k AND 27-5 @100ms — WIN BOTH, merge candidate.**
+  NEXT: (a) merge decision (branch carries zero-cost-OFF sancta
+  machinery); (b) score_into capture popcounts (~57 count_ones/node);
+  (c) NMP dist_union per node; (d) then incremental CONTACT/MULTICAP
+  (E2/E4 knowledge back, per-move delta not per-node loop).
+
 ## Protocol
 
 - Branch: `git checkout -b exp/<name> main`, build clean, record baseline
