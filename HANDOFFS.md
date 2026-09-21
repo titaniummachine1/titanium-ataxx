@@ -1,3 +1,9 @@
+## STATE FOR NEW SESSION (2026-09-21 S22R2M VERDICT)
+
+- 2M@20k self-teacher student: +0 (16-16). Champion stays tupS21hvW (+125, 2M dag/wsum). ECHO CHAMBER confirmed at scale: self-distillation fossilizes; diversity wins. 20k verdict: TOO MUCH. Label cheap (dag-5k), spend on rows/capacity/SMP.
+- All label data retained (lab2m/lab400k/lab10k .out, cache2mR/400kR npz, gitignored) for future capacity experiments.
+- NEXT: LazySMP build (exp/lazysmp SharedTt checkpointed). Then mobility tables, Moonbird re-gate, SPSA.
+
 ## STATE FOR NEW SESSION (2026-09-21 S22 CAPACITY-WALL)
 
 - Ladder: +340/+220/+140 per 3x (log decay, user model confirmed). Relabel: 400k x 20k tuple-teacher -> R1 +56; teacher-parity 17-15 -> CAPACITY wall (29k), not teacher wall. Bootstrap needs capacity/architecture per round, escalating depth to stay ahead.
