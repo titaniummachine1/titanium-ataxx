@@ -147,6 +147,8 @@ real memory. Update them the moment something happens, not at the end.
 
 - 2026-09-21 FLIP-AVALANCHE (user): one landing converts up to 8; +500 becomes -500 in a ply; ALMOST-WINNING IS UNDEFINED. Corollary: S13 contact/multicap are FLIP INSURANCE (endangered = flip candidates, multicap = multi-flip exposure) - the engine already prices treachery, SPSA tunes the paranoia knobs. Volatility-native proposals: (1) conversion extensions (extend big-capture lines, chase avalanches in search); (2) sharpness-weighted training (pre-avalanche decisions = highest-value rows); (3) SMP depth (see the flip coming). Smoothness-assuming mechanisms stay banned.
 
+- 2026-09-21 S22: teacher depth does NOT distill past student capacity (parity 17-15); rows dominate (+125 needs 2M). Lessons: (1) CAPACITY-WALL - 29k shared pairs saturate; distill gaps need architecture bumps per round; (2) RUN-IT-BEATS-BOTTLE-IT - search strength is runtime process, SMP > distillation for the unbottleable fraction; (3) ladder discipline - measure fitness-vs-search before buying label-compute.
+
 ## Protocol
 
 - Branch: `git checkout -b exp/<name> main`, build clean, record baseline

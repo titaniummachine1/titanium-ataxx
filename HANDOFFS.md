@@ -1,3 +1,9 @@
+## STATE FOR NEW SESSION (2026-09-21 S22 CAPACITY-WALL)
+
+- Ladder: +340/+220/+140 per 3x (log decay, user model confirmed). Relabel: 400k x 20k tuple-teacher -> R1 +56; teacher-parity 17-15 -> CAPACITY wall (29k), not teacher wall. Bootstrap needs capacity/architecture per round, escalating depth to stay ahead.
+- Branches: tuple-eval (ahead, label cmd + dump_fens + tcol + R1/dag4k weights local), lazysmp (SharedTt checkpoint, paused).
+- NEXT: LazySMP (run search, the unbottleable part) -> capacity bumps (mobility tables! per-anchor?) -> rebootstrap with escalating teachers -> Moonbird re-gate.
+
 # TITANIUM — engineering handoff notes
 
 Everything measurable lives here so we never re-derive it. Update after every

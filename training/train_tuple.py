@@ -193,6 +193,8 @@ def main():
                     help='residual base: s13 (full hand eval) or simple (mat+PST+tempo, tuple-native)')
     ap.add_argument('--target', default='residual', choices=['residual'],
                     help='teacher-score residual (logit/outcome REMOVED S21g: poison)')
+    ap.add_argument('--tcol', default='sc', choices=['sc', 'teacher'],
+                    help='score column: dag legacy (sc) or relabeled deep teacher')
     ap.add_argument('--out', default='data/nnue/tupS20.tup')
     a = ap.parse_args()
 
@@ -205,7 +207,12 @@ def main():
     occ1 = z['occ1'].astype(np.uint64)
     blk = z['blk'].astype(np.uint64)
     stm = z['stm'].astype(np.uint8)
-    best_cp = np.clip(z['sc'].astype(np.float64) * 2000.0, -1500.0, 1500.0)
+    # S22: teacher column switch — 'sc' (dag legacy scores) vs 'teacher'
+    # (our relabeled deep scores). Same rows/recipe isolates TEACHER effect.
+    assert a.tcol in ('sc', 'teacher') and (a.tcol == 'sc' or 'teacher' in z)
+    mult = 1.0 if a.tcol == 'teacher' else 2000.0
+    best_cp = np.clip(z[a.tcol].astype(np.float64) * mult, -1500.0, 1500.0)
+    print('teacher column: %s' % a.tcol, flush=True)
     d_out = z['out'].astype(np.float64) if 'out' in z else np.zeros(len(occ0))
     n = len(occ0)
     if a.rows:
