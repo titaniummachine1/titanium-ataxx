@@ -151,6 +151,13 @@ embed quotes manually: `$oppQ = "`"$m serve`""`.
   from 535k), bench d8 classical 17034/6.9M, self-check 10–10.
   S6score ep25 gated: 20–0 classical @5k (real games, not wipes).
 
+## STATE FOR NEW SESSION (2026-09-21 S13 MERGED)
+
+- main = S13contact MERGED (merge commit, pushed): eval = material+PST+tempo+E2contact+E4multicap. tune_contact.exe == new main baseline (sperft ~4.3M, bench d8 a1b1/100 13252n). Logs logs/s13_* (gitignored).
+- exp/contact-eval merged, exp/search-retune closed (S11+S12 docs live on that branch, no code delta). mainwt worktree untouched (dirty Cargo.toml hack left alone).
+- USER INSIGHT (2026-09-21): per-node information is capped in Ataxx (800k transformer +25 Elo same-nodes; NNUE wins at 4-5x nodes) -> intelligence must come from RELATIONSHIPS BETWEEN NODES, not richer nodes. Agenda: correction history (learns eval-error = search-vs-static = pure node-relationship signal), singular extensions (sibling comparison), counter-move history, SPSA-from-game-outcomes (inter-node learning). E2/E4 reframed: already proto-relational (stone-vs-enemy-reachability), which is why they beat the pixel-net.
+- NEXT: pick first relational lever (recommend correction history: online ML, ~zero cost, Stockfish-proven) + Moonbird re-gate at new strength.
+
 ## STATE FOR NEW SESSION (2026-09-21 close)
 
 - Branch: `exp/sancta-incr` = 3 commits past main `7ab844e`:
