@@ -143,6 +143,8 @@ real memory. Update them the moment something happens, not at the end.
 
 - 2026-09-21 S20/S21 TUPLES shelved: pairs +125-family @5k (x5 runs) but -44pct cost floor kills time (-55..-66). Lessons: (1) LOOKUPS-DOMINATE - branchless splat only +14pct, cache class (L1 via i8) is the real lever; (2) OUT-COLUMN-POISON - never train on unproven-semantics columns (-400 in one run); (3) VAL-NEVER-CROWNS redux - 2M data better val (42.8k) but worse play than wsum-400k; (4) SCALE-MATCHES-KNOWLEDGE - 2x2 flat (S13 already owns that scale), 8-cell pairs carry it, diagonals add noise (H+V > full).
 
+- 2026-09-21 VOLATILITY-UNIFIES-ALL (user insight): Ataxx = tactical exchanges until sudden fill/wipe. Positions are VOLATILE (800cp swings per ply, no quiet maneuvering). This one fact explains EVERY failed mechanism: countermove (-137, replies do not persist across exchanges), correction history (flat, shallow verdicts are noise), singular (-112, no lone standout among 57 tactical moves), aspiration (exploded, scores jump window edges), outcome-blend (-400, results are 90-ply credit-assignment lottery). Prescription: dense graded teacher-SCORES as signal (proven +125), depth-first engine, distrust any mechanism assuming positional stability.
+
 ## Protocol
 
 - Branch: `git checkout -b exp/<name> main`, build clean, record baseline
