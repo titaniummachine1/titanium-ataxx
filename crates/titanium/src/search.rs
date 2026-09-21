@@ -3,7 +3,7 @@
 //! Search order: TT probe -> eval cache (depth 0) -> move scoring
 //! (TT move > killers > captures*W + history) -> lazy selection -> alpha-beta.
 
-use crate::board::{dist_union, Board, Move, MoveList, RING1, SQUARES};
+use crate::board::{dist_union, jump_union, Board, Move, MoveList, RING1, SQUARES};
 use crate::sancta::{S1Acc, S1Net};
 use std::time::Duration;
 
@@ -51,11 +51,59 @@ const ORD_HISTORY_MAX: i32 = 90_000;
 const _: () = assert!(ORD_HISTORY_MAX + 8 * ORD_CAPTURE_UNIT + ORD_CLONE_BONUS < ORD_KILLER);
 const _: () = assert!(ORD_KILLER < ORD_TT);
 
-/// Static eval from the side-to-move's perspective. O(1): material from the
-/// incremental counters, PST from the incremental `Board::pst` balance
-/// (updated in make()), tempo flat. No per-node stone loops.
+/// Contact penalty per ENDANGERED stone (E2, "virus strategy"): stones the
+/// enemy can infect right now. Avoid contact early, mass-clone first.
+/// Restored S13 (was purged in S1): +190 Elo standalone.
+const CONTACT_PEN: i32 = 15;
+/// Multi-capture exposure (E4, user idea): for every empty landing square
+/// the enemy can reach, each of our stones BEYOND THE FIRST that one enemy
+/// landing would convert costs this much. Restored S13: +330 standalone.
+const MULTICAP_PEN: i32 = 20;
+
+/// Empty landing squares `them` can reach right now (shared E2+E4 input —
+/// computed once per side, not once per term).
+#[inline]
+fn enemy_landings(b: &Board, them: u8) -> u64 {
+    let tp = b.occ[them as usize];
+    b.empty() & (dist_union(tp, 1) | jump_union(tp))
+}
+
+/// E2: stones of `side` the enemy can currently convert — own stones ring-1
+/// of an enemy-reachable landing square.
+#[inline]
+fn endangered_count(b: &Board, side: u8, landings_them: u64) -> u32 {
+    (b.occ[side as usize] & dist_union(landings_them, 1)).count_ones()
+}
+
+/// E4: for each enemy-reachable landing square, own stones there beyond the
+/// first (each extra one = a stone lost in the same single enemy move).
+fn multicapture_penalty(b: &Board, side: u8, landings_them: u64) -> i32 {
+    let us = b.occ[side as usize];
+    let mut pen = 0i32;
+    let mut ls = landings_them;
+    while ls != 0 {
+        let sq = ls.trailing_zeros() as usize;
+        ls &= ls - 1;
+        let n = (RING1[sq] & us).count_ones() as i32;
+        if n >= 2 {
+            pen += (n - 1) * MULTICAP_PEN;
+        }
+    }
+    pen
+}
+
+/// Static eval from the side-to-move's perspective. Material + PST + tempo
+/// are O(1) incremental; E2/E4 regional terms (contact + multicap exposure)
+/// scan enemy reachability per node — the knowledge that won +190/+330.
 pub fn evaluate(b: &Board) -> i32 {
     let mut score = MATERIAL * (b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32) + b.pst;
+    // Black-relative balances (negated for white below, like pst).
+    let land_b = enemy_landings(b, 1); // squares white threatens to land on
+    let land_w = enemy_landings(b, 0);
+    score -= CONTACT_PEN * endangered_count(b, 0, land_b) as i32;
+    score += CONTACT_PEN * endangered_count(b, 1, land_w) as i32;
+    score -= multicapture_penalty(b, 0, land_b);
+    score += multicapture_penalty(b, 1, land_w);
     if b.turn == 0 {
         score += TEMPO;
     } else {
