@@ -1137,8 +1137,7 @@ mod tests {
     fn perft_bb_differential() {
         // Walk depth-2 positions with both counters; find the first child
         // where the leaf counts diverge and dump the position.
-        let mut stack_state: u64 = 0x1234567890ABCDEF;
-        let mut walk = |b: &Board, path: &mut String| -> bool {
+        let walk = |b: &Board, path: &mut String| -> bool {
             let moves = b.legal_moves();
             for i in 0..moves.len() {
                 let m = moves.move_at(i);

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use titanium::{best_move, Board, Move, SearchLimits, Searcher, RING1, StopReason};
+use titanium::{best_move, Board, Move, SearchLimits, Searcher, RING1};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -150,23 +150,6 @@ fn mirror(b: &Board) -> Board {
     m
 }
 
-fn perft(b: &Board, depth: u32, stack: &mut [titanium::MoveList], ply: usize) -> u64 {
-    if depth == 0 {
-        return 1;
-    }
-    b.legal_moves_into(&mut stack[ply]);
-    let n = stack[ply].len();
-    if depth == 1 {
-        return n as u64;
-    }
-    let mut total = 0u64;
-    for i in 0..n {
-        let m = stack[ply].move_at(i);
-        total += perft(&b.make(m), depth - 1, stack, ply + 1);
-    }
-    total
-}
-
 fn perft_cmd(depth: u32) -> ExitCode {
     let start = Board::start();
     let mirrored = mirror(&start);
@@ -190,16 +173,17 @@ fn perft_cmd(depth: u32) -> ExitCode {
 
 // ---------- bench ----------
 
-fn load_net_preset(spec: &Option<String>) -> Result<Option<std::sync::Arc<titanium::S1Net>>, String> {
+fn load_net_preset(spec: &Option<String>) -> Result<Option<titanium::S1Net>, String> {
     // --net none (or flag absent) = classical. --net <path> = that .s1.
-    // Bare --net (empty value) = default data/nnue/sancta_w.s1.
+    // Owned net, NO Arc: Searcher keeps a raw pointer for the search
+    // duration (caller-owned, read-only). Zero refcount in the tree.
     match spec {
         None => Ok(None),
         Some(s) if s == "none" || s.is_empty() => Ok(None),
         Some(s) => {
             let path = if s == "default" { "data/nnue/sancta_w.s1".into() } else { s.clone() };
             match titanium::S1Net::load(&path) {
-                Some(n) => Ok(Some(std::sync::Arc::new(n))),
+                Some(n) => Ok(Some(n)),
                 None => Err(format!("net file missing: {path}")),
             }
         }
@@ -238,7 +222,7 @@ fn bench_cmd(depth: u32, net_spec: Option<String>) -> ExitCode {
         max_depth: depth,
     };
     let mut searcher = Searcher::new();
-    searcher.set_sancta(net);
+    searcher.set_sancta(net.as_ref());
     let r = searcher.search(&b, &limits);
     let secs = r.elapsed.as_secs_f64();
     println!(
@@ -518,15 +502,16 @@ fn out_line(s: &str) {
 fn serve_cmd(tt_bits: usize, net_spec: Option<String>) -> ExitCode {
     let stdin = io::stdin();
     let mut searcher = Searcher::with_tt_bits(tt_bits);
-    // Eval preset comes from --net ONLY. No env vars: match spawns the opp
-    // child with an explicit --opp-net flag, so both sides are unambiguous.
-    match load_net_preset(&net_spec) {
-        Ok(n) => searcher.set_sancta(n),
+    // Eval preset comes from --net ONLY. Owned net outlives the loop;
+    // searcher borrows it per-position (raw pointer, no refcount).
+    let owned = match load_net_preset(&net_spec) {
+        Ok(n) => n,
         Err(e) => {
             eprintln!("serve: {e}");
             return ExitCode::FAILURE;
         }
-    }
+    };
+    searcher.set_sancta(owned.as_ref());
     let mut current: Option<Board> = None;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -806,9 +791,9 @@ fn match_cmd(
     for game in start_game..start_game + games {
         let mut b = Board::start();
         let mut searcher = Searcher::new(); // fresh TT per game
-        searcher.set_sancta(net.clone());
+        searcher.set_sancta(net.as_ref());
         let mut opp_searcher = Searcher::new(); // for --opp self
-        opp_searcher.set_sancta(opp_net.clone());
+        opp_searcher.set_sancta(opp_net.as_ref());
         let titanium_is_black = game % 2 == 1;
         let mut log = String::new();
         let mut result = None;

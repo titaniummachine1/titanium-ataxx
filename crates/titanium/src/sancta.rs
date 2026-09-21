@@ -207,8 +207,10 @@ impl S1Net {
         self.refresh_side(b, 1, &mut acc[1]);
     }
 
-    /// Lazy incremental child update: copy parent + bitboard diffs.
-    /// Call sites have parent+child boards already (copy-make tree).
+    /// Full incremental acc write for `child` (both perspectives), via the
+    /// 4 (bitboard, color, add?) diffs. Overwrites. No per-ply stack here;
+    /// the caller passes the exact acc slots (search.rs MoveStack).
+    #[allow(clippy::needless_range_loop)]
     pub fn update_child(
         &self,
         parent: &S1Acc,
@@ -271,29 +273,6 @@ impl S1Net {
         b2: i32,
     ) -> S1Net {
         S1Net { ft_w, ft_b, w1, b1, w2, b2 }
-    }
-
-    /// Test helper: v1-equivalent net (linear head through h[0]).
-    /// v1 math: out = out_b + sum crelu*out_w. v3: h0 = out_b + sum
-    /// (b1[0]=out_b, W1 col0 = out_w), out = 0 + h0*w2[0] with w2[0]=1 —
-    /// EXCEPT relu(h0) clips negatives. Tests use positive activations
-    /// (bias-dominated), so relu is identity and the mapping is exact.
-    #[cfg(test)]
-    fn from_v1_parts(
-        ft_w: Box<[[i16; S1_L1]; S1_INPUT]>,
-        ft_b: [i16; S1_L1],
-        out_w: [i16; S1_L1 * 2],
-        out_b: i16,
-    ) -> S1Net {
-        let mut w1 = Box::new([[0i16; S1_H2]; S1_L1 * 2]);
-        for i in 0..S1_L1 * 2 {
-            w1[i][0] = out_w[i];
-        }
-        let mut b1 = [0i32; S1_H2];
-        b1[0] = out_b as i32;
-        let mut w2 = [0i16; S1_H2];
-        w2[0] = 1;
-        S1Net { ft_w, ft_b, w1, b1, w2, b2: 0 }
     }
 }
 
