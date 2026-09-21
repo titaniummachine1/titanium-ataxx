@@ -181,6 +181,59 @@ pub static REACH: [u64; SQUARES] = {
     t
 };
 
+/// 2x2 block geometry for the n-tuple eval (S20, clean-room design):
+/// 36 anchors in row-major order (top-left square of each 2x2 block,
+/// rows/cols 0..5), each listing its 4 cells in canonical order
+/// [(r,c),(r,c+1),(r+1,c),(r+1,c+1)]. Ternary cell states (empty/own/enemy;
+/// blockers read as empty — standard games have none), packed base-3 over
+/// the 4 cells = 81 patterns per anchor. stm-relative (own/enemy), so one
+/// table serves both colors.
+const fn build_block2() -> [[u8; 4]; 36] {
+    let mut t = [[0u8; 4]; 36];
+    let mut a = 0usize;
+    let mut r = 0usize;
+    while r < 6 {
+        let mut c = 0usize;
+        while c < 6 {
+            t[a][0] = (r * SIZE + c) as u8;
+            t[a][1] = (r * SIZE + c + 1) as u8;
+            t[a][2] = ((r + 1) * SIZE + c) as u8;
+            t[a][3] = ((r + 1) * SIZE + c + 1) as u8;
+            a += 1;
+            c += 1;
+        }
+        r += 1;
+    }
+    t
+}
+
+/// The 4 member squares of 2x2-block anchor `a` (0..35, row-major).
+pub static BLOCK2: [[u8; 4]; 36] = build_block2();
+
+/// Ternary 2x2-block index for anchor `a`: digit per cell (0 = empty or
+/// blocker, 1 = `own`, 2 = `enemy`), cell order = BLOCK2[a] order.
+#[inline]
+pub fn block2_index(own: u64, enemy: u64, a: usize) -> usize {
+    let cells = BLOCK2[a];
+    let mut idx = 0usize;
+    let mut mult = 1usize;
+    let mut i = 0usize;
+    while i < 4 {
+        let bit = 1u64 << cells[i];
+        let d = if own & bit != 0 {
+            1
+        } else if enemy & bit != 0 {
+            2
+        } else {
+            0
+        };
+        idx += d * mult;
+        mult *= 3;
+        i += 1;
+    }
+    idx
+}
+
 /// Ring-1 neighbor square indices per square (0xFF = absent), plus the count.
 /// This is the extraction layout for the 8-bit infection LUT key: neighbor
 /// `i` of a square corresponds to bit `i` of the extracted pattern.

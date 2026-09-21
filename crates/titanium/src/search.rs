@@ -4,6 +4,7 @@
 //! (TT move > killers > captures*W + history) -> lazy selection -> alpha-beta.
 
 use crate::board::{dist_union, jump_union, Board, Move, MoveList, RING1, SQUARES};
+use crate::tuple::TupleTable;
 use crate::sancta::{S1Acc, S1Net};
 use std::time::Duration;
 
@@ -95,7 +96,9 @@ fn multicapture_penalty(b: &Board, side: u8, landings_them: u64) -> i32 {
 /// Static eval from the side-to-move's perspective. Material + PST + tempo
 /// are O(1) incremental; E2/E4 regional terms (contact + multicap exposure)
 /// scan enemy reachability per node — the knowledge that won +190/+330.
-pub fn evaluate(b: &Board) -> i32 {
+/// The n-tuple term (`tup`, S20) adds learned local-shape knowledge on top;
+/// None = pure hand eval (zero-cost OFF).
+pub fn evaluate(b: &Board, tup: Option<&TupleTable>) -> i32 {
     let mut score = MATERIAL * (b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32) + b.pst;
     // Black-relative balances (negated for white below, like pst).
     let land_b = enemy_landings(b, 1); // squares white threatens to land on
@@ -109,11 +112,13 @@ pub fn evaluate(b: &Board) -> i32 {
     } else {
         score -= TEMPO;
     }
-    if b.turn == 0 {
-        score
-    } else {
-        -score
+    let mut out = if b.turn == 0 { score } else { -score };
+    // Tuple term is stm-relative by construction: add after the flip.
+    // None branch = zero-cost OFF (single predictable branch).
+    if let Some(t) = tup {
+        out += t.forward(b);
     }
+    out
 }
 
 /// Score moves in place: TT move > killers > captures*W + history.
@@ -336,6 +341,9 @@ pub struct Searcher<'a> {
     /// set once via set_sancta, read-only in the tree. Zero refcount,
     /// zero unsafe — the borrow checker proves the net outlives the search.
     sancta: Option<&'a S1Net>,
+    /// Optional n-tuple table (None = pure hand eval). Borrowed, read-only
+    /// in the tree, same zero-cost-OFF pattern as sancta.
+    tuple: Option<&'a TupleTable>,
     /// Per-ply move/acc buffers, reused across searches (no per-search
     /// alloc: MoveStack is ~72KB of lists + acc, was rebuilt per search).
     stack: MoveStack,
@@ -374,6 +382,7 @@ impl<'a> Searcher<'a> {
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[0; 49]; 2]),
             sancta: None,
+            tuple: None,
             stack: MoveStack::new(),
         }
     }
@@ -382,6 +391,12 @@ impl<'a> Searcher<'a> {
     /// duration; zero-cost OFF (None branch).
     pub fn set_sancta(&mut self, net: Option<&'a S1Net>) {
         self.sancta = net;
+    }
+
+    /// Attach an n-tuple table (None = pure hand eval). Borrowed for the
+    /// search duration; zero-cost OFF (None branch).
+    pub fn set_tuple(&mut self, t: Option<&'a TupleTable>) {
+        self.tuple = t;
     }
 
     /// Override the clock (wasm builds inject `performance.now()`).
@@ -475,7 +490,7 @@ impl<'a> Searcher<'a> {
         // no negation (that was the 0-50 bug: double-negated white nodes).
         let static_eval = match self.sancta {
             Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
-            None => evaluate(b),
+            None => evaluate(b, self.tuple),
         };
 
         // Reverse futility pruning (autaxx, exact form): standing pat is so
@@ -533,7 +548,7 @@ impl<'a> Searcher<'a> {
             if list.is_empty() {
                 let static_eval = match self.sancta {
                     Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
-                    None => evaluate(b),
+                    None => evaluate(b, self.tuple),
                 };
                 self.finish_node(b, alpha_orig, beta, static_eval, 0xFFFF, depth, ply);
                 return static_eval;

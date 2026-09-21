@@ -11,6 +11,7 @@
 pub mod board;
 pub mod sancta;
 pub mod search;
+pub mod tuple;
 
 pub use board::{
     bit_of, dist_union, infect_direct, infect_via_lut, extract8, jump_union, perft_bb, Board, Move,
@@ -21,3 +22,4 @@ pub use board::{
 pub use board::extract8_pext;
 pub use search::{best_move, SearchLimits, SearchResult, Searcher, StopReason};
 pub use sancta::{S1Net, S1Acc, S1_L1, S1_H2, S1N_V3};
+pub use tuple::{TupleTable, TUP_LEN, TUP_MAGIC};

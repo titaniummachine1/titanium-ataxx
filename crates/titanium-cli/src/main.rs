@@ -28,6 +28,7 @@ fn main() -> ExitCode {
         "bench" => bench_cmd(
             flag_int(&args, "--depth").unwrap_or(8) as u32,
             flag_str(&args, "--net"),
+            flag_str(&args, "--tuple"),
         ),
         "selfplay" => selfplay_cmd(
             flag_int(&args, "--games").unwrap_or(2) as u32,
@@ -44,6 +45,7 @@ fn main() -> ExitCode {
         "serve" => serve_cmd(
             flag_int(&args, "--tt-bits").unwrap_or(20) as usize,
             flag_str(&args, "--net"),
+            flag_str(&args, "--tuple"),
         ),
         "match" => match_cmd(
             flag_int(&args, "--games").unwrap_or(20) as u32,
@@ -51,6 +53,8 @@ fn main() -> ExitCode {
             flag_str(&args, "--opp"),
             flag_str(&args, "--net"),
             flag_str(&args, "--opp-net"),
+            flag_str(&args, "--tuple"),
+            flag_str(&args, "--opp-tuple"),
             flag_int(&args, "--opp-time").unwrap_or(1000) as u64,
             flag_int(&args, "--opp-depth").map(|d| d as u32),
             flag_int(&args, "--opp-nodes").map(|n| n as u64),
@@ -202,7 +206,31 @@ fn net_flag_str(spec: &Option<String>) -> String {
     }
 }
 
-fn bench_cmd(depth: u32, net_spec: Option<String>) -> ExitCode {
+/// --tuple none (or flag absent) = pure hand eval. --tuple <path> = that
+/// .tup additive table. Owned table, borrowed by the searcher (same
+/// zero-refcount pattern as the net).
+fn load_tuple_preset(spec: &Option<String>) -> Result<Option<titanium::TupleTable>, String> {
+    match spec {
+        None => Ok(None),
+        Some(s) if s == "none" || s.is_empty() => Ok(None),
+        Some(s) => match titanium::TupleTable::load(s) {
+            Ok(t) => Ok(Some(t)),
+            Err(e) => Err(format!("tuple file bad ({s}): {e}")),
+        },
+    }
+}
+
+fn tuple_flag_str(spec: &Option<String>) -> String {
+    // Re-emit for match children: --tuple <spec> flows to the opp serve
+    // child as --opp-tuple.
+    match spec {
+        None => "--tuple none".to_string(),
+        Some(s) if s == "none" || s.is_empty() => "--tuple none".to_string(),
+        Some(s) => format!("--tuple {s}"),
+    }
+}
+
+fn bench_cmd(depth: u32, net_spec: Option<String>, tup_spec: Option<String>) -> ExitCode {
     let net = match load_net_preset(&net_spec) {
         Ok(n) => {
             match &net_spec {
@@ -210,6 +238,19 @@ fn bench_cmd(depth: u32, net_spec: Option<String>) -> ExitCode {
                 _ => println!("Bench: classical (no net)"),
             }
             n
+        }
+        Err(e) => {
+            eprintln!("Bench: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tup = match load_tuple_preset(&tup_spec) {
+        Ok(t) => {
+            match &tup_spec {
+                Some(s) if s != "none" && !s.is_empty() => println!("Bench: tuple ON ({s})"),
+                _ => println!("Bench: hand eval (no tuple)"),
+            }
+            t
         }
         Err(e) => {
             eprintln!("Bench: {e}");
@@ -225,6 +266,7 @@ fn bench_cmd(depth: u32, net_spec: Option<String>) -> ExitCode {
     };
     let mut searcher = Searcher::new();
     searcher.set_sancta(net.as_ref());
+    searcher.set_tuple(tup.as_ref());
     let r = searcher.search(&b, &limits);
     let secs = r.elapsed.as_secs_f64();
     println!(
@@ -501,11 +543,11 @@ fn out_line(s: &str) {
     let _ = o.flush();
 }
 
-fn serve_cmd(tt_bits: usize, net_spec: Option<String>) -> ExitCode {
+fn serve_cmd(tt_bits: usize, net_spec: Option<String>, tup_spec: Option<String>) -> ExitCode {
     let stdin = io::stdin();
     let mut searcher = Searcher::with_tt_bits(tt_bits);
-    // Eval preset comes from --net ONLY. Owned net outlives the loop;
-    // searcher borrows it per-position (raw pointer, no refcount).
+    // Eval presets come from --net / --tuple ONLY. Owned tables outlive the
+    // loop; searcher borrows them per-position (no refcount).
     let owned = match load_net_preset(&net_spec) {
         Ok(n) => n,
         Err(e) => {
@@ -514,6 +556,14 @@ fn serve_cmd(tt_bits: usize, net_spec: Option<String>) -> ExitCode {
         }
     };
     searcher.set_sancta(owned.as_ref());
+    let owned_tup = match load_tuple_preset(&tup_spec) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("serve: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    searcher.set_tuple(owned_tup.as_ref());
     let mut current: Option<Board> = None;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -703,6 +753,8 @@ fn match_cmd(
     opp_cmd: Option<String>,
     net_spec: Option<String>,
     opp_net_spec: Option<String>,
+    tup_spec: Option<String>,
+    opp_tup_spec: Option<String>,
     opp_time: u64,
     opp_depth: Option<u32>,
     opp_nodes: Option<u64>,
@@ -727,6 +779,20 @@ fn match_cmd(
             return ExitCode::FAILURE;
         }
     };
+    let tup = match load_tuple_preset(&tup_spec) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("match: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let opp_tup = match load_tuple_preset(&opp_tup_spec) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("match: opp {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     // "self" = titanium vs titanium in-process (no external process).
     // External opp: auto-append the opp preset to "<exe> serve" commands so
     // one flag controls the child, no 50-line powershell, no env games.
@@ -735,14 +801,17 @@ fn match_cmd(
     } else {
         let cmd = match opp_cmd {
             Some(c) => {
-                let with_net = if c.trim_end().ends_with("serve")
-                    && !c.contains("--net")
-                {
-                    format!("{c} {}", net_flag_str(&opp_net_spec))
-                } else {
-                    c
-                };
-                with_net
+                // Auto-append opp presets to "<exe> serve" child commands.
+                let mut with_flags = c;
+                if with_flags.trim_end().ends_with("serve") {
+                    if !with_flags.contains("--net") {
+                        with_flags = format!("{with_flags} {}", net_flag_str(&opp_net_spec));
+                    }
+                    if !with_flags.contains("--tuple") {
+                        with_flags = format!("{with_flags} {}", tuple_flag_str(&opp_tup_spec));
+                    }
+                }
+                with_flags
             }
             None => {
                 eprintln!("match: --opp \"<UAI engine command>\" or \"self\" is required");
@@ -794,8 +863,10 @@ fn match_cmd(
         let mut b = Board::start();
         let mut searcher = Searcher::new(); // fresh TT per game
         searcher.set_sancta(net.as_ref());
+        searcher.set_tuple(tup.as_ref());
         let mut opp_searcher = Searcher::new(); // for --opp self
         opp_searcher.set_sancta(opp_net.as_ref());
+        opp_searcher.set_tuple(opp_tup.as_ref());
         let titanium_is_black = game % 2 == 1;
         let mut log = String::new();
         let mut result = None;
