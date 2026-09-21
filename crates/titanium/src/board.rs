@@ -103,14 +103,15 @@ pub static ZOB_BLOCK: [u64; SQUARES] = {
 pub fn dist_union(bb: u64, d: u32) -> u64 {
     let na = bb & !FILE_A;
     let ng = bb & !FILE_G;
-    (bb >> (7 * d))      // up
+    ((bb >> (7 * d))      // up
         | (bb << (7 * d))      // down
         | (na >> d)            // left
         | (ng << d)            // right
         | (na >> (8 * d))      // up-left
         | (ng >> (6 * d))      // up-right
         | (na << (6 * d))      // down-left
-        | (ng << (8 * d))      // down-right
+        | (ng << (8 * d)))     // down-right
+        & FULL // down shifts spill past bit 48; stays 49-bit clean
 }
 
 /// Full Chebyshev-2 ring (16 cells): straight + diagonal 2-steps plus the
@@ -131,8 +132,8 @@ pub fn jump_union(bb: u64) -> u64 {
     let v2 = (up | dn) & FULL;
     let h2 = lf | rt;
     let n1 = ((v2 & !FILE_A) >> 1) | ((v2 & !FILE_G) << 1); // (±2,±1)
-    let n2 = (h2 >> 7) | (h2 << 7);                          // (±1,±2)
-    up | dn | lf | rt | ul | ur | dl | drr | n1 | n2
+    let n2 = (h2 >> 7) | ((h2 << 7) & FULL);                // (±1,±2)
+    (up | dn | lf | rt | ul | ur | dl | drr | n1 | n2) & FULL
 }
 
 /// Exactly-Chebyshev-distance-d neighbor masks, computed at compile time.
@@ -405,17 +406,11 @@ impl Move {
     }
 
     /// True if this move is a clone (distance 1) rather than a jump (distance 2).
+    /// Table test: `to` inside `from`'s ring-1. No div/mod (was 2x /7+%7).
     #[inline]
-    pub const fn is_clone(self) -> bool {
-        let dr = (self.to as i32 / SIZE as i32) - (self.from as i32 / SIZE as i32);
-        let df = (self.to as i32 % SIZE as i32) - (self.from as i32 % SIZE as i32);
-        let adr = if dr < 0 { -dr } else { dr };
-        let adf = if df < 0 { -df } else { df };
-        if adr >= adf {
-            adr <= 1
-        } else {
-            adf <= 1
-        }
+    pub fn is_clone(self) -> bool {
+        debug_assert!(self.from < 49 && self.to < 49);
+        (RING1[self.from as usize] >> self.to) & 1 != 0
     }
 
     /// Pack into `u32` as `(from << 8) | to` (pass = 0xFFFF).
@@ -521,7 +516,21 @@ impl MoveList {
     }
 }
 
-/// Immutable board; `make` is copy-make (cheap, ~40 bytes).
+/// Square PST (autaxx quiet-ordering table): corners/edges good, center bad.
+/// Rows top->bottom, horizontally symmetric (mirror helpers rely on this).
+/// Maintained INCREMENTALLY on `Board::pst` (updated in make()) — the static
+/// eval never loops over stones.
+pub const PST: [i32; 49] = [
+    30, 20, 10, 10, 10, 20, 30, //
+    20, 10, 10, 5, 10, 10, 20, //
+    10, 10, 5, 0, 5, 10, 10, //
+    10, 5, 0, 0, 0, 5, 10, //
+    10, 10, 5, 0, 5, 10, 10, //
+    20, 10, 10, 5, 10, 10, 20, //
+    30, 20, 10, 10, 10, 20, 30,
+];
+
+/// Immutable board; `make` is copy-make (cheap, ~48 bytes).
 #[derive(Clone, Copy, Debug)]
 pub struct Board {
     /// `[black, white]` occupancy bitboards.
@@ -538,6 +547,8 @@ pub struct Board {
     pub blocker_cnt: u8,
     /// Incremental zobrist hash (side to move + pieces + blockers).
     pub hash: u64,
+    /// Incremental PST balance (black sum minus white sum), updated in make().
+    pub pst: i32,
 }
 
 impl Board {
@@ -552,6 +563,7 @@ impl Board {
             piece_cnt: [1, 1],
             blocker_cnt: 0,
             hash: ZOB_PIECE[0][42] ^ ZOB_PIECE[1][6],
+            pst: PST[6 * 7] - PST[6],
         }
     }
 
@@ -649,14 +661,18 @@ impl Board {
         let mut next = *self;
         let me_idx = self.turn as usize;
         let opp_idx = 1 - me_idx;
+        // PST sign: pst is black-relative (black sum minus white sum).
+        let sign: i32 = if me_idx == 0 { 1 } else { -1 };
         next.hash = self.hash ^ ZOB_SIDE;
         if !m.is_clone() {
             next.occ[me_idx] &= !bit_of(m.from);
             next.piece_cnt[me_idx] -= 1;
             next.hash ^= ZOB_PIECE[me_idx][m.from as usize];
+            next.pst -= sign * PST[m.from as usize];
         }
         next.occ[me_idx] |= bit_of(m.to);
         next.hash ^= ZOB_PIECE[me_idx][m.to as usize];
+        next.pst += sign * PST[m.to as usize];
         let captured = next.occ[opp_idx] & RING1[m.to as usize];
         next.occ[opp_idx] &= !captured;
         next.occ[me_idx] |= captured;
@@ -665,6 +681,8 @@ impl Board {
             let sq = caps_bb.trailing_zeros() as usize;
             caps_bb &= caps_bb - 1;
             next.hash ^= ZOB_PIECE[opp_idx][sq] ^ ZOB_PIECE[me_idx][sq];
+            // Captured stone flips sides: swing is twice the square value.
+            next.pst += 2 * sign * PST[sq];
         }
         let caps = captured.count_ones() as u8;
         next.piece_cnt[me_idx] += 1 + caps;
@@ -683,14 +701,17 @@ impl Board {
         let mut next = *self;
         let me_idx = self.turn as usize;
         let opp_idx = 1 - me_idx;
+        let sign: i32 = if me_idx == 0 { 1 } else { -1 };
         next.hash = self.hash ^ ZOB_SIDE;
         if !m.is_clone() {
             next.occ[me_idx] &= !bit_of(m.from);
             next.piece_cnt[me_idx] -= 1;
             next.hash ^= ZOB_PIECE[me_idx][m.from as usize];
+            next.pst -= sign * PST[m.from as usize];
         }
         next.occ[me_idx] |= bit_of(m.to);
         next.hash ^= ZOB_PIECE[me_idx][m.to as usize];
+        next.pst += sign * PST[m.to as usize];
         let flip = infect_via_lut(next.occ[opp_idx], m.to);
         next.occ[opp_idx] &= !flip;
         next.occ[me_idx] |= flip;
@@ -699,6 +720,7 @@ impl Board {
             let sq = caps_bb.trailing_zeros() as usize;
             caps_bb &= caps_bb - 1;
             next.hash ^= ZOB_PIECE[opp_idx][sq] ^ ZOB_PIECE[me_idx][sq];
+            next.pst += 2 * sign * PST[sq];
         }
         let caps = flip.count_ones() as u8;
         next.piece_cnt[me_idx] += 1 + caps;
@@ -765,6 +787,7 @@ impl Board {
             piece_cnt: [0; 2],
             blocker_cnt: 0,
             hash: 0,
+            pst: 0,
         };
         let mut cells = 0usize;
         let mut side = 'b';
@@ -802,6 +825,7 @@ impl Board {
                 let sq = bb.trailing_zeros() as usize;
                 bb &= bb - 1;
                 b.hash ^= ZOB_PIECE[c][sq];
+                b.pst += if c == 0 { PST[sq] } else { -PST[sq] };
             }
         }
         let mut blk = b.blockers;
@@ -892,6 +916,7 @@ impl Board {
             piece_cnt: [0; 2],
             blocker_cnt: 0,
             hash: 0,
+            pst: 0,
         };
         let mut parts = s.split_whitespace();
         let board_part = parts.next()?;
@@ -946,6 +971,7 @@ impl Board {
                 let sq = bb.trailing_zeros() as usize;
                 bb &= bb - 1;
                 b.hash ^= ZOB_PIECE[c][sq];
+                b.pst += if c == 0 { PST[sq] } else { -PST[sq] };
             }
         }
         let mut blk = b.blockers;
@@ -1026,6 +1052,9 @@ mod tests {
             piece_cnt: [b.piece_cnt[1], b.piece_cnt[0]],
             blocker_cnt: b.blocker_cnt,
             hash: 0,
+            // PST rows are file-symmetric, so color-swap + file-mirror just
+            // negates the balance.
+            pst: -b.pst,
         };
         let flip = |mut bb: u64| -> u64 {
             let mut out = 0u64;
@@ -1418,6 +1447,18 @@ mod tests {
                 }
                 assert_eq!(b.piece_cnt[0] as u32, b.occ[0].count_ones());
                 assert_eq!(b.piece_cnt[1] as u32, b.occ[1].count_ones());
+                // Incremental PST must equal the from-scratch balance.
+                let mut want = 0i32;
+                for c in 0..2 {
+                    let sign = if c == 0 { 1 } else { -1 };
+                    let mut bb = b.occ[c];
+                    while bb != 0 {
+                        let sq = bb.trailing_zeros() as usize;
+                        bb &= bb - 1;
+                        want += sign * PST[sq];
+                    }
+                }
+                assert_eq!(b.pst, want, "incremental pst diverged");
                 let moves = b.legal_moves();
                 if moves.is_empty() {
                     b = b.make_pass();

@@ -37,17 +37,6 @@ impl MoveStack {
 const MATERIAL: i32 = 100;
 /// Tempo: flat bonus for the side to move. autaxx uses 1.5-2 stones worth.
 const TEMPO: i32 = 150;
-/// Square PST (autaxx quiet-ordering table): corners/edges good, center bad.
-/// Rows top->bottom, symmetric.
-const PST: [i32; 49] = [
-    30, 20, 10, 10, 10, 20, 30, //
-    20, 10, 10, 5, 10, 10, 20, //
-    10, 10, 5, 0, 5, 10, 10, //
-    10, 5, 0, 0, 0, 5, 10, //
-    10, 10, 5, 0, 5, 10, 10, //
-    20, 10, 10, 5, 10, 10, 20, //
-    30, 20, 10, 10, 10, 20, 30,
-];
 /// Reverse futility pruning margins, index = depth-1 (autaxx, stone = 100).
 const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774];
 
@@ -62,22 +51,11 @@ const ORD_HISTORY_MAX: i32 = 90_000;
 const _: () = assert!(ORD_HISTORY_MAX + 8 * ORD_CAPTURE_UNIT + ORD_CLONE_BONUS < ORD_KILLER);
 const _: () = assert!(ORD_KILLER < ORD_TT);
 
-/// Static eval from the side-to-move's perspective.
-/// EXP slim-eval-speed: material + PST + tempo ONLY. Holes/contact/multicap
-/// stripped to measure eval-cost ceiling (speed only, strength be damned).
+/// Static eval from the side-to-move's perspective. O(1): material from the
+/// incremental counters, PST from the incremental `Board::pst` balance
+/// (updated in make()), tempo flat. No per-node stone loops.
 pub fn evaluate(b: &Board) -> i32 {
-    let mat = MATERIAL * (b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32);
-    let mut pst = 0i32;
-    for c in 0..2 {
-        let sign = if c == 0 { 1 } else { -1 };
-        let mut bb = b.occ[c];
-        while bb != 0 {
-            let sq = bb.trailing_zeros() as usize;
-            bb &= bb - 1;
-            pst += sign * PST[sq];
-        }
-    }
-    let mut score = mat + pst;
+    let mut score = MATERIAL * (b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32) + b.pst;
     if b.turn == 0 {
         score += TEMPO;
     } else {
@@ -449,7 +427,7 @@ impl<'a> Searcher<'a> {
         // no negation (that was the 0-50 bug: double-negated white nodes).
         let static_eval = match self.sancta {
             Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
-            None => self.eval_cached(b),
+            None => evaluate(b),
         };
 
         // Reverse futility pruning (autaxx, exact form): standing pat is so
@@ -507,7 +485,7 @@ impl<'a> Searcher<'a> {
             if list.is_empty() {
                 let static_eval = match self.sancta {
                     Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
-                    None => self.eval_cached(b),
+                    None => evaluate(b),
                 };
                 self.finish_node(b, alpha_orig, beta, static_eval, 0xFFFF, depth, ply);
                 return static_eval;
@@ -588,19 +566,6 @@ impl<'a> Searcher<'a> {
         }
         self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply);
         best
-    }
-
-    /// Eval with the TT as cache (depth-0 EXACT entries).
-    #[inline]
-    fn eval_cached(&mut self, b: &Board) -> i32 {
-        if let Some(e) = self.tt.probe(b.hash) {
-            if e.flag == FLAG_EXACT && e.depth == 0 {
-                return e.score;
-            }
-        }
-        let ev = evaluate(b);
-        self.tt.store(b.hash, 0, ev, 0, FLAG_EXACT);
-        ev
     }
 
     /// Killer/history bookkeeping on a beta cutoff.
@@ -703,79 +668,30 @@ impl<'a> Searcher<'a> {
         let mut it_ms: [f64; 2] = [0.0, 0.0];
         for depth in 1..=limits.max_depth.max(1) {
             let iter_start = self.elapsed_ms();
+            let mut alpha = i32::MIN + 1;
             let mut best_this = None;
             let mut best_score = i32::MIN;
-            if depth < 5 || result.depth == 0 {
-                // Full window every iteration.
-                let mut alpha = i32::MIN + 1;
-                for i in 0..n_root {
-                    let m = root_moves[i];
-                    let child = b.make(m);
-                    // Root children: acc[1] = acc[0] + diffs (sancta lazy path).
-                    if let Some(net) = self.sancta {
-                        let (a, z) = self.stack.acc.split_at_mut(1);
-                        net.update_child(&a[0], &mut z[0], b, &child);
-                    }
-                    let score = -self.negamax(&child, -i32::MAX, -alpha, depth - 1, 1, true);
-                    if self.stop {
-                        break;
-                    }
-                    if score > best_score {
-                        best_score = score;
-                        best_this = Some(m);
-                        if score > alpha {
-                            alpha = score;
-                        }
-                    }
+            // Clean-main ID: FULL window every iteration. No aspiration.
+            // (Aspiration reverted: narrowed windows changed PVS cutoffs at
+            // fixed node budgets -> bench d8 9.4k=>17k, QB5k 45-53-2.-28.)
+            for i in 0..n_root {
+                let m = root_moves[i];
+                let child = b.make(m);
+                // Root children: acc[1] = acc[0] + diffs (sancta lazy path).
+                if let Some(net) = self.sancta {
+                    let (a, z) = self.stack.acc.split_at_mut(1);
+                    net.update_child(&a[0], &mut z[0], b, &child);
                 }
-            } else {
-                // Aspiration: delta ladder 50 -> 200 -> 800 -> infinite.
-                let prev = result.score;
-                let mut delta = 50i32;
-                let (mut lo, mut hi) = (prev - delta, prev + delta);
-                loop {
-                    let mut a = lo;
-                    let mut bs = i32::MIN;
-                    let mut bt = None;
-                    for i in 0..n_root {
-                        let m = root_moves[i];
-                        let child = b.make(m);
-                        if let Some(net) = self.sancta {
-                            let (x, z) = self.stack.acc.split_at_mut(1);
-                            net.update_child(&x[0], &mut z[0], b, &child);
-                        }
-                        let score = -self.negamax(&child, -hi, -a, depth - 1, 1, true);
-                        if self.stop {
-                            break;
-                        }
-                        if score > bs {
-                            bs = score;
-                            bt = Some(m);
-                            if score > a {
-                                a = score;
-                            }
-                        }
-                    }
-                    if self.stop {
-                        best_this = bt;
-                        best_score = bs;
-                        break;
-                    }
-                    if bs <= lo {
-                        // Fail low: widen downward, re-search same order.
-                        delta = (delta * 4).min(i32::MAX / 4);
-                        lo = bs.saturating_sub(delta);
-                        continue;
-                    }
-                    if bs >= hi {
-                        // Fail high: widen upward, re-search same order.
-                        delta = (delta * 4).min(i32::MAX / 4);
-                        hi = bs.saturating_add(delta);
-                        continue;
-                    }
-                    best_this = bt;
-                    best_score = bs;
+                let score = -self.negamax(&child, -i32::MAX, -alpha, depth - 1, 1, true);
+                if self.stop {
                     break;
+                }
+                if score > best_score {
+                    best_score = score;
+                    best_this = Some(m);
+                    if score > alpha {
+                        alpha = score;
+                    }
                 }
             }
             // Partial-iteration adoption (titanium/Lague): moves recorded in

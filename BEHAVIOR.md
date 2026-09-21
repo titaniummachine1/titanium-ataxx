@@ -87,6 +87,29 @@ real memory. Update them the moment something happens, not at the end.
   gate vs classical **20–0 @5k** — real games (39-10) not wipes. Progress,
   not parity.
 
+- 2026-09-21 S9night: NIGHT 5/6 DONE (tq=S7quality vs BASE/Moon/own_v3):
+  QB5k 45–53–2 BASE (S7 REGRESSES clean-main on quality gate), QBT100 died
+  at 12g (both tq PIDs are the QNETT100 tail — no QBt100 runner; 12g
+  file = overwritten partial, RERUN NEEDED), QMOON5k 0–100 + QMOONt100
+  0–100 (wall stands), QNET5k 100–0 QUAL (own_net still zero), QNETt100
+  36/100 running (gm5836). S7-aspiration cut node count 535k→28.2M-same-
+  time reading was DEPTH, not Elo: quality per S8gatedef = LOSING.
+  Verdict: revert S7 OR re-tune RFP/LMR around aspiration before any net
+  capacity work.
+
+- 2026-09-21 SESSION CLOSE (handoff for new chat): branch
+  exp/sancta-incr = 3 commits past main 7ab844e (f8b98b5 v3-loss,
+  4271d6b harness+S6, 2a0a0ba S7quality). S7quality = REGRESSION both
+  gates (QBt100 rerun 16-84). Working tree dirty: pattern.rs LUT draft +
+  is_clone/FULL fixes (uncommitted micro, no-gain). Movegen SATURATED
+  (LUT closed 3 ways: sizes/identity/measured 74M vs 33M). Next
+  user-ordered target: eval-saturate = incremental PST in Board (fold
+  delta into make() capture loop, free), evaluate() -> 3 ops, DELETE
+  eval_cached (double TT probe + pollution). O(1) eval, bit-identical
+  values, 5k gate must be 15-15, 100ms gains from speed. Then
+  score_into popcounts + NMP dist_union. Run BOTH gates (S8gatedef:
+  5k=quality, 100ms=strength). main UNTOUCHED.
+
 ## Protocol
 
 - Branch: `git checkout -b exp/<name> main`, build clean, record baseline

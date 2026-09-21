@@ -137,6 +137,8 @@ fn mirror(b: &Board) -> Board {
         piece_cnt: [b.piece_cnt[1], b.piece_cnt[0]],
         blocker_cnt: b.blockers.count_ones() as u8,
         hash: 0,
+        // PST rows are file-symmetric: color-swap + file-mirror negates.
+        pst: -b.pst,
     };
     m.hash = if m.turn == 1 { titanium::ZOB_SIDE } else { 0 };
     for c in 0..2 {

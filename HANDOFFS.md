@@ -151,6 +151,29 @@ embed quotes manually: `$oppQ = "`"$m serve`""`.
   from 535k), bench d8 classical 17034/6.9M, self-check 10–10.
   S6score ep25 gated: 20–0 classical @5k (real games, not wipes).
 
+## STATE FOR NEW SESSION (2026-09-21 close)
+
+- Branch: `exp/sancta-incr` = 3 commits past main `7ab844e`:
+  `f8b98b5` (v3 loss contract), `4271d6b` (harness presets + S6),
+  `2a0a0ba` (S7quality). main UNTOUCHED = slim `7ab844e`.
+- S7quality = REGRESSION both gates (QB 16–84 @100ms rerun + 45–53–2 @5k).
+  Aspiration + borrowed-net rewrite lost quality for speed. Branch holds it.
+- Working tree dirty (uncommitted, measured no-gain micro): `pattern.rs`
+  LUT draft + `is_clone`/`FULL` shift-spill fixes. Safe to discard or keep.
+- Movegen SATURATED: LUT thread closed 3 ways (key sizes 2^48/2^32 dead,
+  identity argument, measured make 74M vs via_lut 33M). perft_bb bulk
+  3.25B pairs/s @d7. Remaining ±10% micro only.
+- NEXT TARGET (user-ordered): eval-saturate. Incremental PST in Board
+  (+pst:i32, fold delta into make() capture loop = free), evaluate() →
+  3 ops, DELETE eval_cached (double TT probe + pollution per node).
+  O(1) eval, bit-identical values → 5k gate must be 15-15 by construction,
+  100ms gains from speed. Then score_into popcounts + NMP dist_union.
+- Gates (S8gatedef): 5k nodes = quality-per-node, 100ms = strength. Run
+  BOTH for every experiment. `scripts/gate.ps1 <games> <net> [5k|100ms|both]`.
+- Nets: own_v3.s1 learned (pred_cp 108/112 vs tgt 120) but gates 0 both.
+  sancta_w.s1 = owner's brain. data/ logs/ scripts/ target/ gitignored.
+
+
 ## Next levers (in the order we'd take them)
 
 1. **Eval weight tuning loop** — automate: parameter sweep over CONTACT_PEN,
