@@ -132,6 +132,24 @@ embed quotes manually: `$oppQ = "`"$m serve`""`.
   gate 14–16 (≈parity — speed compensates). Sign double-negation bug
   found+fixed. NOT merged. Next: retune RFP/LMR for net scale OR saturate
   own net — user decision.
+- S4v3 own-net (2026-09-21): v3 147x64+128→16→1 exact-distill (r4 25ep flat
+  .294/.296, v3exact stale-math ep12 flat .2602/.2606 KILLED). Gate
+  own_v3.s1 @ep9 vs classical: **0–30 @5k nodes** (identical 0-piece wipe
+  pattern as v1/v2; bench d8 34043 nodes/2.76M vs classical 9401/6.5M —
+  net multiplies nodes 3.6x, buys zero). Epoch check S4v3e: e1 0–20,
+  e5 0–20 — never strong, NOT overfit, init/scale broken from ep0.
+  Harness S5tool: `--net/--opp-net` presets on bench/serve/match
+  (env vars DEAD), `scripts/gate.ps1 <games> <net> [5k|100ms|both]`,
+  `training/export_epoch.py` re-exports any ckpt. Committed 4271d6b.
+- S7quality zero-scaffold (2026-09-21, COMMITTED 2a0a0ba on
+  `exp/sancta-incr` BEFORE net capacity experiments — user ordered
+  Stockfish-grade quality first): Arc/unsafe OUT (borrowed `&'a S1Net`),
+  MoveStack owned by Searcher (no per-search alloc), score_into free fn,
+  integer NMP fill, fallthrough-terminal, aspiration ladder ±50→200→800
+  from depth 5, dead perft()/imports/from_v1_parts pruned. 26t green,
+  sperft 4.22–4.34M x3 (28.2M nodes — aspiration deeper, expected change
+  from 535k), bench d8 classical 17034/6.9M, self-check 10–10.
+  S6score ep25 gated: 20–0 classical @5k (real games, not wipes).
 
 ## Next levers (in the order we'd take them)
 
