@@ -210,6 +210,71 @@ const fn build_block2() -> [[u8; 4]; 36] {
 /// The 4 member squares of 2x2-block anchor `a` (0..35, row-major).
 pub static BLOCK2: [[u8; 4]; 36] = build_block2();
 
+/// 2x2-block PAIRS for the n-tuple eval (S21): non-overlapping adjacent
+/// blocks in 4 directions (own clean-room geometry, idea-level n-tuples).
+/// Per direction: H 24 ((r,c)+(r,c+2)), V 24 ((r,c)+(r+2,c)),
+/// D1 16 ((r,c)+(r+2,c+2)), D2 16 ((r,c)+(r+2,c-2)). 80 pairs total.
+/// Pair index = first-block idx + 81 * second-block idx (ternary 8-cell).
+const fn build_pairs() -> ([[(u8, u8); 24]; 4], [usize; 4]) {
+    let mut t = [[(0u8, 0u8); 24]; 4];
+    let mut n = [0usize; 4];
+    let mut r = 0usize;
+    while r < 6 {
+        let mut c = 0usize;
+        while c < 6 {
+            let a = (r * 6 + c) as u8;
+            if c <= 3 {
+                t[0][n[0]] = (a, a + 2);
+                n[0] += 1; // H
+                if r <= 3 {
+                    t[2][n[2]] = (a, a + 2 * 6 + 2);
+                    n[2] += 1; // D1
+                }
+            }
+            if r <= 3 {
+                t[1][n[1]] = (a, a + 2 * 6);
+                n[1] += 1; // V
+            }
+            if r <= 3 && c >= 2 {
+                t[3][n[3]] = (a, a + 2 * 6 - 2);
+                n[3] += 1; // D2
+            }
+            c += 1;
+        }
+        r += 1;
+    }
+    (t, n)
+}
+
+/// Adjacent block-anchor pairs per direction (see `build_pairs`).
+pub static PAIR_BLOCKS: ([[(u8, u8); 24]; 4], [usize; 4]) = build_pairs();
+
+/// Inverse 2x2 map (S21b, splat forward): per square, the (anchor, base-3
+/// multiplier) pairs of the blocks containing it. Corners sit in 1 block,
+/// edges in 2, interior in 4 — occupancy-driven accumulation touches only
+/// live stones, zero branches, zero shifts.
+const fn build_sq_blocks() -> ([[(u8, u8); 4]; 49], [u8; 49]) {
+    let mut t = [[(0u8, 0u8); 4]; 49];
+    let mut n = [0u8; 49];
+    let mut a = 0usize;
+    while a < 36 {
+        let mut i = 0usize;
+        let mut mult = 1u8;
+        while i < 4 {
+            let sq = BLOCK2[a][i] as usize;
+            t[sq][n[sq] as usize] = (a as u8, mult);
+            n[sq] += 1;
+            mult *= 3;
+            i += 1;
+        }
+        a += 1;
+    }
+    (t, n)
+}
+
+/// Per-square (anchor, ternary multiplier) list + count (see above).
+pub static SQ_BLOCKS: ([[(u8, u8); 4]; 49], [u8; 49]) = build_sq_blocks();
+
 /// Ternary 2x2-block index for anchor `a`: digit per cell (0 = empty or
 /// blocker, 1 = `own`, 2 = `enemy`), cell order = BLOCK2[a] order.
 #[inline]

@@ -98,8 +98,24 @@ fn multicapture_penalty(b: &Board, side: u8, landings_them: u64) -> i32 {
 /// scan enemy reachability per node — the knowledge that won +190/+330.
 /// The n-tuple term (`tup`, S20) adds learned local-shape knowledge on top;
 /// None = pure hand eval (zero-cost OFF).
-pub fn evaluate(b: &Board, tup: Option<&TupleTable>) -> i32 {
+pub fn evaluate(b: &Board, tup: Option<&TupleTable>, native_tup: bool) -> i32 {
     let mut score = MATERIAL * (b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32) + b.pst;
+    // Tuple-native eval (S21d): mat + PST + tempo + tuples, NO E2/E4
+    // regional scans (~400 ops/node back). The pairs must carry contact-like
+    // shapes themselves (trained vs the simple base). Falls back to the
+    // full hand eval when no table is attached.
+    if native_tup {
+        if b.turn == 0 {
+            score += TEMPO;
+        } else {
+            score -= TEMPO;
+        }
+        let out = if b.turn == 0 { score } else { -score };
+        if let Some(t) = tup {
+            return out + t.forward(b);
+        }
+        return out;
+    }
     // Black-relative balances (negated for white below, like pst).
     let land_b = enemy_landings(b, 1); // squares white threatens to land on
     let land_w = enemy_landings(b, 0);
@@ -344,6 +360,9 @@ pub struct Searcher<'a> {
     /// Optional n-tuple table (None = pure hand eval). Borrowed, read-only
     /// in the tree, same zero-cost-OFF pattern as sancta.
     tuple: Option<&'a TupleTable>,
+    /// Tuple-native eval mode: skip E2/E4 scans, mat+PST+tempo+tuples only.
+    /// False by default (full hand eval + optional additive tuples).
+    tup_native: bool,
     /// Per-ply move/acc buffers, reused across searches (no per-search
     /// alloc: MoveStack is ~72KB of lists + acc, was rebuilt per search).
     stack: MoveStack,
@@ -383,6 +402,7 @@ impl<'a> Searcher<'a> {
             history: Box::new([[0; 49]; 2]),
             sancta: None,
             tuple: None,
+            tup_native: false,
             stack: MoveStack::new(),
         }
     }
@@ -397,6 +417,12 @@ impl<'a> Searcher<'a> {
     /// search duration; zero-cost OFF (None branch).
     pub fn set_tuple(&mut self, t: Option<&'a TupleTable>) {
         self.tuple = t;
+    }
+
+    /// Tuple-native eval mode (skip E2/E4 scans). Predictable branch,
+    /// ~free; the mode it selects is the fast one.
+    pub fn set_tuple_native(&mut self, native: bool) {
+        self.tup_native = native;
     }
 
     /// Override the clock (wasm builds inject `performance.now()`).
@@ -490,7 +516,7 @@ impl<'a> Searcher<'a> {
         // no negation (that was the 0-50 bug: double-negated white nodes).
         let static_eval = match self.sancta {
             Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
-            None => evaluate(b, self.tuple),
+            None => evaluate(b, self.tuple, self.tup_native),
         };
 
         // Reverse futility pruning (autaxx, exact form): standing pat is so
@@ -548,7 +574,7 @@ impl<'a> Searcher<'a> {
             if list.is_empty() {
                 let static_eval = match self.sancta {
                     Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
-                    None => evaluate(b, self.tuple),
+                    None => evaluate(b, self.tuple, self.tup_native),
                 };
                 self.finish_node(b, alpha_orig, beta, static_eval, 0xFFFF, depth, ply);
                 return static_eval;

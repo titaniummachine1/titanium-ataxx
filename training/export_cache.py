@@ -1,8 +1,9 @@
 """Export dag.db -> packed binary cache (parse FEN ONCE, never again).
 
-Row: occ0:u64, occ1:u64, blk:u64, stm:u8, out:f32, sc:f32 = 32 bytes.
+Row: occ0:u64, occ1:u64, blk:u64, stm:u8, out:f32, sc:f32, wsum:f32.
 400k rows = 12.8MB. Load = single read, zero parsing, zero sqlite.
 Same bitboards the engine uses -> ports straight to Rust later.
+wsum = teacher visit weight (S21f: trust high-visit rows in training).
 
 Usage: python3 training/export_cache.py --top-wsum 400000 --out data/nnue/cache400k.npz
 """
@@ -43,7 +44,7 @@ def main():
 
     con = sqlite3.connect(a.db)
     con.execute('pragma journal_mode=off')
-    base = ('select fen, stm, visits, sum_outcome, best_score from nodes where margin_n>0')
+    base = ('select fen, stm, visits, sum_outcome, best_score, wsum from nodes where margin_n>0')
     if a.limit:
         q = base + ' limit %d' % a.limit
     else:
@@ -60,15 +61,17 @@ def main():
     stm = np.zeros(n, dtype=np.uint8)
     out = np.zeros(n, dtype=np.float32)
     sc = np.zeros(n, dtype=np.float32)
+    wsum = np.zeros(n, dtype=np.float32)
     t0 = time.time()
-    for i, (fen, s, vis, s_out, best) in enumerate(rows):
+    for i, (fen, s, vis, s_out, best, w) in enumerate(rows):
         o0, o1, b = fen_to_bb(fen)
         occ0[i], occ1[i], blk[i] = o0, o1, b
         stm[i] = s
         out[i] = max(-1.0, min(1.0, s_out / max(1, vis)))
         sc[i] = max(-2000.0, min(2000.0, best)) / 2000.0
+        wsum[i] = max(0.0, w)
     print('packed %d rows in %.0fs' % (n, time.time() - t0), flush=True)
-    np.savez_compressed(a.out, occ0=occ0, occ1=occ1, blk=blk, stm=stm, out=out, sc=sc)
+    np.savez_compressed(a.out, occ0=occ0, occ1=occ1, blk=blk, stm=stm, out=out, sc=sc, wsum=wsum)
     import os
     print('wrote %s %.1fMB' % (a.out, os.path.getsize(a.out) / 1e6), flush=True)
 

@@ -29,6 +29,7 @@ fn main() -> ExitCode {
             flag_int(&args, "--depth").unwrap_or(8) as u32,
             flag_str(&args, "--net"),
             flag_str(&args, "--tuple"),
+            args.iter().any(|x| x == "--tuple-native"),
         ),
         "selfplay" => selfplay_cmd(
             flag_int(&args, "--games").unwrap_or(2) as u32,
@@ -46,6 +47,7 @@ fn main() -> ExitCode {
             flag_int(&args, "--tt-bits").unwrap_or(20) as usize,
             flag_str(&args, "--net"),
             flag_str(&args, "--tuple"),
+            args.iter().any(|x| x == "--tuple-native"),
         ),
         "match" => match_cmd(
             flag_int(&args, "--games").unwrap_or(20) as u32,
@@ -55,6 +57,8 @@ fn main() -> ExitCode {
             flag_str(&args, "--opp-net"),
             flag_str(&args, "--tuple"),
             flag_str(&args, "--opp-tuple"),
+            args.iter().any(|x| x == "--tuple-native"),
+            args.iter().any(|x| x == "--opp-tuple-native"),
             flag_int(&args, "--opp-time").unwrap_or(1000) as u64,
             flag_int(&args, "--opp-depth").map(|d| d as u32),
             flag_int(&args, "--opp-nodes").map(|n| n as u64),
@@ -230,7 +234,7 @@ fn tuple_flag_str(spec: &Option<String>) -> String {
     }
 }
 
-fn bench_cmd(depth: u32, net_spec: Option<String>, tup_spec: Option<String>) -> ExitCode {
+fn bench_cmd(depth: u32, net_spec: Option<String>, tup_spec: Option<String>, tup_native: bool) -> ExitCode {
     let net = match load_net_preset(&net_spec) {
         Ok(n) => {
             match &net_spec {
@@ -267,6 +271,10 @@ fn bench_cmd(depth: u32, net_spec: Option<String>, tup_spec: Option<String>) -> 
     let mut searcher = Searcher::new();
     searcher.set_sancta(net.as_ref());
     searcher.set_tuple(tup.as_ref());
+    searcher.set_tuple_native(tup_native && tup.is_some());
+    if tup_native {
+        println!("Bench: tuple-NATIVE eval (no E2/E4 scans)");
+    }
     let r = searcher.search(&b, &limits);
     let secs = r.elapsed.as_secs_f64();
     println!(
@@ -543,7 +551,12 @@ fn out_line(s: &str) {
     let _ = o.flush();
 }
 
-fn serve_cmd(tt_bits: usize, net_spec: Option<String>, tup_spec: Option<String>) -> ExitCode {
+fn serve_cmd(
+    tt_bits: usize,
+    net_spec: Option<String>,
+    tup_spec: Option<String>,
+    tup_native: bool,
+) -> ExitCode {
     let stdin = io::stdin();
     let mut searcher = Searcher::with_tt_bits(tt_bits);
     // Eval presets come from --net / --tuple ONLY. Owned tables outlive the
@@ -564,6 +577,7 @@ fn serve_cmd(tt_bits: usize, net_spec: Option<String>, tup_spec: Option<String>)
         }
     };
     searcher.set_tuple(owned_tup.as_ref());
+    searcher.set_tuple_native(tup_native && owned_tup.is_some());
     let mut current: Option<Board> = None;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -755,6 +769,8 @@ fn match_cmd(
     opp_net_spec: Option<String>,
     tup_spec: Option<String>,
     opp_tup_spec: Option<String>,
+    tup_native: bool,
+    opp_tup_native: bool,
     opp_time: u64,
     opp_depth: Option<u32>,
     opp_nodes: Option<u64>,
@@ -810,6 +826,9 @@ fn match_cmd(
                     if !with_flags.contains("--tuple") {
                         with_flags = format!("{with_flags} {}", tuple_flag_str(&opp_tup_spec));
                     }
+                    if opp_tup_native && !with_flags.contains("--tuple-native") {
+                        with_flags = format!("{with_flags} --tuple-native");
+                    }
                 }
                 with_flags
             }
@@ -864,9 +883,11 @@ fn match_cmd(
         let mut searcher = Searcher::new(); // fresh TT per game
         searcher.set_sancta(net.as_ref());
         searcher.set_tuple(tup.as_ref());
+        searcher.set_tuple_native(tup_native && tup.is_some());
         let mut opp_searcher = Searcher::new(); // for --opp self
         opp_searcher.set_sancta(opp_net.as_ref());
         opp_searcher.set_tuple(opp_tup.as_ref());
+        opp_searcher.set_tuple_native(opp_tup_native && opp_tup.is_some());
         let titanium_is_black = game % 2 == 1;
         let mut log = String::new();
         let mut result = None;
