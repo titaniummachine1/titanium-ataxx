@@ -4,6 +4,7 @@
 //! (TT move > killers > captures*W + history) -> lazy selection -> alpha-beta.
 
 use crate::board::{dist_union, Board, Move, MoveList, RING1, SQUARES};
+use crate::sancta::{S1Acc, S1Net};
 use std::time::Duration;
 
 pub const MATE: i32 = 100_000;
@@ -13,16 +14,21 @@ const MATE_BOUND: i32 = MATE - 2000;
 /// Search stack depth cap (max_depth is clamped well below this).
 const MAX_PLY: usize = 40;
 
-/// Per-ply move buffers allocated once per search: nodes only reset `len`,
-/// they never re-initialize the arrays.
+/// Per-ply move buffers, one alloc per Searcher, reused across searches.
+/// `acc` carries the lazy sancta accumulator per ply (refresh_root once at
+/// the root, update_child parent->child diffs). OFF path = None check only.
+/// MoveList 256x2B moves + 256x4B scores + len = ~1.5KB, acc 2x64x2B =
+/// 256B -> ~1.8KB/ply, ~72KB total. No Clone, no Vec, no Drop in the tree.
 struct MoveStack {
     lists: Box<[MoveList; MAX_PLY]>,
+    acc: Box<[S1Acc; MAX_PLY]>,
 }
 
 impl MoveStack {
     fn new() -> MoveStack {
         MoveStack {
             lists: Box::new([MoveList::new(); MAX_PLY]),
+            acc: Box::new([[[0; 64]; 2]; MAX_PLY]),
         }
     }
 }
@@ -31,17 +37,6 @@ impl MoveStack {
 const MATERIAL: i32 = 100;
 /// Tempo: flat bonus for the side to move. autaxx uses 1.5-2 stones worth.
 const TEMPO: i32 = 150;
-/// Square PST (autaxx quiet-ordering table): corners/edges good, center bad.
-/// Rows top->bottom, symmetric.
-const PST: [i32; 49] = [
-    30, 20, 10, 10, 10, 20, 30, //
-    20, 10, 10, 5, 10, 10, 20, //
-    10, 10, 5, 0, 5, 10, 10, //
-    10, 5, 0, 0, 0, 5, 10, //
-    10, 10, 5, 0, 5, 10, 10, //
-    20, 10, 10, 5, 10, 10, 20, //
-    30, 20, 10, 10, 10, 20, 30,
-];
 /// Reverse futility pruning margins, index = depth-1 (autaxx, stone = 100).
 const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774];
 
@@ -56,22 +51,11 @@ const ORD_HISTORY_MAX: i32 = 90_000;
 const _: () = assert!(ORD_HISTORY_MAX + 8 * ORD_CAPTURE_UNIT + ORD_CLONE_BONUS < ORD_KILLER);
 const _: () = assert!(ORD_KILLER < ORD_TT);
 
-/// Static eval from the side-to-move's perspective.
-/// EXP slim-eval-speed: material + PST + tempo ONLY. Holes/contact/multicap
-/// stripped to measure eval-cost ceiling (speed only, strength be damned).
+/// Static eval from the side-to-move's perspective. O(1): material from the
+/// incremental counters, PST from the incremental `Board::pst` balance
+/// (updated in make()), tempo flat. No per-node stone loops.
 pub fn evaluate(b: &Board) -> i32 {
-    let mat = MATERIAL * (b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32);
-    let mut pst = 0i32;
-    for c in 0..2 {
-        let sign = if c == 0 { 1 } else { -1 };
-        let mut bb = b.occ[c];
-        while bb != 0 {
-            let sq = bb.trailing_zeros() as usize;
-            bb &= bb - 1;
-            pst += sign * PST[sq];
-        }
-    }
-    let mut score = mat + pst;
+    let mut score = MATERIAL * (b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32) + b.pst;
     if b.turn == 0 {
         score += TEMPO;
     } else {
@@ -81,6 +65,51 @@ pub fn evaluate(b: &Board) -> i32 {
         score
     } else {
         -score
+    }
+}
+
+/// Score moves in place: TT move > killers > captures*W + history.
+/// Free function (not a method) so negamax can borrow the move stack
+/// mutably while reading killers/history immutably — no split-borrow
+/// fight, no unsafe, no clone.
+#[inline]
+fn score_into(
+    b: &Board,
+    list: &mut MoveList,
+    tt_mv: u32,
+    ply: u32,
+    killers: &[(u32, u32); MAX_PLY],
+    history: &[[u32; 49]; 2],
+) {
+    b.legal_moves_dedup_into(list);
+    let opp = b.opp();
+    let (k1, k2) = killers[ply as usize];
+    let hist = &history[b.turn as usize];
+    let mut tt_index = usize::MAX;
+    for i in 0..list.len() {
+        let m = list.move_at(i);
+        let packed = m.to_u32();
+        if packed == tt_mv {
+            tt_index = i;
+            list.set_score(i, i32::MAX / 2);
+            continue;
+        }
+        let mut score = (opp & RING1[m.to as usize]).count_ones() as i32 * ORD_CAPTURE_UNIT;
+        // Clone preference: a clone nets one more stone than a jump and
+        // leaves the origin defended ("duplicate as much as you can").
+        if m.is_clone() {
+            score += ORD_CLONE_BONUS;
+        } else {
+            score -= ORD_JUMP_PEN;
+        }
+        if packed == k1 || packed == k2 {
+            score += ORD_KILLER;
+        }
+        score += (hist[m.to as usize] as i32).min(ORD_HISTORY_MAX);
+        list.set_score(i, score);
+    }
+    if tt_index != usize::MAX && tt_index != 0 {
+        list.swap(tt_index, 0);
     }
 }
 
@@ -238,7 +267,7 @@ pub struct SearchResult {
     pub stopped_by: Option<StopReason>,
 }
 
-pub struct Searcher {
+pub struct Searcher<'a> {
     pub nodes: u64,
     /// Absolute deadline in milliseconds (via `time_src`), if time-limited.
     deadline_ms: Option<f64>,
@@ -255,6 +284,13 @@ pub struct Searcher {
     killers: Box<[(u32, u32); MAX_PLY]>,
     /// History heuristic: [mover][to] cutoff counters, aged per search.
     history: Box<[[u32; 49]; 2]>,
+    /// Optional sancta net (None = classical slim eval). Borrowed weights,
+    /// set once via set_sancta, read-only in the tree. Zero refcount,
+    /// zero unsafe — the borrow checker proves the net outlives the search.
+    sancta: Option<&'a S1Net>,
+    /// Per-ply move/acc buffers, reused across searches (no per-search
+    /// alloc: MoveStack is ~72KB of lists + acc, was rebuilt per search).
+    stack: MoveStack,
 }
 
 /// Monotonic milliseconds since process start (native default time source).
@@ -265,19 +301,19 @@ fn native_now_ms() -> f64 {
     BOOT.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
 }
 
-impl Default for Searcher {
+impl Default for Searcher<'_> {
     fn default() -> Self {
         Self::new()
     }
 }
-impl Searcher {
-    pub fn new() -> Searcher {
+impl<'a> Searcher<'a> {
+    pub fn new() -> Searcher<'a> {
         Searcher::with_tt_bits(20)
     }
 
     /// Searcher with a `2^bits`-entry transposition table (wasm builds use
     /// smaller tables).
-    pub fn with_tt_bits(bits: usize) -> Searcher {
+    pub fn with_tt_bits(bits: usize) -> Searcher<'a> {
         Searcher {
             nodes: 0,
             deadline_ms: None,
@@ -289,7 +325,15 @@ impl Searcher {
             tt: Tt::new(bits),
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[0; 49]; 2]),
+            sancta: None,
+            stack: MoveStack::new(),
         }
+    }
+
+    /// Attach a sancta net (None = classical). Borrowed for the search
+    /// duration; zero-cost OFF (None branch).
+    pub fn set_sancta(&mut self, net: Option<&'a S1Net>) {
+        self.sancta = net;
     }
 
     /// Override the clock (wasm builds inject `performance.now()`).
@@ -297,16 +341,12 @@ impl Searcher {
         self.time_src = f;
     }
 
-    pub fn clear_tt(&mut self) {
-        self.tt.clear();
-    }
-
     /// Full state reset between games (TT, killers, history) — prevents
     /// cross-game leakage in long matches (titanium binary_match lesson).
     pub fn reset_for_new_game(&mut self) {
         self.tt.clear();
-        self.killers = Box::new([(0, 0); MAX_PLY]);
-        self.history = Box::new([[0; 49]; 2]);
+        *self.killers = [(0, 0); MAX_PLY];
+        *self.history = [[0; 49]; 2];
     }
 
     #[inline]
@@ -328,45 +368,10 @@ impl Searcher {
         }
     }
 
-    /// Score moves in place: TT move > killers > captures*W + history.
-    /// Clone moves are deduplicated per destination (identical children).
-    fn score_into(&self, b: &Board, list: &mut MoveList, tt_mv: u32, ply: u32) {
-        b.legal_moves_dedup_into(list);
-        let opp = b.opp();
-        let (k1, k2) = self.killers[ply as usize];
-        let hist = &self.history[b.turn as usize];
-        let mut tt_index = usize::MAX;
-        for i in 0..list.len() {
-            let m = list.move_at(i);
-            let packed = m.to_u32();
-            if packed == tt_mv {
-                tt_index = i;
-                list.set_score(i, i32::MAX / 2);
-                continue;
-            }
-            let mut score = (opp & RING1[m.to as usize]).count_ones() as i32 * ORD_CAPTURE_UNIT;
-            // Clone preference: a clone nets one more stone than a jump and
-            // leaves the origin defended ("duplicate as much as you can").
-            if m.is_clone() {
-                score += ORD_CLONE_BONUS;
-            } else {
-                score -= ORD_JUMP_PEN;
-            }
-            if packed == k1 || packed == k2 {
-                score += ORD_KILLER;
-            }
-            score += (hist[m.to as usize] as i32).min(ORD_HISTORY_MAX);
-            list.set_score(i, score);
-        }
-        if tt_index != usize::MAX && tt_index != 0 {
-            list.swap(tt_index, 0);
-        }
-    }
-
+    #[inline]
     fn negamax(
         &mut self,
         b: &Board,
-        stack: &mut MoveStack,
         mut alpha: i32,
         mut beta: i32,
         depth: u32,
@@ -389,9 +394,7 @@ impl Searcher {
         let alpha_orig = alpha;
         let mut tt_mv: u32 = 0;
         let mut depth = depth;
-        let mut tt_hit = false;
         if let Some(e) = self.tt.probe(b.hash) {
-            tt_hit = true;
             tt_mv = e.mv;
             if e.depth as u32 >= depth {
                 let s = score_from_tt(e.score, ply);
@@ -416,9 +419,16 @@ impl Searcher {
         } else if depth >= 4 {
             depth -= 1;
         }
-        let _ = tt_hit;
 
-        let static_eval = self.eval_cached(b);
+        // Lazy incremental sancta: root refreshed once in search(); every
+        // child acc = parent acc + bitboard diffs at make() time (below).
+        // OFF = single branch to classical, zero-cost.
+        // forward_ready(acc, stm) is ALREADY stm-relative (like evaluate) —
+        // no negation (that was the 0-50 bug: double-negated white nodes).
+        let static_eval = match self.sancta {
+            Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
+            None => evaluate(b),
+        };
 
         // Reverse futility pruning (autaxx, exact form): standing pat is so
         // far below alpha that even a generous error margin cannot recover
@@ -437,12 +447,16 @@ impl Searcher {
         // board not too full (forced-pass danger zone). R = 3.
         if null_allowed && depth > 2 {
             let clone_targets = (dist_union(b.occ[b.turn as usize], 1) & b.empty()).count_ones();
-            let fill = (b.piece_cnt[0] + b.piece_cnt[1]) as f64 / SQUARES as f64;
-            if clone_targets >= 11 && fill < 0.54 {
+            // fill < 0.54 as integer: pieces*50 < 26*49 (no per-node float div).
+            if clone_targets >= 11
+                && (b.piece_cnt[0] as u32 + b.piece_cnt[1] as u32) * 50 < 26 * SQUARES as u32
+            {
                 let child = b.make_pass();
+                // NMP pass flips stm: sancta acc is color-relative so it
+                // stays valid — just forward the other perspective.
+                // (pass: no stones change, no diff update needed.)
                 let score = -self.negamax(
                     &child,
-                    stack,
                     -beta,
                     -beta + 1,
                     depth - 3,
@@ -463,27 +477,46 @@ impl Searcher {
         }
 
         {
-            let list = &mut stack.lists[ply as usize];
-            self.score_into(b, list, tt_mv, ply);
+            let list = &mut self.stack.lists[ply as usize];
+            score_into(b, list, tt_mv, ply, &self.killers, &self.history);
+            // Fallthrough terminal: legal_moves_dedup_into tracks dedup
+            // multiplicities, so len>0 always — but double-pass positions
+            // have no children to search: score the pass-through.
+            if list.is_empty() {
+                let static_eval = match self.sancta {
+                    Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
+                    None => evaluate(b),
+                };
+                self.finish_node(b, alpha_orig, beta, static_eval, 0xFFFF, depth, ply);
+                return static_eval;
+            }
         }
 
         let mut best = i32::MIN;
         let mut best_mv: u32 = 0xFFFF;
         let mut move_idx = 0usize;
         loop {
-            let list = &mut stack.lists[ply as usize];
-            if list.is_empty() {
-                break;
-            }
-            let m = list.pop_best();
+            let m = {
+                let list = &mut self.stack.lists[ply as usize];
+                if list.is_empty() {
+                    break;
+                }
+                list.pop_best()
+            };
 
             // PVS + universal LMR (autaxx): first move full window full
             // depth; every later move scouts with a null window at a reduced
             // depth (r = 2, or 3 from the 10th move), re-searching full
             // window + full depth only when the scout beats alpha.
+            // Lazy sancta: child acc = parent acc + diffs BEFORE recursing.
+            let child = b.make(m);
+            if let Some(net) = self.sancta {
+                let (a, z) = self.stack.acc.split_at_mut(ply as usize + 1);
+                net.update_child(&a[ply as usize], &mut z[0], b, &child);
+            }
             let mut score;
             if move_idx == 0 {
-                score = -self.negamax(&b.make(m), stack, -beta, -alpha, depth - 1, ply + 1, true);
+                score = -self.negamax(&child, -beta, -alpha, depth - 1, ply + 1, true);
                 if self.stop {
                     return 0;
                 }
@@ -491,8 +524,7 @@ impl Searcher {
                 let r: u32 = if move_idx < 9 { 2 } else { 3 };
                 let reduced = depth.saturating_sub(1 + r);
                 score = -self.negamax(
-                    &b.make(m),
-                    stack,
+                    &child,
                     -alpha - 1,
                     -alpha,
                     reduced,
@@ -503,9 +535,10 @@ impl Searcher {
                     return 0;
                 }
                 if score > alpha && reduced < depth - 1 {
+                    // Re-search: scout already wrote child acc in place
+                    // (same parent+child), so it is still valid. No rebuild.
                     score = -self.negamax(
-                        &b.make(m),
-                        stack,
+                        &child,
                         -beta,
                         -alpha,
                         depth - 1,
@@ -533,19 +566,6 @@ impl Searcher {
         }
         self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply);
         best
-    }
-
-    /// Eval with the TT as cache (depth-0 EXACT entries).
-    #[inline]
-    fn eval_cached(&mut self, b: &Board) -> i32 {
-        if let Some(e) = self.tt.probe(b.hash) {
-            if e.flag == FLAG_EXACT && e.depth == 0 {
-                return e.score;
-            }
-        }
-        let ev = evaluate(b);
-        self.tt.store(b.hash, 0, ev, 0, FLAG_EXACT);
-        ev
     }
 
     /// Killer/history bookkeeping on a beta cutoff.
@@ -599,7 +619,6 @@ impl Searcher {
             .time
             .map(|t| self.start_ms + t.as_secs_f64() * 1000.0);
 
-        let mut stack = MoveStack::new();
         let mut result = SearchResult::default();
         // Age the history table so old cutoffs don't dominate forever.
         for row in self.history.iter_mut() {
@@ -610,28 +629,33 @@ impl Searcher {
         {
             // Root ordering: score once, drain by pop_best into a fixed
             // array (best-first). Each iteration reorders the array.
-            let root = &mut stack.lists[0];
             let tt_mv = self.tt.probe(b.hash).map(|e| e.mv).unwrap_or(0);
-            self.score_into(b, root, tt_mv, 0);
+            let (kill, hist) = (&self.killers, &self.history);
+            let root = &mut self.stack.lists[0];
+            score_into(b, root, tt_mv, 0, kill, hist);
         }
-        let n_root = stack.lists[0].len();
+        let n_root = self.stack.lists[0].len();
         if n_root == 0 {
             // Pass node: give the caller a meaningful score through the pass.
             if !b.game_over() {
                 result.score =
-                    -self.negamax(&b.make_pass(), &mut stack, -i32::MAX, i32::MAX, 1, 1, true);
+                    -self.negamax(&b.make_pass(), -i32::MAX, i32::MAX, 1, 1, true);
             }
             result.elapsed = self.elapsed();
             result.nodes = self.nodes;
             return result; // caller must handle pass / game over
         }
         // Root best-so-far: drained best-first into a fixed array.
+        // Root acc refreshed once (sancta lazy path: children diff from it).
         let mut root_moves = [Move::PASS; 256];
         {
-            let root = &mut stack.lists[0];
-            for i in 0..n_root {
-                root_moves[i] = root.pop_best();
+            let root = &mut self.stack.lists[0];
+            for m in root_moves.iter_mut().take(n_root) {
+                *m = root.pop_best();
             }
+        }
+        if let Some(net) = self.sancta {
+            net.refresh_root(b, &mut self.stack.acc[0]);
         }
         result.best = Some(root_moves[0]);
 
@@ -647,9 +671,18 @@ impl Searcher {
             let mut alpha = i32::MIN + 1;
             let mut best_this = None;
             let mut best_score = i32::MIN;
+            // Clean-main ID: FULL window every iteration. No aspiration.
+            // (Aspiration reverted: narrowed windows changed PVS cutoffs at
+            // fixed node budgets -> bench d8 9.4k=>17k, QB5k 45-53-2.-28.)
             for i in 0..n_root {
                 let m = root_moves[i];
-                let score = -self.negamax(&b.make(m), &mut stack, -i32::MAX, -alpha, depth - 1, 1, true);
+                let child = b.make(m);
+                // Root children: acc[1] = acc[0] + diffs (sancta lazy path).
+                if let Some(net) = self.sancta {
+                    let (a, z) = self.stack.acc.split_at_mut(1);
+                    net.update_child(&a[0], &mut z[0], b, &child);
+                }
+                let score = -self.negamax(&child, -i32::MAX, -alpha, depth - 1, 1, true);
                 if self.stop {
                     break;
                 }

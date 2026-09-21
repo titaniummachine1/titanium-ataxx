@@ -121,11 +121,58 @@ embed quotes manually: `$oppQ = "`"$m serve`""`.
 - E4 **multi-capture exposure** (user): −20 per extra stone convertible in
   one enemy landing — **+330 Elo. MERGED.**
 - Cumulative ~+700 self-play Elo; Moonbird still 0–32 at both gates.
-- S1 **slim-eval-speed** (branch `exp/slim-eval-speed`, 2026-09-20): eval =
-  material+PST+tempo; Ordering/radix/insertion/LMP/LUT paths deleted
-  (−307/+41). Sperft 4.11 vs main-lazy 2.40 (+71%). **100-game @100ms gate:
-  slim 73 – main 15 – 12 draws = +230 Elo. NO REGRESSION.** Merge-ready.
-  Main still untouched pending user merge order.
+- S1 **slim-eval-speed** (2026-09-20): eval = material+PST+tempo;
+  Ordering/radix/insertion/LMP/LUT paths deleted (−307/+41). Sperft 4.11
+  vs old-lazy 2.40 (+71%). 100g@100ms 73–15–12 (+230). **MERGED to main
+  `7ab844e`, pushed.** Main now = slim, sperft 4.29 Mnps.
+- S2 sancta lazy-incr (branch `exp/sancta-incr`, off new main): minimal
+  sancta.rs (load+refresh+SIMD forward, no S4Undo/PROF), root refresh once,
+  child acc = parent acc + diffs at make(). OFF zero-cost (sperft 4.22 vs
+  4.29). ON 5.0–5.2M NPS (swap ~free). 5k-node gate 10–20 (−140); 100ms
+  gate 14–16 (≈parity — speed compensates). Sign double-negation bug
+  found+fixed. NOT merged. Next: retune RFP/LMR for net scale OR saturate
+  own net — user decision.
+- S4v3 own-net (2026-09-21): v3 147x64+128→16→1 exact-distill (r4 25ep flat
+  .294/.296, v3exact stale-math ep12 flat .2602/.2606 KILLED). Gate
+  own_v3.s1 @ep9 vs classical: **0–30 @5k nodes** (identical 0-piece wipe
+  pattern as v1/v2; bench d8 34043 nodes/2.76M vs classical 9401/6.5M —
+  net multiplies nodes 3.6x, buys zero). Epoch check S4v3e: e1 0–20,
+  e5 0–20 — never strong, NOT overfit, init/scale broken from ep0.
+  Harness S5tool: `--net/--opp-net` presets on bench/serve/match
+  (env vars DEAD), `scripts/gate.ps1 <games> <net> [5k|100ms|both]`,
+  `training/export_epoch.py` re-exports any ckpt. Committed 4271d6b.
+- S7quality zero-scaffold (2026-09-21, COMMITTED 2a0a0ba on
+  `exp/sancta-incr` BEFORE net capacity experiments — user ordered
+  Stockfish-grade quality first): Arc/unsafe OUT (borrowed `&'a S1Net`),
+  MoveStack owned by Searcher (no per-search alloc), score_into free fn,
+  integer NMP fill, fallthrough-terminal, aspiration ladder ±50→200→800
+  from depth 5, dead perft()/imports/from_v1_parts pruned. 26t green,
+  sperft 4.22–4.34M x3 (28.2M nodes — aspiration deeper, expected change
+  from 535k), bench d8 classical 17034/6.9M, self-check 10–10.
+  S6score ep25 gated: 20–0 classical @5k (real games, not wipes).
+
+## STATE FOR NEW SESSION (2026-09-21 close)
+
+- Branch: `exp/sancta-incr` = 3 commits past main `7ab844e`:
+  `f8b98b5` (v3 loss contract), `4271d6b` (harness presets + S6),
+  `2a0a0ba` (S7quality). main UNTOUCHED = slim `7ab844e`.
+- S7quality = REGRESSION both gates (QB 16–84 @100ms rerun + 45–53–2 @5k).
+  Aspiration + borrowed-net rewrite lost quality for speed. Branch holds it.
+- Working tree dirty (uncommitted, measured no-gain micro): `pattern.rs`
+  LUT draft + `is_clone`/`FULL` shift-spill fixes. Safe to discard or keep.
+- Movegen SATURATED: LUT thread closed 3 ways (key sizes 2^48/2^32 dead,
+  identity argument, measured make 74M vs via_lut 33M). perft_bb bulk
+  3.25B pairs/s @d7. Remaining ±10% micro only.
+- NEXT TARGET (user-ordered): eval-saturate. Incremental PST in Board
+  (+pst:i32, fold delta into make() capture loop = free), evaluate() →
+  3 ops, DELETE eval_cached (double TT probe + pollution per node).
+  O(1) eval, bit-identical values → 5k gate must be 15-15 by construction,
+  100ms gains from speed. Then score_into popcounts + NMP dist_union.
+- Gates (S8gatedef): 5k nodes = quality-per-node, 100ms = strength. Run
+  BOTH for every experiment. `scripts/gate.ps1 <games> <net> [5k|100ms|both]`.
+- Nets: own_v3.s1 learned (pred_cp 108/112 vs tgt 120) but gates 0 both.
+  sancta_w.s1 = owner's brain. data/ logs/ scripts/ target/ gitignored.
+
 
 ## Next levers (in the order we'd take them)
 
