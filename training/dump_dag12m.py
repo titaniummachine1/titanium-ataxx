@@ -53,15 +53,28 @@ def main():
     per = (total + a.chunks - 1) // a.chunks
     print('usable %d chunks %d per-chunk ~%d' % (total, a.chunks, per), flush=True)
 
-    man = open(os.path.join(a.out, 'manifest.txt'), 'w')
+    man_path = os.path.join(a.out, 'manifest.txt')
+    man = open(man_path, 'a' if os.path.exists(man_path) else 'w')
     for c in range(a.chunks):
         lo = c * per
         if lo >= total:
             break
         txt = os.path.join(a.out, 'lab_%02d.txt' % c)
         npz = os.path.join(a.out, 'base_%02d.npz' % c)
+        # skip chunks fully done in a previous run (manifest already lists them,
+        # unless --redo). Partial/stale chunks (e.g. from the killed smoke test
+        # that reused --limit offsets) must be redone, so verify row counts.
+        want = min(per, total - lo)
+        done = False
         if os.path.exists(txt) and os.path.exists(npz) and not a.redo:
-            print('chunk %02d exists, skip' % c, flush=True)
+            try:
+                z0 = np.load(npz)
+                if len(z0['occ0']) == want and sum(1 for _ in open(txt, 'rb')) == want:
+                    print('chunk %02d exists, skip' % c, flush=True)
+                    done = True
+            except Exception:
+                done = False
+        if done:
             continue
         q = ('select fen, stm, visits, sum_outcome, best_score, wsum from nodes '
              'where margin_n>0 order by rowid limit %d offset %d' % (per, lo))
