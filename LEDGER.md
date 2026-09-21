@@ -8,8 +8,8 @@ Gate definitions (both engines on the same limit, never depth-capped):
 
 | gate | meaning | command sketch |
 |---|---|---|
-| **5k nodes** | equal compute: `--nodes 5000` both sides, Moonbird gets `go nodes 5000` | `match --games N --nodes 5000 --opp <cmd> --opp-nodes 5000` |
-| **10ms / 100ms** | equal wall-clock strength: `--time 100` both sides (10ms for quick sanity) | `match --games N --time 100 --opp <cmd> --opp-time 100` |
+| **5k nodes** | equal compute (quality DIAGNOSIS): `--nodes 5000` both sides, Moonbird gets `go nodes 5000` | `match --games N --nodes 5000 --opp <cmd> --opp-nodes 5000` |
+| **100ms / 200ms** | realistic strength (the CROWN): `--time 100` (or 200) both sides. Merge requires BOTH won with a discernible pattern (BEHAVIOR law 6 v2) | `match --games N --time 100 --opp <cmd> --opp-time 100` |
 
 8 parallel shards × 4 games = 32 games ≈ 1 min per gate. Bigger runs (100 /
 1000 games) when requested. Elo estimate: `−400·log10(1/s − 1)`,

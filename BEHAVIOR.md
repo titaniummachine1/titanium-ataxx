@@ -22,8 +22,18 @@ real memory. Update them the moment something happens, not at the end.
 5. **TRASH UNTIL PROVEN.** Every prior claim is trash until re-measured on the
    current branch. Microbenchmarks don't crown — tree NPS (bench/sperft,
    back-to-back alternating) does.
-6. **Merge policy:** gains Elo → MERGE; neutral/dry → STILL MERGE; worse by
-   ANY → ASK user, no unilateral rejects.
+6. **Merge policy (user law 2026-09-21 v2 — supersedes "neutral→MERGE"):**
+   merge ONLY what is proven STRONGER beyond reasonable doubt. Proof =
+   BOTH realistic time gates (100ms AND 200ms) won with a discernible
+   pattern (32g minimum, win holds across colors/shards — not coin-flip
+   variance). The 5k-node gate is the quality DIAGNOSIS: per-node may be
+   weaker and the change still merges IF both time gates win (speed
+   legitimately compensates). Neutral/dry does NOT merge anymore — no
+   proof of stronger, no merge. Any regression at the time gates = NO
+   merge. Even the smallest gain counts, but it must be REAL and
+   repeatable: when in doubt, run more games, never merge on vibes.
+   Direction of travel is only forward — we prove each kept change
+   didn't make the engine worse.
 
 ## Mistakes ledger (written when scolded, read before acting)
 
