@@ -145,6 +145,8 @@ real memory. Update them the moment something happens, not at the end.
 
 - 2026-09-21 VOLATILITY-UNIFIES-ALL (user insight): Ataxx = tactical exchanges until sudden fill/wipe. Positions are VOLATILE (800cp swings per ply, no quiet maneuvering). This one fact explains EVERY failed mechanism: countermove (-137, replies do not persist across exchanges), correction history (flat, shallow verdicts are noise), singular (-112, no lone standout among 57 tactical moves), aspiration (exploded, scores jump window edges), outcome-blend (-400, results are 90-ply credit-assignment lottery). Prescription: dense graded teacher-SCORES as signal (proven +125), depth-first engine, distrust any mechanism assuming positional stability.
 
+- 2026-09-21 FLIP-AVALANCHE (user): one landing converts up to 8; +500 becomes -500 in a ply; ALMOST-WINNING IS UNDEFINED. Corollary: S13 contact/multicap are FLIP INSURANCE (endangered = flip candidates, multicap = multi-flip exposure) - the engine already prices treachery, SPSA tunes the paranoia knobs. Volatility-native proposals: (1) conversion extensions (extend big-capture lines, chase avalanches in search); (2) sharpness-weighted training (pre-avalanche decisions = highest-value rows); (3) SMP depth (see the flip coming). Smoothness-assuming mechanisms stay banned.
+
 ## Protocol
 
 - Branch: `git checkout -b exp/<name> main`, build clean, record baseline
