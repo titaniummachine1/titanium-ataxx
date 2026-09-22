@@ -3,12 +3,16 @@
 Best plan while you sleep (nothing else touches the box):
 1. Let the running resweep finish (7 ow nets on fresh 12M, table in RESWEEP.txt).
 2. Moon-label hard200k @5k with Moonbird UAI (foreign teacher, max diversity).
+   Moonbird @5k on hard midgame rows runs ~1-3 rows/s single-process, so
+   200k rows = ~20-50h SINGLE worker. Chunked into 8 x 25k with one UAI
+   process each (8 workers, 4c/8t box) -> ~3-7h. Fits the night.
 3. Train moon-teacher student (ow sweep 0.0/0.1/0.2 on moon labels) + gate
    100g @5k vs champ, LB>0 rule. Verdict in MOONDISTILL.txt.
 
 Launch detached: python training/moon_distill.py
 """
 import argparse
+import concurrent.futures as cf
 import os
 import subprocess
 import sys
@@ -16,7 +20,7 @@ import time
 
 import numpy as np
 
-import flywheel as F
+EXE = 'scripts/moonbird/Moonbird-1.1.0-windows-amd64.exe'
 
 CACHE = 'data/nnue/cache12M.npz'
 HARD = 'data/nnue/hard200k.npy'
@@ -30,6 +34,21 @@ def board_line(o0, o1, blk, stm):
     s = ''.join('#' if (ab >> sq) & 1 else 'x' if (a0 >> sq) & 1
                 else 'o' if (a1 >> sq) & 1 else '.' for sq in range(49))
     return s + (' b\n' if int(stm) == 0 else ' w\n')
+
+
+def label_chunk(txt, out, nodes):
+    # one moon_label worker per chunk (own persistent UAI process inside)
+    if os.path.exists(out):
+        want = sum(1 for _ in open(txt, 'rb'))
+        got = len(open(out, errors='ignore').read().strip().split())
+        if got == want:
+            return 'SKIP-OK %d' % got
+    p = subprocess.run([sys.executable, 'training/moon_label.py', '--in', txt,
+                        '--out', out, '--nodes', str(nodes)],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        return 'FAIL %s' % p.stderr[-300:]
+    return 'OK'
 
 
 def run(cmd, log):
@@ -71,21 +90,20 @@ def main():
             log.flush()
         txts.append(txt)
 
-    # 2. moon-label each chunk (persistent UAI process per chunk)
-    for txt in txts:
-        out = txt.replace('.txt', '.out')
-        if os.path.exists(out):
-            t = open(out).read().strip().split()
-            if len(t) == sum(1 for _ in open(txt)):
-                log.write('%s SKIP-OK\n' % os.path.basename(txt))
-                log.flush()
-                continue
-        rc = run([sys.executable, 'training/moon_label.py', '--in', txt,
-                  '--out', out, '--nodes', str(a.nodes)], log)
-        if rc != 0:
-            log.write('MOON LABEL FAILED %s\n' % txt)
-            log.close()
-            return
+    # 2. moon-label chunks in parallel (8 UAI workers, 4c/8t box).
+    # Moonbird @5k hard rows ~1-3/s/worker -> 200k / 8 / 2 ≈ 3.5h.
+    pairs = [(t, t.replace('.txt', '.out')) for t in txts]
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(label_chunk, t, o, a.nodes): t for t, o in pairs}
+        for fut in cf.as_completed(futs):
+            txt = futs[fut]
+            msg = fut.result()
+            log.write('%s: %s\n' % (os.path.basename(txt), msg))
+            log.flush()
+            if msg.startswith('FAIL'):
+                log.write('MOON LABEL FAILED %s\n' % txt)
+                log.close()
+                return
 
     # 3. join moon teacher cache
     parts = []
@@ -107,7 +125,10 @@ def main():
     log.write('wrote %s %.1fMB\n' % (mc, os.path.getsize(mc) / 1e6))
     log.flush()
 
-    # 4. train + gate each ow on the moon cache
+    # 4. train + gate each ow on the moon cache (sequential, box is busy enough)
+    import sys as _sys
+    _sys.path.insert(0, 'training')
+    import flywheel as F
     rows = []
     start = 26000
     for ow in [float(x) for x in a.ows.split(',')]:

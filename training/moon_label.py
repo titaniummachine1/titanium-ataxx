@@ -18,12 +18,34 @@ EXE = 'scripts/moonbird/Moonbird-1.1.0-windows-amd64.exe'
 MATE_CAP = 5000
 
 
+def drain_banner(p, timeout=2.0):
+    # banner is ~1KB with unicode art; read whatever is available without blocking.
+    import os
+    import time
+    end = time.time() + timeout
+    try:
+        os.set_blocking(p.stdout.fileno(), False)
+    except Exception:
+        return
+    try:
+        while time.time() < end:
+            try:
+                chunk = p.stdout.read(65536)
+            except Exception:
+                break
+            if not chunk:
+                time.sleep(0.1)
+    finally:
+        try:
+            os.set_blocking(p.stdout.fileno(), True)
+        except Exception:
+            pass
+
+
 def spawn():
     p = subprocess.Popen([EXE], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.DEVNULL, text=False, bufsize=0)
-    # swallow banner
-    time.sleep(1.5)
-    p.stdout.read1(65536)
+    drain_banner(p)
     return p
 
 
@@ -33,6 +55,9 @@ def ask(p, board, nodes):
     p.stdin.flush()
     sc = None
     buf = b''
+    # Moonbird @5k on hard positions: ~2-10s/row (deep midgame lines).
+    # readline loop is fine (bestmove-terminated); the earlier hang was the
+    # 30s tool timeout on 2000 rows, not a protocol stall.
     while True:
         chunk = p.stdout.readline()
         if not chunk:
@@ -40,7 +65,7 @@ def ask(p, board, nodes):
         buf += chunk
         if b'bestmove' in chunk:
             break
-    ms = re.findall(rb'score cp (-?\d+)', buf)
+    ms = re.findall(rb'score cp\s+(-?\d+)', buf)
     if ms:
         sc = max(-MATE_CAP, min(MATE_CAP, int(ms[-1])))
     assert sc is not None, 'no score: %r' % buf[-200:]
