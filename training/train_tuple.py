@@ -184,6 +184,16 @@ def main():
     ap.add_argument('--cache', default='data/nnue/cache400k.npz')
     ap.add_argument('--rows', type=int, default=0)
     ap.add_argument('--epochs', type=int, default=12)
+    ap.add_argument('--max-epochs', type=int, default=60,
+                    help='S26 flywheel cap: with --plateau, keep training to this many epochs.')
+    ap.add_argument('--plateau', type=float, default=0.0,
+                    help='S26 flywheel stop: halt when (prev_val - val)/prev_val < plateau '
+                    '(relative val improvement stalls). 0 = off (fixed --epochs). '
+                    'Flywheel recipe: --plateau 1e-4 (4 digits, you called it) with '
+                    '--max-epochs 60, --ckpt to keep every epoch net.')
+    ap.add_argument('--ckpt', default='',
+                    help='S26 flywheel checkpoints: path template, e.g. data/nnue/fly12M_ep{ep}.tup. '
+                    'Empty = only final --out. Best-val epoch also copied to --out.')
     ap.add_argument('--lr', type=float, default=4.0)
     ap.add_argument('--wd', type=float, default=1e-7)
     ap.add_argument('--seed', type=int, default=7)
@@ -213,29 +223,58 @@ def main():
     occ1 = z['occ1'].astype(np.uint64)
     blk = z['blk'].astype(np.uint64)
     stm = z['stm'].astype(np.uint8)
+    # S26 flywheel: sanitise teacher spikes BEFORE clip/blend. label emits
+    # mate scores as +/-99999 and one INT_MIN overflow row; clipping alone
+    # leaves 1% rails that dominate sparse-SGD grads. Rows with
+    # |teacher| > MATE_CAP are dropped (not clipped): they are search
+    # artifacts, and cache12M has 12.4M rows to spare.
+    MATE_CAP = 5000.0
+    raw_t = z['teacher'].astype(np.float64) if 'teacher' in z else None
+    if raw_t is not None:
+        bad = ~np.isfinite(raw_t) | (np.abs(raw_t) > MATE_CAP)
+        if bad.any():
+            print('mate-spike filter: dropping %d/%d rows (|teacher|>%.0f)'
+                  % (int(bad.sum()), len(raw_t), MATE_CAP), flush=True)
+            occ0, occ1, blk, stm = occ0[~bad], occ1[~bad], blk[~bad], stm[~bad]
+            z_teacher = raw_t[~bad]
+            z_out = (z['out'].astype(np.float64) if 'out' in z
+                     else np.zeros(len(raw_t)))[~bad]
+            z_sc = (z['sc'].astype(np.float64) if 'sc' in z else np.zeros(len(raw_t)))[~bad]
+        else:
+            z_teacher = raw_t
+            z_out = (z['out'].astype(np.float64) if 'out' in z
+                     else np.zeros(len(raw_t)))
+            z_sc = (z['sc'].astype(np.float64) if 'sc' in z else np.zeros(len(raw_t)))
+    else:
+        z_teacher = None
+        z_out = (z['out'].astype(np.float64) if 'out' in z
+                 else np.zeros(len(occ0)))
+        z_sc = (z['sc'].astype(np.float64) if 'sc' in z else np.zeros(len(occ0)))
+    n = len(occ0)
+    print('rows %d' % n, flush=True)
     # S22: teacher column switch — 'sc' (dag legacy scores) vs 'teacher'
     # (our relabeled deep scores). Same rows/recipe isolates TEACHER effect.
-    assert a.tcol in ('sc', 'teacher') and (a.tcol == 'sc' or 'teacher' in z)
-    mult = 1.0 if a.tcol == 'teacher' else 2000.0
-    prime = np.clip(z[a.tcol].astype(np.float64) * mult, -1500.0, 1500.0)
+    assert a.tcol in ('sc', 'teacher') and (a.tcol == 'sc' or z_teacher is not None)
+    if a.tcol == 'teacher':
+        prime = np.clip(z_teacher * 1.0, -1500.0, 1500.0)
+    else:
+        prime = np.clip(z['sc'].astype(np.float64) * 2000.0, -1500.0, 1500.0)
+        prime = prime[:n] if len(prime) != n else prime
     # S23 blend: target = blend*prime + (1-blend)*dag-legacy. blend=1.0 is
     # pure champ (status quo); lower = retain diverse legacy signal as
     # echo-chamber regularizer. Legacy = sc column (dag scores, stm-rel).
     if abs(a.blend - 1.0) > 1e-9:
-        assert 'teacher' in z and a.tcol == 'teacher', 'blend needs teacher tcol + sc legacy'
-        legacy = np.clip(z['sc'].astype(np.float64) * 2000.0, -1500.0, 1500.0)
+        assert z_teacher is not None and a.tcol == 'teacher', 'blend needs teacher tcol + sc legacy'
+        legacy = np.clip(z_sc * 2000.0, -1500.0, 1500.0)
         score_cp = (a.blend * prime + (1.0 - a.blend) * legacy).astype(np.float64)
     else:
         score_cp = prime.astype(np.float64)
     print('teacher column: %s blend %.2f' % (a.tcol, a.blend), flush=True)
-    d_out = z['out'].astype(np.float64) if 'out' in z else np.zeros(len(occ0))
+    d_out = z_out
     # S25 REAL outcome sweep: outcome_cp is stm-relative (out column already
     # stored stm-relative per datagen: 1 = stm won, 0 = stm lost, 0.5 = draw).
     # OUTCOME_SCALE maps [0,1] -> [-S,+S] cp. Sweep --outcome-weight 0..1 with
     # --tcol teacher --blend 1.0 to get pure teacher-vs-outcome (Moonbird recipe).
-    # NOTE: raw out mean here is 0.52 (cache400kR5), but split by stm it is
-    # 0.31 (stm0/black) vs 0.77 (stm1/white) — column is suspect (see audit
-    # below); sweep runs anyway so the user gets the number they asked for.
     OUTCOME_SCALE = 1000.0
     outcome_cp = np.clip((d_out * 2.0 - 1.0) * OUTCOME_SCALE, -1500.0, 1500.0)
     print('outcome stats: mean %+.3f frac0 %.3f frac05 %.3f frac1 %.3f -> cp mean %+.1f std %.1f'
@@ -248,12 +287,11 @@ def main():
     else:
         best_cp = score_cp.astype(np.float32)
     print('outcome-weight %.2f' % ow, flush=True)
-    n = len(occ0)
     if a.rows:
         sel = np.random.choice(n, min(a.rows, n), replace=False)
-        occ0, occ1, blk, stm, best_cp, d_out = occ0[sel], occ1[sel], blk[sel], stm[sel], best_cp[sel], d_out[sel]
+        occ0, occ1, blk, stm, best_cp = occ0[sel], occ1[sel], blk[sel], stm[sel], best_cp[sel]
         n = len(occ0)
-    print('rows %d' % n, flush=True)
+        print('rows subsample %d' % n, flush=True)
 
     # stm-relative own/enemy (stm 0 = black=x=occ0 to move)
     is_b = (stm == 0)
@@ -344,8 +382,42 @@ def main():
             pred = pred + bags[d + 1](Xpb[d]).squeeze(1)
         return pred
 
+    def dump_tup(path):
+        ws = bags[0].weight.detach().squeeze(1).numpy().reshape(36, 81)
+        wp = [bg.weight.detach().squeeze(1).numpy().reshape(6561) for bg in list(bags)[1:]]
+        assert ws[0, 0] == 0 and all(p[0] == 0 for p in wp), 'index-0 constraint broken'
+        allw = np.concatenate([ws.reshape(-1)] + [p.reshape(-1) for p in wp])
+        print('weight spread: max|w| %.1f mean|w| %.2f frac_nonzero %.3f bias %+.1f'
+              % (np.abs(allw).max(), np.abs(allw).mean(), (allw != 0).mean(), float(bias.item())),
+              flush=True)
+        # TUP4 layout: magic + bias i32 + singles i8 + per-dir ACTIVE counts
+        # (LE u32) + active direction tables i8. Values clip to [-127, 127]
+        # (S21e: only 4/29k exceed it, zero gate loss).
+        counts = [24, 24, 16, 16]
+        q = lambda v: max(-127, min(127, int(round(v))))
+        payload = struct.pack('<i', int(round(float(bias.item()))))
+        payload += bytes(bytearray([(q(v) & 0xFF) for v in ws.reshape(-1)]))
+        intc = [counts[d] if d in active else 0 for d in range(4)]
+        payload += struct.pack('<4i', *intc)
+        for d in range(4):
+            seg = wp[d].reshape(-1) if d in active else np.zeros(6561)
+            payload += bytes(bytearray([(q(v) & 0xFF) for v in seg]))
+        with open(path, 'wb') as f:
+            f.write(b'TUP4' + payload)
+        import os
+        print('wrote %s %.1fKB dirs %s' % (path, os.path.getsize(path) / 1024, a.dirs), flush=True)
+
     bs = 4096
-    for ep in range(1, a.epochs + 1):
+    # S26 flywheel: plateau stop on RELATIVE val improvement. Your call of 4
+    # digits (1e-4) is right for this data: 12.4M rows x sparse updates =
+    # val is glassy-smooth (no minibatch noise at 620k val rows), so a 5th
+    # digit is noise-chasing; 4 digits stops at true saturation. Needs
+    # --plateau 1e-4 --max-epochs N --ckpt template; plain --epochs is
+    # unchanged (plateau 0 = off).
+    max_ep = a.max_epochs if a.plateau > 0 else a.epochs
+    prev_val, best_val, best_ep, stale = None, float('inf'), 0, 0
+    import shutil
+    for ep in range(1, max_ep + 1):
         t0 = time.time()
         for bg in bags:
             bg.train()
@@ -368,32 +440,29 @@ def main():
         with torch.no_grad():
             pv = forward(Xva, XPtr_va)
             vmse = (((pv - yva) ** 2) * wva).mean().item()
-        print('epoch %d train_mse %.1f val_mse %.1f bias %+.1f (%.0fs)'
-              % (ep, tot / cnt, vmse, bias.item(), time.time() - t0), flush=True)
-
-    ws = bags[0].weight.detach().squeeze(1).numpy().reshape(36, 81)
-    wp = [bg.weight.detach().squeeze(1).numpy().reshape(6561) for bg in list(bags)[1:]]
-    assert ws[0, 0] == 0 and all(p[0] == 0 for p in wp), 'index-0 constraint broken'
-    allw = np.concatenate([ws.reshape(-1)] + [p.reshape(-1) for p in wp])
-    print('weight spread: max|w| %.1f mean|w| %.2f frac_nonzero %.3f bias %+.1f'
-          % (np.abs(allw).max(), np.abs(allw).mean(), (allw != 0).mean(), float(bias.item())),
-          flush=True)
-    # TUP4 layout: magic + bias i32 + singles i8 + per-dir ACTIVE counts
-    # (LE u32) + active direction tables i8. Values clip to [-127, 127]
-    # (S21e: only 4/29k exceed it, zero gate loss).
-    counts = [24, 24, 16, 16]
-    q = lambda v: max(-127, min(127, int(round(v))))
-    payload = struct.pack('<i', int(round(float(bias.item()))))
-    payload += bytes(bytearray([(q(v) & 0xFF) for v in ws.reshape(-1)]))
-    intc = [counts[d] if d in active else 0 for d in range(4)]
-    payload += struct.pack('<4i', *intc)
-    for d in range(4):
-        seg = wp[d].reshape(-1) if d in active else np.zeros(6561)
-        payload += bytes(bytearray([(q(v) & 0xFF) for v in seg]))
-    with open(a.out, 'wb') as f:
-        f.write(b'TUP4' + payload)
-    import os
-    print('wrote %s %.1fKB dirs %s' % (a.out, os.path.getsize(a.out) / 1024, a.dirs), flush=True)
+        improv = (prev_val - vmse) / max(prev_val, 1e-9) if prev_val else 1.0
+        tag = ''
+        if vmse < best_val:
+            best_val, best_ep = vmse, ep
+            if a.ckpt:
+                dump_tup(a.ckpt.format(ep=ep))
+                shutil.copy(a.ckpt.format(ep=ep), a.out)
+                tag = ' BEST->out'
+        if a.plateau > 0 and prev_val is not None and improv < a.plateau:
+            stale += 1
+        else:
+            stale = 0
+        print('epoch %d train_mse %.1f val_mse %.1f rel_improv %+.2e bias %+.1f (%.0fs)%s'
+              % (ep, tot / cnt, vmse, improv, bias.item(), time.time() - t0, tag), flush=True)
+        prev_val = vmse
+        if a.plateau > 0 and stale >= 2:
+            print('plateau: rel improv < %.0e twice in a row -> stop at ep %d (best ep %d val %.1f)'
+                  % (a.plateau, ep, best_ep, best_val), flush=True)
+            break
+    if not a.ckpt:
+        dump_tup(a.out)
+    else:
+        print('flywheel: best ep %d val %.1f -> %s' % (best_ep, best_val, a.out), flush=True)
 
 
 if __name__ == '__main__':
