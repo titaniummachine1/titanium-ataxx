@@ -146,6 +146,13 @@ def main():
               '--top', '200000', '--out', 'data/nnue/hard200k.npy'], log)
     log.write('rank rc=%d\n' % rc)
     log.flush()
+    # S29: teacher changed (ow20-5k labels replaced dag scores), so the
+    # optimal teacher-vs-outcome blend may have moved. Re-sweep ow on the
+    # refreshed corpus automatically, same LB>0 rule, table in RESWEEP.txt.
+    rc = run([sys.executable, 'training/resweep.py',
+              '--ows', '0.0,0.05,0.10,0.15,0.20,0.25,0.30'], log)
+    log.write('resweep rc=%d\n' % rc)
+    log.flush()
     log.write('===== flywheel done: %s =====\n' % verdict)
     log.close()
 
