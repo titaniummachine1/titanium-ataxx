@@ -10,9 +10,38 @@ Launch (detached): python training/flywheel.py
 Resume/morning gate: python training/flywheel.py --gate-only
 """
 import argparse
+import math
 import subprocess
 import sys
 import time
+
+
+def parse_match(path):
+    W = L = D = 0
+    for line in open(path, errors='ignore'):
+        if line.startswith('-- game'):
+            if 'titanium wins' in line:
+                W += 1
+            elif 'opponent wins' in line:
+                L += 1
+            else:
+                D += 1
+    return W, L, D
+
+
+def elo_ci(W, L, D):
+    """Elo point + 95% CI from game scores (1/0.5/0). Promotion iff lo > 0."""
+    N = W + L + D
+    assert N > 0, 'empty gate log'
+    s = (W + D / 2.0) / N
+    m2 = (W + D * 0.25) / N
+    var = max((m2 - s * s) * N / max(N - 1, 1), 1e-12)
+    se = math.sqrt(var / N)
+
+    def f(x):
+        x = min(max(x, 1e-6), 1 - 1e-6)
+        return -400 * math.log10(1 / x - 1)
+    return f(s), f(s - 1.96 * se), f(s + 1.96 * se), s, se
 
 CACHE = 'data/nnue/cache12M.npz'
 TEACHER = 'data/nnue/tupS25ow20.tup'
@@ -46,26 +75,60 @@ def train(log):
     return rc
 
 
-def gate(log, games=100, nodes=5000):
-    for name, a, b in [('fly-vs-teacher', OUT, TEACHER),
-                       ('fly-vs-base', None, None)]:
-        cmd = [EXE, 'match', '--games', str(games), '--nodes', str(nodes)]
-        if a:
-            cmd += ['--tuple', a]
-        cmd += ['--opp', EXE + ' serve', '--opp-nodes', str(nodes)]
-        if b:
-            cmd += ['--opp-tuple', b]
-        cmd += ['--start-game', '23000' if 'teacher' in name else '23100',
-                '--out', 'logs/s26_%s_%dg.txt' % (name, games)]
-        rc = run(cmd, log)
-        log.write('%s rc=%d\n' % (name, rc))
+def run_gate(log, tup, opp_tup, games, start, out):
+    cmd = [EXE, 'match', '--games', str(games), '--nodes', '5000']
+    if tup:
+        cmd += ['--tuple', tup]
+    cmd += ['--opp', EXE + ' serve', '--opp-nodes', '5000']
+    if opp_tup:
+        cmd += ['--opp-tuple', opp_tup]
+    cmd += ['--start-game', str(start), '--out', out]
+    rc = run(cmd, log)
+    W, L, D = parse_match(out)
+    elo, lo, hi, s, se = elo_ci(W, L, D)
+    log.write('%s: %d-%d-%d elo %+.0f 95CI [%+.0f,%+.0f] s=%.3f se=%.4f rc=%d\n'
+              % (out, W, L, D, elo, lo, hi, s, se, rc))
+    log.flush()
+    return W, L, D, elo, lo, hi
+
+
+def promote_gate(log):
+    """S26 promotion rule: new net vs champ (champ as baseline), 100g @5k.
+    PROMOTE iff 95% lower bound > 0. Else statistical refine: extend to 200g
+    and re-test. Then magnitude/regression guard vs S13 hand eval."""
+    W, L, D, elo, lo, hi = run_gate(log, OUT, TEACHER, 100, 23000,
+                                    'logs/s26_fly_vs_champ_100g.txt')
+    verdict = None
+    if lo > 0:
+        verdict = 'PROMOTED-100g'
+    else:
+        log.write('champ-gate LB %+.0f <= 0: extending to 200g (statistical refine)\n' % lo)
         log.flush()
+        W2, L2, D2, _, _, _ = run_gate(log, OUT, TEACHER, 100, 23200,
+                                       'logs/s26_fly_vs_champ_xtra100g.txt')
+        W, L, D = W + W2, L + L2, D + D2
+        elo, lo, hi, s, se = elo_ci(W, L, D)
+        log.write('champ-gate combined 200g: %d-%d-%d elo %+.0f 95CI [%+.0f,%+.0f]\n'
+                  % (W, L, D, elo, lo, hi))
+        log.flush()
+        verdict = 'PROMOTED-200g' if lo > 0 else 'STALLED'
+    Wb, Lb, Db, eb, lob, hib = run_gate(log, OUT, None, 100, 23400,
+                                        'logs/s26_fly_vs_base_100g.txt')
+    if eb < 0:
+        verdict = 'REGRESSION-vs-base'
+    with open('data/nnue/PROMOTION.txt', 'w') as f:
+        f.write('net: %s\nteacher/champ: %s\n' % (OUT, TEACHER))
+        f.write('vs-champ: %d-%d-%d elo %+.0f 95CI [%+.0f,%+.0f]\n' % (W, L, D, elo, lo, hi))
+        f.write('vs-base: %d-%d-%d elo %+.0f 95CI [%+.0f,%+.0f]\n' % (Wb, Lb, Db, eb, lob, hib))
+        f.write('verdict: %s\n' % verdict)
+    log.write('PROMOTION VERDICT: %s\n' % verdict)
+    log.flush()
+    return verdict
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--gate-only', action='store_true')
-    ap.add_argument('--games', type=int, default=100)
     a = ap.parse_args()
     log = open(LOG, 'a')
     log.write('\n===== flywheel %s %s =====\n'
@@ -76,8 +139,14 @@ def main():
             log.write('TRAIN FAILED, abort\n')
             log.close()
             return
-    gate(log, games=a.games)
-    log.write('===== flywheel done =====\n')
+    verdict = promote_gate(log)
+    log.write('verdict %s, ranking hard positions for round 2\n' % verdict)
+    log.flush()
+    rc = run([sys.executable, 'training/rank_hard.py', '--net', OUT,
+              '--top', '200000', '--out', 'data/nnue/hard200k.npy'], log)
+    log.write('rank rc=%d\n' % rc)
+    log.flush()
+    log.write('===== flywheel done: %s =====\n' % verdict)
     log.close()
 
 
