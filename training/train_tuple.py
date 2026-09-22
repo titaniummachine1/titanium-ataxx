@@ -319,9 +319,12 @@ def main():
         pp = [(x, y) for (dd, x, y) in PAIRS if dd == d]
         xa = np.array([x for x, y in pp], dtype=np.int64)
         ya = np.array([y for x, y in pp], dtype=np.int64)
-        pidx.append(feats[:, xa] + 81 * feats[:, ya])
+        pidx.append((feats[:, xa] + 81 * feats[:, ya]).astype(np.int64))
     print('features %.0fs' % (time.time() - t0), flush=True)
     off = (np.arange(36, dtype=np.int64)[None, :] * 81 + feats).astype(np.int64)
+    del feats
+    import gc as _gc
+    _gc.collect()
 
     # S21g lesson (OUT-COLUMN-POISON, LEDGER): dag sum_outcome is NOT a game
     # result (proof-search visit values, exotic perspective; white rows mean
