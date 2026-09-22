@@ -313,31 +313,30 @@ def main():
 
     t0 = time.time()
     feats = block_indices(own, enm)
-    del own, enm
-    # S27 OOM fix: int64 indices cost 11.3GB at 12.2M rows (off 3.5 + pidx
-    # 7.8) -> swap death. int32 halves to 5.7GB: EmbeddingBag takes LongTensor
-    # indices, but we gather per-batch and cast UP to int64 only for the 4k
-    # rows in flight (negligible). off/pidx/Xp stored int32 from here on.
-    # pair indices per direction: b1 + 81 * b2
-    pidx = []
-    for d in range(4):
-        pp = [(x, y) for (dd, x, y) in PAIRS if dd == d]
-        xa = np.array([x for x, y in pp], dtype=np.int64)
-        ya = np.array([y for x, y in pp], dtype=np.int64)
-        pidx.append((feats[:, xa] + 81 * feats[:, ya]).astype(np.int32))
-    print('features %.0fs' % (time.time() - t0), flush=True)
-    off = (np.arange(36, dtype=np.int64)[None, :] * 81 + feats).astype(np.int32)
-    del feats
+    t_feat = time.time() - t0
+    # S28 STREAMING (12M OOM fix, replaces S27 int32): index arrays are NOT
+    # materialised. Block features are int8 (36B/row), index math happens
+    # per-batch inside the epoch loop. RAM: feats 0.4GB + cache-mmap 0 +
+    # model/tensors small. Same math, same recipe, fits in 16GB.
+    feats8 = feats.astype(np.int8)
+    del feats, own, enm
     import gc as _gc
     _gc.collect()
-    print('index RAM GB: off %.1f pidx %.1f'
-          % (off.nbytes / 1e9, sum(p.nbytes for p in pidx) / 1e9), flush=True)
+    print('features %.0fs RAM feats8 %.2fGB'
+          % (t_feat, feats8.nbytes / 1e9), flush=True)
+    XA = [np.array([x for x, y in pp], dtype=np.int64)
+          for pp in [[(x, y) for (dd, x, y) in PAIRS if dd == d] for d in range(4)]]
+    YA = [np.array([y for x, y in pp], dtype=np.int64)
+          for pp in [[(x, y) for (dd, x, y) in PAIRS if dd == d] for d in range(4)]]
+    AR = np.arange(36, dtype=np.int64)[None, :]
 
     # S21g lesson (OUT-COLUMN-POISON, LEDGER): dag sum_outcome is NOT a game
     # result (proof-search visit values, exotic perspective; white rows mean
     # 0.75). Blending it produced a -400-Elo table. Teacher best_score
     # residuals ONLY — never touch `out` again.
     resid = (best_cp - base).astype(np.float32)
+    del base, best_cp
+    _gc.collect()
     print('residual mean %+.1f std %.1f' % (resid.mean(), resid.std()), flush=True)
     # S21f: trust high-visit rows (wsum weights, mean-normalized). Absent in
     # old caches -> uniform weights (backward compatible).
@@ -349,15 +348,25 @@ def main():
         sw = sw / max(sw.mean(), 1e-9)
         print('wsum weights: mean 1.0 max %.1f frac>2x %.3f' % (sw.max(), (sw > 2).mean()), flush=True)
         samp_w = torch.from_numpy(sw.astype(np.float32))
+        del sw
     else:
         samp_w = torch.ones(n)
+    _gc.collect()
 
     idx = np.arange(n)
     np.random.shuffle(idx)
     cut = int(n * 0.95)
     tr, va = idx[:cut], idx[cut:]
-    Xtr, ytr = torch.from_numpy(off[tr]), torch.from_numpy(resid[tr])
-    Xva, yva = torch.from_numpy(off[va]), torch.from_numpy(resid[va])
+    del idx
+    ytr, yva = torch.from_numpy(resid[tr]), torch.from_numpy(resid[va])
+    Xtr8, Xva8 = feats8[tr], feats8[va]
+    del feats8, resid
+    _gc.collect()
+    wtr, wva = samp_w[tr], samp_w[va]
+    # S28: feats8 sub-gathers are views; copy to compact int8 (tr/va order).
+    Xtr8, Xva8 = np.ascontiguousarray(Xtr8), np.ascontiguousarray(Xva8)
+    print('batch RAM GB: Xtr8 %.2f Xva8 %.2f' % (Xtr8.nbytes / 1e9, Xva8.nbytes / 1e9),
+          flush=True)
 
     # 1 single bag + 4 pair bags + scalar bias. Index-0 entries are
     # constrained to exactly 0 after every step (empty patterns contribute
@@ -373,28 +382,32 @@ def main():
     # NOTE: torch SGD weight_decay is dense+sparse incompatible; L2 is added
     # to the loss manually below (works on the dense weight tensors).
     opt = torch.optim.SGD(params, lr=a.lr)
-    Xp = [torch.from_numpy(p) for p in pidx]
 
     def zero_constrained():
         with torch.no_grad():
             for bg in bags:
                 bg.weight.data[0].zero_()
-    XPtr_tr = [p[tr] for p in Xp]
-    XPtr_va = [p[va] for p in Xp]
-    wtr, wva = samp_w[tr], samp_w[va]
 
     active = [int(x) for x in a.dirs.split(',')]
     assert set(active) <= {0, 1, 2, 3} and active, a.dirs
+
+    # S28 streaming index math: per-batch int8 feats -> int64 EmbeddingBag
+    # indices. Same values as the old materialised off/pidx (off = AR + feat,
+    # pidx[d] = feat[xa] + 81 * feat[ya]).
+    def batch_idx(Fb):
+        F = torch.from_numpy(Fb.astype(np.int64))
+        Xo = (AR + F.numpy()).astype(np.int64)
+        Xpo = [(F.numpy()[:, XA[d]] + 81 * F.numpy()[:, YA[d]]).astype(np.int64)
+               for d in range(4)]
+        return (torch.from_numpy(Xo),
+                [torch.from_numpy(p) for p in Xpo])
+        # NOTE: AR/XA/YA are module-level int64 numpy; Fb rows sliced already.
 
     def forward(Xb, Xpb):
         pred = bags[0](Xb).squeeze(1) + bias
         for d in active:
             pred = pred + bags[d + 1](Xpb[d]).squeeze(1)
         return pred
-
-    def L(x):
-        # S27: EmbeddingBag needs int64; stored int32, cast per-batch in flight.
-        return x.long() if x.dtype != torch.int64 else x
 
     def dump_tup(path):
         ws = bags[0].weight.detach().squeeze(1).numpy().reshape(36, 81)
@@ -431,16 +444,19 @@ def main():
     max_ep = a.max_epochs if a.plateau > 0 else a.epochs
     prev_val, best_val, best_ep, stale = None, float('inf'), 0, 0
     import shutil
+    ntr = len(Xtr8)
     for ep in range(1, max_ep + 1):
         t0 = time.time()
         for bg in bags:
             bg.train()
-        perm = torch.randperm(len(Xtr))
+        perm = torch.randperm(ntr)
         tot, cnt = 0.0, 0
-        for i in range(0, len(Xtr), bs):
+        for i in range(0, ntr, bs):
             b = perm[i:i + bs]
+            Fb = Xtr8[b.numpy()]
+            Xo, Xpo = batch_idx(Fb)
             opt.zero_grad()
-            pred = forward(L(Xtr[b]), [L(p[b]) for p in XPtr_tr])
+            pred = forward(Xo, Xpo)
             l2 = sum((bg.weight ** 2).sum() for bg in bags)
             wb = wtr[b]
             loss = ((pred - ytr[b]) ** 2 * wb).mean() + a.wd * l2
@@ -452,8 +468,16 @@ def main():
         for bg in bags:
             bg.eval()
         with torch.no_grad():
-            pv = forward(L(Xva), [L(p) for p in XPtr_va])
-            vmse = (((pv - yva) ** 2) * wva).mean().item()
+            # S28: val streamed in 100k blocks (full Xva int64 = 2.5GB).
+            totv, cntv = 0.0, 0
+            for j in range(0, len(Xva8), 100000):
+                Fv = Xva8[j:j + 100000]
+                Xo, Xpo = batch_idx(Fv)
+                pv = forward(Xo, Xpo)
+                wv = wva[j:j + len(Fv)]
+                totv += ((((pv - yva[j:j + len(Fv)]) ** 2) * wv).sum().item())
+                cntv += len(Fv)
+            vmse = totv / max(cntv, 1)
         improv = (prev_val - vmse) / max(prev_val, 1e-9) if prev_val else 1.0
         tag = ''
         if vmse < best_val:
