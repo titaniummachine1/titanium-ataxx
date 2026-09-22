@@ -76,6 +76,8 @@ def gate(chall, opp_tup, games, start, out):
 
 def judge(chall, log):
     c = champ()
+    if c == chall:
+        return
     tag = os.path.basename(chall).replace('.tup', '')
     W, L, D, elo, lo, hi = gate(chall, c, 100, 24000, 'logs/nite_%s_vs_champ.txt' % tag)
     log.write('%s vs champ %s: %d-%d-%d elo %+.0f [LB %+.0f] -> ' %
