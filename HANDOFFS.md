@@ -1,3 +1,14 @@
+## STATE FOR NEW SESSION (2026-09-22 S26-S30 OVERNIGHT)
+
+- Champion: `data/nnue/tupS25ow20.tup` (ow 0.20, 73-26-1 +177 @5k 100g vs tupS21hvW). `CHAMPION.txt` points here. main untouched, all on `exp/tuple-eval`.
+- cache12M.npz DONE (12,398,075 rows, 178.8MB, ow20-5k labels, 6wk ~100min). relab12m/ chunks retained.
+- Flywheel S26: 25 epochs plateau-stopped, PROMOTION=REGRESSION-vs-base (fly 8-90-2 -402 vs S13 base; 60-134-6 -135 vs champ). ECHO CHAMBER at 12M: val 43k improves, play collapses. ckpts fly12M_ep*.tup retained, best ep14.
+- Nightly: every ckpt STALLED vs champ (ep20 22-71 -186 worst). Nothing promotes without LB>0.
+- Resweep S29 RUNNING (ow 0.0-0.30 on fresh 12M, table -> RESWEEP.txt): ow0-12M gated 32-63-5 -111 — old 0.20 blend did NOT survive teacher change. ow5+ training.
+- Moondistill QUEUED (moon_distill.py, UAI-verified labeler): hard200k (rank done, wsum_mass 0.034) x Moonbird @5k, 8 workers -> cache12M_moon200k -> ow 0/10/20 train+gate -> MOONDISTILL.txt. Probe showed Moonbird hard-row speed ~1-3/s (slow!) + probe200.out came back EMPTY (0 rows, needs debug before full launch).
+- Trainer is S28 streaming (int8 feats, per-batch index math, 20k-probe parity 13-17). OOM fixed (was 11.5GB swap death).
+- NEXT: (1) fix moon probe (empty output), measure true Moonbird rows/s; (2) read RESWEEP.txt when done; (3) if moon wins -> expand; else capacity wall -> mobility/per-anchor tables, then SMP.
+
 ## STATE FOR NEW SESSION (2026-09-21 S22R2M VERDICT)
 
 - 2M@20k self-teacher student: +0 (16-16). Champion stays tupS21hvW (+125, 2M dag/wsum). ECHO CHAMBER confirmed at scale: self-distillation fossilizes; diversity wins. 20k verdict: TOO MUCH. Label cheap (dag-5k), spend on rows/capacity/SMP.
