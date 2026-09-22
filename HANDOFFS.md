@@ -1,3 +1,13 @@
+## STATE FOR NEW SESSION (2026-09-22 FROZEN — user switched projects)
+
+- STOPPED clean: all trainers + Moonbird workers killed, NOTHING running (verified empty process list).
+- Frozen commit `1e88d3a` on `exp/tuple-eval`. main untouched throughout.
+- Resume: `python training/moon_distill.py --top 200000 --nodes 5000 --ows 0.0,0.10,0.20`
+  (resumable: moon_*.txt/.out skip-OK, then join -> train -> gate).
+  Resweep resume: `python training/resweep.py --ows 0.05,0.10,0.15,0.20,0.25,0.30` (ow0 done: 32-63-5 -111).
+- Data on disk: cache12M.npz (12.4M), hard200k.npy, fly12M_ep*.tup (14 ckpts), lab_moon/probe200 (2000/2000 moon scores OK).
+- Champion: tupS25ow20. Morning tables pending: RESWEEP.txt, MOONDISTILL.txt.
+
 ## STATE FOR NEW SESSION (2026-09-22 S26-S30 OVERNIGHT)
 
 - Champion: `data/nnue/tupS25ow20.tup` (ow 0.20, 73-26-1 +177 @5k 100g vs tupS21hvW). `CHAMPION.txt` points here. main untouched, all on `exp/tuple-eval`.
