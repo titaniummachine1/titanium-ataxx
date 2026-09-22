@@ -81,6 +81,8 @@ def main():
     fin = open(a.inp, 'rb') if a.inp else sys.stdin.buffer
     fout = open(a.out, 'w') if a.out else sys.stdout
     lines = [l.decode().strip() for l in fin if l.strip()]
+    # unbuffered append: every score hits disk immediately (kill-safe).
+    fout_fd = fout.fileno() if hasattr(fout, 'fileno') else None
     p = spawn()
     t0 = time.time()
     n = 0
@@ -97,6 +99,13 @@ def main():
             p = spawn()
             sc = ask(p, board, a.nodes)
         fout.write('%d\n' % sc)
+        try:
+            fout.flush()
+            if fout_fd is not None:
+                import os as _os
+                _os.fsync(fout_fd)
+        except Exception:
+            pass
         n += 1
         if n % 500 == 0:
             sys.stderr.write('moon_label %d/%d (%.0fs)\n' % (n, len(lines), time.time() - t0))
