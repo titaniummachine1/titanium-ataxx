@@ -8,7 +8,9 @@ web/dist
 node_modules/
 
 # Local scratch space (never pushed: gate .exes, moonbird, per-gate launchers, match logs)
-/data
+/data/*
+!/data/nnue/
+/data/nnue/*
 /logs
 /scripts
 
@@ -36,3 +38,7 @@ __pycache__/
 *.tmp
 .DS_Store
 Thumbs.db
+
+# Shipped champion eval (LAST so it overrides *.tup above): our own SGD
+# weights, 28KB, main runs it by default. Every other blob stays out.
+!/data/nnue/tupS37fix.tup

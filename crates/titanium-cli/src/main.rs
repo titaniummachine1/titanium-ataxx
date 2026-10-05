@@ -215,12 +215,19 @@ fn net_flag_str(spec: &Option<String>) -> String {
     }
 }
 
-/// --tuple none (or flag absent) = pure hand eval. --tuple <path> = that
-/// .tup additive table. Owned table, borrowed by the searcher (same
-/// zero-refcount pattern as the net).
+/// Shipped champion: main runs this unless --tuple says otherwise.
+pub const DEFAULT_TUP: &str = "data/nnue/tupS37fix.tup";
+
+/// Flag absent = champion default (main is always strongest out of the box).
+/// --tuple none = pure hand eval (explicit escape hatch for A/B).
+/// --tuple <path> = that .tup additive table. Owned table, borrowed by the
+/// searcher (same zero-refcount pattern as the net).
 fn load_tuple_preset(spec: &Option<String>) -> Result<Option<titanium::TupleTable>, String> {
     match spec {
-        None => Ok(None),
+        None => match titanium::TupleTable::load(DEFAULT_TUP) {
+            Ok(t) => Ok(Some(t)),
+            Err(e) => Err(format!("champion {DEFAULT_TUP} missing: {e}")),
+        },
         Some(s) if s == "none" || s.is_empty() => Ok(None),
         Some(s) => match titanium::TupleTable::load(s) {
             Ok(t) => Ok(Some(t)),
@@ -231,9 +238,10 @@ fn load_tuple_preset(spec: &Option<String>) -> Result<Option<titanium::TupleTabl
 
 fn tuple_flag_str(spec: &Option<String>) -> String {
     // Re-emit for match children: --tuple <spec> flows to the opp serve
-    // child as --opp-tuple.
+    // child as --opp-tuple. Absent flag = explicit champion path (children
+    // must not depend on their own defaults).
     match spec {
-        None => "--tuple none".to_string(),
+        None => format!("--tuple {DEFAULT_TUP}"),
         Some(s) if s == "none" || s.is_empty() => "--tuple none".to_string(),
         Some(s) => format!("--tuple {s}"),
     }
