@@ -392,11 +392,13 @@ def main():
     assert set(active) <= {0, 1, 2, 3} and active, a.dirs
 
     # S28 streaming index math: per-batch int8 feats -> int64 EmbeddingBag
-    # indices. Same values as the old materialised off/pidx (off = AR + feat,
-    # pidx[d] = feat[xa] + 81 * feat[ya]).
+    # indices. Same values as the old materialised off/pidx
+    # (off = AR*81 + feat, pidx[d] = feat[xa] + 81 * feat[ya]).
+    # S37 FIX: S28 wrote AR + feat (dropped the *81), hashing 2916 singles
+    # rows into 117 — every training since used broken singles in Rust.
     def batch_idx(Fb):
         F = torch.from_numpy(Fb.astype(np.int64))
-        Xo = (AR + F.numpy()).astype(np.int64)
+        Xo = (AR * 81 + F.numpy()).astype(np.int64)
         Xpo = [(F.numpy()[:, XA[d]] + 81 * F.numpy()[:, YA[d]]).astype(np.int64)
                for d in range(4)]
         return (torch.from_numpy(Xo),
