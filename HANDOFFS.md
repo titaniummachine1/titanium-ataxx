@@ -1,3 +1,12 @@
+## STATE FOR NEW SESSION (2026-10-05 S31 PROMOTION PROTOCOL DONE — MAIN STANDS)
+
+- Champ tupS25ow20 vs MAIN 1a27b92 @5k 100g = 25-73-2 (CI [0.174,0.346], -182). Conclusive REJECT, no merge. Self-check pooled to 100g: 45-51-4, identity-consistent. Law 10: no gate stops below 100g.
+- Logs: `logs/s31_selfcheck_5k.txt` + `logs/s31_selfcheck_5k_ext.txt`, `logs/s31_champ_5k.txt`. Binaries: main = mainwt rebuild, champ = target/release + data/nnue/tupS25ow20.tup.
+- S32 LADDER DONE: moon@5k beats main-classical@200k (0-99-1) and champ@200k (0-100). Margins flat -20 → -19 across 4x-40x. Nodes cannot buy this; knowledge gap confirmed. Next levers: eval knowledge or SMP, not nodes.
+- S33 SPOT DONE: parity = titan@50k-100k vs moon@100 (~500-1000x handicap). 20k conclusively loses (0.375); 100k pooled 0.545 [0.476,0.614] coin flip. Fair-sparring recipe: moon@100 vs titan@50k+. Logs logs/s33_*.txt.
+- Nothing else qualifies: corrhist/countermove/singular/aspiration all conclusive rejects on record; LazySMP unbuilt. main = strongest. Tuple line stays on exp/tuple-eval.
+- Logs: `logs/s31_selfcheck_5k.txt`, `logs/s31_champ_5k.txt`. Binaries: main = mainwt rebuild, champ = target/release + data/nnue/tupS25ow20.tup.
+
 ## STATE FOR NEW SESSION (2026-10-05 S30 OPENING-HANDOVER DONE)
 
 - Champ tupS25ow20 vs Moonbird 1.1.0 @5k (+/-20% jitter): takeover-after-moon-opening 0-100 AND direct 0-100. Margins -20 vs -21 stones. OPENING EXONERATED — gap is mid/endgame, not opening. First-ever champ-vs-Moonbird gate.

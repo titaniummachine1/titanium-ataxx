@@ -52,6 +52,14 @@ real memory. Update them the moment something happens, not at the end.
     to satisfy a loader. A net main cannot load yet waits for its wiring +
     parity proof; it is never cut down. Reads (hash, load-for-eval, carve a
     copy for verification) are free.
+10. **NO GATE STOPS BELOW 100 GAMES (user law 2026-10-05).** Identity is
+    not a reason to stop small: expecting ~50% never justifies a sub-100
+    gate. Every gate leg runs to >=100 games, then extends on a straddle.
+11. **GATES ARE BY SEAT (user law 2026-10-05).** Sides swap colors every
+    game (odd/even) — every leg ends exactly 50/50 black/white per side,
+    verified from the log, not assumed from the game count. Paired openings
+    (same line, both seats) when the harness supports books; until then,
+    alternation + balance check is the floor.
 
 ## Mistakes ledger (written when scolded, read before acting)
 
