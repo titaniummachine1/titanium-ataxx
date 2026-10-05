@@ -1,16 +1,38 @@
 # Build artifacts
 /target
-/web/pkg
-/web/dist
+/target-*/
+/target_*/
+target/
+web/pkg
+web/dist
 node_modules/
 
-# Local scratch space (never pushed)
+# Local scratch space (never pushed: gate .exes, moonbird, per-gate launchers, match logs)
 /data
 /logs
 /scripts
 
+# Binaries and weight blobs are NEVER versioned (Stockfish rule: build them,
+# don't track them). Snapshot .exes live in scripts/bench/, nets in data/nnue/.
+*.exe
+*.dll
+*.pdb
+*.tup
+*.s1
+*.pt
+*.npz
+*.onnx
+*.db
+*.db-wal
+*.db-shm
+
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Misc
 *.log
+*.jsonl
 *.tmp
 .DS_Store
 Thumbs.db

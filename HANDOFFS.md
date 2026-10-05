@@ -1,3 +1,9 @@
+## STATE FOR NEW SESSION (2026-10-05 S30 OPENING-HANDOVER DONE)
+
+- Champ tupS25ow20 vs Moonbird 1.1.0 @5k (+/-20% jitter): takeover-after-moon-opening 0-100 AND direct 0-100. Margins -20 vs -21 stones. OPENING EXONERATED — gap is mid/endgame, not opening. First-ever champ-vs-Moonbird gate.
+- Log: `logs/opening_gate_5k.txt`. Harness: `C:\Users\TERMIN~1\AppData\Local\Temp\opencode\opening_gate.py` (copy into scripts/ if reused; needs --jitter since both engines are deterministic at fixed nodes).
+- Still FROZEN otherwise: branch exp/tuple-eval @576699d, resume via 09-22 pointers below.
+
 ## STATE FOR NEW SESSION (2026-09-22 FROZEN — user switched projects)
 
 - STOPPED clean: all trainers + Moonbird workers killed, NOTHING running (verified empty process list).

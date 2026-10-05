@@ -35,6 +35,24 @@ real memory. Update them the moment something happens, not at the end.
    Direction of travel is only forward — we prove each kept change
    didn't make the engine worse.
 
+7. **MAIN IS ALWAYS STRONGEST (Stockfish rule, adopted 2026-10-05 from
+    QuoridorBestAI).** Nothing merges to main — code or weights — without a
+    sufficient-games gate proving the new build STRONGER (pair-mean +
+    paired-bootstrap CI clears 0.5). "Sufficient" is sized until the CI is
+    decisive; a straddling CI EXTENDS the gate, it never merges and never
+    rejects on the bound alone. Identical-decision proofs (perft, fixed-node
+    parity) excuse nothing: strength is proven by games, and only games.
+    Extends law 6: time gates (100ms AND 200ms) are the crown, 5k nodes is
+    the quality diagnosis.
+8. **NEVER REJECT ON A DIP.** An inconclusive gate is an order to SPEND MORE
+    GATE (more games), not a verdict. Reject only on a conclusive CI below
+    0.5; promote only on a conclusive CI above it.
+9. **ENGINE ADAPTS TO NET.** Never damage an experimental net to make it fit
+    main: no stripping sections, no converting formats, no rewriting blobs
+    to satisfy a loader. A net main cannot load yet waits for its wiring +
+    parity proof; it is never cut down. Reads (hash, load-for-eval, carve a
+    copy for verification) are free.
+
 ## Mistakes ledger (written when scolded, read before acting)
 
 - 2026-09-20: built S1–S5 sancta scaffolding (PROF atomics, Box/Arc in hot
