@@ -179,6 +179,61 @@ def block_indices(own, enm):
     return out
 
 
+def q2_indices(own, enm, blk):
+    """(n,36) QUATERNARY 2x2 indices (S36 enriched input = Moonbird level-1
+    geometry): digits 0 empty, 1 own, 2 enemy, 3 blocker; same anchors and
+    cell order as block_indices (mult x4). Startpos: (5,0)->16, (0,5)->8."""
+    n = len(own)
+    out = np.zeros((n, 36), dtype=np.uint8)
+    for a, cells in enumerate(CELLS):
+        idx = np.zeros(n, dtype=np.uint64)
+        mult = 1
+        for bit in cells:
+            o = (own & bit) != 0
+            e = (enm & bit) != 0
+            bl = (blk & bit) != 0
+            d = o.astype(np.uint64) + 2 * e.astype(np.uint64)
+            d = np.where(bl, np.uint64(3), d)
+            idx += d * mult
+            mult *= 4
+        out[:, a] = idx.astype(np.uint8)
+    return out
+
+
+RING1A = np.array(build_ring1(), dtype=np.uint64)
+
+
+def env_tables(own, enm, blk):
+    """Per-square ring tallies (S36 enriched input = Moonbird envCounts
+    geometry, own-trained weights). Returns (US, THEM) int32 (n,49):
+    US[sq] = sq*729 + o*81 + e*9 + bl (own/foe from OUR side);
+    THEM swaps the perspective. All-empty rings index sq*729
+    (constrained 0, skipped in forward)."""
+    n = len(own)
+    US = np.zeros((n, 49), dtype=np.int32)
+    TH = np.zeros((n, 49), dtype=np.int32)
+    for s in range(49):
+        ring = RING1A[s]
+        o = popcnt(own & ring).astype(np.int64)
+        e = popcnt(enm & ring).astype(np.int64)
+        bl = popcnt(blk & ring).astype(np.int64)
+        US[:, s] = (s * 729 + o * 81 + e * 9 + bl).astype(np.int32)
+        TH[:, s] = (s * 729 + e * 81 + o * 9 + bl).astype(np.int32)
+    return US, TH
+
+
+def mob_tables(own, enm, blk):
+    """Mobility (S36 enriched input): phase = total occupancy (cap 49),
+    count = clone-targets & empty per color. Returns (US, THEM) int64 (n,)
+    = phase*50 + count. Count 0 constrained 0, skipped in forward."""
+    total = own | enm | blk
+    empty = (~total) & FULL
+    phase = np.minimum(popcnt(total), 49)
+    cu = np.minimum(popcnt(dist_union(own, 1) & empty), 49)
+    ct = np.minimum(popcnt(dist_union(enm, 1) & empty), 49)
+    return (phase * 50 + cu).astype(np.int64), (phase * 50 + ct).astype(np.int64)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--cache', default='data/nnue/cache400k.npz')
@@ -319,6 +374,23 @@ def main():
     # per-batch inside the epoch loop. RAM: feats 0.4GB + cache-mmap 0 +
     # model/tensors small. Same math, same recipe, fits in 16GB.
     feats8 = feats.astype(np.int8)
+    t0 = time.time()
+    Q = q2_indices(own, enm, blk)
+    EUS, ETH = env_tables(own, enm, blk)
+    MUS, MTH = mob_tables(own, enm, blk)
+    print('enriched features %.0fs' % (time.time() - t0), flush=True)
+    # startpos guards (black a1 + white g7, black stm, no blockers):
+    # q2 (5,0) = 16 (own 3rd cell x16), (0,5) = 8 (foe 2nd x4)
+    o0 = np.array([np.uint64(1 << 42)])
+    o1 = np.array([np.uint64(1 << 6)])
+    zb = np.array([np.uint64(0)])
+    qsp = q2_indices(o0, o1, zb)
+    assert int(qsp[0, 5 * 6 + 0]) == 16 and int(qsp[0, 0 * 6 + 5]) == 8, qsp[0]
+    esp, thsp = env_tables(o0, o1, zb)
+    assert int(esp[0, 42]) == 42 * 729 and int(thsp[0, 6]) == 6 * 729, (esp[0, 42], thsp[0, 6])
+    mspu, mspth = mob_tables(o0, o1, zb)
+    assert int(mspu[0]) == 2 * 50 + 3 and int(mspth[0]) == 2 * 50 + 3, (mspu[0], mspth[0])
+    print('enriched guards OK (q2 16/8, env skip, mob 103/103)', flush=True)
     del feats, own, enm
     import gc as _gc
     _gc.collect()
@@ -360,7 +432,12 @@ def main():
     del idx
     ytr, yva = torch.from_numpy(resid[tr]), torch.from_numpy(resid[va])
     Xtr8, Xva8 = feats8[tr], feats8[va]
-    del feats8, resid
+    Qtr, Qva = Q[tr], Q[va]
+    EUtr, EUva = EUS[tr], EUS[va]
+    ETtr, ETva = ETH[tr], ETH[va]
+    MUtr, MUva = MUS[tr], MUS[va]
+    MTtr, MTva = MTH[tr], MTH[va]
+    del feats8, resid, Q, EUS, ETH, MUS, MTH
     _gc.collect()
     wtr, wva = samp_w[tr], samp_w[va]
     # S28: feats8 sub-gathers are views; copy to compact int8 (tr/va order).
@@ -371,9 +448,16 @@ def main():
     # 1 single bag + 4 pair bags + scalar bias. Index-0 entries are
     # constrained to exactly 0 after every step (empty patterns contribute
     # nothing, so the engine can SKIP them — bit-identical forward).
+    # S38 enriched: + quat bag (36x256) + env us/them (49x729 each) + mob
+    # us/them (2500 each). Env/mob have separate us/them tables (no sign
+    # sharing — SGD learns color asymmetry); empty-ring (sq*729) and
+    # zero-count (phase*50) rows constrained 0 and skipped in forward.
     bags = torch.nn.ModuleList(
         [torch.nn.EmbeddingBag(36 * 81, 1, mode='sum', sparse=True)]
         + [torch.nn.EmbeddingBag(81 * 81, 1, mode='sum', sparse=True) for _ in range(4)]
+        + [torch.nn.EmbeddingBag(36 * 256, 1, mode='sum', sparse=True)]
+        + [torch.nn.EmbeddingBag(49 * 729, 1, mode='sum', sparse=True) for _ in range(2)]
+        + [torch.nn.EmbeddingBag(50 * 50, 1, mode='sum', sparse=True) for _ in range(2)]
     )
     for bg in bags:
         torch.nn.init.zeros_(bg.weight)
@@ -387,6 +471,12 @@ def main():
         with torch.no_grad():
             for bg in bags:
                 bg.weight.data[0].zero_()
+            for sq in range(49):
+                bags[6].weight.data[sq * 729].zero_()
+                bags[7].weight.data[sq * 729].zero_()
+            for ph in range(50):
+                bags[8].weight.data[ph * 50].zero_()
+                bags[9].weight.data[ph * 50].zero_()
 
     active = [int(x) for x in a.dirs.split(',')]
     assert set(active) <= {0, 1, 2, 3} and active, a.dirs
@@ -396,26 +486,47 @@ def main():
     # (off = AR*81 + feat, pidx[d] = feat[xa] + 81 * feat[ya]).
     # S37 FIX: S28 wrote AR + feat (dropped the *81), hashing 2916 singles
     # rows into 117 — every training since used broken singles in Rust.
-    def batch_idx(Fb):
+    # S38 enriched: Q (36x256 quat, AR2 stride) + env us/them (49x729,
+    # absolute indices) + mob us/them (phase*50+cnt). All plain sums.
+    AR2 = np.arange(36, dtype=np.int64)[None, :] * 256
+
+    def batch_idx(Fb, Qb, EUb, ETb, MUb, MTb):
         F = torch.from_numpy(Fb.astype(np.int64))
         Xo = (AR * 81 + F.numpy()).astype(np.int64)
         Xpo = [(F.numpy()[:, XA[d]] + 81 * F.numpy()[:, YA[d]]).astype(np.int64)
                for d in range(4)]
+        Xq = (AR2 + Qb.astype(np.int64)).astype(np.int64)
         return (torch.from_numpy(Xo),
-                [torch.from_numpy(p) for p in Xpo])
+                [torch.from_numpy(p) for p in Xpo],
+                torch.from_numpy(Xq),
+                torch.from_numpy(EUb.astype(np.int64)),
+                torch.from_numpy(ETb.astype(np.int64)),
+                torch.from_numpy(MUb.astype(np.int64))[:, None],
+                torch.from_numpy(MTb.astype(np.int64))[:, None])
         # NOTE: AR/XA/YA are module-level int64 numpy; Fb rows sliced already.
 
-    def forward(Xb, Xpb):
+    def forward(Xb, Xpb, Xq, Xeu, Xet, Xmu, Xmt):
         pred = bags[0](Xb).squeeze(1) + bias
         for d in active:
             pred = pred + bags[d + 1](Xpb[d]).squeeze(1)
+        pred = (pred + bags[5](Xq).squeeze(1) + bags[6](Xeu).squeeze(1)
+                + bags[7](Xet).squeeze(1) + bags[8](Xmu).squeeze(1)
+                + bags[9](Xmt).squeeze(1))
         return pred
 
     def dump_tup(path):
         ws = bags[0].weight.detach().squeeze(1).numpy().reshape(36, 81)
-        wp = [bg.weight.detach().squeeze(1).numpy().reshape(6561) for bg in list(bags)[1:]]
-        assert ws[0, 0] == 0 and all(p[0] == 0 for p in wp), 'index-0 constraint broken'
-        allw = np.concatenate([ws.reshape(-1)] + [p.reshape(-1) for p in wp])
+        wp = [bg.weight.detach().squeeze(1).numpy().reshape(6561) for bg in list(bags)[1:5]]
+        wq = bags[5].weight.detach().squeeze(1).numpy().reshape(36 * 256)
+        weu = bags[6].weight.detach().squeeze(1).numpy()
+        wet = bags[7].weight.detach().squeeze(1).numpy()
+        wmu = bags[8].weight.detach().squeeze(1).numpy()
+        wmt = bags[9].weight.detach().squeeze(1).numpy()
+        assert ws[0, 0] == 0 and all(p[0] == 0 for p in wp) and wq[0] == 0, 'index-0 constraint broken'
+        assert all(weu[sq * 729] == 0 and wet[sq * 729] == 0 for sq in range(49)), 'env-0 broken'
+        assert all(wmu[ph * 50] == 0 and wmt[ph * 50] == 0 for ph in range(50)), 'mob-0 broken'
+        allw = np.concatenate([ws.reshape(-1)] + [p.reshape(-1) for p in wp]
+                              + [wq, weu, wet, wmu, wmt])
         print('weight spread: max|w| %.1f mean|w| %.2f frac_nonzero %.3f bias %+.1f'
               % (np.abs(allw).max(), np.abs(allw).mean(), (allw != 0).mean(), float(bias.item())),
               flush=True)
@@ -431,10 +542,15 @@ def main():
         for d in range(4):
             seg = wp[d].reshape(-1) if d in active else np.zeros(6561)
             payload += bytes(bytearray([(q(v) & 0xFF) for v in seg]))
+        # TUP5: TUP4 prefix + i16 LE sections q2 (9216), envus (35721),
+        # envthem, mobus (2500), mobthem. i16: enriched families exceed i8.
+        q16 = lambda arr: struct.pack('<%dh' % len(arr),
+                                      *[max(-32767, min(32767, int(round(v)))) for v in arr])
+        payload += q16(wq) + q16(weu) + q16(wet) + q16(wmu) + q16(wmt)
         with open(path, 'wb') as f:
-            f.write(b'TUP4' + payload)
+            f.write(b'TUP5' + payload)
         import os
-        print('wrote %s %.1fKB dirs %s' % (path, os.path.getsize(path) / 1024, a.dirs), flush=True)
+        print('wrote %s %.1fKB dirs %s TUP5' % (path, os.path.getsize(path) / 1024, a.dirs), flush=True)
 
     bs = 4096
     # S26 flywheel: plateau stop on RELATIVE val improvement. Your call of 4
@@ -455,10 +571,12 @@ def main():
         tot, cnt = 0.0, 0
         for i in range(0, ntr, bs):
             b = perm[i:i + bs]
-            Fb = Xtr8[b.numpy()]
-            Xo, Xpo = batch_idx(Fb)
+            bn = b.numpy()
+            Fb = Xtr8[bn]
+            Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt = batch_idx(
+                Fb, Qtr[bn], EUtr[bn], ETtr[bn], MUtr[bn], MTtr[bn])
             opt.zero_grad()
-            pred = forward(Xo, Xpo)
+            pred = forward(Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt)
             l2 = sum((bg.weight ** 2).sum() for bg in bags)
             wb = wtr[b]
             loss = ((pred - ytr[b]) ** 2 * wb).mean() + a.wd * l2
@@ -474,8 +592,10 @@ def main():
             totv, cntv = 0.0, 0
             for j in range(0, len(Xva8), 100000):
                 Fv = Xva8[j:j + 100000]
-                Xo, Xpo = batch_idx(Fv)
-                pv = forward(Xo, Xpo)
+                Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt = batch_idx(
+                    Fv, Qva[j:j + 100000], EUva[j:j + 100000],
+                    ETva[j:j + 100000], MUva[j:j + 100000], MTva[j:j + 100000])
+                pv = forward(Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt)
                 wv = wva[j:j + len(Fv)]
                 totv += ((((pv - yva[j:j + len(Fv)]) ** 2) * wv).sum().item())
                 cntv += len(Fv)
