@@ -415,6 +415,14 @@ def main():
                     help='Deadband: ignore loss moves within this fraction.')
     ap.add_argument('--step-ema', type=float, default=0.01,
                     help='EMA weight for the loss tracker (slow = robust).')
+    ap.add_argument('--step-kalman', action='store_true',
+                    help='Variance-aware detector (Kalman steady-state family): '
+                    'track batch-loss mean AND variance online (self-'
+                    'calibrating, no Q/R to tune); overshoot = beyond '
+                    'k*sigma, improvement = below -k*sigma. Replaces the '
+                    'fixed-deadband EMA test when set.')
+    ap.add_argument('--kf-k', type=float, default=2.0,
+                    help='Sigma threshold for overshoot/improvement.')
     ap.add_argument('--bt-factor', type=float, default=0.5)
     ap.add_argument('--bt-tol', type=float, default=1e-4,
                     help='Relative worsening that counts as overshoot.')
@@ -894,6 +902,7 @@ def main():
     max_ep = a.max_epochs if a.plateau > 0 else a.epochs
     prev_val, best_val, best_ep, stale = None, float('inf'), 0, 0
     step_ema, step_snap, step_reverts, step_bad = None, None, 0, 0
+    av_mean, av_var = None, None
     # Cyclic SGDR state (explore/exploit slider 3): cosine lr within a
     # cycle, restart (rewind to best + lr back to max) at cycle end.
     cyc_on = a.cyclic_T0 > 0
@@ -932,15 +941,25 @@ def main():
                 # Per-step bold driver: snapshot BEFORE seeing this step's
                 # effect is impossible without extra forwards, so assess with
                 # 1-step delay — revert restores the pre-step weights.
+                # Detector: EMA band by default, or variance-aware band with
+                # --step-kalman (online mean+variance, self-calibrating, no
+                # fixed deadband — steady-state Kalman family).
+                import math as _math2
                 cur = loss.item()
                 if step_ema is None:
                     step_ema = cur
+                    av_mean, av_var = cur, abs(cur) * 0.1 + 1.0
                     with torch.no_grad():
                         step_snap = ([bg.weight.detach().clone() for bg in bags],
                                      bias.detach().clone())
                 else:
-                    over = cur > step_ema * (1.0 + a.step_tol)
-                    under = cur < step_ema * (1.0 - a.step_tol)
+                    if a.step_kalman:
+                        sigma = _math2.sqrt(max(av_var, 1e-12))
+                        over = cur > av_mean + a.kf_k * sigma
+                        under = cur < av_mean - a.kf_k * sigma
+                    else:
+                        over = cur > step_ema * (1.0 + a.step_tol)
+                        under = cur < step_ema * (1.0 - a.step_tol)
                     # Persistence-2: single noisy batches don't trigger;
                     # sustained overshoot does (then revert + cut LR).
                     step_bad = step_bad + 1 if over else 0
@@ -958,6 +977,11 @@ def main():
                         for pg in opt.param_groups:
                             pg['lr'] = min(pg['lr'] * a.step_up, lr_max0 * 10.0)
                 step_ema = (1.0 - a.step_ema) * step_ema + a.step_ema * cur
+                if a.step_kalman:
+                    k = a.step_ema
+                    d = cur - av_mean
+                    av_mean = av_mean + k * d
+                    av_var = (1.0 - k) * av_var + k * d * d
                 with torch.no_grad():
                     step_snap = ([bg.weight.detach().clone() for bg in bags],
                                  bias.detach().clone())
