@@ -234,6 +234,104 @@ def mob_tables(own, enm, blk):
     return (phase * 50 + cu).astype(np.int64), (phase * 50 + ct).astype(np.int64)
 
 
+def capn_tables(own, enm, blk):
+    """Max conversion available per color (user: network input for how many
+    pieces moves convert; STATELESS so TT stays sound — last-move counts
+    would corrupt transposition entries). Returns (US, THEM) int64 (n,)
+    = max foe-adjacent over landing squares (0-8). US = own landings x foe
+    rings, THEM mirrored. 0 constrained 0, skipped in forward."""
+    total = own | enm | blk
+    empty = (~total) & FULL
+    lu = empty & (dist_union(own, 1) | jump_union(own))
+    lt = empty & (dist_union(enm, 1) | jump_union(enm))
+    mu = np.zeros(len(own), dtype=np.int64)
+    mt = np.zeros(len(own), dtype=np.int64)
+    for s in range(49):
+        bit = np.uint64(1 << s)
+        in_u = (lu & bit) != 0
+        in_t = (lt & bit) != 0
+        cu = popcnt(enm & RING1A[s]).astype(np.int64)
+        ct = popcnt(own & RING1A[s]).astype(np.int64)
+        mu = np.maximum(mu, np.where(in_u, cu, 0))
+        mt = np.maximum(mt, np.where(in_t, ct, 0))
+    return np.minimum(mu, 8), np.minimum(mt, 8)
+
+
+def ring_sorted():
+    """Ring squares per square in ASCENDING order (matches NEIGH_POS order
+    used by extract8/PEXT: HANDOFFS + extract8_matches_ring1 test)."""
+    out = []
+    for sq in range(49):
+        r, f = sq // 7, sq % 7
+        cells = []
+        for dr in (-1, 0, 1):
+            for df in (-1, 0, 1):
+                if dr == 0 and df == 0:
+                    continue
+                rr, ff = r + dr, f + df
+                if 0 <= rr < 7 and 0 <= ff < 7:
+                    cells.append(rr * 7 + ff)
+        out.append(sorted(cells))
+    return out
+
+
+RINGSORT = ring_sorted()
+
+
+def conv_tables(own, enm, blk):
+    """Conversion-kernel keys (user: index by the LUT key used for
+    conversion). For each square: 8-bit key of FOE occupancy in ascending
+    ring order = EXACTLY the key infect_via_lut feeds CONVERT8 (blockers
+    read as empty, same conflation). US table sees foe bits, THEM table
+    sees own bits. Returns (US, THEM) int32 (n,49), 0-255. Key 0
+    constrained 0 (empty surroundings contribute nothing)."""
+    n = len(own)
+    US = np.zeros((n, 49), dtype=np.int32)
+    TH = np.zeros((n, 49), dtype=np.int32)
+    for sq in range(49):
+        ring = RINGSORT[sq]
+        ku = 0
+        kt = 0
+        for i, s in enumerate(ring):
+            bit = np.uint64(1 << s)
+            ku |= (((enm & bit) != 0).astype(np.int64) << i)
+            kt |= (((own & bit) != 0).astype(np.int64) << i)
+        US[:, sq] = ku.astype(np.int32)
+        TH[:, sq] = kt.astype(np.int32)
+    return US, TH
+
+
+def capn_bruteforce(cells, color):
+    """Independent reference: enumerate moves, max conversions. cells =
+    list of 49 (0 empty 1 black 2 white), color 1/2. Cross-check only."""
+    best = 0
+    for o, v in enumerate(cells):
+        if v != color:
+            continue
+        r, f = o // 7, o % 7
+        for dr in (-2, -1, 0, 1, 2):
+            for df in (-2, -1, 0, 1, 2):
+                if dr == 0 and df == 0:
+                    continue
+                rr, ff = r + dr, f + df
+                if not (0 <= rr < 7 and 0 <= ff < 7):
+                    continue
+                d = rr * 7 + ff
+                if cells[d] != 0:
+                    continue
+                foe = 3 - color
+                conv = 0
+                for er in (-1, 0, 1):
+                    for ef in (-1, 0, 1):
+                        if er == 0 and ef == 0:
+                            continue
+                        sr, sf = rr + er, ff + ef
+                        if 0 <= sr < 7 and 0 <= sf < 7 and cells[sr * 7 + sf] == foe:
+                            conv += 1
+                best = max(best, conv)
+    return best
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--cache', default='data/nnue/cache400k.npz')
@@ -250,6 +348,8 @@ def main():
                     help='S26 flywheel checkpoints: path template, e.g. data/nnue/fly12M_ep{ep}.tup. '
                     'Empty = only final --out. Best-val epoch also copied to --out.')
     ap.add_argument('--lr', type=float, default=4.0)
+    ap.add_argument('--conv-lr', type=float, default=0.005,
+                    help='LR for dense-visit capn/conv families (bags 10-13).')
     ap.add_argument('--wd', type=float, default=1e-7)
     ap.add_argument('--seed', type=int, default=7)
     ap.add_argument('--dirs', default='0,1,2,3',
@@ -384,6 +484,8 @@ def main():
     Q = q2_indices(own, enm, blk)
     EUS, ETH = env_tables(own, enm, blk)
     MUS, MTH = mob_tables(own, enm, blk)
+    CUS, CTH = capn_tables(own, enm, blk)
+    VUS, VTH = conv_tables(own, enm, blk)
     print('enriched features %.0fs' % (time.time() - t0), flush=True)
     # startpos guards (black a1 + white g7, black stm, no blockers):
     # q2 (5,0) = 16 (own 3rd cell x16), (0,5) = 8 (foe 2nd x4)
@@ -395,8 +497,30 @@ def main():
     esp, thsp = env_tables(o0, o1, zb)
     assert int(esp[0, 42]) == 42 * 729 and int(thsp[0, 6]) == 6 * 729, (esp[0, 42], thsp[0, 6])
     mspu, mspth = mob_tables(o0, o1, zb)
+    # capn startpos guard: no landing converts anything (lone stones far apart)
+    cspu, cspth = capn_tables(o0, o1, zb)
+    assert int(cspu[0]) == 0 and int(cspth[0]) == 0, (cspu[0], cspth[0])
+    # brute-force cross-check on 200 sample rows (independent move loop
+    # vs vectorized rings — must agree exactly).
+    import random as _rng
+    _r = _rng.Random(5)
+    for _i in _r.sample(range(len(occ0)), min(200, len(occ0))):
+        a0, a1, ab = int(occ0[_i]), int(occ1[_i]), int(blk[_i])
+        cells = [3 if (ab >> sq) & 1 else 1 if (a0 >> sq) & 1
+                 else 2 if (a1 >> sq) & 1 else 0 for sq in range(49)]
+        bu = capn_bruteforce(cells, 1 if stm[_i] == 0 else 2)
+        bt = capn_bruteforce(cells, 2 if stm[_i] == 0 else 1)
+        assert bu == int(CUS[_i]) and bt == int(CTH[_i]), (_i, bu, bt, CUS[_i], CTH[_i])
+    print('capn guards OK (startpos 0/0 + 200-row brute-force parity)', flush=True)
     assert int(mspu[0]) == 2 * 50 + 3 and int(mspth[0]) == 2 * 50 + 3, (mspu[0], mspth[0])
     print('enriched guards OK (q2 16/8, env skip, mob 103/103)', flush=True)
+    # conv guard on startpos probe (NOT cache row 0): f7(5) ring dr-outer ->
+    # e7(4),g7(6),e6(12),f6(13),g6(20); white at g7 = bit1 -> key 2.
+    # a1(42): foe far -> key 0. Them-side: own far -> 0.
+    vspu, vspth = conv_tables(o0, o1, zb)
+    assert int(vspu[0, 5]) == 2 and int(vspu[0, 42]) == 0, (vspu[0, 5], vspu[0, 42])
+    assert int(vspth[0, 5]) == 0, vspth[0, 5]
+    print('conv guards OK (f7 key 2)', flush=True)
     del feats, own, enm
     import gc as _gc
     _gc.collect()
@@ -458,6 +582,13 @@ def main():
     ETtr, ETva = ETH[tr], ETH[va]
     MUtr, MUva = MUS[tr], MUS[va]
     MTtr, MTva = MTH[tr], MTH[va]
+    CUtr, CUva = CUS[tr], CUS[va]
+    CTtr, CTva = CTH[tr], CTH[va]
+    del CUS, CTH
+    VUtr, VUva = VUS[tr], VUS[va]
+    VTtr, VTva = VTH[tr], VTH[va]
+    del VUS, VTH
+    _gc.collect()
     del feats8, Q, EUS, ETH, MUS, MTH
     _gc.collect()
     wtr, wva = samp_w[tr], samp_w[va]
@@ -479,6 +610,8 @@ def main():
         + [torch.nn.EmbeddingBag(36 * 256, 1, mode='sum', sparse=True)]
         + [torch.nn.EmbeddingBag(49 * 729, 1, mode='sum', sparse=True) for _ in range(2)]
         + [torch.nn.EmbeddingBag(50 * 50, 1, mode='sum', sparse=True) for _ in range(2)]
+        + [torch.nn.EmbeddingBag(9, 1, mode='sum', sparse=True) for _ in range(2)]
+        + [torch.nn.EmbeddingBag(256, 1, mode='sum', sparse=True) for _ in range(2)]
     )
     for bg in bags:
         torch.nn.init.zeros_(bg.weight)
@@ -486,7 +619,15 @@ def main():
     params = list(bags.parameters()) + [bias]
     # NOTE: torch SGD weight_decay is dense+sparse incompatible; L2 is added
     # to the loss manually below (works on the dense weight tensors).
-    opt = torch.optim.SGD(params, lr=a.lr)
+    # Dense-visit families (conv 49 lookups/row, capn 1/9) diverge at the
+    # sparse-family lr — own param group at --conv-lr.
+    opt = torch.optim.SGD(
+        [
+            {'params': list(bags[0:10].parameters()) + [bias]},
+            {'params': list(bags[10:14].parameters()), 'lr': a.conv_lr},
+        ],
+        lr=a.lr,
+    )
 
     def zero_constrained():
         with torch.no_grad():
@@ -498,6 +639,10 @@ def main():
             for ph in range(50):
                 bags[8].weight.data[ph * 50].zero_()
                 bags[9].weight.data[ph * 50].zero_()
+            bags[10].weight.data[0].zero_()
+            bags[11].weight.data[0].zero_()
+            bags[12].weight.data[0].zero_()
+            bags[13].weight.data[0].zero_()
 
     active = [int(x) for x in a.dirs.split(',')]
     assert set(active) <= {0, 1, 2, 3} and active, a.dirs
@@ -511,7 +656,7 @@ def main():
     # absolute indices) + mob us/them (phase*50+cnt). All plain sums.
     AR2 = np.arange(36, dtype=np.int64)[None, :] * 256
 
-    def batch_idx(Fb, Qb, EUb, ETb, MUb, MTb):
+    def batch_idx(Fb, Qb, EUb, ETb, MUb, MTb, CUb, CTb, VUb, VTb):
         F = torch.from_numpy(Fb.astype(np.int64))
         Xo = (AR * 81 + F.numpy()).astype(np.int64)
         Xpo = [(F.numpy()[:, XA[d]] + 81 * F.numpy()[:, YA[d]]).astype(np.int64)
@@ -523,16 +668,22 @@ def main():
                 torch.from_numpy(EUb.astype(np.int64)),
                 torch.from_numpy(ETb.astype(np.int64)),
                 torch.from_numpy(MUb.astype(np.int64))[:, None],
-                torch.from_numpy(MTb.astype(np.int64))[:, None])
+                torch.from_numpy(MTb.astype(np.int64))[:, None],
+                torch.from_numpy(CUb.astype(np.int64))[:, None],
+                torch.from_numpy(CTb.astype(np.int64))[:, None],
+                torch.from_numpy(VUb.astype(np.int64)),
+                torch.from_numpy(VTb.astype(np.int64)))
         # NOTE: AR/XA/YA are module-level int64 numpy; Fb rows sliced already.
 
-    def forward(Xb, Xpb, Xq, Xeu, Xet, Xmu, Xmt):
+    def forward(Xb, Xpb, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt):
         pred = bags[0](Xb).squeeze(1) + bias
         for d in active:
             pred = pred + bags[d + 1](Xpb[d]).squeeze(1)
         pred = (pred + bags[5](Xq).squeeze(1) + bags[6](Xeu).squeeze(1)
                 + bags[7](Xet).squeeze(1) + bags[8](Xmu).squeeze(1)
-                + bags[9](Xmt).squeeze(1))
+                + bags[9](Xmt).squeeze(1) + bags[10](Xcu).squeeze(1)
+                + bags[11](Xct).squeeze(1) + bags[12](Xvu).squeeze(1)
+                + bags[13](Xvt).squeeze(1))
         return pred
 
     def dump_tup(path):
@@ -546,8 +697,13 @@ def main():
         assert ws[0, 0] == 0 and all(p[0] == 0 for p in wp) and wq[0] == 0, 'index-0 constraint broken'
         assert all(weu[sq * 729] == 0 and wet[sq * 729] == 0 for sq in range(49)), 'env-0 broken'
         assert all(wmu[ph * 50] == 0 and wmt[ph * 50] == 0 for ph in range(50)), 'mob-0 broken'
+        wcu = bags[10].weight.detach().squeeze(1).numpy()
+        wct = bags[11].weight.detach().squeeze(1).numpy()
+        wvu = bags[12].weight.detach().squeeze(1).numpy()
+        wvt = bags[13].weight.detach().squeeze(1).numpy()
+        assert wcu[0] == 0 and wct[0] == 0 and wvu[0] == 0 and wvt[0] == 0, 'capn/conv-0 broken'
         allw = np.concatenate([ws.reshape(-1)] + [p.reshape(-1) for p in wp]
-                              + [wq, weu, wet, wmu, wmt])
+                              + [wq, weu, wet, wmu, wmt, wcu, wct, wvu, wvt])
         print('weight spread: max|w| %.1f mean|w| %.2f frac_nonzero %.3f bias %+.1f'
               % (np.abs(allw).max(), np.abs(allw).mean(), (allw != 0).mean(), float(bias.item())),
               flush=True)
@@ -565,13 +721,15 @@ def main():
             payload += bytes(bytearray([(q(v) & 0xFF) for v in seg]))
         # TUP5: TUP4 prefix + i16 LE sections q2 (9216), envus (35721),
         # envthem, mobus (2500), mobthem. i16: enriched families exceed i8.
+        # TUP6: TUP5 + capn us/them (9 each) + conv us/them (256 each).
         q16 = lambda arr: struct.pack('<%dh' % len(arr),
                                       *[max(-32767, min(32767, int(round(v)))) for v in arr])
         payload += q16(wq) + q16(weu) + q16(wet) + q16(wmu) + q16(wmt)
+        payload += q16(wcu) + q16(wct) + q16(wvu) + q16(wvt)
         with open(path, 'wb') as f:
-            f.write(b'TUP5' + payload)
+            f.write(b'TUP6' + payload)
         import os
-        print('wrote %s %.1fKB dirs %s TUP5' % (path, os.path.getsize(path) / 1024, a.dirs), flush=True)
+        print('wrote %s %.1fKB dirs %s TUP6' % (path, os.path.getsize(path) / 1024, a.dirs), flush=True)
 
     bs = 4096
     # S26 flywheel: plateau stop on RELATIVE val improvement. Your call of 4
@@ -594,10 +752,11 @@ def main():
             b = perm[i:i + bs]
             bn = b.numpy()
             Fb = Xtr8[bn]
-            Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt = batch_idx(
-                Fb, Qtr[bn], EUtr[bn], ETtr[bn], MUtr[bn], MTtr[bn])
+            Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt = batch_idx(
+                Fb, Qtr[bn], EUtr[bn], ETtr[bn], MUtr[bn], MTtr[bn],
+                CUtr[bn], CTtr[bn], VUtr[bn], VTtr[bn])
             opt.zero_grad()
-            pred = forward(Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt)
+            pred = forward(Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt)
             l2 = sum((bg.weight ** 2).sum() for bg in bags)
             wb = wtr[b]
             if a.texel:
@@ -617,10 +776,12 @@ def main():
             totv, cntv = 0.0, 0
             for j in range(0, len(Xva8), 100000):
                 Fv = Xva8[j:j + 100000]
-                Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt = batch_idx(
+                Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt = batch_idx(
                     Fv, Qva[j:j + 100000], EUva[j:j + 100000],
-                    ETva[j:j + 100000], MUva[j:j + 100000], MTva[j:j + 100000])
-                pv = forward(Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt)
+                    ETva[j:j + 100000], MUva[j:j + 100000], MTva[j:j + 100000],
+                    CUva[j:j + 100000], CTva[j:j + 100000],
+                    VUva[j:j + 100000], VTva[j:j + 100000])
+                pv = forward(Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt)
                 wv = wva[j:j + len(Fv)]
                 if a.texel:
                     pwv = torch.sigmoid((base_va[j:j + len(Fv)] + pv) * LN10K)

@@ -13,14 +13,19 @@
 //! (S21e, zero gate loss): H+V tables = 16KB total, L1-resident — the
 //! lookups stop missing L2. Inactive directions cost zero lookups.
 
-use crate::board::{block2_index, dist_union, Board, PAIR_BLOCKS, RING1, SQ_BLOCKS};
+use crate::board::{block2_index, dist_union, jump_union, Board, PAIR_BLOCKS, RING1, SQ_BLOCKS};
 
 /// Magic header of `.tup` weight files (v4: bias + i8 singles + sparse dirs).
 pub const TUP_MAGIC: [u8; 4] = *b"TUP4";
 /// v5: TUP4 prefix + i16 LE sections q2 (36x256) + env us/them (49x729 each)
 /// + mob us/them (50x50 each). S38 enriched inputs (quat 2x2, env tallies,
 /// mobility), own-trained weights.
+/// v6: TUP5 + capn us/them (max conversion 0-8, 9 each) + conv us/them
+/// (conversion-kernel LUT keys 0-255 each). User: max-conversion magnitude
+/// + PEXT-key patterns as network inputs (stateless — last-move counts
+/// would corrupt TT entries).
 pub const TUP5_MAGIC: [u8; 4] = *b"TUP5";
+pub const TUP6_MAGIC: [u8; 4] = *b"TUP6";
 /// 8-cell ternary pair patterns per direction table.
 pub const PAIR_PATTERNS: usize = 81 * 81;
 /// Geometry pair counts per direction (H, V, D1, D2).
@@ -50,6 +55,42 @@ pub struct TupleTable {
     mob_us: Box<[i16; MOB_PATTERNS]>,
     mob_them: Box<[i16; MOB_PATTERNS]>,
     has_enriched: bool,
+    capn_us: Box<[i16; 9]>,
+    capn_them: Box<[i16; 9]>,
+    conv_us: Box<[i16; 256]>,
+    conv_them: Box<[i16; 256]>,
+    has_capconv: bool,
+}
+
+/// Conversion-kernel key for a square: foe occupancy in dr-outer ring
+/// order (matches NEIGH_POS bit order used by extract8/PEXT; off-board
+/// absent since we iterate NEIGH_CNT entries only). Bit i = i-th ring
+/// square holds a foe stone.
+#[inline]
+fn conv_key(occ_foe: u64, sq: usize) -> usize {
+    let mut key = 0usize;
+    for i in 0..crate::board::NEIGH_CNT[sq] as usize {
+        let s = crate::board::NEIGH_POS[sq][i] as usize;
+        if occ_foe & (1u64 << s) != 0 {
+            key |= 1 << i;
+        }
+    }
+    key
+}
+
+/// Max conversion available to `own` stones (foe = enemy bits).
+fn maxconv(own: u64, foe: u64, empty: u64) -> usize {
+    let mut best = 0u32;
+    let mut land = empty & (dist_union(own, 1) | crate::board::jump_union(own));
+    while land != 0 {
+        let sq = land.trailing_zeros() as usize;
+        land &= land - 1;
+        let c = (foe & RING1[sq]).count_ones();
+        if c > best {
+            best = c;
+        }
+    }
+    best.min(8) as usize
 }
 
 /// Ternary anchor mult (1/3/9/27 from SQ_BLOCKS) -> quaternary mult.
@@ -85,19 +126,28 @@ impl TupleTable {
             mob_us: Box::new([0; MOB_PATTERNS]),
             mob_them: Box::new([0; MOB_PATTERNS]),
             has_enriched: false,
+            capn_us: Box::new([0; 9]),
+            capn_them: Box::new([0; 9]),
+            conv_us: Box::new([0; 256]),
+            conv_them: Box::new([0; 256]),
+            has_capconv: false,
         }
     }
 
-    /// Load `.tup` weights (v4 classic, v5 enriched — backward compatible).
+    /// Load `.tup` weights (v4 classic, v5 enriched, v6 +capn/conv —
+    /// backward compatible, missing sections read as zeros).
     pub fn load(path: &str) -> std::io::Result<TupleTable> {
         let buf = std::fs::read(path)?;
-        if buf.len() < 8 || (buf[0..4] != TUP_MAGIC && buf[0..4] != TUP5_MAGIC) {
+        if buf.len() < 8
+            || (buf[0..4] != TUP_MAGIC && buf[0..4] != TUP5_MAGIC && buf[0..4] != TUP6_MAGIC)
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "bad .tup magic (want TUP4/TUP5)",
+                "bad .tup magic (want TUP4/TUP5/TUP6)",
             ));
         }
         let rd32 = |o: usize| i32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+        let rd16 = |o: usize| i16::from_le_bytes([buf[o], buf[o + 1]]);
         let bias = rd32(4);
         let mut o = 8usize;
         let need = |o: usize, n: usize| {
@@ -149,9 +199,13 @@ impl TupleTable {
             mob_us: Box::new([0; MOB_PATTERNS]),
             mob_them: Box::new([0; MOB_PATTERNS]),
             has_enriched: false,
+            capn_us: Box::new([0; 9]),
+            capn_them: Box::new([0; 9]),
+            conv_us: Box::new([0; 256]),
+            conv_them: Box::new([0; 256]),
+            has_capconv: false,
         };
-        if buf[0..4] == TUP5_MAGIC {
-            let rd16 = |o: usize| i16::from_le_bytes([buf[o], buf[o + 1]]);
+        if buf[0..4] == TUP5_MAGIC || buf[0..4] == TUP6_MAGIC {
             for a in t.q2.iter_mut() {
                 for v in a.iter_mut() {
                     need(o, 2)?;
@@ -174,6 +228,23 @@ impl TupleTable {
                 }
             }
             t.has_enriched = true;
+        }
+        if buf[0..4] == TUP6_MAGIC {
+            for table in [&mut t.capn_us, &mut t.capn_them].iter_mut() {
+                for v in table.iter_mut() {
+                    need(o, 2)?;
+                    *v = rd16(o);
+                    o += 2;
+                }
+            }
+            for table in [&mut t.conv_us, &mut t.conv_them].iter_mut() {
+                for v in table.iter_mut() {
+                    need(o, 2)?;
+                    *v = rd16(o);
+                    o += 2;
+                }
+            }
+            t.has_capconv = true;
         }
         Ok(t)
     }
@@ -228,6 +299,9 @@ impl TupleTable {
         }
         if self.has_enriched {
             s += self.forward_enriched(b, &blocks);
+        }
+        if self.has_capconv {
+            s += self.forward_capconv(b);
         }
         s
     }
@@ -323,6 +397,54 @@ impl TupleTable {
         }
         s
     }
+
+    /// S45 capn/conv forward: max-conversion magnitudes (0-8) + per-square
+    /// conversion-kernel LUT keys (foe pattern in NEIGH_POS bit order).
+    /// Stateless (position-only) so TT stays sound. Skips mirror the
+    /// zero-constraints (0 entries).
+    fn forward_capconv(&self, b: &Board) -> i32 {
+        let ou = b.me();
+        let ot = b.opp();
+        let mut s: i32 = 0;
+        // Max conversion available per side.
+        let empty = !ou & !ot & !b.blockers & crate::board::FULL;
+        let land_u = empty & (dist_union(ou, 1) | jump_union(ou));
+        let land_t = empty & (dist_union(ot, 1) | jump_union(ot));
+        let mut mu = 0u32;
+        let mut ls = land_u;
+        while ls != 0 {
+            let sq = ls.trailing_zeros() as usize;
+            ls &= ls - 1;
+            mu = mu.max((ot & RING1[sq]).count_ones());
+        }
+        let mut mt = 0u32;
+        ls = land_t;
+        while ls != 0 {
+            let sq = ls.trailing_zeros() as usize;
+            ls &= ls - 1;
+            mt = mt.max((ou & RING1[sq]).count_ones());
+        }
+        if mu != 0 {
+            s += self.capn_us[mu.min(8) as usize] as i32;
+        }
+        if mt != 0 {
+            s += self.capn_them[mt.min(8) as usize] as i32;
+        }
+        // Conversion-kernel keys per square (foe pattern, NEIGH_POS order).
+        let mut sq = 0usize;
+        while sq < 49 {
+            let ku = conv_key(ot, sq);
+            if ku != 0 {
+                s += self.conv_us[ku] as i32;
+            }
+            let kt = conv_key(ou, sq);
+            if kt != 0 {
+                s += self.conv_them[kt] as i32;
+            }
+            sq += 1;
+        }
+        s
+    }
 }
 
 #[cfg(test)]
@@ -411,6 +533,27 @@ mod tests {
         t2.has_enriched = true;
         t2.q2[30][144] = 7;
         assert_eq!(t2.forward(&b), 7);
+    }
+
+    #[test]
+    fn capconv_single_entry_picks() {
+        // Black a1, white b1+a2, black stm (35 dots + "o......" + "xo.....").
+        // Black maxconv = 2 (b2 takes a2+b1); white maxconv >= 1 but its
+        // table is zero here.
+        let b = Board::from_str(
+            "...................................o......xo..... b",
+        )
+        .unwrap();
+        let mut t = TupleTable::zeros();
+        t.has_capconv = true;
+        t.capn_us[2] = 7;
+        assert_eq!(t.forward(&b), 7);
+        // conv key at b2(36): dr-outer ring bits i3 (a2) + i6 (b1) = 72.
+        // (No other square on this board has key 72 — verified by enumeration.)
+        let mut t2 = TupleTable::zeros();
+        t2.has_capconv = true;
+        t2.conv_us[72] = 11;
+        assert_eq!(t2.forward(&b), 11);
     }
 
     #[test]
