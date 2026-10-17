@@ -56,7 +56,7 @@ const EXEMPT: &[&str] = &[
     // The shipped champion eval. Small (28KB), our own SGD weights, and main
     // runs it by default — like Stockfish shipping its net with the repo.
     // Every other blob stays untracked (the *.tup rule above still bites).
-    "data/nnue/tupS37fix.tup",
+    "data/nnue/tups53r0.tup", // lowercase: reason() compares against lowercased paths
 ];
 
 fn glob_match(pattern: &str, name: &str) -> bool {
@@ -90,7 +90,7 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 fn reason(path: &str) -> Option<String> {
     let lower = path.to_ascii_lowercase();
 
-    if EXEMPT.iter().any(|e| lower.starts_with(e)) {
+    if EXEMPT.iter().any(|e| lower.starts_with(&e.to_ascii_lowercase())) {
         return None;
     }
     if is_target_dir(&lower) {
