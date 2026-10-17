@@ -64,6 +64,11 @@ real memory. Update them the moment something happens, not at the end.
     verified from the log, not assumed from the game count. Paired openings
     (same line, both seats) when the harness supports books; until then,
     alternation + balance check is the floor.
+12. **WORK LOSERS, DON'T ONE-GATE ABANDON (user law 2026-10-05).** A losing
+    challenger gets recipe variants (epochs, blend, families, seeds) until
+    it beats the champion or fails by understood mechanism. Reject on a
+    single gate only for conclusive blowouts or protocol violations —
+    never on a straddle, never from impatience.
 
 ## Mistakes ledger (written when scolded, read before acting)
 
