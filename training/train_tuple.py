@@ -266,6 +266,12 @@ def main():
                     help='S25: weight on game outcome (out column -> cp); '
                     'target = (1-ow)*score_target + ow*outcome_cp. '
                     'outcome_cp = (out*2-1)*OUTCOME_SCALE stm-relative.')
+    ap.add_argument('--texel', action='store_true',
+                    help='Moonbird-style Texel loss: MSE on win-probability '
+                    'sigmoid(base+pred) instead of MSE on cp residuals. '
+                    'Targets = sigmoid(best_cp). Same tables, same export.')
+    ap.add_argument('--texel-k', type=float, default=567.89,
+                    help='Elo-logistic scale for the Texel sigmoid.')
     ap.add_argument('--out', default='data/nnue/tupS20.tup')
     a = ap.parse_args()
 
@@ -406,10 +412,18 @@ def main():
     # result (proof-search visit values, exotic perspective; white rows mean
     # 0.75). Blending it produced a -400-Elo table. Teacher best_score
     # residuals ONLY — never touch `out` again.
-    resid = (best_cp - base).astype(np.float32)
-    del base, best_cp
+    LN10K = 2.302585093 / float(a.texel_k)
+    if a.texel:
+        plab = 1.0 / (1.0 + np.power(10.0, -np.clip(best_cp, -1500.0, 1500.0) / float(a.texel_k)))
+        y_full = plab.astype(np.float32)
+        print('texel targets: winprob mean %.3f (k=%.2f)' % (y_full.mean(), a.texel_k), flush=True)
+        resid = None
+    else:
+        resid = (best_cp - base).astype(np.float32)
+        print('residual mean %+.1f std %.1f' % (resid.mean(), resid.std()), flush=True)
+        y_full = None
+    del best_cp
     _gc.collect()
-    print('residual mean %+.1f std %.1f' % (resid.mean(), resid.std()), flush=True)
     # S21f: trust high-visit rows (wsum weights, mean-normalized). Absent in
     # old caches -> uniform weights (backward compatible).
     if 'wsum' in z:
@@ -430,7 +444,14 @@ def main():
     cut = int(n * 0.95)
     tr, va = idx[:cut], idx[cut:]
     del idx
-    ytr, yva = torch.from_numpy(resid[tr]), torch.from_numpy(resid[va])
+    if a.texel:
+        ytr, yva = torch.from_numpy(y_full[tr]), torch.from_numpy(y_full[va])
+        base_tr = torch.from_numpy(base[tr].astype(np.float32))
+        base_va = torch.from_numpy(base[va].astype(np.float32))
+        del base, y_full
+    else:
+        ytr, yva = torch.from_numpy(resid[tr]), torch.from_numpy(resid[va])
+        del base, resid
     Xtr8, Xva8 = feats8[tr], feats8[va]
     Qtr, Qva = Q[tr], Q[va]
     EUtr, EUva = EUS[tr], EUS[va]
@@ -579,7 +600,11 @@ def main():
             pred = forward(Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt)
             l2 = sum((bg.weight ** 2).sum() for bg in bags)
             wb = wtr[b]
-            loss = ((pred - ytr[b]) ** 2 * wb).mean() + a.wd * l2
+            if a.texel:
+                pw = torch.sigmoid((base_tr[b] + pred) * LN10K)
+                loss = (((pw - ytr[b]) ** 2) * wb).mean() + a.wd * l2
+            else:
+                loss = ((pred - ytr[b]) ** 2 * wb).mean() + a.wd * l2
             loss.backward()
             opt.step()
             zero_constrained()
@@ -597,7 +622,11 @@ def main():
                     ETva[j:j + 100000], MUva[j:j + 100000], MTva[j:j + 100000])
                 pv = forward(Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt)
                 wv = wva[j:j + len(Fv)]
-                totv += ((((pv - yva[j:j + len(Fv)]) ** 2) * wv).sum().item())
+                if a.texel:
+                    pwv = torch.sigmoid((base_va[j:j + len(Fv)] + pv) * LN10K)
+                    totv += ((((pwv - yva[j:j + len(Fv)]) ** 2) * wv).sum().item())
+                else:
+                    totv += ((((pv - yva[j:j + len(Fv)]) ** 2) * wv).sum().item())
                 cntv += len(Fv)
             vmse = totv / max(cntv, 1)
         improv = (prev_val - vmse) / max(prev_val, 1e-9) if prev_val else 1.0
