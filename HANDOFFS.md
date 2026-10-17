@@ -246,3 +246,7 @@ embed quotes manually: `$oppQ = "`"$m serve`""`.
 4. Aspiration windows (ladder ±50/±200/±800 from depth 3, autaxx).
 5. LazySMP with TOTAL node budget across workers (Arc<AtomicU64> counter —
    titanium commit 8a0399d pattern) — we have 4c/8t idle during gates.
+
+## 2026-10-17 R0 shipped (S53r0, 1903dca on origin/main)
+
+- Champion is now data/nnue/tupS53r0.tup (TUP7, DEFAULT_TUP). S37fix retired. Resume: seeds/PBT queue + 12M graft-label pipeline; next escapes per S40 map (aspiration re-implant, doubles-ordering, SMP, SPSA joint tuning). Infra lessons: hygiene reason() is case-sensitive vs lowercased paths (fixed); Edit tool preserves mtime so cargo may skip rebuilds - touch the file to force.
