@@ -48,6 +48,8 @@ const ORD_KILLER: i32 = 100_000;
 const ORD_CAPTURE_UNIT: i32 = 1000; // per conversion, max 8
 const ORD_CLONE_BONUS: i32 = 500;
 const ORD_JUMP_PEN: i32 = 500;
+/// exp/ab O1: extra jump penalty per own stone neighboring the origin.
+const ORD_JUMP_CONN: i32 = 250;
 const ORD_HISTORY_MAX: i32 = 90_000;
 const _: () = assert!(ORD_HISTORY_MAX + 8 * ORD_CAPTURE_UNIT + ORD_CLONE_BONUS < ORD_KILLER);
 const _: () = assert!(ORD_KILLER < ORD_TT);
@@ -166,10 +168,16 @@ fn score_into(
         let mut score = (opp & RING1[m.to as usize]).count_ones() as i32 * ORD_CAPTURE_UNIT;
         // Clone preference: a clone nets one more stone than a jump and
         // leaves the origin defended ("duplicate as much as you can").
+        // (exp/ab A tested no-asymmetry: 41-55, keep preference.)
         if m.is_clone() {
             score += ORD_CLONE_BONUS;
         } else {
-            score -= ORD_JUMP_PEN;
+            // exp/ab O1 (hole-aware jumps): a jump vacates its origin —
+            // leaving a connected origin breaks formation, so penalty
+            // scales with own stones adjacent to the origin square.
+            let conn =
+                (b.occ[b.turn as usize] & RING1[m.from as usize]).count_ones() as i32;
+            score -= ORD_JUMP_PEN + conn * ORD_JUMP_CONN;
         }
         if packed == k1 || packed == k2 {
             score += ORD_KILLER;
@@ -534,6 +542,7 @@ impl<'a> Searcher<'a> {
         // in Ataxx and there is no zugzwang to speak of. Gates: not right
         // after another null, depth > 2, enough clone targets (mobility),
         // board not too full (forced-pass danger zone). R = 3.
+        // (exp/ab B: R = 2 pooled 108-84-8, straddles, parked for 3rd leg.)
         if null_allowed && depth > 2 {
             let clone_targets = (dist_union(b.occ[b.turn as usize], 1) & b.empty()).count_ones();
             // fill < 0.54 as integer: pieces*50 < 26*49 (no per-node float div).
