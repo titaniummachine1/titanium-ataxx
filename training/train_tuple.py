@@ -332,6 +332,45 @@ def capn_bruteforce(cells, color):
     return best
 
 
+def load_tup(path):
+    """Warm start (PBT exploit step): read TUP4/5/6/7 into bags, missing
+    sections stay zero-init. Returns (bias, ws, wps, rest, capconv, paa)
+    with rest/capconv/paa None when the file predates them."""
+    buf = open(path, 'rb').read()
+    magic = buf[:4]
+    assert magic in (b'TUP4', b'TUP5', b'TUP6', b'TUP7'), magic
+    o = 8
+    bias0 = float(struct.unpack('<i', buf[4:8])[0])
+    ws = np.frombuffer(buf[o:o + 2916], dtype=np.int8).astype(np.float32)
+    o += 2916
+    counts = struct.unpack('<4i', buf[o:o + 16])
+    o += 16
+    wps = []
+    for d in range(4):
+        wps.append(np.frombuffer(buf[o:o + 6561], dtype=np.int8).astype(np.float32))
+        o += 6561
+
+    def r16(n):
+        nonlocal o
+        v = np.frombuffer(buf[o:o + 2 * n], dtype='<i2').astype(np.float32)
+        o += 2 * n
+        return v
+
+    rest = capconv = paa = None
+    if magic in (b'TUP5', b'TUP6', b'TUP7'):
+        wq = r16(36 * 256)
+        weu, wet = r16(35721), r16(35721)
+        wmu, wmt = r16(2500), r16(2500)
+        rest = (wq, weu, wet, wmu, wmt)
+    if magic in (b'TUP6', b'TUP7'):
+        wcu, wct = r16(9), r16(9)
+        wvu, wvt = r16(256), r16(256)
+        capconv = (wcu, wct, wvu, wvt)
+    if magic == b'TUP7':
+        paa = np.frombuffer(buf[o:o + 80 * 6561], dtype=np.int8).astype(np.float32)
+    return bias0, ws, wps, rest, capconv, paa
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--cache', default='data/nnue/cache400k.npz')
@@ -362,6 +401,13 @@ def main():
     ap.add_argument('--cyclic-mult', type=float, default=2.0)
     ap.add_argument('--cyclic-lr-min', type=float, default=1e-5,
                     help='LR floor inside cycles (5-decimal precision).')
+    ap.add_argument('--backtrack', action='store_true',
+                    help='Backtracking line search: if an epoch overshoots '
+                    '(val worse than best), revert weights to best and cut '
+                    'LR x --bt-factor. Assesses steps instead of trends.')
+    ap.add_argument('--bt-factor', type=float, default=0.5)
+    ap.add_argument('--bt-tol', type=float, default=1e-4,
+                    help='Relative worsening that counts as overshoot.')
     ap.add_argument('--wd', type=float, default=1e-7)
     ap.add_argument('--seed', type=int, default=7)
     ap.add_argument('--dirs', default='0,1,2,3',
@@ -385,6 +431,9 @@ def main():
     ap.add_argument('--texel-k', type=float, default=567.89,
                     help='Elo-logistic scale for the Texel sigmoid.')
     ap.add_argument('--out', default='data/nnue/tupS20.tup')
+    ap.add_argument('--init', default='',
+                    help='Warm start from a .tup (PBT exploit step): loads '
+                    'matching sections, missing stay zero-init.')
     a = ap.parse_args()
 
     import torch
@@ -631,15 +680,20 @@ def main():
     # us/them (2500 each). Env/mob have separate us/them tables (no sign
     # sharing — SGD learns color asymmetry); empty-ring (sq*729) and
     # zero-count (phase*50) rows constrained 0 and skipped in forward.
+    # FUSED bags (S50 speedup: 15 sparse backward ops -> 2). Same math:
+    # one bag per visit-density group, per-family base offsets added to the
+    # same local indices as before. Sparse group (base lr): singles, pairs,
+    # q2, env, mob, pa. Dense group (conv-lr): capn, conv.
+    SP_OFF = {'s': 0, 'H': 2916, 'V': 9477, 'D1': 16038, 'D2': 22599,
+              'q2': 29160, 'envus': 38376, 'envthem': 74097,
+              'mobus': 109818, 'mobthem': 112318, 'pa': 114818}
+    SP_N = 114818 + 80 * 6561  # 639698
+    DE_OFF = {'capnus': 0, 'capnthem': 9, 'convus': 18, 'convthem': 274}
+    DE_N = 274 + 256  # 530
+    SP_DIR = {0: 'H', 1: 'V', 2: 'D1', 3: 'D2'}
     bags = torch.nn.ModuleList(
-        [torch.nn.EmbeddingBag(36 * 81, 1, mode='sum', sparse=True)]
-        + [torch.nn.EmbeddingBag(81 * 81, 1, mode='sum', sparse=True) for _ in range(4)]
-        + [torch.nn.EmbeddingBag(36 * 256, 1, mode='sum', sparse=True)]
-        + [torch.nn.EmbeddingBag(49 * 729, 1, mode='sum', sparse=True) for _ in range(2)]
-        + [torch.nn.EmbeddingBag(50 * 50, 1, mode='sum', sparse=True) for _ in range(2)]
-        + [torch.nn.EmbeddingBag(9, 1, mode='sum', sparse=True) for _ in range(2)]
-        + [torch.nn.EmbeddingBag(256, 1, mode='sum', sparse=True) for _ in range(2)]
-        + [torch.nn.EmbeddingBag(80 * 6561, 1, mode='sum', sparse=True)]
+        [torch.nn.EmbeddingBag(SP_N, 1, mode='sum', sparse=True),
+         torch.nn.EmbeddingBag(DE_N, 1, mode='sum', sparse=True)]
     )
     for bg in bags:
         torch.nn.init.zeros_(bg.weight)
@@ -651,28 +705,69 @@ def main():
     # sparse-family lr — own param group at --conv-lr.
     opt = torch.optim.SGD(
         [
-            {'params': list(bags[0:10].parameters()) + list(bags[14:15].parameters()) + [bias]},
-            {'params': list(bags[10:14].parameters()), 'lr': a.conv_lr},
+            {'params': [bags[0].weight, bias]},
+            {'params': [bags[1].weight], 'lr': a.conv_lr},
         ],
         lr=a.lr,
     )
 
     def zero_constrained():
         with torch.no_grad():
-            for bg in bags:
-                bg.weight.data[0].zero_()
+            sp, de = bags[0].weight.data, bags[1].weight.data
+            sp[0].zero_()
+            for d in range(4):
+                sp[SP_OFF[['H', 'V', 'D1', 'D2'][d]]].zero_()
+            sp[SP_OFF['q2']].zero_()
             for sq in range(49):
-                bags[6].weight.data[sq * 729].zero_()
-                bags[7].weight.data[sq * 729].zero_()
+                sp[SP_OFF['envus'] + sq * 729].zero_()
+                sp[SP_OFF['envthem'] + sq * 729].zero_()
             for ph in range(50):
-                bags[8].weight.data[ph * 50].zero_()
-                bags[9].weight.data[ph * 50].zero_()
-            bags[10].weight.data[0].zero_()
-            bags[11].weight.data[0].zero_()
-            bags[12].weight.data[0].zero_()
-            bags[13].weight.data[0].zero_()
+                sp[SP_OFF['mobus'] + ph * 50].zero_()
+                sp[SP_OFF['mobthem'] + ph * 50].zero_()
             for pi in range(80):
-                bags[14].weight.data[pi * 6561].zero_()
+                sp[SP_OFF['pa'] + pi * 6561].zero_()
+            de[DE_OFF['capnus']].zero_()
+            de[DE_OFF['capnthem']].zero_()
+            de[DE_OFF['convus']].zero_()
+            de[DE_OFF['convthem']].zero_()
+
+    if a.init:
+        b0, ws0, wps0, rest0, cc0, pa0 = load_tup(a.init)
+        with torch.no_grad():
+            W, D = bags[0].weight, bags[1].weight
+            bias.copy_(torch.tensor([b0]))
+            W[SP_OFF['s']:SP_OFF['s'] + 36 * 81].copy_(
+                torch.from_numpy(ws0.reshape(-1, 1)))
+            for d, nm in enumerate(['H', 'V', 'D1', 'D2']):
+                W[SP_OFF[nm]:SP_OFF[nm] + 6561].copy_(
+                    torch.from_numpy(wps0[d].reshape(-1, 1)))
+            if rest0 is not None:
+                wq, weu, wet, wmu, wmt = rest0
+                W[SP_OFF['q2']:SP_OFF['q2'] + 36 * 256].copy_(
+                    torch.from_numpy(wq.reshape(-1, 1)))
+                W[SP_OFF['envus']:SP_OFF['envus'] + 35721].copy_(
+                    torch.from_numpy(weu.reshape(-1, 1)))
+                W[SP_OFF['envthem']:SP_OFF['envthem'] + 35721].copy_(
+                    torch.from_numpy(wet.reshape(-1, 1)))
+                W[SP_OFF['mobus']:SP_OFF['mobus'] + 2500].copy_(
+                    torch.from_numpy(wmu.reshape(-1, 1)))
+                W[SP_OFF['mobthem']:SP_OFF['mobthem'] + 2500].copy_(
+                    torch.from_numpy(wmt.reshape(-1, 1)))
+            if cc0 is not None:
+                wcu, wct, wvu, wvt = cc0
+                D[DE_OFF['capnus']:DE_OFF['capnus'] + 9].copy_(
+                    torch.from_numpy(wcu.reshape(-1, 1)))
+                D[DE_OFF['capnthem']:DE_OFF['capnthem'] + 9].copy_(
+                    torch.from_numpy(wct.reshape(-1, 1)))
+                D[DE_OFF['convus']:DE_OFF['convus'] + 256].copy_(
+                    torch.from_numpy(wvu.reshape(-1, 1)))
+                D[DE_OFF['convthem']:DE_OFF['convthem'] + 256].copy_(
+                    torch.from_numpy(wvt.reshape(-1, 1)))
+            if pa0 is not None:
+                W[SP_OFF['pa']:SP_OFF['pa'] + 80 * 6561].copy_(
+                    torch.from_numpy(pa0.reshape(-1, 1)))
+        zero_constrained()
+        print('warm start from %s' % a.init, flush=True)
 
     active = [int(x) for x in a.dirs.split(',')]
     assert set(active) <= {0, 1, 2, 3} and active, a.dirs
@@ -686,56 +781,65 @@ def main():
     # absolute indices) + mob us/them (phase*50+cnt). All plain sums.
     AR2 = np.arange(36, dtype=np.int64)[None, :] * 256
 
-    def batch_idx(Fb, Qb, EUb, ETb, MUb, MTb, CUb, CTb, VUb, VTb):
-        F = torch.from_numpy(Fb.astype(np.int64))
-        Xo = (AR * 81 + F.numpy()).astype(np.int64)
-        Xpo = [(F.numpy()[:, XA[d]] + 81 * F.numpy()[:, YA[d]]).astype(np.int64)
-               for d in range(4)]
-        Xq = (AR2 + Qb.astype(np.int64)).astype(np.int64)
-        Fn = F.numpy()
-        Xpa = (PAOFF + Fn[:, PAX] + 81 * Fn[:, PAY]).astype(np.int64)
-        return (torch.from_numpy(Xo),
-                [torch.from_numpy(p) for p in Xpo],
-                torch.from_numpy(Xq),
-                torch.from_numpy(EUb.astype(np.int64)),
-                torch.from_numpy(ETb.astype(np.int64)),
-                torch.from_numpy(MUb.astype(np.int64))[:, None],
-                torch.from_numpy(MTb.astype(np.int64))[:, None],
-                torch.from_numpy(CUb.astype(np.int64))[:, None],
-                torch.from_numpy(CTb.astype(np.int64))[:, None],
-                torch.from_numpy(VUb.astype(np.int64)),
-                torch.from_numpy(VTb.astype(np.int64)),
-                torch.from_numpy(Xpa))
-        # NOTE: AR/XA/YA are module-level int64 numpy; Fb rows sliced already.
+    SP_DIR = {0: 'H', 1: 'V', 2: 'D1', 3: 'D2'}
+    ARB = (np.arange(36, dtype=np.int64) * 81)[None, :]
+    AR2B = (np.arange(36, dtype=np.int64) * 256)[None, :]
 
-    def forward(Xb, Xpb, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt, Xpa):
-        pred = bags[0](Xb).squeeze(1) + bias
+    def batch_idx(Fb, Qb, EUb, ETb, MUb, MTb, CUb, CTb, VUb, VTb):
+        # Fused flat indices + row offsets: ONE sparse backward op per
+        # group instead of 15. Same rows, same math as the split version.
+        F = Fb.astype(np.int64)
+        B = F.shape[0]
+        sp_parts = [(ARB + F).reshape(-1)]
         for d in active:
-            pred = pred + bags[d + 1](Xpb[d]).squeeze(1)
-        pred = (pred + bags[5](Xq).squeeze(1) + bags[6](Xeu).squeeze(1)
-                + bags[7](Xet).squeeze(1) + bags[8](Xmu).squeeze(1)
-                + bags[9](Xmt).squeeze(1) + bags[10](Xcu).squeeze(1)
-                + bags[11](Xct).squeeze(1) + bags[12](Xvu).squeeze(1)
-                + bags[13](Xvt).squeeze(1) + bags[14](Xpa).squeeze(1))
+            sp_parts.append(
+                (SP_OFF[SP_DIR[d]] + F[:, XA[d]] + 81 * F[:, YA[d]]).reshape(-1))
+        sp_parts.append((SP_OFF['q2'] + AR2B + Qb.astype(np.int64)).reshape(-1))
+        sp_parts.append((SP_OFF['envus'] + EUb.astype(np.int64)).reshape(-1))
+        sp_parts.append((SP_OFF['envthem'] + ETb.astype(np.int64)).reshape(-1))
+        sp_parts.append((SP_OFF['mobus'] + MUb.astype(np.int64)).reshape(-1))
+        sp_parts.append((SP_OFF['mobthem'] + MTb.astype(np.int64)).reshape(-1))
+        sp_parts.append((SP_OFF['pa'] + PAOFF
+                         + F[:, PAX] + 81 * F[:, PAY]).reshape(-1))
+        de_parts = [(DE_OFF['capnus'] + CUb.astype(np.int64)).reshape(-1),
+                    (DE_OFF['capnthem'] + CTb.astype(np.int64)).reshape(-1),
+                    (DE_OFF['convus'] + VUb.astype(np.int64)).reshape(-1),
+                    (DE_OFF['convthem'] + VTb.astype(np.int64)).reshape(-1)]
+        Xsp_np = np.concatenate(sp_parts)
+        Xde_np = np.concatenate(de_parts)
+        Ksp, Kspd = len(Xsp_np) // B, len(Xde_np) // B
+        assert Ksp * B == len(Xsp_np) and Kspd * B == len(Xde_np)
+        Xsp = torch.from_numpy(Xsp_np)
+        Osp = torch.arange(B, dtype=torch.int64) * Ksp
+        Xde = torch.from_numpy(Xde_np)
+        Ode = torch.arange(B, dtype=torch.int64) * Kspd
+        return Xsp, Osp, Xde, Ode
+        # NOTE: Fb rows sliced already; all math int64 numpy, one concat each.
+
+    def forward(Xsp, Osp, Xde, Ode):
+        pred = bags[0](Xsp, Osp).squeeze(1) + bags[1](Xde, Ode).squeeze(1) + bias
         return pred
 
     def dump_tup(path):
-        ws = bags[0].weight.detach().squeeze(1).numpy().reshape(36, 81)
-        wp = [bg.weight.detach().squeeze(1).numpy().reshape(6561) for bg in list(bags)[1:5]]
-        wq = bags[5].weight.detach().squeeze(1).numpy().reshape(36 * 256)
-        weu = bags[6].weight.detach().squeeze(1).numpy()
-        wet = bags[7].weight.detach().squeeze(1).numpy()
-        wmu = bags[8].weight.detach().squeeze(1).numpy()
-        wmt = bags[9].weight.detach().squeeze(1).numpy()
+        W = bags[0].weight.detach().squeeze(1).numpy()
+        D = bags[1].weight.detach().squeeze(1).numpy()
+        ws = W[SP_OFF['s']:SP_OFF['s'] + 36 * 81].reshape(36, 81)
+        wp = [W[SP_OFF[nm]:SP_OFF[nm] + 6561].reshape(6561)
+              for nm in ['H', 'V', 'D1', 'D2']]
+        wq = W[SP_OFF['q2']:SP_OFF['q2'] + 36 * 256].reshape(36 * 256)
+        weu = W[SP_OFF['envus']:SP_OFF['envus'] + 35721]
+        wet = W[SP_OFF['envthem']:SP_OFF['envthem'] + 35721]
+        wmu = W[SP_OFF['mobus']:SP_OFF['mobus'] + 2500]
+        wmt = W[SP_OFF['mobthem']:SP_OFF['mobthem'] + 2500]
         assert ws[0, 0] == 0 and all(p[0] == 0 for p in wp) and wq[0] == 0, 'index-0 constraint broken'
         assert all(weu[sq * 729] == 0 and wet[sq * 729] == 0 for sq in range(49)), 'env-0 broken'
         assert all(wmu[ph * 50] == 0 and wmt[ph * 50] == 0 for ph in range(50)), 'mob-0 broken'
-        wcu = bags[10].weight.detach().squeeze(1).numpy()
-        wct = bags[11].weight.detach().squeeze(1).numpy()
-        wvu = bags[12].weight.detach().squeeze(1).numpy()
-        wvt = bags[13].weight.detach().squeeze(1).numpy()
+        wcu = D[DE_OFF['capnus']:DE_OFF['capnus'] + 9]
+        wct = D[DE_OFF['capnthem']:DE_OFF['capnthem'] + 9]
+        wvu = D[DE_OFF['convus']:DE_OFF['convus'] + 256]
+        wvt = D[DE_OFF['convthem']:DE_OFF['convthem'] + 256]
         assert wcu[0] == 0 and wct[0] == 0 and wvu[0] == 0 and wvt[0] == 0, 'capn/conv-0 broken'
-        wpa = bags[14].weight.detach().squeeze(1).numpy()
+        wpa = W[SP_OFF['pa']:SP_OFF['pa'] + 80 * 6561]
         assert all(wpa[pi * 6561] == 0 for pi in range(80)), 'pa-0 broken'
         allw = np.concatenate([ws.reshape(-1)] + [p.reshape(-1) for p in wp]
                               + [wq, weu, wet, wmu, wmt, wcu, wct, wvu, wvt, wpa])
@@ -770,6 +874,7 @@ def main():
         import os
         print('wrote %s %.1fKB dirs %s TUP7' % (path, os.path.getsize(path) / 1024, a.dirs), flush=True)
 
+
     bs = 4096
     # S26 flywheel: plateau stop on RELATIVE val improvement. Your call of 4
     # digits (1e-4) is right for this data: 12.4M rows x sparse updates =
@@ -798,11 +903,11 @@ def main():
             b = perm[i:i + bs]
             bn = b.numpy()
             Fb = Xtr8[bn]
-            Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt, Xpa = batch_idx(
+            Xsp, Osp, Xde, Ode = batch_idx(
                 Fb, Qtr[bn], EUtr[bn], ETtr[bn], MUtr[bn], MTtr[bn],
                 CUtr[bn], CTtr[bn], VUtr[bn], VTtr[bn])
             opt.zero_grad()
-            pred = forward(Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt, Xpa)
+            pred = forward(Xsp, Osp, Xde, Ode)
             if a.noise_w > 0:
                 pred = pred + torch.randn_like(pred) * a.noise_w
             l2 = sum((bg.weight ** 2).sum() for bg in bags)
@@ -824,12 +929,12 @@ def main():
             totv, cntv = 0.0, 0
             for j in range(0, len(Xva8), 100000):
                 Fv = Xva8[j:j + 100000]
-                Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt, Xpa = batch_idx(
+                Xsp, Osp, Xde, Ode = batch_idx(
                     Fv, Qva[j:j + 100000], EUva[j:j + 100000],
                     ETva[j:j + 100000], MUva[j:j + 100000], MTva[j:j + 100000],
                     CUva[j:j + 100000], CTva[j:j + 100000],
                     VUva[j:j + 100000], VTva[j:j + 100000])
-                pv = forward(Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt, Xpa)
+                pv = forward(Xsp, Osp, Xde, Ode)
                 wv = wva[j:j + len(Fv)]
                 if a.texel:
                     pwv = torch.sigmoid((base_va[j:j + len(Fv)] + pv) * LN10K)
@@ -849,6 +954,17 @@ def main():
                 dump_tup(a.ckpt.format(ep=ep))
                 shutil.copy(a.ckpt.format(ep=ep), a.out)
                 tag = ' BEST->out'
+        # Backtracking line search: overshoot -> revert to best + cut LR.
+        bt_msg = ''
+        if a.backtrack and best_state is not None and vmse > best_val * (1.0 + a.bt_tol):
+            with torch.no_grad():
+                for bg, w in zip(bags, best_state[0]):
+                    bg.weight.copy_(w)
+                bias.copy_(best_state[1])
+            zero_constrained()
+            for pg in opt.param_groups:
+                pg['lr'] = max(pg['lr'] * a.bt_factor, a.cyclic_lr_min)
+            bt_msg = ' BACKTRACK'
         # Cyclic restart: rewind to best, lr back to max, cycle lengthens.
         cyc_msg = ''
         if cyc_on:
@@ -871,10 +987,10 @@ def main():
             stale += 1
         else:
             stale = 0
-        print('epoch %d train_mse %.1f val_mse %.1f rel_improv %+.2e bias %+.1f lr %.5f (%.0fs)%s%s'
+        print('epoch %d train_mse %.1f val_mse %.1f rel_improv %+.2e bias %+.1f lr %.5f (%.0fs)%s%s%s'
               % (ep, tot / cnt, vmse, improv, bias.item(), opt.param_groups[0]['lr'],
-                 time.time() - t0, tag, cyc_msg), flush=True)
-        prev_val = vmse
+                 time.time() - t0, tag, cyc_msg, bt_msg), flush=True)
+        prev_val = best_val if bt_msg else vmse
         if a.plateau > 0 and stale >= 2:
             print('plateau: rel improv < %.0e twice in a row -> stop at ep %d (best ep %d val %.1f)'
                   % (a.plateau, ep, best_ep, best_val), flush=True)
