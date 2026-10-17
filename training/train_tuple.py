@@ -903,6 +903,7 @@ def main():
     prev_val, best_val, best_ep, stale = None, float('inf'), 0, 0
     step_ema, step_snap, step_reverts, step_bad = None, None, 0, 0
     av_mean, av_var = None, None
+    batch_best = float('inf')
     # Cyclic SGDR state (explore/exploit slider 3): cosine lr within a
     # cycle, restart (rewind to best + lr back to max) at cycle end.
     cyc_on = a.cyclic_T0 > 0
@@ -946,6 +947,7 @@ def main():
                 # fixed deadband — steady-state Kalman family).
                 import math as _math2
                 cur = loss.item()
+                reverted = False
                 if step_ema is None:
                     step_ema = cur
                     av_mean, av_var = cur, abs(cur) * 0.1 + 1.0
@@ -960,9 +962,15 @@ def main():
                     else:
                         over = cur > step_ema * (1.0 + a.step_tol)
                         under = cur < step_ema * (1.0 - a.step_tol)
+                    # Absolute guard: 100x above the best batch ever seen is
+                    # never noise (EMA would chase the explosion blind).
+                    if cur > 100.0 * batch_best:
+                        over = True
+                        step_bad = 99
                     # Persistence-2: single noisy batches don't trigger;
                     # sustained overshoot does (then revert + cut LR).
                     step_bad = step_bad + 1 if over else 0
+                    reverted = False
                     if over and step_bad >= 2 and step_snap is not None:
                         with torch.no_grad():
                             for bg, w in zip(bags, step_snap[0]):
@@ -973,15 +981,22 @@ def main():
                             pg['lr'] = max(pg['lr'] * a.step_down, a.cyclic_lr_min)
                         step_reverts += 1
                         step_bad = 0
+                        reverted = True
                     elif under:
                         for pg in opt.param_groups:
                             pg['lr'] = min(pg['lr'] * a.step_up, lr_max0 * 10.0)
-                step_ema = (1.0 - a.step_ema) * step_ema + a.step_ema * cur
+                if cur < batch_best:
+                    batch_best = cur
+                if not reverted:
+                    step_ema = (1.0 - a.step_ema) * step_ema + a.step_ema * cur
                 if a.step_kalman:
-                    k = a.step_ema
-                    d = cur - av_mean
-                    av_mean = av_mean + k * d
-                    av_var = (1.0 - k) * av_var + k * d * d
+                    # Frozen on revert batches: don't let explosions poison
+                    # the baseline the detector measures against.
+                    if not reverted:
+                        k = a.step_ema
+                        d = cur - av_mean
+                        av_mean = av_mean + k * d
+                        av_var = (1.0 - k) * av_var + k * d * d
                 with torch.no_grad():
                     step_snap = ([bg.weight.detach().clone() for bg in bags],
                                  bias.detach().clone())
