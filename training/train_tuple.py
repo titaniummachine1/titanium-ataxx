@@ -243,13 +243,13 @@ def capn_tables(own, enm, blk):
     total = own | enm | blk
     empty = (~total) & FULL
     lu = empty & (dist_union(own, 1) | jump_union(own))
-    lt = empty & (dist_union(enm, 1) | jump_union(enm))
+    lv = empty & (dist_union(enm, 1) | jump_union(enm))
     mu = np.zeros(len(own), dtype=np.int64)
     mt = np.zeros(len(own), dtype=np.int64)
     for s in range(49):
         bit = np.uint64(1 << s)
         in_u = (lu & bit) != 0
-        in_t = (lt & bit) != 0
+        in_t = (lv & bit) != 0
         cu = popcnt(enm & RING1A[s]).astype(np.int64)
         ct = popcnt(own & RING1A[s]).astype(np.int64)
         mu = np.maximum(mu, np.where(in_u, cu, 0))
@@ -405,6 +405,16 @@ def main():
                     help='Backtracking line search: if an epoch overshoots '
                     '(val worse than best), revert weights to best and cut '
                     'LR x --bt-factor. Assesses steps instead of trends.')
+    ap.add_argument('--step-lr', action='store_true',
+                    help='Per-STEP adaptive LR (not per-epoch): EMA-smoothed '
+                    'batch loss with deadband; overshoot -> revert step + '
+                    'cut LR, improvement -> raise LR. Reacts in batches.')
+    ap.add_argument('--step-up', type=float, default=1.1)
+    ap.add_argument('--step-down', type=float, default=0.5)
+    ap.add_argument('--step-tol', type=float, default=0.05,
+                    help='Deadband: ignore loss moves within this fraction.')
+    ap.add_argument('--step-ema', type=float, default=0.01,
+                    help='EMA weight for the loss tracker (slow = robust).')
     ap.add_argument('--bt-factor', type=float, default=0.5)
     ap.add_argument('--bt-tol', type=float, default=1e-4,
                     help='Relative worsening that counts as overshoot.')
@@ -883,6 +893,7 @@ def main():
     # unchanged (plateau 0 = off).
     max_ep = a.max_epochs if a.plateau > 0 else a.epochs
     prev_val, best_val, best_ep, stale = None, float('inf'), 0, 0
+    step_ema, step_snap, step_reverts, step_bad = None, None, 0, 0
     # Cyclic SGDR state (explore/exploit slider 3): cosine lr within a
     # cycle, restart (rewind to best + lr back to max) at cycle end.
     cyc_on = a.cyclic_T0 > 0
@@ -917,6 +928,39 @@ def main():
             loss.backward()
             opt.step()
             zero_constrained()
+            if a.step_lr:
+                # Per-step bold driver: snapshot BEFORE seeing this step's
+                # effect is impossible without extra forwards, so assess with
+                # 1-step delay — revert restores the pre-step weights.
+                cur = loss.item()
+                if step_ema is None:
+                    step_ema = cur
+                    with torch.no_grad():
+                        step_snap = ([bg.weight.detach().clone() for bg in bags],
+                                     bias.detach().clone())
+                else:
+                    over = cur > step_ema * (1.0 + a.step_tol)
+                    under = cur < step_ema * (1.0 - a.step_tol)
+                    # Persistence-2: single noisy batches don't trigger;
+                    # sustained overshoot does (then revert + cut LR).
+                    step_bad = step_bad + 1 if over else 0
+                    if over and step_bad >= 2 and step_snap is not None:
+                        with torch.no_grad():
+                            for bg, w in zip(bags, step_snap[0]):
+                                bg.weight.copy_(w)
+                            bias.copy_(step_snap[1])
+                        zero_constrained()
+                        for pg in opt.param_groups:
+                            pg['lr'] = max(pg['lr'] * a.step_down, a.cyclic_lr_min)
+                        step_reverts += 1
+                        step_bad = 0
+                    elif under:
+                        for pg in opt.param_groups:
+                            pg['lr'] = min(pg['lr'] * a.step_up, lr_max0 * 10.0)
+                step_ema = (1.0 - a.step_ema) * step_ema + a.step_ema * cur
+                with torch.no_grad():
+                    step_snap = ([bg.weight.detach().clone() for bg in bags],
+                                 bias.detach().clone())
             tot += loss.item() * len(b)
             cnt += len(b)
         for bg in bags:
@@ -980,9 +1024,10 @@ def main():
             stale += 1
         else:
             stale = 0
-        print('epoch %d train_mse %.1f val_mse %.1f rel_improv %+.2e bias %+.1f lr %.5f (%.0fs)%s%s%s'
-              % (ep, tot / cnt, vmse, improv, bias.item(), opt.param_groups[0]['lr'],
+        print('epoch %d train_mse %.1f val_mse %.1f rel_improv %+.2e bias %+.1f lr %.5f reverts %d (%.0fs)%s%s%s'
+              % (ep, tot / cnt, vmse, improv, bias.item(), opt.param_groups[0]['lr'], step_reverts,
                  time.time() - t0, tag, cyc_msg, bt_msg), flush=True)
+        step_reverts = 0
         prev_val = best_val if bt_msg else vmse
         if a.plateau > 0 and stale >= 2:
             print('plateau: rel improv < %.0e twice in a row -> stop at ep %d (best ep %d val %.1f)'
