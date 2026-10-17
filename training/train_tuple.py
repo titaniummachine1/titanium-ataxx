@@ -592,6 +592,7 @@ def main():
     YA = [np.array([y for x, y in pp], dtype=np.int64)
           for pp in [[(x, y) for (dd, x, y) in PAIRS if dd == d] for d in range(4)]]
     AR = np.arange(36, dtype=np.int64)[None, :]
+    AR2 = np.arange(36, dtype=np.int64)[None, :] * 256
     # Per-anchor pairs (the missing Moonbird feature): all 80 pairs in
     # H/V/D1/D2 order (matches Rust PAIR_BLOCKS), absolute index.
     PAX = np.array([x for (dd, x, y) in PAIRS], dtype=np.int64)
@@ -666,12 +667,46 @@ def main():
     del VUS, VTH
     _gc.collect()
     del feats8, Q, EUS, ETH, MUS, MTH
+    # Materialized flat indices (S50b speedup): one-time concat, per-batch
+    # slicing (views, no recompute). Same values batch_idx built per batch.
+    active = [int(x) for x in a.dirs.split(',')]
+    assert set(active) <= {0, 1, 2, 3} and active, a.dirs
+    SP_OFF = {'s': 0, 'H': 2916, 'V': 9477, 'D1': 16038, 'D2': 22599,
+              'q2': 29160, 'envus': 38376, 'envthem': 74097,
+              'mobus': 109818, 'mobthem': 112318, 'pa': 114818}
+    SP_N = 114818 + 80 * 6561  # 639698
+    DE_OFF = {'capnus': 0, 'capnthem': 9, 'convus': 18, 'convthem': 274}
+    DE_N = 274 + 256  # 530
+    SP_DIR = {0: 'H', 1: 'V', 2: 'D1', 3: 'D2'}
+    def materialize(Fb, Qb, EUb, ETb, MUb, MTb, CUb, CTb, VUb, VTb):
+        F = Fb.astype(np.int64)
+        sp = [(AR * 81 + F)]
+        for d in active:
+            sp.append((SP_OFF[SP_DIR[d]] + F[:, XA[d]] + 81 * F[:, YA[d]]).reshape(F.shape[0], -1))
+        sp.append((AR2 + Qb.astype(np.int64)))
+        sp.append((SP_OFF['envus'] + EUb.astype(np.int64)))
+        sp.append((SP_OFF['envthem'] + ETb.astype(np.int64)))
+        sp.append(((SP_OFF['mobus'] + MUb.astype(np.int64))).reshape(F.shape[0], -1))
+        sp.append(((SP_OFF['mobthem'] + MTb.astype(np.int64))).reshape(F.shape[0], -1))
+        sp.append((SP_OFF['pa'] + PAOFF + F[:, PAX] + 81 * F[:, PAY]))
+        de = [((DE_OFF['capnus'] + CUb.astype(np.int64))).reshape(F.shape[0], -1),
+              ((DE_OFF['capnthem'] + CTb.astype(np.int64))).reshape(F.shape[0], -1),
+              (DE_OFF['convus'] + VUb.astype(np.int64)),
+              (DE_OFF['convthem'] + VTb.astype(np.int64))]
+        SP = np.concatenate(sp, axis=1).astype(np.int32)
+        DE = np.concatenate(de, axis=1).astype(np.int32)
+        return SP, DE
+
+    t0 = time.time()
+    SPtr, DEtr = materialize(Xtr8, Qtr, EUtr, ETtr, MUtr, MTtr, CUtr, CTtr, VUtr, VTtr)
+    SPva, DEva = materialize(Xva8, Qva, EUva, ETva, MUva, MTva, CUva, CTva, VUva, VTva)
+    print('materialized flat %.0fs RAM %.2fGB' % (time.time() - t0, (SPtr.nbytes + DEtr.nbytes + SPva.nbytes + DEva.nbytes) / 1e9), flush=True)
+    del Xtr8, Xva8, Qtr, Qva, EUtr, EUva, ETtr, ETva, MUtr, MUva, MTtr, MTva
+    del CUtr, CUva, CTtr, CTva, VUtr, VUva, VTtr, VTva
     _gc.collect()
     wtr, wva = samp_w[tr], samp_w[va]
-    # S28: feats8 sub-gathers are views; copy to compact int8 (tr/va order).
-    Xtr8, Xva8 = np.ascontiguousarray(Xtr8), np.ascontiguousarray(Xva8)
-    print('batch RAM GB: Xtr8 %.2f Xva8 %.2f' % (Xtr8.nbytes / 1e9, Xva8.nbytes / 1e9),
-          flush=True)
+    del samp_w
+    _gc.collect()
 
     # 1 single bag + 4 pair bags + scalar bias. Index-0 entries are
     # constrained to exactly 0 after every step (empty patterns contribute
@@ -684,13 +719,7 @@ def main():
     # one bag per visit-density group, per-family base offsets added to the
     # same local indices as before. Sparse group (base lr): singles, pairs,
     # q2, env, mob, pa. Dense group (conv-lr): capn, conv.
-    SP_OFF = {'s': 0, 'H': 2916, 'V': 9477, 'D1': 16038, 'D2': 22599,
-              'q2': 29160, 'envus': 38376, 'envthem': 74097,
-              'mobus': 109818, 'mobthem': 112318, 'pa': 114818}
-    SP_N = 114818 + 80 * 6561  # 639698
-    DE_OFF = {'capnus': 0, 'capnthem': 9, 'convus': 18, 'convthem': 274}
-    DE_N = 274 + 256  # 530
-    SP_DIR = {0: 'H', 1: 'V', 2: 'D1', 3: 'D2'}
+    # (Layout consts live above materialize(); bags only need totals here.)
     bags = torch.nn.ModuleList(
         [torch.nn.EmbeddingBag(SP_N, 1, mode='sum', sparse=True),
          torch.nn.EmbeddingBag(DE_N, 1, mode='sum', sparse=True)]
@@ -769,9 +798,6 @@ def main():
         zero_constrained()
         print('warm start from %s' % a.init, flush=True)
 
-    active = [int(x) for x in a.dirs.split(',')]
-    assert set(active) <= {0, 1, 2, 3} and active, a.dirs
-
     # S28 streaming index math: per-batch int8 feats -> int64 EmbeddingBag
     # indices. Same values as the old materialised off/pidx
     # (off = AR*81 + feat, pidx[d] = feat[xa] + 81 * feat[ya]).
@@ -779,45 +805,18 @@ def main():
     # rows into 117 — every training since used broken singles in Rust.
     # S38 enriched: Q (36x256 quat, AR2 stride) + env us/them (49x729,
     # absolute indices) + mob us/them (phase*50+cnt). All plain sums.
-    AR2 = np.arange(36, dtype=np.int64)[None, :] * 256
 
     SP_DIR = {0: 'H', 1: 'V', 2: 'D1', 3: 'D2'}
-    ARB = (np.arange(36, dtype=np.int64) * 81)[None, :]
-    AR2B = (np.arange(36, dtype=np.int64) * 256)[None, :]
 
-    def batch_idx(Fb, Qb, EUb, ETb, MUb, MTb, CUb, CTb, VUb, VTb):
-        # Fused flat indices + row offsets: ONE sparse backward op per
-        # group instead of 15. Same rows, same math as the split version.
-        F = Fb.astype(np.int64)
-        B = F.shape[0]
-        sp_parts = [(ARB + F).reshape(-1)]
-        for d in active:
-            sp_parts.append(
-                (SP_OFF[SP_DIR[d]] + F[:, XA[d]] + 81 * F[:, YA[d]]).reshape(-1))
-        sp_parts.append((SP_OFF['q2'] + AR2B + Qb.astype(np.int64)).reshape(-1))
-        sp_parts.append((SP_OFF['envus'] + EUb.astype(np.int64)).reshape(-1))
-        sp_parts.append((SP_OFF['envthem'] + ETb.astype(np.int64)).reshape(-1))
-        sp_parts.append((SP_OFF['mobus'] + MUb.astype(np.int64)).reshape(-1))
-        sp_parts.append((SP_OFF['mobthem'] + MTb.astype(np.int64)).reshape(-1))
-        sp_parts.append((SP_OFF['pa'] + PAOFF
-                         + F[:, PAX] + 81 * F[:, PAY]).reshape(-1))
-        de_parts = [(DE_OFF['capnus'] + CUb.astype(np.int64)).reshape(-1),
-                    (DE_OFF['capnthem'] + CTb.astype(np.int64)).reshape(-1),
-                    (DE_OFF['convus'] + VUb.astype(np.int64)).reshape(-1),
-                    (DE_OFF['convthem'] + VTb.astype(np.int64)).reshape(-1)]
-        Xsp_np = np.concatenate(sp_parts)
-        Xde_np = np.concatenate(de_parts)
-        Ksp, Kspd = len(Xsp_np) // B, len(Xde_np) // B
-        assert Ksp * B == len(Xsp_np) and Kspd * B == len(Xde_np)
-        Xsp = torch.from_numpy(Xsp_np)
-        Osp = torch.arange(B, dtype=torch.int64) * Ksp
-        Xde = torch.from_numpy(Xde_np)
-        Ode = torch.arange(B, dtype=torch.int64) * Kspd
-        return Xsp, Osp, Xde, Ode
-        # NOTE: Fb rows sliced already; all math int64 numpy, one concat each.
+    def batch_idx(SPb, DEb):
+        # Slices of materialized int32 flats (views, no compute). 2D
+        # fixed-length rows need no offsets (each row = one bag).
+        Xsp = torch.from_numpy(SPb.astype(np.int64))
+        Xde = torch.from_numpy(DEb.astype(np.int64))
+        return Xsp, Xde
 
-    def forward(Xsp, Osp, Xde, Ode):
-        pred = bags[0](Xsp, Osp).squeeze(1) + bags[1](Xde, Ode).squeeze(1) + bias
+    def forward(Xsp, Xde):
+        pred = bags[0](Xsp).squeeze(1) + bags[1](Xde).squeeze(1) + bias
         return pred
 
     def dump_tup(path):
@@ -892,7 +891,8 @@ def main():
     lr_ratio = conv_max0 / max(lr_max0, 1e-12)
     best_state = None
     import shutil
-    ntr = len(Xtr8)
+    _gc.collect()
+    ntr = len(SPtr)
     for ep in range(1, max_ep + 1):
         t0 = time.time()
         for bg in bags:
@@ -902,12 +902,9 @@ def main():
         for i in range(0, ntr, bs):
             b = perm[i:i + bs]
             bn = b.numpy()
-            Fb = Xtr8[bn]
-            Xsp, Osp, Xde, Ode = batch_idx(
-                Fb, Qtr[bn], EUtr[bn], ETtr[bn], MUtr[bn], MTtr[bn],
-                CUtr[bn], CTtr[bn], VUtr[bn], VTtr[bn])
+            Xsp, Xde = batch_idx(SPtr[bn], DEtr[bn])
             opt.zero_grad()
-            pred = forward(Xsp, Osp, Xde, Ode)
+            pred = forward(Xsp, Xde)
             if a.noise_w > 0:
                 pred = pred + torch.randn_like(pred) * a.noise_w
             l2 = sum((bg.weight ** 2).sum() for bg in bags)
@@ -927,21 +924,17 @@ def main():
         with torch.no_grad():
             # S28: val streamed in 100k blocks (full Xva int64 = 2.5GB).
             totv, cntv = 0.0, 0
-            for j in range(0, len(Xva8), 100000):
-                Fv = Xva8[j:j + 100000]
-                Xsp, Osp, Xde, Ode = batch_idx(
-                    Fv, Qva[j:j + 100000], EUva[j:j + 100000],
-                    ETva[j:j + 100000], MUva[j:j + 100000], MTva[j:j + 100000],
-                    CUva[j:j + 100000], CTva[j:j + 100000],
-                    VUva[j:j + 100000], VTva[j:j + 100000])
-                pv = forward(Xsp, Osp, Xde, Ode)
-                wv = wva[j:j + len(Fv)]
+            for j in range(0, len(SPva), 100000):
+                nv = min(100000, len(SPva) - j)
+                Xsp, Xde = batch_idx(SPva[j:j + nv], DEva[j:j + nv])
+                pv = forward(Xsp, Xde)
+                wv = wva[j:j + nv]
                 if a.texel:
-                    pwv = torch.sigmoid((base_va[j:j + len(Fv)] + pv) * LN10K)
-                    totv += ((((pwv - yva[j:j + len(Fv)]) ** 2) * wv).sum().item())
+                    pwv = torch.sigmoid((base_va[j:j + nv] + pv) * LN10K)
+                    totv += ((((pwv - yva[j:j + nv]) ** 2) * wv).sum().item())
                 else:
-                    totv += ((((pv - yva[j:j + len(Fv)]) ** 2) * wv).sum().item())
-                cntv += len(Fv)
+                    totv += ((((pv - yva[j:j + nv]) ** 2) * wv).sum().item())
+                cntv += nv
             vmse = totv / max(cntv, 1)
         improv = (prev_val - vmse) / max(prev_val, 1e-9) if prev_val else 1.0
         tag = ''
