@@ -350,17 +350,18 @@ def main():
     ap.add_argument('--lr', type=float, default=4.0)
     ap.add_argument('--conv-lr', type=float, default=0.005,
                     help='LR for dense-visit capn/conv families (bags 10-13).')
-    ap.add_argument('--adaptive', action='store_true',
-                    help='Bold-driver LR: val improve -> lr UP (x --lr-up),
-                    overshoot (val worse) -> lr DOWN (x --lr-down). Floor
-                    --lr-min, 5-decimal precision. Maximizes learning until
-                    it overshoots, then backs off until it stops.')
-    ap.add_argument('--lr-up', type=float, default=1.1)
-    ap.add_argument('--lr-down', type=float, default=0.5)
-    ap.add_argument('--lr-min', type=float, default=1e-5,
-                    help='LR floor (5-decimal precision).')
-    ap.add_argument('--lr-max', type=float, default=0.0,
-                    help='LR ceiling, 0 = 10x initial lr.')
+    ap.add_argument('--noise-w', type=float, default=0.0,
+                    help='Explore/exploit slider 1: gaussian noise std added to '
+                    'train predictions (target units). >0 explores.')
+    ap.add_argument('--smooth', type=float, default=0.0,
+                    help='Explore/exploit slider 2: shrink labels toward their '
+                    'mean by this fraction (label smoothing).')
+    ap.add_argument('--cyclic-T0', type=int, default=0,
+                    help='Explore/exploit slider 3 (SGDR): epochs per cycle, '
+                    'x --cyclic-mult each restart. 0 = off.')
+    ap.add_argument('--cyclic-mult', type=float, default=2.0)
+    ap.add_argument('--cyclic-lr-min', type=float, default=1e-5,
+                    help='LR floor inside cycles (5-decimal precision).')
     ap.add_argument('--wd', type=float, default=1e-7)
     ap.add_argument('--seed', type=int, default=7)
     ap.add_argument('--dirs', default='0,1,2,3',
@@ -542,6 +543,13 @@ def main():
     YA = [np.array([y for x, y in pp], dtype=np.int64)
           for pp in [[(x, y) for (dd, x, y) in PAIRS if dd == d] for d in range(4)]]
     AR = np.arange(36, dtype=np.int64)[None, :]
+    # Per-anchor pairs (the missing Moonbird feature): all 80 pairs in
+    # H/V/D1/D2 order (matches Rust PAIR_BLOCKS), absolute index.
+    PAX = np.array([x for (dd, x, y) in PAIRS], dtype=np.int64)
+    PAY = np.array([y for (dd, x, y) in PAIRS], dtype=np.int64)
+    PAOFF = np.arange(80, dtype=np.int64)[None, :] * 6561
+    assert len(PAIRS) == 80 and [sum(1 for p in PAIRS if p[0] == d) for d in range(4)] == [24, 24, 16, 16]
+    assert (0, 30, 32) in PAIRS  # H ((5,0),(5,2)) at global position 20
 
     # S21g lesson (OUT-COLUMN-POISON, LEDGER): dag sum_outcome is NOT a game
     # result (proof-search visit values, exotic perspective; white rows mean
@@ -557,6 +565,14 @@ def main():
         resid = (best_cp - base).astype(np.float32)
         print('residual mean %+.1f std %.1f' % (resid.mean(), resid.std()), flush=True)
         y_full = None
+    if a.smooth > 0:
+        if a.texel:
+            ym = float(y_full.mean())
+            y_full = ((1.0 - a.smooth) * y_full + a.smooth * ym).astype(np.float32)
+        else:
+            ym = float(resid.mean())
+            resid = ((1.0 - a.smooth) * resid + a.smooth * ym).astype(np.float32)
+        print('smoothing %.2f toward %.3f' % (a.smooth, ym), flush=True)
     del best_cp
     _gc.collect()
     # S21f: trust high-visit rows (wsum weights, mean-normalized). Absent in
@@ -623,6 +639,7 @@ def main():
         + [torch.nn.EmbeddingBag(50 * 50, 1, mode='sum', sparse=True) for _ in range(2)]
         + [torch.nn.EmbeddingBag(9, 1, mode='sum', sparse=True) for _ in range(2)]
         + [torch.nn.EmbeddingBag(256, 1, mode='sum', sparse=True) for _ in range(2)]
+        + [torch.nn.EmbeddingBag(80 * 6561, 1, mode='sum', sparse=True)]
     )
     for bg in bags:
         torch.nn.init.zeros_(bg.weight)
@@ -634,7 +651,7 @@ def main():
     # sparse-family lr — own param group at --conv-lr.
     opt = torch.optim.SGD(
         [
-            {'params': list(bags[0:10].parameters()) + [bias]},
+            {'params': list(bags[0:10].parameters()) + list(bags[14:15].parameters()) + [bias]},
             {'params': list(bags[10:14].parameters()), 'lr': a.conv_lr},
         ],
         lr=a.lr,
@@ -654,6 +671,8 @@ def main():
             bags[11].weight.data[0].zero_()
             bags[12].weight.data[0].zero_()
             bags[13].weight.data[0].zero_()
+            for pi in range(80):
+                bags[14].weight.data[pi * 6561].zero_()
 
     active = [int(x) for x in a.dirs.split(',')]
     assert set(active) <= {0, 1, 2, 3} and active, a.dirs
@@ -673,6 +692,8 @@ def main():
         Xpo = [(F.numpy()[:, XA[d]] + 81 * F.numpy()[:, YA[d]]).astype(np.int64)
                for d in range(4)]
         Xq = (AR2 + Qb.astype(np.int64)).astype(np.int64)
+        Fn = F.numpy()
+        Xpa = (PAOFF + Fn[:, PAX] + 81 * Fn[:, PAY]).astype(np.int64)
         return (torch.from_numpy(Xo),
                 [torch.from_numpy(p) for p in Xpo],
                 torch.from_numpy(Xq),
@@ -683,10 +704,11 @@ def main():
                 torch.from_numpy(CUb.astype(np.int64))[:, None],
                 torch.from_numpy(CTb.astype(np.int64))[:, None],
                 torch.from_numpy(VUb.astype(np.int64)),
-                torch.from_numpy(VTb.astype(np.int64)))
+                torch.from_numpy(VTb.astype(np.int64)),
+                torch.from_numpy(Xpa))
         # NOTE: AR/XA/YA are module-level int64 numpy; Fb rows sliced already.
 
-    def forward(Xb, Xpb, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt):
+    def forward(Xb, Xpb, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt, Xpa):
         pred = bags[0](Xb).squeeze(1) + bias
         for d in active:
             pred = pred + bags[d + 1](Xpb[d]).squeeze(1)
@@ -694,7 +716,7 @@ def main():
                 + bags[7](Xet).squeeze(1) + bags[8](Xmu).squeeze(1)
                 + bags[9](Xmt).squeeze(1) + bags[10](Xcu).squeeze(1)
                 + bags[11](Xct).squeeze(1) + bags[12](Xvu).squeeze(1)
-                + bags[13](Xvt).squeeze(1))
+                + bags[13](Xvt).squeeze(1) + bags[14](Xpa).squeeze(1))
         return pred
 
     def dump_tup(path):
@@ -713,8 +735,10 @@ def main():
         wvu = bags[12].weight.detach().squeeze(1).numpy()
         wvt = bags[13].weight.detach().squeeze(1).numpy()
         assert wcu[0] == 0 and wct[0] == 0 and wvu[0] == 0 and wvt[0] == 0, 'capn/conv-0 broken'
+        wpa = bags[14].weight.detach().squeeze(1).numpy()
+        assert all(wpa[pi * 6561] == 0 for pi in range(80)), 'pa-0 broken'
         allw = np.concatenate([ws.reshape(-1)] + [p.reshape(-1) for p in wp]
-                              + [wq, weu, wet, wmu, wmt, wcu, wct, wvu, wvt])
+                              + [wq, weu, wet, wmu, wmt, wcu, wct, wvu, wvt, wpa])
         print('weight spread: max|w| %.1f mean|w| %.2f frac_nonzero %.3f bias %+.1f'
               % (np.abs(allw).max(), np.abs(allw).mean(), (allw != 0).mean(), float(bias.item())),
               flush=True)
@@ -737,10 +761,14 @@ def main():
                                       *[max(-32767, min(32767, int(round(v)))) for v in arr])
         payload += q16(wq) + q16(weu) + q16(wet) + q16(wmu) + q16(wmt)
         payload += q16(wcu) + q16(wct) + q16(wvu) + q16(wvt)
+        # TUP7: TUP6 + per-anchor pairs (80x6561 i8, position order H/V/D1/D2
+        # matching Rust PAIR_BLOCKS).
+        q8 = lambda arr: bytes(bytearray([(max(-127, min(127, int(round(v)))) & 0xFF) for v in arr]))
+        payload += q8(wpa)
         with open(path, 'wb') as f:
-            f.write(b'TUP6' + payload)
+            f.write(b'TUP7' + payload)
         import os
-        print('wrote %s %.1fKB dirs %s TUP6' % (path, os.path.getsize(path) / 1024, a.dirs), flush=True)
+        print('wrote %s %.1fKB dirs %s TUP7' % (path, os.path.getsize(path) / 1024, a.dirs), flush=True)
 
     bs = 4096
     # S26 flywheel: plateau stop on RELATIVE val improvement. Your call of 4
@@ -751,6 +779,13 @@ def main():
     # unchanged (plateau 0 = off).
     max_ep = a.max_epochs if a.plateau > 0 else a.epochs
     prev_val, best_val, best_ep, stale = None, float('inf'), 0, 0
+    # Cyclic SGDR state (explore/exploit slider 3): cosine lr within a
+    # cycle, restart (rewind to best + lr back to max) at cycle end.
+    cyc_on = a.cyclic_T0 > 0
+    cyc_T, cyc_Ti = 0, max(a.cyclic_T0, 1)
+    lr_max0, conv_max0 = float(a.lr), float(a.conv_lr)
+    lr_ratio = conv_max0 / max(lr_max0, 1e-12)
+    best_state = None
     import shutil
     ntr = len(Xtr8)
     for ep in range(1, max_ep + 1):
@@ -763,11 +798,13 @@ def main():
             b = perm[i:i + bs]
             bn = b.numpy()
             Fb = Xtr8[bn]
-            Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt = batch_idx(
+            Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt, Xpa = batch_idx(
                 Fb, Qtr[bn], EUtr[bn], ETtr[bn], MUtr[bn], MTtr[bn],
                 CUtr[bn], CTtr[bn], VUtr[bn], VTtr[bn])
             opt.zero_grad()
-            pred = forward(Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt)
+            pred = forward(Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt, Xpa)
+            if a.noise_w > 0:
+                pred = pred + torch.randn_like(pred) * a.noise_w
             l2 = sum((bg.weight ** 2).sum() for bg in bags)
             wb = wtr[b]
             if a.texel:
@@ -787,12 +824,12 @@ def main():
             totv, cntv = 0.0, 0
             for j in range(0, len(Xva8), 100000):
                 Fv = Xva8[j:j + 100000]
-                Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt = batch_idx(
+                Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt, Xpa = batch_idx(
                     Fv, Qva[j:j + 100000], EUva[j:j + 100000],
                     ETva[j:j + 100000], MUva[j:j + 100000], MTva[j:j + 100000],
                     CUva[j:j + 100000], CTva[j:j + 100000],
                     VUva[j:j + 100000], VTva[j:j + 100000])
-                pv = forward(Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt)
+                pv = forward(Xo, Xpo, Xq, Xeu, Xet, Xmu, Xmt, Xcu, Xct, Xvu, Xvt, Xpa)
                 wv = wva[j:j + len(Fv)]
                 if a.texel:
                     pwv = torch.sigmoid((base_va[j:j + len(Fv)] + pv) * LN10K)
@@ -805,16 +842,38 @@ def main():
         tag = ''
         if vmse < best_val:
             best_val, best_ep = vmse, ep
+            with torch.no_grad():
+                best_state = ([bg.weight.detach().clone() for bg in bags],
+                              bias.detach().clone())
             if a.ckpt:
                 dump_tup(a.ckpt.format(ep=ep))
                 shutil.copy(a.ckpt.format(ep=ep), a.out)
                 tag = ' BEST->out'
+        # Cyclic restart: rewind to best, lr back to max, cycle lengthens.
+        cyc_msg = ''
+        if cyc_on:
+            cyc_T += 1
+            if cyc_T >= cyc_Ti and best_state is not None:
+                with torch.no_grad():
+                    for bg, w in zip(bags, best_state[0]):
+                        bg.weight.copy_(w)
+                    bias.copy_(best_state[1])
+                zero_constrained()
+                cyc_T, cyc_Ti = 0, int(cyc_Ti * a.cyclic_mult)
+                cyc_msg = ' RESTART(T=%d)' % cyc_Ti
+            frac = min(cyc_T / max(cyc_Ti, 1), 1.0)
+            import math as _math
+            lr_ep = a.cyclic_lr_min + 0.5 * (lr_max0 - a.cyclic_lr_min) * (
+                1.0 + _math.cos(_math.pi * frac))
+            opt.param_groups[0]['lr'] = lr_ep
+            opt.param_groups[1]['lr'] = max(lr_ep * lr_ratio, a.cyclic_lr_min)
         if a.plateau > 0 and prev_val is not None and improv < a.plateau:
             stale += 1
         else:
             stale = 0
-        print('epoch %d train_mse %.1f val_mse %.1f rel_improv %+.2e bias %+.1f (%.0fs)%s'
-              % (ep, tot / cnt, vmse, improv, bias.item(), time.time() - t0, tag), flush=True)
+        print('epoch %d train_mse %.1f val_mse %.1f rel_improv %+.2e bias %+.1f lr %.5f (%.0fs)%s%s'
+              % (ep, tot / cnt, vmse, improv, bias.item(), opt.param_groups[0]['lr'],
+                 time.time() - t0, tag, cyc_msg), flush=True)
         prev_val = vmse
         if a.plateau > 0 and stale >= 2:
             print('plateau: rel improv < %.0e twice in a row -> stop at ep %d (best ep %d val %.1f)'

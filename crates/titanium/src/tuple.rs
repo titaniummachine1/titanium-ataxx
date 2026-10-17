@@ -26,6 +26,7 @@ pub const TUP_MAGIC: [u8; 4] = *b"TUP4";
 /// would corrupt TT entries).
 pub const TUP5_MAGIC: [u8; 4] = *b"TUP5";
 pub const TUP6_MAGIC: [u8; 4] = *b"TUP6";
+pub const TUP7_MAGIC: [u8; 4] = *b"TUP7";
 /// 8-cell ternary pair patterns per direction table.
 pub const PAIR_PATTERNS: usize = 81 * 81;
 /// Geometry pair counts per direction (H, V, D1, D2).
@@ -43,6 +44,8 @@ pub const MOB_PATTERNS: usize = 50 * 50;
 /// Enriched families (v5) are i16 (~110KB): quat/env/mob own-trained tables.
 /// Accumulation stays i32 (25 env terms x ±32767 max -- real weights are
 /// small; debug_assert guards in tests, gates guard in production).
+/// Per-anchor pairs (v7): 80 anchor-pair tables (the missing Moonbird
+/// feature: position-dependent pair weights instead of 4 shared tables).
 #[derive(Clone)]
 pub struct TupleTable {
     bias: i32,
@@ -60,7 +63,12 @@ pub struct TupleTable {
     conv_us: Box<[i16; 256]>,
     conv_them: Box<[i16; 256]>,
     has_capconv: bool,
+    pa: Box<[i8; PA_PATTERNS]>,
+    has_pa: bool,
 }
+
+/// Per-anchor pair entries (80 pairs x 6561 ternary patterns).
+pub const PA_PATTERNS: usize = 80 * 81 * 81;
 
 /// Conversion-kernel key for a square: foe occupancy in dr-outer ring
 /// order (matches NEIGH_POS bit order used by extract8/PEXT; off-board
@@ -131,19 +139,25 @@ impl TupleTable {
             conv_us: Box::new([0; 256]),
             conv_them: Box::new([0; 256]),
             has_capconv: false,
+            pa: Box::new([0; PA_PATTERNS]),
+            has_pa: false,
         }
     }
 
-    /// Load `.tup` weights (v4 classic, v5 enriched, v6 +capn/conv —
-    /// backward compatible, missing sections read as zeros).
+    /// Load `.tup` weights (v4 classic, v5 enriched, v6 +capn/conv, v7
+    /// +per-anchor pairs — backward compatible, missing sections read as
+    /// zeros).
     pub fn load(path: &str) -> std::io::Result<TupleTable> {
         let buf = std::fs::read(path)?;
         if buf.len() < 8
-            || (buf[0..4] != TUP_MAGIC && buf[0..4] != TUP5_MAGIC && buf[0..4] != TUP6_MAGIC)
+            || (buf[0..4] != TUP_MAGIC
+                && buf[0..4] != TUP5_MAGIC
+                && buf[0..4] != TUP6_MAGIC
+                && buf[0..4] != TUP7_MAGIC)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "bad .tup magic (want TUP4/TUP5/TUP6)",
+                "bad .tup magic (want TUP4/TUP5/TUP6/TUP7)",
             ));
         }
         let rd32 = |o: usize| i32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
@@ -204,8 +218,10 @@ impl TupleTable {
             conv_us: Box::new([0; 256]),
             conv_them: Box::new([0; 256]),
             has_capconv: false,
+            pa: Box::new([0; PA_PATTERNS]),
+            has_pa: false,
         };
-        if buf[0..4] == TUP5_MAGIC || buf[0..4] == TUP6_MAGIC {
+        if buf[0..4] == TUP5_MAGIC || buf[0..4] == TUP6_MAGIC || buf[0..4] == TUP7_MAGIC {
             for a in t.q2.iter_mut() {
                 for v in a.iter_mut() {
                     need(o, 2)?;
@@ -245,6 +261,14 @@ impl TupleTable {
                 }
             }
             t.has_capconv = true;
+        }
+        if buf[0..4] == TUP7_MAGIC {
+            for v in t.pa.iter_mut() {
+                need(o, 1)?;
+                *v = buf[o] as i8;
+                o += 1;
+            }
+            t.has_pa = true;
         }
         Ok(t)
     }
@@ -294,6 +318,22 @@ impl TupleTable {
                 let (bx, by) = (blocks[pairs[d][i].0 as usize], blocks[pairs[d][i].1 as usize]);
                 if bx | by != 0 {
                     s += t[bx as usize + 81 * by as usize] as i32;
+                }
+            }
+        }
+        // Per-anchor pairs (S47 the missing feature): same indices, but
+        // each of the 80 anchor-pairs has its OWN table (position-dependent
+        // weights like Moonbird) instead of 4 shared direction tables.
+        if self.has_pa {
+            const BASE: [usize; 4] = [0, 24, 48, 64];
+            for d in 0..4 {
+                for i in 0..self.dir_counts[d] {
+                    let (bx, by) =
+                        (blocks[pairs[d][i].0 as usize], blocks[pairs[d][i].1 as usize]);
+                    if bx | by != 0 {
+                        s += self.pa[(BASE[d] + i) * PAIR_PATTERNS + bx as usize
+                            + 81 * by as usize] as i32;
+                    }
                 }
             }
         }
@@ -554,6 +594,17 @@ mod tests {
         t2.has_capconv = true;
         t2.conv_us[72] = 11;
         assert_eq!(t2.forward(&b), 11);
+    }
+
+    #[test]
+    fn per_anchor_pair_spot() {
+        // Startpos: H pair ((5,0),(5,2)) = global pair 20, feats 9+0.
+        // Rigged per-anchor entry must be picked exactly there.
+        let b = Board::start();
+        let mut t = TupleTable::zeros();
+        t.has_pa = true;
+        t.pa[20 * PAIR_PATTERNS + 9] = 5;
+        assert_eq!(t.forward(&b), 5);
     }
 
     #[test]
