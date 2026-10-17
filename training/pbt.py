@@ -31,6 +31,7 @@ def run_member(cache, outdir, name, hypers, epochs, init, rows=()):
            '--smooth', str(hypers['smooth']),
            '--seed', str(hypers['seed']),
            '--plateau', '0', '--epochs', str(epochs),
+           '--ckpt', os.path.join(outdir, name + '_ep{ep}.tup'),
            '--out', out] + list(rows)
     if init:
         cmd += ['--init', init]
