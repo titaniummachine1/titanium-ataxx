@@ -350,6 +350,17 @@ def main():
     ap.add_argument('--lr', type=float, default=4.0)
     ap.add_argument('--conv-lr', type=float, default=0.005,
                     help='LR for dense-visit capn/conv families (bags 10-13).')
+    ap.add_argument('--adaptive', action='store_true',
+                    help='Bold-driver LR: val improve -> lr UP (x --lr-up),
+                    overshoot (val worse) -> lr DOWN (x --lr-down). Floor
+                    --lr-min, 5-decimal precision. Maximizes learning until
+                    it overshoots, then backs off until it stops.')
+    ap.add_argument('--lr-up', type=float, default=1.1)
+    ap.add_argument('--lr-down', type=float, default=0.5)
+    ap.add_argument('--lr-min', type=float, default=1e-5,
+                    help='LR floor (5-decimal precision).')
+    ap.add_argument('--lr-max', type=float, default=0.0,
+                    help='LR ceiling, 0 = 10x initial lr.')
     ap.add_argument('--wd', type=float, default=1e-7)
     ap.add_argument('--seed', type=int, default=7)
     ap.add_argument('--dirs', default='0,1,2,3',
