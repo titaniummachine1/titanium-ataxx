@@ -458,7 +458,7 @@ def main():
     ETtr, ETva = ETH[tr], ETH[va]
     MUtr, MUva = MUS[tr], MUS[va]
     MTtr, MTva = MTH[tr], MTH[va]
-    del feats8, resid, Q, EUS, ETH, MUS, MTH
+    del feats8, Q, EUS, ETH, MUS, MTH
     _gc.collect()
     wtr, wva = samp_w[tr], samp_w[va]
     # S28: feats8 sub-gathers are views; copy to compact int8 (tr/va order).
