@@ -56,7 +56,7 @@ const EXEMPT: &[&str] = &[
     // The shipped champion eval. Small (28KB), our own SGD weights, and main
     // runs it by default — like Stockfish shipping its net with the repo.
     // Every other blob stays untracked (the *.tup rule above still bites).
-    "data/nnue/tups54align.tup", // lowercase: reason() compares against lowercased paths
+    "data/nnue/tups55tree.tup", // lowercase: reason() compares against lowercased paths
 ];
 
 fn glob_match(pattern: &str, name: &str) -> bool {

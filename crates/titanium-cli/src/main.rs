@@ -219,7 +219,7 @@ fn net_flag_str(spec: &Option<String>) -> String {
 }
 
 /// Shipped champion: main runs this unless --tuple says otherwise.
-pub const DEFAULT_TUP: &str = "data/nnue/tupS54align.tup";
+pub const DEFAULT_TUP: &str = "data/nnue/tupS55tree.tup";
 
 /// Flag absent = champion default (main is always strongest out of the box).
 /// --tuple none = pure hand eval (explicit escape hatch for A/B).
