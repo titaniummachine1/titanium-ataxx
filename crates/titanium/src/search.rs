@@ -76,6 +76,13 @@ pub struct SearchParams {
     /// cost at ordering time, not inference. Defaults OFF (huge).
     pub lmr_gap1: i32,
     pub lmr_gap2: i32,
+    /// LMR curve (mode 3): closed-form r = min(cap, base +
+    /// (idx*slope)/32 + (depth*drslope)/32), plus the same gap kickers.
+    /// 4 tunable params — the identifiable subset of the 16-cell table.
+    pub lmr_cbase: u32,
+    pub lmr_cslope: u32,
+    pub lmr_cdepth: u32,
+    pub lmr_ccap: u32,
 }
 
 impl Default for SearchParams {
@@ -103,6 +110,10 @@ impl Default for SearchParams {
             lmr_tab: [0, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3],
             lmr_gap1: 2000000000,
             lmr_gap2: 2000000000,
+            lmr_cbase: 2,
+            lmr_cslope: 6,
+            lmr_cdepth: 2,
+            lmr_ccap: 5,
         }
     }
 }
@@ -500,13 +511,15 @@ impl<'a> Searcher<'a> {
             "LMRSplit" => self.params.lmr_split = val.max(0) as u32,
             "LMRR1" => self.params.lmr_r1 = val.max(0) as u32,
             "LMRR2" => self.params.lmr_r2 = val.max(0) as u32,
-            "LMRMode" => self.params.lmr_mode = val.clamp(0, 2) as u32,
+            "LMRMode" => self.params.lmr_mode = val.clamp(0, 3) as u32,
             "LMRHalf" => self.params.lmr_half = val.max(1) as u32,
             "LMRSub" => self.params.lmr_sub = val.max(0) as u32,
             "LMRGap1" => self.params.lmr_gap1 = val as i32,
             "LMRGap2" => self.params.lmr_gap2 = val as i32,
-            "LMRGap1" => self.params.lmr_gap1 = val as i32,
-            "LMRGap2" => self.params.lmr_gap2 = val as i32,
+            "CurveBase" => self.params.lmr_cbase = val.clamp(0, 6) as u32,
+            "CurveSlope" => self.params.lmr_cslope = val.clamp(0, 64) as u32,
+            "CurveDepth" => self.params.lmr_cdepth = val.clamp(0, 64) as u32,
+            "CurveCap" => self.params.lmr_ccap = val.clamp(1, 8) as u32,
             _ => return false,
         }
         true
@@ -751,12 +764,27 @@ impl<'a> Searcher<'a> {
                     ((base * h) / (h + move_idx as u64))
                         .saturating_sub(self.params.lmr_sub as u64)
                         .min(base) as u32
-                } else {
+                } else if self.params.lmr_mode == 2 {
                     // Table (mode 2): tuned 1D function r = tab[idx],
                     // plus score-gap kicker: moves that looked much worse
                     // than the best at ordering time reduce more.
                     // Gap thresholds tunable; OFF when gap small.
                     let mut r = self.params.lmr_tab[move_idx.min(15)];
+                    if gap > self.params.lmr_gap1 {
+                        r += 1;
+                    }
+                    if gap > self.params.lmr_gap2 {
+                        r += 1;
+                    }
+                    depth.saturating_sub(1 + r)
+                } else {
+                    // Curve (mode 3): closed-form r = min(cap, base +
+                    // idx*slope/32 + depth*drslope/32) plus gap kickers.
+                    // Identifiable 4-param cousin of the 16-cell table.
+                    let mut r = (self.params.lmr_cbase
+                        + ((move_idx as u32 * self.params.lmr_cslope) >> 5)
+                        + ((depth * self.params.lmr_cdepth) >> 5))
+                        .min(self.params.lmr_ccap);
                     if gap > self.params.lmr_gap1 {
                         r += 1;
                     }
