@@ -704,10 +704,9 @@ fn serve_cmd(
             }
             out_line("option name LMRGap1 type spin default 2000000000 min 0 max 2000000000");
             out_line("option name LMRGap2 type spin default 2000000000 min 0 max 2000000000");
-            for i in 0..16 {
-                let dflt = if i == 0 { 0 } else if i < 9 { 2 } else { 3 };
-                out_line(&format!("option name LMRT{i} type spin default {dflt} min 0 max 8"));
-            }
+            out_line("option name PCutDepth type spin default 5 min 3 max 12");
+            out_line("option name PCutMargin type spin default 250 min 0 max 2000000000");
+            out_line("option name PCutReduce type spin default 3 min 1 max 6");
             out_line("uaiok");
         } else if t == "isready" {
             out_line("readyok");

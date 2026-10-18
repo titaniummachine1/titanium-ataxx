@@ -76,6 +76,12 @@ pub struct SearchParams {
     /// cost at ordering time, not inference. Defaults OFF (huge).
     pub lmr_gap1: i32,
     pub lmr_gap2: i32,
+    /// ProbCut: minimum depth, static-eval margin over beta, and the
+    /// verification-search reduction. Defaults ON but conservative
+    /// (screen decides); OFF via huge margin.
+    pub pcut_depth: u32,
+    pub pcut_margin: i32,
+    pub pcut_reduce: u32,
 }
 
 impl Default for SearchParams {
@@ -103,6 +109,9 @@ impl Default for SearchParams {
             lmr_tab: [0, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3],
             lmr_gap1: 2000000000,
             lmr_gap2: 2000000000,
+            pcut_depth: 5,
+            pcut_margin: 250,
+            pcut_reduce: 3,
         }
     }
 }
@@ -505,8 +514,9 @@ impl<'a> Searcher<'a> {
             "LMRSub" => self.params.lmr_sub = val.max(0) as u32,
             "LMRGap1" => self.params.lmr_gap1 = val as i32,
             "LMRGap2" => self.params.lmr_gap2 = val as i32,
-            "LMRGap1" => self.params.lmr_gap1 = val as i32,
-            "LMRGap2" => self.params.lmr_gap2 = val as i32,
+            "PCutDepth" => self.params.pcut_depth = val.clamp(3, 12) as u32,
+            "PCutMargin" => self.params.pcut_margin = val as i32,
+            "PCutReduce" => self.params.pcut_reduce = val.clamp(1, 6) as u32,
             _ => return false,
         }
         true
@@ -639,6 +649,50 @@ impl<'a> Searcher<'a> {
             && static_eval + self.params.rfp[(depth.max(1) - 1) as usize] < alpha
         {
             return alpha;
+        }
+
+        // ProbCut (exp/search-probcut): static eval far above beta ->
+        // verify the fail-high with a reduced-depth search on the TT move
+        // (else the first legal), exactly like the main move loop updates
+        // the child acc first so sancta stays valid. Tunable depth /
+        // margin / reduction; OFF via huge margin.
+        if null_allowed
+            && ply > 0
+            && depth >= self.params.pcut_depth
+            && static_eval >= beta + self.params.pcut_margin
+        {
+            let plist = b.legal_moves();
+            if !plist.is_empty() {
+                let mut pc_move = plist.move_at(0);
+                if tt_mv != 0 {
+                    for i in 0..plist.len() {
+                        if plist.move_at(i).to_u32() == tt_mv {
+                            pc_move = plist.move_at(i);
+                            break;
+                        }
+                    }
+                }
+                let pchild = b.make(pc_move);
+                if let Some(net) = self.sancta {
+                    let (a, z) = self.stack.acc.split_at_mut(ply as usize + 1);
+                    net.update_child(&a[ply as usize], &mut z[0], b, &pchild);
+                }
+                let pc_beta = beta + self.params.pcut_margin;
+                let pscore = -self.negamax(
+                    &pchild,
+                    -pc_beta,
+                    -pc_beta + 1,
+                    depth.saturating_sub(1 + self.params.pcut_reduce),
+                    ply + 1,
+                    true,
+                );
+                if self.stop {
+                    return 0;
+                }
+                if pscore >= pc_beta {
+                    return pscore;
+                }
+            }
         }
 
         // Null-move pruning (autaxx + Moonbird hybrid): pass is a real move
