@@ -122,6 +122,11 @@ def ensure_worktree(item):
     try:
         wt = item.get('worktree')
         br = item['branch']
+        # If this runner's own worktree is already on the branch, use it.
+        cur = sh(['git', '-C', REPO, 'branch', '--show-current'], timeout=60)
+        if cur.returncode == 0 and cur.stdout.strip() == br:
+            r = sh(['git', '-C', REPO, 'rev-parse', 'HEAD'], timeout=60)
+            return REPO, (r.stdout.strip() if r.returncode == 0 else 'unknown')
         if not wt:
             wt = os.path.join(os.path.dirname(REPO), 'titanium-gate-' + item['tag'])
             item['worktree'] = wt

@@ -18,7 +18,9 @@
   "nodes": 5000,
   "max_chunks": 20,
   "seed": 200,
-  "enabled": true
+  "enabled": false,
+  "done": true,
+  "note": "REJECTED LLR -1.66 500-500"
  },
  {
   "tag": "hyperlmr",
@@ -39,6 +41,29 @@
   "nodes": 5000,
   "max_chunks": 20,
   "seed": 300,
+  "enabled": false,
+  "done": true,
+  "note": "REJECTED LLR -1.12 (196-204 @5k, 2026-10-18)"
+ },
+ {
+  "tag": "lmp",
+  "desc": "Late-move pruning (autaxx form) vs flat (no LMP)",
+  "branch": "exp/search-lmp",
+  "worktree": "C:/gitProjects/titanium-gate-lmp",
+  "main_exe": "C:/gitProjects/titanium-main/target/release/titanium-cli.exe",
+  "tup": "C:/gitProjects/engines/titan_champ.tup",
+  "books": [
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100u.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100v.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100w.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100x.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100y.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100z.txt"
+  ],
+  "games": 200,
+  "nodes": 5000,
+  "max_chunks": 20,
+  "seed": 400,
   "enabled": true
  }
 ]
