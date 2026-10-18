@@ -695,7 +695,7 @@ fn serve_cmd(
             out_line("option name LMRSplit type spin default 9 min 1 max 40");
             out_line("option name LMRR1 type spin default 2 min 0 max 6");
             out_line("option name LMRR2 type spin default 3 min 0 max 6");
-            out_line("option name LMRMode type spin default 0 min 0 max 1");
+            out_line("option name LMRMode type spin default 1 min 0 max 1");
             out_line("option name LMRHalf type spin default 4 min 1 max 16");
             out_line("option name LMRSub type spin default 0 min 0 max 4");
             out_line("uaiok");

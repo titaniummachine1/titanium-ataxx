@@ -71,6 +71,9 @@ pub struct SearchParams {
 
 impl Default for SearchParams {
     fn default() -> Self {
+        // CANDIDATE (exp/search-hyperlmr): Moonbird hyperbolic LMR curve
+        // instead of flat r1/r2 step. Screen 101-99 LLR -0.22 (unresolved).
+        // Gated on this branch; main defaults otherwise identical.
         // Defaults REVERTED to pre-R1 values 2026-10-18: R1 thetas
         // (RFP1 189, NullMaxFill 29, LMRR2 5) showed +67 CI but only
         // LLR +1.86 = UNDECIDED under SPRT law v3. They stay available
@@ -88,7 +91,7 @@ impl Default for SearchParams {
             lmr_split: 9,
             lmr_r1: 2,
             lmr_r2: 3,
-            lmr_mode: 0,
+            lmr_mode: 1,
             lmr_half: 4,
             lmr_sub: 0,
         }
