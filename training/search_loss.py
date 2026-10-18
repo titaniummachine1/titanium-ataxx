@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-sys.path.insert(0, 'training')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import place_bench as pb
 
 EXE = os.path.join('target-loss', 'release', 'titanium-cli.exe')

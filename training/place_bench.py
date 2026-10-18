@@ -11,6 +11,7 @@ Usage:
 import argparse
 import hashlib
 import math
+import os
 import random
 import subprocess
 import sys
@@ -18,7 +19,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-sys.path.insert(0, 'training')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import book_gate as bg
 
 
