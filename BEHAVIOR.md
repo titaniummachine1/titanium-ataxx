@@ -187,3 +187,14 @@ real memory. Update them the moment something happens, not at the end.
   code pushes, blobs stay local.
 - Update LEDGER (experiment row), HANDOFFS (state), BEHAVIOR (this file)
   in the same session as the work, not later.
+
+## GATE LAW v4 (2026-10-18, user-ordered: trend + tripwire, SPRT default)
+- AHEAD by even 1 point = presumed WINNING, until behind at least once.
+- BEHIND = presumed LOSING, until proven otherwise.
+- SPRT LLR +-1.0 minimum is the proof instrument (H0<=0 vs H1>=+20 Elo, alpha=beta=0.05): cross +1 while ahead = winning confirmed (solid Elo gain, merge-eligible); cross -1 while behind = losing confirmed (solid loss, reject). +-2.94 stays as strong confirmation.
+- Trend rules the presumption, tripwire confirms it: staying ahead = keep (merge gains, never let proven Elo rot); staying behind = cut (reject, never throw good games after bad). Straddle inside (-1,+1) with lead changes = UNRESOLVED = extend with fresh books, no verdict either way.
+- Fixed-game matches are SCREENS, not gates: run-SPRT-next or bank. A straddle means unresolved, never rejected.
+- Every rejection logged in LEDGER carries its miss risk P(true>0.5|data) — the hidden-gem probability. Harness prints it on every summary.
+- Hygiene: fresh books (generated, never replayed), both seats per position, one engine per binary with sha recorded, net sha per gate, seat alternation verified.
+- No merge without ALL THREE: SPRT tripwire crossed the right way + user explicit approval naming branch/net + LEDGER promotion row with DB entries. Branch is gated, never a loose binary: gate the branch build, merge the branch.
+- Enforcement: training/gate_check.py recomputes SPRT from the DB (not chat claims); merge scripts abort unless the tripwire + approval + row hold.

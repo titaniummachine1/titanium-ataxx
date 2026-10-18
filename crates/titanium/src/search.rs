@@ -36,10 +36,64 @@ impl MoveStack {
 
 /// Material weight per piece (eval = piece diff * MATERIAL).
 const MATERIAL: i32 = 100;
-/// Tempo: flat bonus for the side to move. autaxx uses 1.5-2 stones worth.
-const TEMPO: i32 = 150;
-/// Reverse futility pruning margins, index = depth-1 (autaxx, stone = 100).
-const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774];
+/// Tunable search/eval parameters. Defaults = current champion values.
+/// Exposed via UAI `setoption` (serve) so SPSA can perturb without rebuilds:
+/// Tempo/ContactPen/MulticapPen/RFP0..3/NullR/NullMinTargets/NullMaxFill/
+/// LMRSplit/LMRR1/LMRR2.
+#[derive(Clone, Copy, Debug)]
+pub struct SearchParams {
+    /// Tempo: flat bonus for the side to move. autaxx tuned 243/394 (!);
+    /// ours is 150 — prime SPSA candidate.
+    pub tempo: i32,
+    /// Contact penalty per ENDANGERED stone (E2).
+    pub contact_pen: i32,
+    /// Multi-capture exposure per extra stone (E4).
+    pub multicap_pen: i32,
+    /// Reverse futility pruning margins, index = depth-1.
+    pub rfp: [i32; 4],
+    /// Null-move reduction R.
+    pub null_r: u32,
+    /// Null-move mobility gate: minimum clone targets.
+    pub null_min_targets: u32,
+    /// Null-move phase gate: max fill percent (pieces*100 < pct*49).
+    /// 52 mirrors autaxx phase<0.54; the phase study will measure this.
+    pub null_max_fill: u32,
+    /// LMR: moves with index < split get r1, later moves r2.
+    pub lmr_split: u32,
+    pub lmr_r1: u32,
+    pub lmr_r2: u32,
+    /// LMR shape: 0 = flat (r1/r2 split, autaxx form), 1 = hyperbolic
+    /// (Moonbird form: reduced = depth*half/(half+idx) - sub). Default flat.
+    pub lmr_mode: u32,
+    pub lmr_half: u32,
+    pub lmr_sub: u32,
+}
+
+impl Default for SearchParams {
+    fn default() -> Self {
+        // Defaults REVERTED to pre-R1 values 2026-10-18: R1 thetas
+        // (RFP1 189, NullMaxFill 29, LMRR2 5) showed +67 CI but only
+        // LLR +1.86 = UNDECIDED under SPRT law v3. They stay available
+        // via setoption for proper SPRT proving; defaults ship only
+        // what SPRT passed. Previous: RFP 330/189/491/754, NullR 4,
+        // NMT 12, NMF 29, LMR 9/2/5 (R1, unproven).
+        SearchParams {
+            tempo: 150,
+            contact_pen: 15,
+            multicap_pen: 20,
+            rfp: [257, 347, 478, 774],
+            null_r: 3,
+            null_min_targets: 11,
+            null_max_fill: 52,
+            lmr_split: 9,
+            lmr_r1: 2,
+            lmr_r2: 3,
+            lmr_mode: 0,
+            lmr_half: 4,
+            lmr_sub: 0,
+        }
+    }
+}
 
 // Ordering tiers (titanium-engine pattern: compile-asserted bands so no
 // ordering signal can structurally leak into its neighbor).
@@ -48,20 +102,9 @@ const ORD_KILLER: i32 = 100_000;
 const ORD_CAPTURE_UNIT: i32 = 1000; // per conversion, max 8
 const ORD_CLONE_BONUS: i32 = 500;
 const ORD_JUMP_PEN: i32 = 500;
-/// exp/ab O1: extra jump penalty per own stone neighboring the origin.
-const ORD_JUMP_CONN: i32 = 250;
 const ORD_HISTORY_MAX: i32 = 90_000;
 const _: () = assert!(ORD_HISTORY_MAX + 8 * ORD_CAPTURE_UNIT + ORD_CLONE_BONUS < ORD_KILLER);
 const _: () = assert!(ORD_KILLER < ORD_TT);
-
-/// Contact penalty per ENDANGERED stone (E2, "virus strategy"): stones the
-/// enemy can infect right now. Avoid contact early, mass-clone first.
-/// Restored S13 (was purged in S1): +190 Elo standalone.
-const CONTACT_PEN: i32 = 15;
-/// Multi-capture exposure (E4, user idea): for every empty landing square
-/// the enemy can reach, each of our stones BEYOND THE FIRST that one enemy
-/// landing would convert costs this much. Restored S13: +330 standalone.
-const MULTICAP_PEN: i32 = 20;
 
 /// Empty landing squares `them` can reach right now (shared E2+E4 input —
 /// computed once per side, not once per term).
@@ -80,7 +123,7 @@ fn endangered_count(b: &Board, side: u8, landings_them: u64) -> u32 {
 
 /// E4: for each enemy-reachable landing square, own stones there beyond the
 /// first (each extra one = a stone lost in the same single enemy move).
-fn multicapture_penalty(b: &Board, side: u8, landings_them: u64) -> i32 {
+fn multicapture_penalty(b: &Board, side: u8, landings_them: u64, pen_each: i32) -> i32 {
     let us = b.occ[side as usize];
     let mut pen = 0i32;
     let mut ls = landings_them;
@@ -89,7 +132,7 @@ fn multicapture_penalty(b: &Board, side: u8, landings_them: u64) -> i32 {
         ls &= ls - 1;
         let n = (RING1[sq] & us).count_ones() as i32;
         if n >= 2 {
-            pen += (n - 1) * MULTICAP_PEN;
+            pen += (n - 1) * pen_each;
         }
     }
     pen
@@ -100,7 +143,12 @@ fn multicapture_penalty(b: &Board, side: u8, landings_them: u64) -> i32 {
 /// scan enemy reachability per node — the knowledge that won +190/+330.
 /// The n-tuple term (`tup`, S20) adds learned local-shape knowledge on top;
 /// None = pure hand eval (zero-cost OFF).
-pub fn evaluate(b: &Board, tup: Option<&TupleTable>, native_tup: bool) -> i32 {
+pub fn evaluate(
+    b: &Board,
+    tup: Option<&TupleTable>,
+    native_tup: bool,
+    p: &SearchParams,
+) -> i32 {
     let mut score = MATERIAL * (b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32) + b.pst;
     // Tuple-native eval (S21d): mat + PST + tempo + tuples, NO E2/E4
     // regional scans (~400 ops/node back). The pairs must carry contact-like
@@ -108,9 +156,9 @@ pub fn evaluate(b: &Board, tup: Option<&TupleTable>, native_tup: bool) -> i32 {
     // full hand eval when no table is attached.
     if native_tup {
         if b.turn == 0 {
-            score += TEMPO;
+            score += p.tempo;
         } else {
-            score -= TEMPO;
+            score -= p.tempo;
         }
         let out = if b.turn == 0 { score } else { -score };
         if let Some(t) = tup {
@@ -121,14 +169,14 @@ pub fn evaluate(b: &Board, tup: Option<&TupleTable>, native_tup: bool) -> i32 {
     // Black-relative balances (negated for white below, like pst).
     let land_b = enemy_landings(b, 1); // squares white threatens to land on
     let land_w = enemy_landings(b, 0);
-    score -= CONTACT_PEN * endangered_count(b, 0, land_b) as i32;
-    score += CONTACT_PEN * endangered_count(b, 1, land_w) as i32;
-    score -= multicapture_penalty(b, 0, land_b);
-    score += multicapture_penalty(b, 1, land_w);
+    score -= p.contact_pen * endangered_count(b, 0, land_b) as i32;
+    score += p.contact_pen * endangered_count(b, 1, land_w) as i32;
+    score -= multicapture_penalty(b, 0, land_b, p.multicap_pen);
+    score += multicapture_penalty(b, 1, land_w, p.multicap_pen);
     if b.turn == 0 {
-        score += TEMPO;
+        score += p.tempo;
     } else {
-        score -= TEMPO;
+        score -= p.tempo;
     }
     let mut out = if b.turn == 0 { score } else { -score };
     // Tuple term is stm-relative by construction: add after the flip.
@@ -168,16 +216,10 @@ fn score_into(
         let mut score = (opp & RING1[m.to as usize]).count_ones() as i32 * ORD_CAPTURE_UNIT;
         // Clone preference: a clone nets one more stone than a jump and
         // leaves the origin defended ("duplicate as much as you can").
-        // (exp/ab A tested no-asymmetry: 41-55, keep preference.)
         if m.is_clone() {
             score += ORD_CLONE_BONUS;
         } else {
-            // exp/ab O1 (hole-aware jumps): a jump vacates its origin —
-            // leaving a connected origin breaks formation, so penalty
-            // scales with own stones adjacent to the origin square.
-            let conn =
-                (b.occ[b.turn as usize] & RING1[m.from as usize]).count_ones() as i32;
-            score -= ORD_JUMP_PEN + conn * ORD_JUMP_CONN;
+            score -= ORD_JUMP_PEN;
         }
         if packed == k1 || packed == k2 {
             score += ORD_KILLER;
@@ -219,72 +261,6 @@ const FLAG_EMPTY: u8 = 0;
 const FLAG_EXACT: u8 = 1;
 const FLAG_LOWER: u8 = 2;
 const FLAG_UPPER: u8 = 3;
-
-/// Correction history (S54 experiment, OFF unless enabled via set_corr):
-/// per-context EMA of (search score - static eval), added to future static
-/// evals. Two cheap O(1) keys: stm piece-diff bucket + empties bucket.
-/// Bounded, reset per game, never stored in TT (TT keeps search scores).
-const CORR_SIZE: usize = 64;
-const CORR_SCALE: i32 = 256;
-const CORR_WMAX: i32 = 128;
-/// Per-entry rails (raw cp): search artifacts beyond this don't teach.
-const CORR_TGT_MAX: i32 = 256;
-const CORR_ENTRY_MAX: i32 = 512;
-/// Applied correction rails (raw cp sum): small nudge, never a verdict.
-const CORR_APPLY_MAX: i32 = 64;
-
-pub struct CorrHist {
-    pd: Box<[i32; CORR_SIZE]>,
-    em: Box<[i32; CORR_SIZE]>,
-}
-
-impl CorrHist {
-    pub fn new() -> Self {
-        CorrHist {
-            pd: Box::new([0; CORR_SIZE]),
-            em: Box::new([0; CORR_SIZE]),
-        }
-    }
-
-    #[inline]
-    fn idx_pd(b: &Board) -> usize {
-        let d = b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32 + 49;
-        ((d / 2).clamp(0, 63)) as usize
-    }
-
-    #[inline]
-    fn idx_em(b: &Board) -> usize {
-        let e = b.empty().count_ones() as usize;
-        (e * CORR_SIZE / 50).min(CORR_SIZE - 1)
-    }
-
-    /// Corrected static eval (stm-relative in, stm-relative out).
-    #[inline]
-    pub fn apply(&self, b: &Board, raw: i32) -> i32 {
-        let c = (self.pd[Self::idx_pd(b)] + self.em[Self::idx_em(b)]) / 4;
-        raw + c.clamp(-CORR_APPLY_MAX, CORR_APPLY_MAX)
-    }
-
-    /// EMA toward (search - static), depth-weighted. Skips mate scores
-    /// (not eval error) and zero diffs (no information).
-    pub fn update(&mut self, b: &Board, best: i32, static_eval: i32, depth: u32) {
-        if best.abs() > MATE_BOUND || static_eval.abs() > MATE_BOUND {
-            return;
-        }
-        let diff = (best - static_eval).clamp(-CORR_TGT_MAX, CORR_TGT_MAX);
-        if diff == 0 {
-            return;
-        }
-        let w = ((depth * depth + 2 * depth + 1) as i32).min(CORR_WMAX);
-        for (tab, idx) in [
-            (&mut *self.pd, Self::idx_pd(b)),
-            (&mut *self.em, Self::idx_em(b)),
-        ] {
-            let e = tab[idx];
-            tab[idx] = (e + w * (diff - e) / CORR_SCALE).clamp(-CORR_ENTRY_MAX, CORR_ENTRY_MAX);
-        }
-    }
-}
 
 /// Fixed-size transposition table, power-of-two entry count. Depth-0 EXACT
 /// entries double as the eval cache (Ataxx transpositions repeat a lot).
@@ -437,9 +413,9 @@ pub struct Searcher<'a> {
     /// Tuple-native eval mode: skip E2/E4 scans, mat+PST+tempo+tuples only.
     /// False by default (full hand eval + optional additive tuples).
     tup_native: bool,
-    /// Correction history (None = OFF, zero-cost branch). Owned tables,
-    /// reset per game; never merged into weights or TT.
-    corr: Option<CorrHist>,
+    /// Tunable search/eval parameters (SPSA target). Defaults = champion
+    /// values; overridden live via UAI `setoption` without rebuilds.
+    pub params: SearchParams,
     /// Per-ply move/acc buffers, reused across searches (no per-search
     /// alloc: MoveStack is ~72KB of lists + acc, was rebuilt per search).
     stack: MoveStack,
@@ -480,9 +456,34 @@ impl<'a> Searcher<'a> {
             sancta: None,
             tuple: None,
             tup_native: false,
-            corr: None,
+            params: SearchParams::default(),
             stack: MoveStack::new(),
         }
+    }
+
+    /// Set one tunable parameter by UAI option name. Returns false for
+    /// unknown names. Powers SPSA without rebuilds.
+    pub fn set_param(&mut self, name: &str, val: i64) -> bool {
+        match name {
+            "Tempo" => self.params.tempo = val as i32,
+            "ContactPen" => self.params.contact_pen = val as i32,
+            "MulticapPen" => self.params.multicap_pen = val as i32,
+            "RFP0" => self.params.rfp[0] = val as i32,
+            "RFP1" => self.params.rfp[1] = val as i32,
+            "RFP2" => self.params.rfp[2] = val as i32,
+            "RFP3" => self.params.rfp[3] = val as i32,
+            "NullR" => self.params.null_r = val.max(1) as u32,
+            "NullMinTargets" => self.params.null_min_targets = val.max(0) as u32,
+            "NullMaxFill" => self.params.null_max_fill = val.clamp(0, 100) as u32,
+            "LMRSplit" => self.params.lmr_split = val.max(0) as u32,
+            "LMRR1" => self.params.lmr_r1 = val.max(0) as u32,
+            "LMRR2" => self.params.lmr_r2 = val.max(0) as u32,
+            "LMRMode" => self.params.lmr_mode = val.clamp(0, 1) as u32,
+            "LMRHalf" => self.params.lmr_half = val.max(1) as u32,
+            "LMRSub" => self.params.lmr_sub = val.max(0) as u32,
+            _ => return false,
+        }
+        true
     }
 
     /// Attach a sancta net (None = classical). Borrowed for the search
@@ -503,22 +504,6 @@ impl<'a> Searcher<'a> {
         self.tup_native = native;
     }
 
-    /// Correction-history tables, off by default. Enabled searchers learn
-    /// per-context eval biases within a game; disabled = main behavior.
-    pub fn set_corr(&mut self, on: bool) {
-        self.corr = on.then(CorrHist::new);
-    }
-
-    /// Raw static eval plus correction (if enabled). Single call site shape
-    /// so both negamax static-eval points stay consistent.
-    #[inline]
-    fn corrected(&self, b: &Board, raw: i32) -> i32 {
-        match &self.corr {
-            Some(c) => c.apply(b, raw),
-            None => raw,
-        }
-    }
-
     /// Override the clock (wasm builds inject `performance.now()`).
     pub fn set_time_source(&mut self, f: fn() -> f64) {
         self.time_src = f;
@@ -530,9 +515,12 @@ impl<'a> Searcher<'a> {
         self.tt.clear();
         *self.killers = [(0, 0); MAX_PLY];
         *self.history = [[0; 49]; 2];
-        if self.corr.is_some() {
-            self.corr = Some(CorrHist::new());
-        }
+    }
+
+    /// Resize the transposition table (`2^bits` entries, clamped 10..=26).
+    /// Backs the UAI `setoption name Hash` command.
+    pub fn set_tt_bits(&mut self, bits: usize) {
+        self.tt = Tt::new(bits.clamp(10, 26));
     }
 
     #[inline]
@@ -611,11 +599,10 @@ impl<'a> Searcher<'a> {
         // OFF = single branch to classical, zero-cost.
         // forward_ready(acc, stm) is ALREADY stm-relative (like evaluate) —
         // no negation (that was the 0-50 bug: double-negated white nodes).
-        let raw = match self.sancta {
+        let static_eval = match self.sancta {
             Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
-            None => evaluate(b, self.tuple, self.tup_native),
+            None => evaluate(b, self.tuple, self.tup_native, &self.params),
         };
-        let static_eval = self.corrected(b, raw);
 
         // Reverse futility pruning (autaxx, exact form): standing pat is so
         // far below alpha that even a generous error margin cannot recover
@@ -623,21 +610,22 @@ impl<'a> Searcher<'a> {
         if null_allowed
             && ply > 0
             && depth <= 4
-            && static_eval + RFP_MARGINS[(depth.max(1) - 1) as usize] < alpha
+            && static_eval + self.params.rfp[(depth.max(1) - 1) as usize] < alpha
         {
             return alpha;
         }
 
         // Null-move pruning (autaxx + Moonbird hybrid): pass is a real move
-        // in Ataxx and there is no zugzwang to speak of. Gates: not right
-        // after another null, depth > 2, enough clone targets (mobility),
-        // board not too full (forced-pass danger zone). R = 3.
-        // (exp/ab B: R = 2 pooled 108-84-8, straddles, parked for 3rd leg.)
+        // in Ataxx and there is no zugzwang to speak of. Gates (all tunable
+        // via SearchParams for the phase study): not right after another
+        // null, depth > 2, enough clone targets (mobility), board fill below
+        // the phase gate. R = null_r.
         if null_allowed && depth > 2 {
             let clone_targets = (dist_union(b.occ[b.turn as usize], 1) & b.empty()).count_ones();
-            // fill < 0.54 as integer: pieces*50 < 26*49 (no per-node float div).
-            if clone_targets >= 11
-                && (b.piece_cnt[0] as u32 + b.piece_cnt[1] as u32) * 50 < 26 * SQUARES as u32
+            // fill gate as integer: pieces*100 < max_fill*49 (no float div).
+            if clone_targets >= self.params.null_min_targets
+                && (b.piece_cnt[0] as u32 + b.piece_cnt[1] as u32) * 100
+                    < self.params.null_max_fill * SQUARES as u32
             {
                 let child = b.make_pass();
                 // NMP pass flips stm: sancta acc is color-relative so it
@@ -647,7 +635,7 @@ impl<'a> Searcher<'a> {
                     &child,
                     -beta,
                     -beta + 1,
-                    depth - 3,
+                    depth.saturating_sub(self.params.null_r),
                     ply + 1,
                     false,
                 );
@@ -671,12 +659,11 @@ impl<'a> Searcher<'a> {
             // multiplicities, so len>0 always — but double-pass positions
             // have no children to search: score the pass-through.
             if list.is_empty() {
-                let raw = match self.sancta {
+                let static_eval = match self.sancta {
                     Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
-                    None => evaluate(b, self.tuple, self.tup_native),
+                    None => evaluate(b, self.tuple, self.tup_native, &self.params),
                 };
-                let static_eval = self.corrected(b, raw);
-                self.finish_node(b, alpha_orig, beta, static_eval, 0xFFFF, depth, ply, static_eval);
+                self.finish_node(b, alpha_orig, beta, static_eval, 0xFFFF, depth, ply);
                 return static_eval;
             }
         }
@@ -710,8 +697,23 @@ impl<'a> Searcher<'a> {
                     return 0;
                 }
             } else {
-                let r: u32 = if move_idx < 9 { 2 } else { 3 };
-                let reduced = depth.saturating_sub(1 + r);
+                let reduced = if self.params.lmr_mode == 0 {
+                    let r: u32 = if move_idx < self.params.lmr_split as usize {
+                        self.params.lmr_r1
+                    } else {
+                        self.params.lmr_r2
+                    };
+                    depth.saturating_sub(1 + r)
+                } else {
+                    // Hyperbolic (Moonbird form): reduced = base*half /
+                    // (half+idx) - sub, where base = depth-1 (child depth
+                    // before reduction). Smooth curve instead of a step.
+                    let h = self.params.lmr_half.max(1) as u64;
+                    let base = depth.saturating_sub(1) as u64;
+                    ((base * h) / (h + move_idx as u64))
+                        .saturating_sub(self.params.lmr_sub as u64)
+                        .min(base) as u32
+                };
                 score = -self.negamax(
                     &child,
                     -alpha - 1,
@@ -753,7 +755,7 @@ impl<'a> Searcher<'a> {
                 }
             }
         }
-        self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply, raw);
+        self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply);
         best
     }
 
@@ -771,7 +773,6 @@ impl<'a> Searcher<'a> {
     }
 
     /// TT store at the end of a node (skipped when the clock cut it short).
-    /// Also feeds the correction-history EMA: (search - static) per context.
     #[inline]
     fn finish_node(
         &mut self,
@@ -782,13 +783,9 @@ impl<'a> Searcher<'a> {
         best_mv: u32,
         depth: u32,
         ply: u32,
-        static_eval: i32,
     ) {
         if self.stop {
             return;
-        }
-        if let Some(c) = &mut self.corr {
-            c.update(b, best, static_eval, depth);
         }
         let flag = if best <= alpha_orig {
             FLAG_UPPER

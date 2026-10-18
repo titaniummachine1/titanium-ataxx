@@ -53,7 +53,6 @@ fn main() -> ExitCode {
             flag_str(&args, "--net"),
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
-            args.iter().any(|x| x == "--corr"),
         ),
         "match" => match_cmd(
             flag_int(&args, "--games").unwrap_or(20) as u32,
@@ -71,8 +70,6 @@ fn main() -> ExitCode {
             flag_int(&args, "--nodes").map(|n| n as u64),
             flag_int(&args, "--start-game").unwrap_or(1) as u32,
             flag_str(&args, "--out"),
-            args.iter().any(|x| x == "--corr"),
-            args.iter().any(|x| x == "--opp-corr"),
         ),
         "sperft" => sperft_cmd(
             flag_int(&args, "--depth").unwrap_or(8) as u32,
@@ -218,19 +215,12 @@ fn net_flag_str(spec: &Option<String>) -> String {
     }
 }
 
-/// Shipped champion: main runs this unless --tuple says otherwise.
-pub const DEFAULT_TUP: &str = "data/nnue/tupS55tree.tup";
-
-/// Flag absent = champion default (main is always strongest out of the box).
-/// --tuple none = pure hand eval (explicit escape hatch for A/B).
-/// --tuple <path> = that .tup additive table. Owned table, borrowed by the
-/// searcher (same zero-refcount pattern as the net).
+/// --tuple none (or flag absent) = pure hand eval. --tuple <path> = that
+/// .tup additive table. Owned table, borrowed by the searcher (same
+/// zero-refcount pattern as the net).
 fn load_tuple_preset(spec: &Option<String>) -> Result<Option<titanium::TupleTable>, String> {
     match spec {
-        None => match titanium::TupleTable::load(DEFAULT_TUP) {
-            Ok(t) => Ok(Some(t)),
-            Err(e) => Err(format!("champion {DEFAULT_TUP} missing: {e}")),
-        },
+        None => Ok(None),
         Some(s) if s == "none" || s.is_empty() => Ok(None),
         Some(s) => match titanium::TupleTable::load(s) {
             Ok(t) => Ok(Some(t)),
@@ -241,22 +231,11 @@ fn load_tuple_preset(spec: &Option<String>) -> Result<Option<titanium::TupleTabl
 
 fn tuple_flag_str(spec: &Option<String>) -> String {
     // Re-emit for match children: --tuple <spec> flows to the opp serve
-    // child as --opp-tuple. Absent flag = explicit champion path (children
-    // must not depend on their own defaults).
+    // child as --opp-tuple.
     match spec {
-        None => format!("--tuple {DEFAULT_TUP}"),
+        None => "--tuple none".to_string(),
         Some(s) if s == "none" || s.is_empty() => "--tuple none".to_string(),
         Some(s) => format!("--tuple {s}"),
-    }
-}
-
-fn corr_flag_str(on: bool) -> String {
-    // Re-emit for match children: --corr flows to the opp serve child.
-    // Absent = off (experiments are opt-in on both sides).
-    if on {
-        "--corr".to_string()
-    } else {
-        String::new()
     }
 }
 
@@ -537,6 +516,42 @@ fn parse_move(text: &str) -> Option<Move> {
     Some(Move { from, to })
 }
 
+/// Apply one UAI move token to a board (for `position ... moves ...`).
+/// Accepts 4-char jumps ("e2e4"/"e2-e4"), 2-char clones ("e4"),
+/// and nulls ("0000"/"null"/"pass"). Matches against our own legal
+/// movegen, so only truly legal tokens apply (mirrors libataxx from_uai:
+/// from==to 4-char tokens are rejected).
+fn apply_uai_token(b: &Board, tok: &str) -> Option<Board> {
+    let t: String = tok
+        .chars()
+        .filter(|&c| c != '-')
+        .collect::<String>()
+        .to_lowercase();
+    if t == "0000" || t == "null" || t == "pass" {
+        return Some(b.make_pass());
+    }
+    let legal = b.legal_moves();
+    if t.len() == 2 {
+        let to = Board::parse_sq(&t)?;
+        legal
+            .iter()
+            .find(|m| m.to == to && m.is_clone())
+            .map(|m| b.make(m))
+    } else if t.len() == 4 {
+        let from = Board::parse_sq(&t[0..2])?;
+        let to = Board::parse_sq(&t[2..4])?;
+        if from == to {
+            return None;
+        }
+        legal
+            .iter()
+            .find(|m| m.from == from && m.to == to)
+            .map(|m| b.make(m))
+    } else {
+        None
+    }
+}
+
 fn play_cmd(time_ms: u64) -> ExitCode {
     println!("Titanium console game. You are black (x). Moves like e2e3, or: moves, quit");
     let mut b = Board::start();
@@ -631,7 +646,6 @@ fn serve_cmd(
     net_spec: Option<String>,
     tup_spec: Option<String>,
     tup_native: bool,
-    corr: bool,
 ) -> ExitCode {
     let stdin = io::stdin();
     let mut searcher = Searcher::with_tt_bits(tt_bits);
@@ -654,7 +668,6 @@ fn serve_cmd(
     };
     searcher.set_tuple(owned_tup.as_ref());
     searcher.set_tuple_native(tup_native && owned_tup.is_some());
-    searcher.set_corr(corr);
     let mut current: Option<Board> = None;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -668,40 +681,135 @@ fn serve_cmd(
         if t == "uai" {
             out_line("id name Titanium Ataxx");
             out_line("id author titaniummachine1");
+            out_line("option name Hash type spin default 256 min 1 max 16384");
+            out_line("option name Tempo type spin default 150 min 0 max 1000");
+            out_line("option name ContactPen type spin default 15 min 0 max 200");
+            out_line("option name MulticapPen type spin default 20 min 0 max 200");
+            out_line("option name RFP0 type spin default 257 min 0 max 2000");
+            out_line("option name RFP1 type spin default 347 min 0 max 2000");
+            out_line("option name RFP2 type spin default 478 min 0 max 2000");
+            out_line("option name RFP3 type spin default 774 min 0 max 2000");
+            out_line("option name NullR type spin default 3 min 1 max 6");
+            out_line("option name NullMinTargets type spin default 11 min 0 max 40");
+            out_line("option name NullMaxFill type spin default 52 min 0 max 100");
+            out_line("option name LMRSplit type spin default 9 min 1 max 40");
+            out_line("option name LMRR1 type spin default 2 min 0 max 6");
+            out_line("option name LMRR2 type spin default 3 min 0 max 6");
+            out_line("option name LMRMode type spin default 0 min 0 max 1");
+            out_line("option name LMRHalf type spin default 4 min 1 max 16");
+            out_line("option name LMRSub type spin default 0 min 0 max 4");
             out_line("uaiok");
         } else if t == "isready" {
             out_line("readyok");
+        } else if let Some(rest) = t.strip_prefix("setoption name ") {
+            // "setoption name <Name> value <N>": Hash resizes the TT,
+            // anything else routes to the tunable search params.
+            if let Some((name, val)) = rest.split_once(" value ") {
+                let name = name.trim();
+                if name == "Hash" {
+                    if let Ok(mb) = val.trim().parse::<usize>() {
+                        // MB -> bits: entries are ~16 bytes; bits = log2(mb*2^20/16).
+                        let bits = ((mb as f64 * 65536.0).log2().round() as usize)
+                            .clamp(10, 26);
+                        searcher.set_tt_bits(bits);
+                    }
+                } else {
+                    match val.trim().parse::<i64>() {
+                        Ok(v) => {
+                            searcher.set_param(name, v);
+                        }
+                        Err(_) => {
+                            eprintln!("serve: bad value for {name}");
+                        }
+                    }
+                }
+            }
         } else if t == "uainewgame" {
             searcher.reset_for_new_game();
-        } else if t == "position startpos" {
-            current = Some(Board::start());
+        } else if t == "position startpos" || t.starts_with("position startpos ") {
+            let mut b = Board::start();
+            if let Some(mv) = t.split_once(" moves ") {
+                for tok in mv.1.split_whitespace() {
+                    if let Some(nb) = apply_uai_token(&b, tok) {
+                        b = nb;
+                    }
+                }
+            }
+            current = Some(b);
         } else if let Some(fen) = t.strip_prefix("position fen ") {
-            current = Board::from_ataxx_fen(fen.trim());
+            // Split off an optional trailing " moves ..." (UAI standard).
+            let (fen_part, moves_part) = match fen.split_once(" moves ") {
+                Some((f, m)) => (f, Some(m)),
+                None => (fen, None),
+            };
+            if let Some(mut b) = Board::from_ataxx_fen(fen_part.trim()) {
+                if let Some(mv) = moves_part {
+                    for tok in mv.split_whitespace() {
+                        if let Some(nb) = apply_uai_token(&b, tok) {
+                            b = nb;
+                        }
+                    }
+                }
+                current = Some(b);
+            }
         } else if t.starts_with("go") {
-            let mut nodes = None;
-            let mut movetime = None;
-            let mut depth = None;
+            let mut nodes: Option<u64> = None;
+            let mut movetime: Option<u64> = None;
+            let mut depth: Option<u32> = None;
+            let mut btime: Option<u64> = None;
+            let mut wtime: Option<u64> = None;
+            let mut binc: u64 = 0;
+            let mut winc: u64 = 0;
+            let mut infinite = false;
             let toks: Vec<&str> = t.split_whitespace().collect();
             for (i, k) in toks.iter().enumerate() {
                 match *k {
                     "nodes" => nodes = toks.get(i + 1).and_then(|v| v.parse().ok()),
                     "movetime" => movetime = toks.get(i + 1).and_then(|v| v.parse().ok()),
                     "depth" => depth = toks.get(i + 1).and_then(|v| v.parse().ok()),
+                    "btime" => btime = toks.get(i + 1).and_then(|v| v.parse().ok()),
+                    "wtime" => wtime = toks.get(i + 1).and_then(|v| v.parse().ok()),
+                    "binc" => binc = toks.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0),
+                    "winc" => winc = toks.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0),
+                    "infinite" => infinite = true,
                     _ => {}
                 }
             }
+            // Incremental clock (websites/GUIs): our share = time/30 + inc/2,
+            // mirroring the standard minimal allocation. `infinite` on a
+            // synchronous search clears point limits and falls back to a
+            // bounded depth (stop is acknowledged but not mid-search).
+            if infinite {
+                nodes = None;
+                movetime = None;
+            }
+            let clock_ms: Option<u64> = match current.as_ref() {
+                Some(b) if movetime.is_none() && (btime.is_some() || wtime.is_some()) => {
+                    let (t, inc) = if b.turn == 0 {
+                        (btime, binc)
+                    } else {
+                        (wtime, winc)
+                    };
+                    t.map(|ms| (ms / 30 + inc / 2).max(1))
+                }
+                _ => None,
+            };
             let reply = current
                 .as_ref()
                 .map(|b| {
                     if b.game_over() || !b.has_moves(b.turn) {
-                        return "0000".to_string();
+                        return ("0000".to_string(), None);
                     }
                     let limits = SearchLimits {
-                        time: movetime.filter(|ms| *ms > 0).map(Duration::from_millis),
+                        time: movetime
+                            .filter(|ms| *ms > 0)
+                            .map(Duration::from_millis)
+                            .or_else(|| clock_ms.map(Duration::from_millis)),
                         max_nodes: nodes,
                         max_depth: depth.unwrap_or(24),
                     };
-                    match searcher.search(b, &limits).best {
+                    let r = searcher.search(b, &limits);
+                    let mv = match r.best {
                         Some(m) => {
                             if m.is_clone() {
                                 Board::sq_name(m.to)
@@ -710,10 +818,23 @@ fn serve_cmd(
                             }
                         }
                         None => "0000".to_string(),
-                    }
+                    };
+                    // Standard UCI info line (GUIs, logs, and score-based
+                    // tooling such as search-loss tuning consume this).
+                    let info = format!(
+                        "info depth {} score cp {} nodes {} time {}",
+                        r.depth,
+                        r.score,
+                        r.nodes,
+                        r.elapsed.as_millis()
+                    );
+                    (mv, Some(info))
                 })
-                .unwrap_or_else(|| "0000".to_string());
-            out_line(&format!("bestmove {reply}"));
+                .unwrap_or_else(|| ("0000".to_string(), None));
+            if let (_, Some(info)) = &reply {
+                out_line(info);
+            }
+            out_line(&format!("bestmove {}", reply.0));
         }
         // "stop" ignored: searches are synchronous.
     }
@@ -854,8 +975,6 @@ fn match_cmd(
     max_nodes: Option<u64>,
     start_game: u32,
     out: Option<String>,
-    corr: bool,
-    opp_corr: bool,
 ) -> ExitCode {
     // Eval presets, explicit per side — no env vars anywhere:
     // --net = OUR side (in-process), --opp-net = child side (appended to the
@@ -904,9 +1023,6 @@ fn match_cmd(
                     }
                     if !with_flags.contains("--tuple") {
                         with_flags = format!("{with_flags} {}", tuple_flag_str(&opp_tup_spec));
-                    }
-                    if opp_corr && !with_flags.contains("--corr") {
-                        with_flags = format!("{with_flags} {}", corr_flag_str(true));
                     }
                     if opp_tup_native && !with_flags.contains("--tuple-native") {
                         with_flags = format!("{with_flags} --tuple-native");
@@ -966,12 +1082,10 @@ fn match_cmd(
         searcher.set_sancta(net.as_ref());
         searcher.set_tuple(tup.as_ref());
         searcher.set_tuple_native(tup_native && tup.is_some());
-        searcher.set_corr(corr);
         let mut opp_searcher = Searcher::new(); // for --opp self
         opp_searcher.set_sancta(opp_net.as_ref());
         opp_searcher.set_tuple(opp_tup.as_ref());
         opp_searcher.set_tuple_native(opp_tup_native && opp_tup.is_some());
-        opp_searcher.set_corr(opp_corr);
         let titanium_is_black = game % 2 == 1;
         let mut log = String::new();
         let mut result = None;

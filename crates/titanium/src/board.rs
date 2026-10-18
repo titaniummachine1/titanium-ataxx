@@ -1056,14 +1056,14 @@ impl Board {
                         return None;
                     }
                 }
-                'x' | 'o' | '#' => {
+                'x' | 'X' | 'b' | 'B' | 'o' | 'O' | 'w' | 'W' | '#' | '-' => {
                     if col >= SIZE {
                         return None;
                     }
                     let bit = bit_of((row * SIZE + col) as u8);
                     match ch {
-                        'x' => b.occ[0] |= bit,
-                        'o' => b.occ[1] |= bit,
+                        'x' | 'X' | 'b' | 'B' => b.occ[0] |= bit,
+                        'o' | 'O' | 'w' | 'W' => b.occ[1] |= bit,
                         _ => b.blockers |= bit,
                     }
                     col += 1;
@@ -1074,10 +1074,10 @@ impl Board {
         if row != SIZE - 1 || col != SIZE {
             return None;
         }
+        // UAI side convention (libataxx-compatible): x/b first player, else second.
         b.turn = match side {
-            "x" => 0,
-            "o" => 1,
-            _ => return None,
+            "x" | "X" | "b" | "B" => 0,
+            _ => 1,
         };
         b.piece_cnt[0] = b.occ[0].count_ones() as u8;
         b.piece_cnt[1] = b.occ[1].count_ones() as u8;
