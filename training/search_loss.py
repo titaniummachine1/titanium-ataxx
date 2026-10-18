@@ -56,6 +56,12 @@ PARAMS = [
     ('LMRT15', 3, 0, 8, 1.0, 3000.0),
     ('LMRGap1', 2000000000, 0, 2000000000, 20000.0, 200000000.0),
     ('LMRGap2', 2000000000, 0, 2000000000, 20000.0, 200000000.0),
+    # LMR curve (mode 3) params: closed-form r = min(cap, base +
+    # idx*slope/32 + depth*drslope/32). c/a scaled by range vs LMRT cells.
+    ('CurveBase', 2, 0, 6, 1.0, 3000.0),
+    ('CurveSlope', 6, 0, 64, 4.0, 12000.0),
+    ('CurveDepth', 2, 0, 64, 4.0, 12000.0),
+    ('CurveCap', 5, 1, 8, 1.0, 3000.0),
 ]
 
 
@@ -265,6 +271,8 @@ def main():
     ap.add_argument('--seed', type=int, default=7)
     ap.add_argument('--ascale', type=float, default=1.0,
                     help='global step multiplier (R2 refinement: 0.3)')
+    ap.add_argument('--force-mode', type=int, default=-1,
+                    help='override pinned LMRMode for this run (e.g. 3 = curve)')
     a = ap.parse_args()
 
     names = [p[0] for p in PARAMS]
@@ -272,6 +280,11 @@ def main():
         want = set(x.strip() for x in a.params.split(','))
         names = [n for n in names if n in want]
     pmap = {p[0]: p for p in PARAMS}
+    if a.force_mode >= 0:
+        pmap['LMRMode'] = ('LMRMode', a.force_mode, a.force_mode,
+                           a.force_mode, 0.0, 0.0)
+        if 'LMRMode' not in names:
+            names.append('LMRMode')
     if os.path.exists(a.state):
         st = json.load(open(a.state))
         theta = st['theta']
@@ -279,6 +292,8 @@ def main():
     else:
         theta = {p[0]: float(p[1]) for p in PARAMS}
         k0 = 0
+    if a.force_mode >= 0:
+        theta['LMRMode'] = float(a.force_mode)
     print('building dataset...', flush=True)
     if a.jsonl:
         ds = []
