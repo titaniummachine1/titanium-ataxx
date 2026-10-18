@@ -695,9 +695,13 @@ fn serve_cmd(
             out_line("option name LMRSplit type spin default 9 min 1 max 40");
             out_line("option name LMRR1 type spin default 2 min 0 max 6");
             out_line("option name LMRR2 type spin default 3 min 0 max 6");
-            out_line("option name LMRMode type spin default 0 min 0 max 1");
+            out_line("option name LMRMode type spin default 0 min 0 max 2");
             out_line("option name LMRHalf type spin default 4 min 1 max 16");
             out_line("option name LMRSub type spin default 0 min 0 max 4");
+            for i in 0..16 {
+                let dflt = if i == 0 { 0 } else if i < 9 { 2 } else { 3 };
+                out_line(&format!("option name LMRT{i} type spin default {dflt} min 0 max 8"));
+            }
             out_line("uaiok");
         } else if t == "isready" {
             out_line("readyok");

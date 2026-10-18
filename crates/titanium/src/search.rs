@@ -67,6 +67,10 @@ pub struct SearchParams {
     pub lmr_mode: u32,
     pub lmr_half: u32,
     pub lmr_sub: u32,
+    // LMR table (mode 2): reduction r = tab[min(idx,15)].
+    // 1D tuned function of move-index (Stockfish-style, no inference cost).
+    // Defaults replicate flat (idx0=0, idx1-8=2, idx9+=3).
+    pub lmr_tab: [u32; 16],
 }
 
 impl Default for SearchParams {
@@ -91,6 +95,7 @@ impl Default for SearchParams {
             lmr_mode: 0,
             lmr_half: 4,
             lmr_sub: 0,
+            lmr_tab: [0, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3],
         }
     }
 }
@@ -464,6 +469,16 @@ impl<'a> Searcher<'a> {
     /// Set one tunable parameter by UAI option name. Returns false for
     /// unknown names. Powers SPSA without rebuilds.
     pub fn set_param(&mut self, name: &str, val: i64) -> bool {
+        // LMR table cells LMRT0..LMRT15 (tunable 1D reduction function).
+        if let Some(idx) = name.strip_prefix("LMRT") {
+            if let Ok(i) = idx.parse::<usize>() {
+                if i < 16 {
+                    self.params.lmr_tab[i] = val.clamp(0, 8) as u32;
+                    return true;
+                }
+            }
+            return false;
+        }
         match name {
             "Tempo" => self.params.tempo = val as i32,
             "ContactPen" => self.params.contact_pen = val as i32,
@@ -478,7 +493,7 @@ impl<'a> Searcher<'a> {
             "LMRSplit" => self.params.lmr_split = val.max(0) as u32,
             "LMRR1" => self.params.lmr_r1 = val.max(0) as u32,
             "LMRR2" => self.params.lmr_r2 = val.max(0) as u32,
-            "LMRMode" => self.params.lmr_mode = val.clamp(0, 1) as u32,
+            "LMRMode" => self.params.lmr_mode = val.clamp(0, 2) as u32,
             "LMRHalf" => self.params.lmr_half = val.max(1) as u32,
             "LMRSub" => self.params.lmr_sub = val.max(0) as u32,
             _ => return false,
@@ -704,7 +719,7 @@ impl<'a> Searcher<'a> {
                         self.params.lmr_r2
                     };
                     depth.saturating_sub(1 + r)
-                } else {
+                } else if self.params.lmr_mode == 1 {
                     // Hyperbolic (Moonbird form): reduced = base*half /
                     // (half+idx) - sub, where base = depth-1 (child depth
                     // before reduction). Smooth curve instead of a step.
@@ -713,6 +728,10 @@ impl<'a> Searcher<'a> {
                     ((base * h) / (h + move_idx as u64))
                         .saturating_sub(self.params.lmr_sub as u64)
                         .min(base) as u32
+                } else {
+                    // Table (mode 2): tuned 1D function r = tab[idx].
+                    let r = self.params.lmr_tab[move_idx.min(15)];
+                    depth.saturating_sub(1 + r)
                 };
                 score = -self.negamax(
                     &child,
