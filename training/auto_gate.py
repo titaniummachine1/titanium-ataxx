@@ -30,6 +30,7 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STOP = os.path.join(REPO, 'training', 'STOP_AUTO')
 STATE = os.path.join(REPO, 'logs', 'auto_gate.state.json')
+LOCK = os.path.join(REPO, 'logs', 'auto_gate.lock')
 
 S1 = 1 / (1 + 10 ** (-20 / 400))
 
@@ -53,14 +54,27 @@ def miss_risk(w, l, d):
 
 
 def cpu_pct():
+    """Real CPU % or None (never a fake number). typeperf first, wmic backup."""
+    try:
+        out = subprocess.run(
+            ['typeperf', r'\Processor(_Total)\% Processor Time', '-sc', '1'],
+            capture_output=True, text=True, timeout=30).stdout
+        m = re.findall(r'"([\d.,]+)"', out)
+        if m:
+            return float(m[-1].replace(',', '.'))
+    except Exception as e:
+        print('typeperf failed: %s' % str(e)[:120], flush=True)
     try:
         out = subprocess.run(
             ['wmic', 'cpu', 'get', 'loadpercentage', '/value'],
             capture_output=True, text=True, timeout=30).stdout
         m = re.search(r'LoadPercentage=(\d+)', out)
-        return int(m.group(1)) if m else 100
-    except Exception:
-        return 100
+        if m:
+            return int(m.group(1))
+    except Exception as e:
+        print('wmic failed: %s' % str(e)[:120], flush=True)
+    print('CPU SENSOR FAILED (raw wmic/typeperf output above if any)', flush=True)
+    return None
 
 
 def load_state():
@@ -78,17 +92,21 @@ def save_state(st):
 
 
 def idle_ready(args):
-    """True once CPU < threshold for idle_minutes continuously."""
+    """True once CPU < threshold for idle_minutes continuously.
+    Unknown readings change nothing (no fake resets, no fake accumulation)."""
     st = load_state()
     now = time.time()
     pct = cpu_pct()
-    if pct >= args.idle_threshold + 1:
+    if pct is None:
+        print('cpu UNKNOWN idle %ds/%ds (held)' % (
+            int(st['idle_secs']), int(args.idle_minutes * 60)), flush=True)
+    elif pct >= args.idle_threshold + 1:
         st['idle_secs'] = 0
     else:
         st['idle_secs'] += max(0, now - st.get('last_check', now))
     st['last_check'] = now
     save_state(st)
-    return st['idle_secs'] >= args.idle_minutes * 60, pct, st['idle_secs']
+    return (st['idle_secs'] >= args.idle_minutes * 60 and pct is not None), pct, st['idle_secs']
 
 
 def sh(cmd, cwd=REPO, timeout=None):
@@ -198,7 +216,8 @@ def main():
                 print('STOP file present, exiting', flush=True)
                 return
             ready, pct, secs = idle_ready(a)
-            print('cpu %d%% idle %ds/%ds' % (pct, int(secs), int(a.idle_minutes * 60)), flush=True)
+            ps = ('%d' % pct) if pct is not None else '??'
+            print('cpu %s%% idle %ds/%ds' % (ps, int(secs), int(a.idle_minutes * 60)), flush=True)
             if ready:
                 break
             time.sleep(a.sample_secs)
