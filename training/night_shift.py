@@ -17,7 +17,7 @@ import os, sys, subprocess, time, json, re, datetime
 REPO = 'C:/gitProjects/titanium-ataxx'
 LOGS = 'C:/gitProjects/logs'
 STOP = os.path.join(LOGS, 'STOP')
-NLOG = os.path.join(LOGS, 'night.log')
+NLOG = os.path.join(LOGS, 'night_driver.log')
 REPORT = os.path.join(LOGS, 'NIGHT_REPORT.md')
 
 def log(msg):
