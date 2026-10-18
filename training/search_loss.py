@@ -60,6 +60,10 @@ PARAMS = [
     ('JumpEscape', 1500, 0, 10000, 500.0, 25000000.0),
     ('JumpAttack', 600, 0, 10000, 500.0, 25000000.0),
     ('JumpGamble', 800, 0, 10000, 500.0, 25000000.0),
+    # ProbCut params (pruning = value-visible, RFP-scale c/a).
+    ('PCutMargin', 250, 0, 2000, 100.0, 5000000.0),
+    ('PCutDepth', 5, 3, 8, 1.0, 2000.0),
+    ('PCutReduce', 3, 1, 6, 1.0, 2000.0),
 ]
 
 
