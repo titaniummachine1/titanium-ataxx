@@ -83,23 +83,30 @@ def add_training(name, cache='', teacher='', blend=0.0, ow=0.0, lr=0.0,
 
 TOTAL_RE = re.compile(
     r'total: titanium (\d+) - .*? (\d+), draws (\d+)')
+BOOK_TOTAL_RE = re.compile(
+    r'total: titan (\d+) - moon (\d+) draws (\d+)')
 HEADER_RE = re.compile(r'titanium limits: (.*?), net: (.*?) vs (.*)')
 
 
 def parse_log(path):
-    """(games, w, l, d, tc_desc) from a match log. None on failure."""
+    """(games, w, l, d, tc_desc) from a match or book log. None on failure."""
     try:
         txt = open(path, encoding='utf-8', errors='replace').read()
     except OSError:
         return None
     m = TOTAL_RE.search(txt)
-    if not m:
-        return None
-    w, l, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    h = HEADER_RE.search(txt)
-    tc = h.group(1).strip() if h else '?'
-    games = len(re.findall(r'^-- game \d+:', txt, re.M))
-    return games, w, l, d, tc
+    if m:
+        w, l, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        h = HEADER_RE.search(txt)
+        tc = h.group(1).strip() if h else '?'
+        games = len(re.findall(r'^-- game \d+:', txt, re.M))
+        return games, w, l, d, tc
+    m = BOOK_TOTAL_RE.search(txt)
+    if m:
+        w, l, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        games = len(re.findall(r'^game \S+ \[titan=', txt, re.M))
+        return games, w, l, d, 'book'
+    return None
 
 
 KEEP_PREFIX = ('s30', 's31', 's32', 's33', 's34', 's35', 's36', 's37',
@@ -109,14 +116,18 @@ KEEP_PREFIX = ('s30', 's31', 's32', 's33', 's34', 's35', 's36', 's37',
 
 def cmd_backfill():
     import glob
-    n = 0
+    c = connect()
+    seen = {r[0].replace('/', '\\') for r in c.execute('SELECT log FROM gates')}
+    c.close()
+    n = skip = 0
     for path in sorted(glob.glob('logs/*.txt')):
-        base = os.path.basename(path)
-        if not base.startswith(KEEP_PREFIX):
+        if path.replace('/', '\\') in seen:
+            skip += 1
             continue
         r = parse_log(path)
         if not r:
             continue
+        base = os.path.basename(path)
         games, w, l, d, tc = r
         nodes = ms = 0
         m = re.search(r'(\d+) nodes', tc)
@@ -128,7 +139,7 @@ def cmd_backfill():
         add_gate('match', 'titanium', 'opp', tc, nodes, ms, games,
                  w, l, d, path, note='backfill:' + base)
         n += 1
-    print('backfilled %d gates' % n)
+    print('backfilled %d gates (%d already present)' % (n, skip))
 
 
 def cmd_gates():

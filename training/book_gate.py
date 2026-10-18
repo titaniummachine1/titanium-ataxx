@@ -192,13 +192,17 @@ def main():
     ap.add_argument('--titanium', required=True)
     ap.add_argument('--targs', nargs='*', default=[])
     ap.add_argument('--tup', default='none')
+    ap.add_argument('--tcorr', action='store_true')
     ap.add_argument('--opp', required=True)
     ap.add_argument('--oargs', nargs='*', default=[])
     ap.add_argument('--opp-tup', default='none')
+    ap.add_argument('--ocorr', action='store_true')
     ap.add_argument('--opp-nodes', type=int, default=0)
     ap.add_argument('--opp-movetime', type=int, default=0)
     ap.add_argument('--workers', type=int, default=6)
     ap.add_argument('--out', required=True)
+    ap.add_argument('--moves-out', default='',
+                    help='optional match-format log with move lists + ## startpos lines for mine_blunders')
     ap.add_argument('--skip', type=int, default=0)
     ap.add_argument('--take', type=int, default=0)
     ap.add_argument('--seed', type=int, default=7)
@@ -212,6 +216,11 @@ def main():
         a.targs = a.targs + ['--tuple', a.tup]
     if a.opp.endswith('.exe') and a.oargs and a.oargs[-1] == 'serve' and a.opp_tup != 'none':
         a.oargs = a.oargs + ['--tuple', a.opp_tup]
+    # corr passthrough (S54): same position, appended after --tuple
+    if a.titanium.endswith('.exe') and 'serve' in a.targs and a.tcorr and '--corr' not in a.targs:
+        a.targs = a.targs + ['--corr']
+    if a.opp.endswith('.exe') and 'serve' in a.oargs and a.ocorr and '--corr' not in a.oargs:
+        a.oargs = a.oargs + ['--corr']
     # jobs: each position twice (both seats), interleaved, capped at --games
     jobs = []
     order = list(range(len(lines)))
@@ -222,9 +231,23 @@ def main():
     jobs = jobs[:a.games]
     # per-side limits: titanium uses --nodes/--movetime, opp uses opp-*
     a.nodes, a.movetime = a.nodes, a.movetime
+    import hashlib as _hl
+    def _sha(p):
+        try:
+            return _hl.sha256(open(p, 'rb').read()).hexdigest()[:16]
+        except OSError:
+            return 'missing'
     with open(a.out, 'w') as f:
         f.write('book-gate %d jobs\n' % len(jobs))
+        f.write('titan: exe=%s sha=%s tup=%s sha=%s\n' % (
+            a.titanium, _sha(a.titanium), a.tup,
+            _sha(a.tup) if a.tup != 'none' else 'nofile'))
+        f.write('opp: exe=%s sha=%s tup=%s sha=%s\n' % (
+            a.opp, _sha(a.opp), a.opp_tup,
+            _sha(a.opp_tup) if a.opp_tup != 'none' else 'nofile'))
     print('book-gate %d jobs' % len(jobs), flush=True)
+
+    gnum = [0]
 
     def run(job):
         line, tb, tag = job
@@ -233,6 +256,18 @@ def main():
             with open(a.out, 'a') as f:
                 f.write('game %s [titan=%s]: %s b%d-w%d plies=%d\n' % (
                     r['tag'], r['titanium'], r['winner'], r['black'], r['white'], r['plies']))
+            if a.moves_out:
+                gnum[0] += 1
+                tcol = 'x' if tb else 'o'
+                ocol = 'o' if tb else 'x'
+                res = ('titanium wins' if r['winner'] == 'titanium'
+                       else 'draw draw' if r['winner'] == 'draw'
+                       else 'opponent wins')
+                with open(a.moves_out, 'a') as f:
+                    f.write('-- game %d: titanium=%s opp=%s: %s\n' % (
+                        gnum[0], tcol, ocol, res))
+                    f.write(' '.join(r['moves']) + '\n')
+                    f.write('## %s\n' % r['start'])
         print('game %s [titan=%s]: %s (%d-%d)' % (
             r['tag'], r['titanium'], r['winner'], r['black'], r['white']), flush=True)
         return r
@@ -263,11 +298,13 @@ def play_one_limits(a, line, titan_black, tag):
     ta.newgame()
     tb.newgame()
     ply, passes = 0, 0
+    moves = []
     forfeit = None
     while ply < 300 and not over(cells):
         titan_m = (turn == 0) == titan_black
         if not has_moves(cells, turn):
             passes += 1
+            moves.append('pass')
             if passes >= 2:
                 break
             turn = 1 - turn
@@ -283,6 +320,7 @@ def play_one_limits(a, line, titan_black, tag):
         if tok is None:
             forfeit = 'moon' if not titan_m else 'titanium'
             break
+        moves.append(tok)
         st = apply(cells, turn, tok)
         if st == 'illegal':
             forfeit = 'moon' if not titan_m else 'titanium'
@@ -301,7 +339,8 @@ def play_one_limits(a, line, titan_black, tag):
     else:
         winner = 'titanium' if ((b > w) == titan_black) else 'moon'
     return {'tag': tag, 'titanium': 'black' if titan_black else 'white',
-            'winner': winner, 'black': b, 'white': w, 'plies': ply}
+            'winner': winner, 'black': b, 'white': w, 'plies': ply,
+            'moves': moves, 'start': line}
 
 
 if __name__ == '__main__':

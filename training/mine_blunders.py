@@ -92,7 +92,22 @@ def main():
         g, tcol, ocol, res1, res2 = m.groups()
         g = int(g)
         moves = lines[i + 1].strip().split() if i + 1 < len(lines) else []
-        i += 2
+        # startpos default: black a1 (42), white g7 (6); optional '## <49cells> <b|w>'
+        # override (book games) on the line after moves.
+        cells = [0] * 49
+        cells[42] = 1
+        cells[6] = 2
+        turn0 = 0
+        if i + 2 < len(lines) and lines[i + 2].startswith('## '):
+            parts = lines[i + 2][3:].strip().split()
+            if len(parts) == 2 and len(parts[0]) == 49:
+                cells = [0] * 49
+                for sq, ch in enumerate(parts[0]):
+                    cells[sq] = 1 if ch == 'x' else (2 if ch == 'o' else 0)
+                turn0 = 0 if parts[1] == 'b' else 1
+            i += 3
+        else:
+            i += 2
         # titanium wins -> skip (we mine LOSSES); draws skip
         titan_won = (res1 == 'titanium' and res2 == 'wins') or \
                     (res1 == 'opponent' and False)
@@ -104,11 +119,7 @@ def main():
             break
         ng += 1
         tside = 0 if tcol == 'x' else 1
-        # startpos: black a1 (42), white g7 (6)
-        cells = [0] * 49
-        cells[42] = 1
-        cells[6] = 2
-        turn = 0
+        turn = turn0
         ply = 0
         for tok in moves:
             if tside == turn:

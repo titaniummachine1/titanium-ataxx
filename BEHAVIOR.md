@@ -44,9 +44,12 @@ real memory. Update them the moment something happens, not at the end.
     parity) excuse nothing: strength is proven by games, and only games.
     Extends law 6: time gates (100ms AND 200ms) are the crown, 5k nodes is
     the quality diagnosis.
-8. **NEVER REJECT ON A DIP.** An inconclusive gate is an order to SPEND MORE
-    GATE (more games), not a verdict. Reject only on a conclusive CI below
-    0.5; promote only on a conclusive CI above it.
+8. **NEVER REJECT ON A DIP — AND NEVER REJECT ABOVE 50%.** An
+    inconclusive gate is an order to SPEND MORE GATE (more games), not a
+    verdict. Any Elo gain is a gain: above-50% NEVER rejects for any
+    reason, including laziness — it extends until decisive (more games,
+    varied conditions for independent samples). Reject only on a
+    conclusive CI below 0.5; promote only on a conclusive CI above it.
 9. **ENGINE ADAPTS TO NET.** Never damage an experimental net to make it fit
     main: no stripping sections, no converting formats, no rewriting blobs
     to satisfy a loader. A net main cannot load yet waits for its wiring +
@@ -196,3 +199,9 @@ real memory. Update them the moment something happens, not at the end.
   code pushes, blobs stay local.
 - Update LEDGER (experiment row), HANDOFFS (state), BEHAVIOR (this file)
   in the same session as the work, not later.
+
+## FISHTEST LAW (2026-10-18, user-ordered, no exceptions)
+- Every candidate lives on its own branch: engines as exp/<name>, nets as versioned .tup files referenced by LEDGER row. main NEVER receives direct commits except reverts.
+- No merge to main without ALL THREE: (1) SPRT pass vs current main at fixed nodes on books (LLR >= +2.94, alpha=beta=0.05, H0<=0 vs H1>=+20), (2) user explicit approval naming the branch/net, (3) LEDGER promotion row + DB gate entries present.
+- Gates run unlimited games until decisive: pass promotes (with approval), fail rejects and banks, cap only extends with fresh books. NEVER merge on straddle, NEVER merge on user order alone - the assistant must refuse and say which gate is missing.
+- Enforcement: training/gate_check.py is the door. It recomputes SPRT from the DB (not from chat claims) and prints PASS/FAIL/UNDECIDED. Merge scripts must call it and abort unless PASS (or user override logged verbatim in LEDGER).

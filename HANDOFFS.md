@@ -250,3 +250,5 @@ embed quotes manually: `$oppQ = "`"$m serve`""`.
 ## 2026-10-17 R0 shipped (S53r0, 1903dca on origin/main)
 
 - Champion is now data/nnue/tupS53r0.tup (TUP7, DEFAULT_TUP). S37fix retired. Resume: seeds/PBT queue + 12M graft-label pipeline; next escapes per S40 map (aspiration re-implant, doubles-ordering, SMP, SPSA joint tuning). Infra lessons: hygiene reason() is case-sensitive vs lowercased paths (fixed); Edit tool preserves mtime so cargo may skip rebuilds - touch the file to force.
+
+## night plan 2026-10-17 (user asleep, authorized autonomous): 22:45 titan-overnight runs P1 CH-gate (auto-merge to main ONLY on SPRT pass + push + LEDGER; otherwise banked), P2 regret v2 2M labels books C/D to ~06:30, P3 backfill + LEDGER + this file. Morning read: logs/overnight_status.txt, logs/overnight_ch.txt, logs/moon_track.txt. v1 loop ends ~22:15 by deadline; no task overlap (regretloop task deleted, v2 uses own workdir).

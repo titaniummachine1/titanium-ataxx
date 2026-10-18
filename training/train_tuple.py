@@ -386,7 +386,35 @@ def main():
     ap.add_argument('--ckpt', default='',
                     help='S26 flywheel checkpoints: path template, e.g. data/nnue/fly12M_ep{ep}.tup. '
                     'Empty = only final --out. Best-val epoch also copied to --out.')
-    ap.add_argument('--lr', type=float, default=4.0)
+    ap.add_argument('--lr', type=float, default=0.01,
+                    help='SGD lr (gated recipe; 4.0-era default exploded weights to rails).')
+    ap.add_argument('--opt', default='sgd', choices=['sgd', 'adam', 'adamw', 'radam'],
+                    help='optimizer family (dossier order: sgd status quo, adam/WD-off, '
+                    'adamw, radam; + --lookahead approximates Ranger). Same init/data '
+                    'required for fair comparison; judge exported net by games, not loss.')
+    ap.add_argument('--opt-lr', type=float, default=0.0,
+                    help='lr for adam-family (SGD --lr ignored when set). 0 = auto: '
+                    '0.001 adam/adamw, 0.001 radam. Adaptive methods want ~1e-3, not SGD scale.')
+    ap.add_argument('--decay', type=float, default=0.0,
+                    help='decoupled weight decay for adamw/radam (dossier late-phase '
+                    'suggests 1e-5..1e-4). 0 = off. Ignored by sgd/adam (manual L2 '
+                    'in loss covers those via --wd).')
+    ap.add_argument('--freq-decay', type=float, default=0.0,
+                    help='rarity-weighted decay: per-weight shrink scaled by '
+                    '1/sqrt(update count), so rare-pattern weights (overfit-prone) '
+                    'decay harder than common ones. 0 = off. Needs no extra data; '
+                    'update counts come from the materialized batch indices. '
+                    'Prints coverage stats at end.')
+    ap.add_argument('--freq-weight', type=float, default=0.0,
+                    help='transposition-frequency loss weight: rows whose active '
+                    'patterns are common in the dataset get proportionally more '
+                    'loss (fit common positions precisely), rare rows keep base '
+                    'weight. Linear: mult = 1 + k*relfreq. Sampling unchanged; '
+                    'composes with --freq-decay (precision for common, restraint '
+                    'for rare). 0 = off.')
+    ap.add_argument('--lookahead', action='store_true',
+                    help='Lookahead wrapper (k=5, alpha=0.5) around opt.step; '
+                    'radam+lookahead ~= Ranger.')
     ap.add_argument('--conv-lr', type=float, default=0.005,
                     help='LR for dense-visit capn/conv families (bags 10-13).')
     ap.add_argument('--noise-w', type=float, default=0.0,
@@ -434,8 +462,10 @@ def main():
                     help='residual base: s13 (full hand eval) or simple (mat+PST+tempo, tuple-native)')
     ap.add_argument('--target', default='residual', choices=['residual'],
                     help='teacher-score residual (logit/outcome REMOVED S21g: poison)')
-    ap.add_argument('--tcol', default='sc', choices=['sc', 'teacher'],
-                    help='score column: dag legacy (sc) or relabeled deep teacher')
+    ap.add_argument('--tcol', default='teacher', choices=['sc', 'teacher'],
+                    help='score column: relabeled deep teacher (sane cp scale) or '
+                    'dag legacy (sc, x2000 rail-prone). Teacher is the default; '
+                    'falls back to sc with a warning if the cache lacks it.')
     ap.add_argument('--blend', type=float, default=1.0,
                     help='teacher weight; remainder = dag legacy (echo regularizer)')
     ap.add_argument('--outcome-weight', type=float, default=0.0,
@@ -492,9 +522,15 @@ def main():
         z_sc = (z['sc'].astype(np.float64) if 'sc' in z else np.zeros(len(occ0)))
     n = len(occ0)
     print('rows %d' % n, flush=True)
-    # S22: teacher column switch — 'sc' (dag legacy scores) vs 'teacher'
-    # (our relabeled deep scores). Same rows/recipe isolates TEACHER effect.
-    assert a.tcol in ('sc', 'teacher') and (a.tcol == 'sc' or z_teacher is not None)
+    # S22: teacher column switch — 'teacher' (our relabeled deep scores) vs
+    # 'sc' (dag legacy scores, x2000 rail-prone). Same rows/recipe isolates
+    # TEACHER effect. Teacher default; sc only on explicit request or when
+    # the cache has no teacher column (warn + fall back, never crash).
+    assert a.tcol in ('sc', 'teacher')
+    if a.tcol == 'teacher' and z_teacher is None:
+        print('tcol=teacher requested but cache has no teacher column: '
+              'falling back to sc', flush=True)
+        a.tcol = 'sc'
     if a.tcol == 'teacher':
         prime = np.clip(z_teacher * 1.0, -1500.0, 1500.0)
     else:
@@ -717,6 +753,15 @@ def main():
 
     t0 = time.time()
     SPtr, DEtr = materialize(Xtr8, Qtr, EUtr, ETtr, MUtr, MTtr, CUtr, CTtr, VUtr, VTtr)
+    # Transposition-frequency weights (--freq-weight): one counting pass over
+    # the materialized sparse indices; per-row multiplier 1 + k*relfreq where
+    # relfreq = mean index-count over the row's active patterns, normalized.
+    fmult = None
+    if a.freq_weight > 0:
+        cnt = np.bincount(SPtr.reshape(-1).astype(np.int64), minlength=SP_N).astype(np.float64)
+        rf = cnt[SPtr].mean(axis=1)
+        rf /= rf.max() if rf.max() > 0 else 1.0
+        fmult = (1.0 + a.freq_weight * rf).astype(np.float32)
     SPva, DEva = materialize(Xva8, Qva, EUva, ETva, MUva, MTva, CUva, CTva, VUva, VTva)
     print('materialized flat %.0fs RAM %.2fGB' % (time.time() - t0, (SPtr.nbytes + DEtr.nbytes + SPva.nbytes + DEva.nbytes) / 1e9), flush=True)
     del Xtr8, Xva8, Qtr, Qva, EUtr, EUva, ETtr, ETva, MUtr, MUva, MTtr, MTva
@@ -725,6 +770,16 @@ def main():
     wtr, wva = samp_w[tr], samp_w[va]
     del samp_w
     _gc.collect()
+    if fmult is not None:
+        # Combined focus weight = regret-reward x repetition, bounded by
+        # construction (wcap x (1+k)): precision where common AND regretted.
+        wq = wtr if isinstance(wtr, np.ndarray) else wtr.numpy()
+        eff = wq * fmult
+        c = np.corrcoef(wq, fmult)[0, 1]
+        print('freq-weight k=%.2f: mult mean %.3f max %.3f | regret-freq corr %+.3f | '
+              'effective wmean %.3f wmax %.2f (cap %.1f)' % (
+              a.freq_weight, fmult.mean(), fmult.max(), c,
+              eff.mean(), eff.max(), 10.0 * (1.0 + a.freq_weight)), flush=True)
 
     # 1 single bag + 4 pair bags + scalar bias. Index-0 entries are
     # constrained to exactly 0 after every step (empty patterns contribute
@@ -750,13 +805,63 @@ def main():
     # to the loss manually below (works on the dense weight tensors).
     # Dense-visit families (conv 49 lookups/row, capn 1/9) diverge at the
     # sparse-family lr — own param group at --conv-lr.
-    opt = torch.optim.SGD(
-        [
+    def make_opt(a, bags, bias):
+        groups = [
             {'params': [bags[0].weight, bias]},
             {'params': [bags[1].weight], 'lr': a.conv_lr},
-        ],
-        lr=a.lr,
-    )
+        ]
+        if a.opt == 'sgd':
+            return torch.optim.SGD(groups, lr=a.lr)
+        lr = a.opt_lr or 0.001
+        if a.opt == 'adam':
+            return torch.optim.Adam(groups, lr=lr, weight_decay=0.0)
+        if a.opt == 'adamw':
+            return torch.optim.AdamW(groups, lr=lr, weight_decay=a.decay)
+        if a.opt == 'radam':
+            return torch.optim.RAdam(groups, lr=lr, weight_decay=a.decay)
+        raise ValueError(a.opt)
+
+    opt = make_opt(a, bags, bias)
+    # Rarity tracking for --freq-decay: per-weight update counts from the
+    # materialized sparse indices (zero extra search/data cost).
+    fdec = float(a.freq_decay)
+    freq = None
+    if fdec > 0:
+        freq = [torch.zeros(SP_N), torch.zeros(DE_N)]
+
+    class Lookahead:
+        # Slow-weights wrapper: every k steps, slow += alpha*(fast - slow),
+        # fast <- slow. Ranger ~= RAdam + this.
+        def __init__(self, base, k=5, alpha=0.5):
+            self.base = base
+            self.k = k
+            self.alpha = alpha
+            self.step_no = 0
+            self.slow = [p.detach().clone() for g in base.param_groups for p in g['params']]
+
+        def zero_grad(self):
+            self.base.zero_grad()
+
+        def step(self):
+            self.base.step()
+            self.step_no += 1
+            if self.step_no % self.k:
+                return
+            idx = 0
+            with torch.no_grad():
+                for g in self.base.param_groups:
+                    for p in g['params']:
+                        s = self.slow[idx]
+                        idx += 1
+                        s.add_(self.alpha * (p.detach() - s))
+                        p.copy_(s)
+
+        @property
+        def param_groups(self):
+            return self.base.param_groups
+
+    if a.lookahead:
+        opt = Lookahead(opt)
 
     def zero_constrained():
         with torch.no_grad():
@@ -863,6 +968,14 @@ def main():
         print('weight spread: max|w| %.1f mean|w| %.2f frac_nonzero %.3f bias %+.1f'
               % (np.abs(allw).max(), np.abs(allw).mean(), (allw != 0).mean(), float(bias.item())),
               flush=True)
+        if freq is not None:
+            for bi, (nm, nn) in enumerate((('sparse', SP_N), ('dense', DE_N))):
+                fr = freq[bi]
+                touched = float((fr > 0).sum()) / nn
+                q = torch.quantile(fr[fr > 0] if touched > 0 else fr,
+                                   torch.tensor([0.1, 0.5, 0.9])).tolist()
+                print('coverage %s: touched %.3f update-count q10/med/q90 %.0f/%.0f/%.0f'
+                      % (nm, touched, q[0], q[1], q[2]), flush=True)
         # TUP4 layout: magic + bias i32 + singles i8 + per-dir ACTIVE counts
         # (LE u32) + active direction tables i8. Values clip to [-127, 127]
         # (S21e: only 4/29k exceed it, zero gate loss).
@@ -924,12 +1037,18 @@ def main():
             b = perm[i:i + bs]
             bn = b.numpy()
             Xsp, Xde = batch_idx(SPtr[bn], DEtr[bn])
+            if freq is not None:
+                with torch.no_grad():
+                    freq[0] += torch.bincount(Xsp.flatten(), minlength=SP_N).float()
+                    freq[1] += torch.bincount(Xde.flatten(), minlength=DE_N).float()
             opt.zero_grad()
             pred = forward(Xsp, Xde)
             if a.noise_w > 0:
                 pred = pred + torch.randn_like(pred) * a.noise_w
             l2 = sum((bg.weight ** 2).sum() for bg in bags)
             wb = wtr[b]
+            if fmult is not None:
+                wb = wb * torch.from_numpy(fmult[bn]).to(wb.dtype)
             if a.texel:
                 pw = torch.sigmoid((base_tr[b] + pred) * LN10K)
                 loss = (((pw - ytr[b]) ** 2) * wb).mean() + a.wd * l2
@@ -938,6 +1057,17 @@ def main():
             loss.backward()
             opt.step()
             zero_constrained()
+            if freq is not None:
+                # Rare-pattern weights shrink harder (overfit-prone), common
+                # ones barely. Zero-init untouched weights are unaffected.
+                with torch.no_grad():
+                    lr_now = opt.param_groups[0].get('lr', 0.0)
+                    for bi, bg in enumerate(bags):
+                        fr = freq[bi]
+                        fmax = float(fr.max()) if float(fr.max()) > 0 else 1.0
+                        rarity = torch.sqrt(fmax / (fr + 1.0))
+                        shrink = (lr_now * fdec * rarity).clamp(max=0.05)
+                        bg.weight.mul_(1.0 - shrink.view(-1, 1))
             if a.step_lr:
                 # Per-step bold driver: snapshot BEFORE seeing this step's
                 # effect is impossible without extra forwards, so assess with
