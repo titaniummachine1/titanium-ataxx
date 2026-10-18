@@ -710,6 +710,7 @@ fn serve_cmd(
             out_line("option name JumpEscape type spin default 1500 min 0 max 10000");
             out_line("option name JumpAttack type spin default 600 min 0 max 10000");
             out_line("option name JumpGamble type spin default 800 min 0 max 10000");
+            out_line("option name NullRDiv type spin default 0 min 0 max 16");
             out_line("uaiok");
         } else if t == "isready" {
             out_line("readyok");

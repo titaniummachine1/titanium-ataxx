@@ -90,6 +90,9 @@ pub struct SearchParams {
     pub jump_escape: i32,
     pub jump_attack: i32,
     pub jump_gamble: i32,
+    /// Dynamic nullmove R (Stockfish form): R = min(null_r +
+    /// depth/null_rdiv, 6). null_rdiv = 0 keeps flat R (current).
+    pub null_rdiv: u32,
 }
 
 impl Default for SearchParams {
@@ -123,6 +126,7 @@ impl Default for SearchParams {
             jump_escape: 1500,
             jump_attack: 600,
             jump_gamble: 800,
+            null_rdiv: 0,
         }
     }
 }
@@ -553,6 +557,7 @@ impl<'a> Searcher<'a> {
             "JumpEscape" => self.params.jump_escape = val as i32,
             "JumpAttack" => self.params.jump_attack = val as i32,
             "JumpGamble" => self.params.jump_gamble = val as i32,
+            "NullRDiv" => self.params.null_rdiv = val.clamp(0, 16) as u32,
             _ => return false,
         }
         true
@@ -745,6 +750,13 @@ impl<'a> Searcher<'a> {
                     < self.params.null_max_fill * SQUARES as u32
             {
                 let child = b.make_pass();
+                // Dynamic R: deeper nodes reduce more (Stockfish form).
+                // div = 0 keeps the flat R (current behavior).
+                let dyn_r = if self.params.null_rdiv == 0 {
+                    self.params.null_r
+                } else {
+                    (self.params.null_r + depth / self.params.null_rdiv).min(6)
+                };
                 // NMP pass flips stm: sancta acc is color-relative so it
                 // stays valid — just forward the other perspective.
                 // (pass: no stones change, no diff update needed.)
@@ -752,7 +764,7 @@ impl<'a> Searcher<'a> {
                     &child,
                     -beta,
                     -beta + 1,
-                    depth.saturating_sub(self.params.null_r),
+                    depth.saturating_sub(dyn_r),
                     ply + 1,
                     false,
                 );
