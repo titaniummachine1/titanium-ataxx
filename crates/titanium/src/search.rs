@@ -82,6 +82,14 @@ pub struct SearchParams {
     pub pcut_depth: u32,
     pub pcut_margin: i32,
     pub pcut_reduce: u32,
+    /// Intent-aware jump ordering (user idea): classify non-clone jumps.
+    /// ESCAPE: from-square in contact (leaving danger) -> bonus.
+    /// ATTACK: landing threatens >=2 (multi-threat posture) -> bonus.
+    /// GAMBLE: safe from-square, contact landing, converts nothing
+    /// (walks into danger for free) -> penalty. Ordering only.
+    pub jump_escape: i32,
+    pub jump_attack: i32,
+    pub jump_gamble: i32,
 }
 
 impl Default for SearchParams {
@@ -112,6 +120,9 @@ impl Default for SearchParams {
             pcut_depth: 5,
             pcut_margin: 250,
             pcut_reduce: 3,
+            jump_escape: 1500,
+            jump_attack: 600,
+            jump_gamble: 800,
         }
     }
 }
@@ -220,12 +231,20 @@ fn score_into(
     ply: u32,
     killers: &[(u32, u32); MAX_PLY],
     history: &[[u32; 49]; 2],
+    p: &SearchParams,
 ) {
     b.legal_moves_dedup_into(list);
     let opp = b.opp();
     let (k1, k2) = killers[ply as usize];
     let hist = &history[b.turn as usize];
     let mut tt_index = usize::MAX;
+    // Intent: enemy-reachable landings once per node (zero-cost when off).
+    let intent_on = p.jump_escape != 0 || p.jump_attack != 0 || p.jump_gamble != 0;
+    let them_land = if intent_on {
+        enemy_landings(b, 1 - b.turn)
+    } else {
+        0
+    };
     for i in 0..list.len() {
         let m = list.move_at(i);
         let packed = m.to_u32();
@@ -241,6 +260,20 @@ fn score_into(
             score += ORD_CLONE_BONUS;
         } else {
             score -= ORD_JUMP_PEN;
+            // Intent-aware jumps (user idea): escape / attack / gamble.
+            if intent_on {
+                let from_c = (RING1[m.from as usize] & opp).count_ones();
+                let to_c = (RING1[m.to as usize] & opp).count_ones();
+                if from_c > 0 {
+                    score += p.jump_escape;
+                }
+                if to_c >= 2 {
+                    score += p.jump_attack;
+                }
+                if from_c == 0 && to_c == 0 && (them_land >> m.to) & 1 == 1 {
+                    score -= p.jump_gamble;
+                }
+            }
         }
         if packed == k1 || packed == k2 {
             score += ORD_KILLER;
@@ -517,6 +550,9 @@ impl<'a> Searcher<'a> {
             "PCutDepth" => self.params.pcut_depth = val.clamp(3, 12) as u32,
             "PCutMargin" => self.params.pcut_margin = val as i32,
             "PCutReduce" => self.params.pcut_reduce = val.clamp(1, 6) as u32,
+            "JumpEscape" => self.params.jump_escape = val as i32,
+            "JumpAttack" => self.params.jump_attack = val as i32,
+            "JumpGamble" => self.params.jump_gamble = val as i32,
             _ => return false,
         }
         true
@@ -735,7 +771,7 @@ impl<'a> Searcher<'a> {
 
         {
             let list = &mut self.stack.lists[ply as usize];
-            score_into(b, list, tt_mv, ply, &self.killers, &self.history);
+            score_into(b, list, tt_mv, ply, &self.killers, &self.history, &self.params);
             // Fallthrough terminal: legal_moves_dedup_into tracks dedup
             // multiplicities, so len>0 always — but double-pass positions
             // have no children to search: score the pass-through.
@@ -929,7 +965,7 @@ impl<'a> Searcher<'a> {
             let tt_mv = self.tt.probe(b.hash).map(|e| e.mv).unwrap_or(0);
             let (kill, hist) = (&self.killers, &self.history);
             let root = &mut self.stack.lists[0];
-            score_into(b, root, tt_mv, 0, kill, hist);
+            score_into(b, root, tt_mv, 0, kill, hist, &self.params);
         }
         let n_root = self.stack.lists[0].len();
         if n_root == 0 {

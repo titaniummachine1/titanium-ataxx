@@ -707,6 +707,9 @@ fn serve_cmd(
             out_line("option name PCutDepth type spin default 5 min 3 max 12");
             out_line("option name PCutMargin type spin default 250 min 0 max 2000000000");
             out_line("option name PCutReduce type spin default 3 min 1 max 6");
+            out_line("option name JumpEscape type spin default 1500 min 0 max 10000");
+            out_line("option name JumpAttack type spin default 600 min 0 max 10000");
+            out_line("option name JumpGamble type spin default 800 min 0 max 10000");
             out_line("uaiok");
         } else if t == "isready" {
             out_line("readyok");
