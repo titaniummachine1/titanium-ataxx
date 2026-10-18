@@ -239,12 +239,14 @@ def main():
             return 'missing'
     with open(a.out, 'w') as f:
         f.write('book-gate %d jobs\n' % len(jobs))
-        f.write('titan: exe=%s sha=%s tup=%s sha=%s\n' % (
-            a.titanium, _sha(a.titanium), a.tup,
-            _sha(a.tup) if a.tup != 'none' else 'nofile'))
-        f.write('opp: exe=%s sha=%s tup=%s sha=%s\n' % (
-            a.opp, _sha(a.opp), a.opp_tup,
-            _sha(a.opp_tup) if a.opp_tup != 'none' else 'nofile'))
+        f.write('titan: exe=%s sha=%s tup=%s sha=%s corr=%s\n' % (
+            a.titanium, _sha(a.titanium.split()[0]), a.tup,
+            _sha(a.tup) if a.tup != 'none' else 'nofile',
+            'on' if getattr(a, 'tcorr', False) else 'off'))
+        f.write('opp: exe=%s sha=%s tup=%s sha=%s corr=%s\n' % (
+            a.opp, _sha(a.opp.split()[0]), a.opp_tup,
+            _sha(a.opp_tup) if a.opp_tup != 'none' else 'nofile',
+            'on' if getattr(a, 'ocorr', False) else 'off'))
     print('book-gate %d jobs' % len(jobs), flush=True)
 
     gnum = [0]

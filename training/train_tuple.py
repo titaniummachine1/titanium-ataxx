@@ -478,6 +478,24 @@ def main():
                     'Targets = sigmoid(best_cp). Same tables, same export.')
     ap.add_argument('--texel-k', type=float, default=567.89,
                     help='Elo-logistic scale for the Texel sigmoid.')
+    ap.add_argument('--tree-temp', type=float, default=50.0)
+    ap.add_argument('--tree-align', type=float, default=0.1)
+    ap.add_argument('--tree-steps', type=int, default=2000)
+    ap.add_argument('--tree-backup', default='',
+                    help='hive-mind mode: train on a tree-dump npz (with edge_p/edge_c). '
+                    'Batches = random subtrees; loss = root MSE vs stored backed-up value '
+                    '+ align*(static - soft_backup(children))^2. Backprop flows through '
+                    'the backup operator: the whole search learns, not one static eval. '
+                    'Needs --opt adam (or sgd), --tree-temp, --tree-align, --tree-steps.')
+    ap.add_argument('--val-probe', default='',
+                    help='search-backed validation: npz with deep teacher labels '
+                    '(same schema as cache). Reports mean|pred+base-teacher| per '
+                    'epoch = agreement with DEEP search, not static fit. '
+                    'Use for model selection instead of val_mse (which never '
+                    'predicted a gate). See --agree-select.')
+    ap.add_argument('--agree-select', action='store_true',
+                    help='select best checkpoint by agreement (search-backed) '
+                    'instead of val_mse (static). Needs --val-probe.')
     ap.add_argument('--out', default='data/nnue/tupS20.tup')
     ap.add_argument('--init', default='',
                     help='Warm start from a .tup (PBT exploit step): loads '
@@ -763,6 +781,34 @@ def main():
         rf /= rf.max() if rf.max() > 0 else 1.0
         fmult = (1.0 + a.freq_weight * rf).astype(np.float32)
     SPva, DEva = materialize(Xva8, Qva, EUva, ETva, MUva, MTva, CUva, CTva, VUva, VTva)
+    # Search-backed validation probe: fixed positions + deep-teacher labels,
+    # materialized once. Per-epoch agreement = mean|pred+base-teacher|.
+    # No live search at train time (labels precomputed); the metric still
+    # measures search-relevant fit instead of static fit.
+    AG = None
+    if a.val_probe:
+        _pz = np.load(a.val_probe)
+        _po = _pz['occ0'].astype(np.uint64)
+        _pe = _pz['occ1'].astype(np.uint64)
+        _pb = _pz['blk'].astype(np.uint64)
+        _ps = _pz['stm'].astype(np.uint8)
+        _is_b = (_ps == 0)
+        _own = np.where(_is_b, _po, _pe)
+        _enm = np.where(_is_b, _pe, _po)
+        _F = block_indices(_own, _enm)
+        _AG = {'teach': _pz['teacher'].astype(np.float32)}
+        _AG['base'] = base_eval_stm(_po, _pe, _pb, _ps).astype(np.float32)
+        SPp, DEp = materialize(_F,
+                               q2_indices(_own, _enm, _pb),
+                               *env_tables(_own, _enm, _pb),
+                               *mob_tables(_own, _enm, _pb),
+                               *capn_tables(_own, _enm, _pb),
+                               *conv_tables(_own, _enm, _pb))
+        _AG['SP'], _AG['DE'] = SPp, DEp
+        del _F, SPp, DEp
+        AG = _AG
+        print('val probe: %d rows deep-teacher mean %+.1f' % (
+            len(_AG['teach']), float(_AG['teach'].mean())), flush=True)
     print('materialized flat %.0fs RAM %.2fGB' % (time.time() - t0, (SPtr.nbytes + DEtr.nbytes + SPva.nbytes + DEva.nbytes) / 1e9), flush=True)
     del Xtr8, Xva8, Qtr, Qva, EUtr, EUva, ETtr, ETva, MUtr, MUva, MTtr, MTva
     del CUtr, CUva, CTtr, CTva, VUtr, VUva, VTtr, VTva
@@ -1014,6 +1060,7 @@ def main():
     # unchanged (plateau 0 = off).
     max_ep = a.max_epochs if a.plateau > 0 else a.epochs
     prev_val, best_val, best_ep, stale = None, float('inf'), 0, 0
+    best_agree = [float('inf')]
     step_ema, step_snap, step_reverts, step_bad = None, None, 0, 0
     av_mean, av_var = None, None
     batch_best = float('inf')
@@ -1026,7 +1073,108 @@ def main():
     best_state = None
     import shutil
     _gc.collect()
+    def run_tree_backup():
+        # Hive-mind training: batches are random subtrees; the loss anchors
+        # roots at stored deep backed-up values and pulls every node toward
+        # its CURRENT-net soft backup (detached fixed point). Gradients flow
+        # through the backup operator: blame distributes over the subtree.
+        import random as _rng
+        z = np.load(a.tree_backup)
+        occ0 = z['occ0'].astype(np.uint64); occ1 = z['occ1'].astype(np.uint64)
+        blk = z['blk'].astype(np.uint64); stm = z['stm'].astype(np.uint8)
+        backed_all = z['teacher'].astype(np.float32)
+        w_all = z['wsum'].astype(np.float32) if 'wsum' in z else np.ones(len(occ0), np.float32)
+        ep_ = z['edge_p'].astype(np.int64); ec_ = z['edge_c'].astype(np.int64)
+        n = len(occ0)
+        # Cap memory: random 1.5M-row subset, edges remapped into it.
+        if n > 1500000:
+            keep = np.sort(np.random.RandomState(a.seed).choice(n, 1500000, replace=False))
+            remap = np.full(n, -1, dtype=np.int64)
+            remap[keep] = np.arange(len(keep), dtype=np.int64)
+            ep2 = remap[ep_]
+            ec2 = remap[ec_]
+            ok = (ep2 >= 0) & (ec2 >= 0)
+            ep_, ec_ = ep2[ok], ec2[ok]
+            occ0, occ1, blk, stm = occ0[keep], occ1[keep], blk[keep], stm[keep]
+            backed_all, w_all = backed_all[keep], w_all[keep]
+            n = len(occ0)
+            print('tree subsample: %d rows kept' % n, flush=True)
+        kids = {}
+        for p, c in zip(ep_.tolist(), ec_.tolist()):
+            if 0 <= p < n and 0 <= c < n:
+                kids.setdefault(p, []).append(c)
+        for k in kids:
+            if len(kids[k]) > 64:
+                kids[k] = kids[k][:64]
+        print('tree: %d nodes, %d internal, %d edges' % (
+            n, len(kids), sum(len(v) for v in kids.values())), flush=True)
+        is_b = (stm == 0)
+        own = np.where(is_b, occ0, occ1); enm = np.where(is_b, occ1, occ0)
+        F = block_indices(own, enm); Q = q2_indices(own, enm, blk)
+        EUS, ETH = env_tables(own, enm, blk); MUS, MTH = mob_tables(own, enm, blk)
+        CUS, CTH = capn_tables(own, enm, blk); VUS, VTH = conv_tables(own, enm, blk)
+        SPt, DEt = materialize(F.astype(np.int64), Q, EUS, ETH, MUS, MTH, CUS, CTH, VUS, VTH)
+        del F, Q, EUS, ETH, MUS, MTH, CUS, CTH, VUS, VTH
+        _gc.collect()
+        base_t = base_eval_stm(occ0, occ1, blk, stm).astype(np.float32)
+        SPt = torch.from_numpy(SPt); DEt = torch.from_numpy(DEt)
+        base_t = torch.from_numpy(base_t)
+        backed_t = torch.from_numpy(backed_all)
+        w_t = torch.from_numpy(w_all)
+        temp = float(a.tree_temp); al = float(a.tree_align)
+        roots = np.array(sorted(kids.keys()), dtype=np.int64)
+        if len(roots) == 0:
+            roots = np.arange(n)
+        rrng = _rng.Random(a.seed)
+        t00 = time.time()
+        tot = 0.0
+        for step in range(1, int(a.tree_steps) + 1):
+            rbatch = [int(roots[rrng.randrange(len(roots))]) for _ in range(8)]
+            seen = {}; order = []
+            stack = list(rbatch)
+            while stack and len(order) < 2048:
+                u = stack.pop()
+                if u in seen:
+                    continue
+                seen[u] = len(order)
+                order.append(u)
+                stack.extend(kids.get(u, ()))
+            idx = torch.tensor(order, dtype=torch.long)
+            opt.zero_grad()
+            pred = bags[0](SPt[idx]).squeeze(1) + bags[1](DEt[idx]).squeeze(1) + bias
+            val = {u: pred[seen[u]] for u in order}
+            for u in reversed(order):
+                ch = [c for c in kids.get(u, ()) if c in seen]
+                if ch:
+                    cs = torch.stack([val[c] for c in ch])
+                    val[u] = temp * torch.logsumexp(cs / temp, dim=0)
+            is_root = torch.zeros(len(order), dtype=torch.bool)
+            for r in rbatch:
+                if r in seen:
+                    is_root[seen[r]] = True
+            lroot = (((pred[is_root] + base_t[idx][is_root] - backed_t[idx][is_root]) ** 2)
+                     * w_t[idx][is_root]).mean() if is_root.any() else pred.sum() * 0.0
+            with torch.no_grad():
+                bv = torch.stack([val[u].detach() for u in order])
+            lalign = ((pred - bv) ** 2).mean()
+            # Manual L2 like the flat path: doubles as the dense-gradient source
+            # Adam needs (pure sparse grads crash it).
+            l2 = sum((bg.weight ** 2).sum() for bg in bags)
+            (lroot + al * lalign + a.wd * l2).backward()
+            opt.step()
+            zero_constrained()
+            tot += float(lroot.detach() + al * lalign.detach())
+            if step % 200 == 0:
+                print('treestep %d loss %.1f (root %.1f align %.1f)' % (
+                    step, tot / 200, float(lroot.detach()), float(lalign.detach())), flush=True)
+                tot = 0.0
+        print('tree training done %.0fs' % (time.time() - t00), flush=True)
+
     ntr = len(SPtr)
+    if a.tree_backup:
+        run_tree_backup()
+        dump_tup(a.out)
+        return
     for ep in range(1, max_ep + 1):
         t0 = time.time()
         for bg in bags:
@@ -1149,6 +1297,39 @@ def main():
                     totv += ((((pv - yva[j:j + nv]) ** 2) * wv).sum().item())
                 cntv += nv
             vmse = totv / max(cntv, 1)
+        # Search-backed validation: agreement of CURRENT net with deep search
+        # on the fixed probe set (precomputed labels, no live search).
+        # This is the number that should predict gates; val_mse never did.
+        agree_msg = ''
+        if AG is not None:
+            with torch.no_grad():
+                to = 0.0
+                cn = 0
+                SPp, DEp = AG['SP'], AG['DE']
+                for j in range(0, len(SPp), 2000):
+                    e = min(len(SPp), j + 2000)
+                    Xsp = torch.from_numpy(SPp[j:e].astype(np.int64))
+                    Xde = torch.from_numpy(DEp[j:e].astype(np.int64))
+                    pv = forward(Xsp, Xde)
+                    to += torch.abs(pv + torch.from_numpy(
+                        AG['base'][j:e]) - torch.from_numpy(
+                        AG['teach'][j:e])).sum().item()
+                    cn += e - j
+                agree = to / max(cn, 1)
+            agree_msg = ' agree %.0f' % agree
+            if agree < best_agree[0]:
+                best_agree[0] = agree
+                if a.agree_select:
+                    best_val, best_ep = vmse, ep
+                    with torch.no_grad():
+                        best_state = ([bg.weight.detach().clone() for bg in bags],
+                                      bias.detach().clone())
+                    if a.ckpt:
+                        dump_tup(a.ckpt.format(ep=ep))
+                        shutil.copy(a.ckpt.format(ep=ep), a.out)
+                    agree_msg += ' AGREE-BEST->out'
+                else:
+                    agree_msg += ' (best %.0f)' % best_agree[0]
         improv = (prev_val - vmse) / max(prev_val, 1e-9) if prev_val else 1.0
         tag = ''
         if vmse < best_val:
@@ -1193,8 +1374,8 @@ def main():
             stale += 1
         else:
             stale = 0
-        print('epoch %d train_mse %.1f val_mse %.1f rel_improv %+.2e bias %+.1f lr %.5f reverts %d (%.0fs)%s%s%s'
-              % (ep, tot / cnt, vmse, improv, bias.item(), opt.param_groups[0]['lr'], step_reverts,
+        print('epoch %d train_mse %.1f val_mse %.1f%s rel_improv %+.2e bias %+.1f lr %.5f reverts %d (%.0fs)%s%s%s'
+              % (ep, tot / cnt, vmse, agree_msg, improv, bias.item(), opt.param_groups[0]['lr'], step_reverts,
                  time.time() - t0, tag, cyc_msg, bt_msg), flush=True)
         step_reverts = 0
         prev_val = best_val if bt_msg else vmse

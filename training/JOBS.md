@@ -26,3 +26,4 @@
 - ow10/ow20 postfix: gated (45-55, 44-53) REJECTED.
 | regretloop | AUTONOMOUS REGRET LOOP (user-authorized 2026-10-17, ~2h): champ vs Moonbird 40g/4w -> mine losses -> graft-label @500k x4 -> warm retrain (regret upweight + 10k base replay) -> gate 100g, adopt iff better | schtasks titan-regretloop | logs/regret_loop_status.txt | RUNNING round 1 (infra patched: book_gate --moves-out, miner ## startpos override) |
 | night | OVERNIGHT (user-authorized, unattended): P1 corr-build+gate (auto-merge to main ONLY on SPRT pass, LEDGER row), P2 regret v2 2M-labels books C/D to 06:30, P3 backfill+closeout | schtasks titan-overnight 22:45 | logs/overnight_status.txt | QUEUED |
+| align-extend | align20k vs R0 books A-J + K-O partial, SPRT uncapped | schtasks titan-extend (deleted after) | logs/align20k_gate*.txt + align_uncapped | DONE: 879-821/1700 LLR +0.52 UNDECIDED. Merged to main per explicit user order (9da300d). Extension stopped by user. |

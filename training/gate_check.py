@@ -15,7 +15,7 @@ import sqlite3
 import sys
 
 DB = 'data/nnue/results.db'
-SHA_RE = re.compile(r'^titan: exe=\S+ sha=(\S+) tup=(\S+) sha=(\S+)')
+SHA_RE = re.compile(r'^titan: exe=\S+ sha=(\S+) tup=(\S+) sha=(\S+)(?: corr=(\w+))?')
 
 
 def llr(w, l, d, elo0=0.0, elo1=20.0):
@@ -56,7 +56,7 @@ def main():
             continue
         m = SHA_RE.search(txt, re.M)
         if m:
-            arts.add((m.group(2), m.group(3)))
+            arts.add((m.group(2), m.group(3), m.group(4) or 'nocorr'))
     if len(arts) > 1:
         print('cand=%s MIXED ARTIFACTS across %d logs %s -> FAIL '
               '(tested one thing, merging another)' % (a.cand, len(rows), arts))
@@ -73,16 +73,29 @@ def main():
                 a.cand, exp, cur))
             sys.exit(1)
     v = llr(W, L, D, 0.0, a.elo1)
+    import math as _m
+    def _elo(x):
+        x = min(0.999, max(0.001, x))
+        return 400.0 * _m.log10(x / (1.0 - x))
     s = (W + D / 2) / max(1, W + L + D)
+    n = W + L + D
+    se = (s * (1 - s) / max(1, n)) ** 0.5
+    elo, elo_lo, elo_hi = _elo(s), _elo(max(0.001, s - 1.96 * se)), _elo(min(0.999, s + 1.96 * se))
     if v >= 2.94:
-        verdict = 'PASS'
+        verdict = 'PASS (proven better: merge)'
     elif v <= -2.94:
-        verdict = 'FAIL'
+        verdict = 'FAIL (proven worse: reject)'
+    elif n < 200:
+        verdict = 'TOO-SHORT (under 200 games proves nothing either way: extend)'
+    elif W > L:
+        verdict = 'MERGE-DEFAULT (ahead %d-%d over %d: merge on user go unless later games prove worse)' % (W, L, n)
+    elif W < L:
+        verdict = 'EXTEND-OR-REJECT (behind %d-%d over %d: extend to prove better, else reject)' % (W, L, n)
     else:
-        verdict = 'UNDECIDED'
-    print('cand=%s games=%d pooled=%d-%d-%d score=%.3f LLR=%+.2f -> %s (n=%d logs)' % (
-        a.cand, G, W, L, D, s, v, verdict, len(rows)))
-    sys.exit(0 if verdict == 'PASS' else 1)
+        verdict = 'EXACT-TIE (user decides; equal merges need explicit approval + not-worse evidence)'
+    print('cand=%s games=%d pooled=%d-%d-%d score=%.3f Elo %+.0f [95%% CI %+.0f..%+.0f] LLR=%+.2f -> %s (n=%d logs)' % (
+        a.cand, G, W, L, D, s, elo, elo_lo, elo_hi, v, verdict, len(rows)))
+    sys.exit(0 if verdict.startswith('PASS') else 1)
 
 
 if __name__ == '__main__':

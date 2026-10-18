@@ -205,3 +205,13 @@ real memory. Update them the moment something happens, not at the end.
 - No merge to main without ALL THREE: (1) SPRT pass vs current main at fixed nodes on books (LLR >= +2.94, alpha=beta=0.05, H0<=0 vs H1>=+20), (2) user explicit approval naming the branch/net, (3) LEDGER promotion row + DB gate entries present.
 - Gates run unlimited games until decisive: pass promotes (with approval), fail rejects and banks, cap only extends with fresh books. NEVER merge on straddle, NEVER merge on user order alone - the assistant must refuse and say which gate is missing.
 - Enforcement: training/gate_check.py is the door. It recomputes SPRT from the DB (not from chat claims) and prints PASS/FAIL/UNDECIDED. Merge scripts must call it and abort unless PASS (or user override logged verbatim in LEDGER).
+
+## GATE LAW v2 (2026-10-18, user-ordered, REPLACES the SPRT-only rule above)
+- SHORT gate by default (200-400 games, fresh books, both seats per position, fixed nodes). Moonbird checks and collapse checks are separate quick tests, not promotion gates.
+- NO UNDECIDED verdict exists. Outcomes are only: proven better (merge), proven worse (reject).
+- AHEAD on points after a sufficient short gate: merged BY DEFAULT on user go (even +1 Elo counts; equal allowed only with explicit user approval AND evidence of not-worse). It may only be stopped by PROOF of worse, never by doubt.
+- BEHIND on points: extend in fresh-book chunks to PROVE better; if it cannot be shown better, REJECT by default. Never merge a behind candidate.
+- EXTEND means extend: no game cap. New books get generated rather than replaying positions. SPRT LLR is still tracked as the instrument, but the verdict follows the ahead/behind rule above, not the +-2.94 lines alone.
+- One engine per binary. Branch -> clean build -> hashed binary. Gating the SAME binary with different flags is FORBIDDEN (that mess caused the corr-gate violation). Nets travel with explicit sha256 recorded per gate.
+- Every gate alternates the same book opening for both colors. No setup where one side gets an opening only as white or only as black.
+- _Why the v1 law died: it let straddles rot forever and treated ahead-on-points as nothing. Strength is relative; a candidate that will not lose and might win goes in, a candidate that loses goes out._
