@@ -3,8 +3,8 @@
   "tag": "r1params-ext",
   "desc": "R1 search thetas vs main, SPRT extension (prior screen 119-81 LLR +1.86)",
   "branch": "exp/search-r1params",
-  "worktree": "C:\\gitProjects\\titanium-ataxx",
-  "main_exe": "C:\\gitProjects\\titanium-main\\target\\release\\titanium-cli.exe",
+  "worktree": "C:/gitProjects/titanium-gate-r1",
+  "main_exe": "C:/gitProjects/titanium-main/target/release/titanium-cli.exe",
   "tup": "C:\\gitProjects\\engines\\titan_champ.tup",
   "books": [
    "data/nnue/book100u.txt",
@@ -22,8 +22,8 @@
   "tag": "hyperlmr",
   "desc": "Hyperbolic LMR (Moonbird curve) vs flat (screen 101-99 LLR -0.22)",
   "branch": "exp/search-hyperlmr",
-  "worktree": "C:\\gitProjects\\titanium-ataxx",
-  "main_exe": "C:\\gitProjects\\titanium-main\\target\\release\\titanium-cli.exe",
+  "worktree": "C:/gitProjects/titanium-gate-hyper",
+  "main_exe": "C:/gitProjects/titanium-main/target/release/titanium-cli.exe",
   "tup": "C:\\gitProjects\\engines\\titan_champ.tup",
   "books": [
    "data/nnue/book100u.txt",

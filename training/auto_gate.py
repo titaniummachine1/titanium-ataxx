@@ -116,20 +116,55 @@ def sh(cmd, cwd=REPO, timeout=None):
                           timeout=timeout, shell=isinstance(cmd, str))
 
 
-def stop_requested():
-    return os.path.exists(STOP)
+def ensure_worktree(item):
+    """Dedicated worktree per branch so gating never disturbs the dev tree.
+    Returns (worktree_path, commit_hash)."""
+    wt = item.get('worktree')
+    br = item['branch']
+    if not wt:
+        wt = os.path.join(os.path.dirname(REPO), 'titanium-gate-' + item['tag'])
+        item['worktree'] = wt
+    if not os.path.isdir(os.path.join(wt, '.git')):
+        # worktree metadata lives in main repo; check by path existence
+        r = sh(['git', '-C', REPO, 'worktree', 'add', wt, br])
+        if r.returncode != 0 and 'already used' not in (r.stderr or ''):
+            # maybe branch needs no checkout: path exists but not a worktree
+            pass
+    # make sure the worktree tracks the latest commit of the branch
+    r = sh(['git', '-C', wt, 'rev-parse', 'HEAD'])
+    head = r.stdout.strip() if r.returncode == 0 else 'unknown'
+    want = item.get('commit')
+    if want and want != head:
+        sh(['git', '-C', wt, 'checkout', want])
+        head = want
+    else:
+        # pull branch tip (fast-forward only, never touch dirty tree)
+        st = sh(['git', '-C', wt, 'status', '--short'])
+        if st.returncode == 0 and not st.stdout.strip():
+            sh(['git', '-C', wt, 'checkout', br])
+            sh(['git', '-C', wt, 'merge', '--ff-only', 'origin/' + br])
+            r = sh(['git', '-C', wt, 'rev-parse', 'HEAD'])
+            head = r.stdout.strip() if r.returncode == 0 else head
+    return wt, head
 
 
 def build_branch(item):
-    """Build branch binary into its own target dir. Returns exe path."""
-    bdir = os.path.join(REPO, 'target-%s' % item['tag'])
+    """Build the branch binary into its own target dir. Returns (exe, err)."""
+    wt, head = ensure_worktree(item)
+    item['commit_built'] = head
+    bdir = os.path.join(wt, 'target-gate')
     r = sh(['cargo', 'build', '--release', '--target-dir', bdir,
-            '--bin', 'titanium-cli'], cwd=item.get('worktree', REPO),
-           timeout=3600)
+            '--bin', 'titanium-cli'], cwd=wt, timeout=3600)
     if r.returncode != 0:
-        return None, r.stderr[-2000:]
+        return None, (r.stderr or '')[-2000:]
     exe = os.path.join(bdir, 'release', 'titanium-cli.exe')
-    return (exe if os.path.exists(exe) else None), ''
+    if not os.path.exists(exe):
+        return None, 'binary missing after build'
+    return exe, ''
+
+
+def stop_requested():
+    return os.path.exists(STOP)
 
 
 def run_chunk(item, exe_b, book, games, seed, out, workers, nodes, tup):
@@ -164,6 +199,7 @@ def gate_item(item, args, logf):
         print('BUILD FAIL %s: %s' % (tag, err[-300:]), flush=True)
         return 'BUILDFAIL', 0, 0, 0
     item['exe'] = exe_a
+    print('### %s built %s @ %s' % (tag, item['branch'], item.get('commit_built', '?')[:12]), flush=True)
     exe_b = item['main_exe']
     tup = item['tup']
     W = L = D = 0
@@ -207,8 +243,13 @@ def main():
     ap.add_argument('--sample-secs', type=float, default=60)
     ap.add_argument('--max-workers', type=int, default=7)
     ap.add_argument('--force', action='store_true',
-                    help='skip idle wait, gate immediately (testing)')
+                    help='skip idle wait, gate immediately')
+    ap.add_argument('--only', default='',
+                    help='gate only this item tag (manual trigger)')
     a = ap.parse_args()
+
+    if a.only:
+        a.force = True
 
     if not a.force:
         print('watching CPU: need <%g%% for %g min (reset at >=%g%%)' % (
@@ -235,6 +276,8 @@ def main():
         os.remove(STOP)
     logf = open(os.path.join(REPO, 'logs', 'auto_gate.log'), 'a')
     for item in queue:
+        if a.only and item['tag'] != a.only:
+            continue
         if stop_requested():
             print('STOP requested, exiting queue', flush=True)
             break
