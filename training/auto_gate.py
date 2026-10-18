@@ -117,40 +117,39 @@ def sh(cmd, cwd=REPO, timeout=None):
 
 
 def ensure_worktree(item):
-    """Dedicated worktree per branch so gating never disturbs the dev tree.
-    Returns (worktree_path, commit_hash)."""
-    wt = item.get('worktree')
-    br = item['branch']
-    if not wt:
-        wt = os.path.join(os.path.dirname(REPO), 'titanium-gate-' + item['tag'])
-        item['worktree'] = wt
-    if not os.path.isdir(os.path.join(wt, '.git')):
-        # worktree metadata lives in main repo; check by path existence
-        r = sh(['git', '-C', REPO, 'worktree', 'add', wt, br])
-        if r.returncode != 0 and 'already used' not in (r.stderr or ''):
-            # maybe branch needs no checkout: path exists but not a worktree
-            pass
-    # make sure the worktree tracks the latest commit of the branch
-    r = sh(['git', '-C', wt, 'rev-parse', 'HEAD'])
-    head = r.stdout.strip() if r.returncode == 0 else 'unknown'
-    want = item.get('commit')
-    if want and want != head:
-        sh(['git', '-C', wt, 'checkout', want])
-        head = want
-    else:
-        # pull branch tip (fast-forward only, never touch dirty tree)
-        st = sh(['git', '-C', wt, 'status', '--short'])
+    """Dedicated worktree per branch (auto-created). Returns (path, commit)
+    or (None, err). Never throws."""
+    try:
+        wt = item.get('worktree')
+        br = item['branch']
+        if not wt:
+            wt = os.path.join(os.path.dirname(REPO), 'titanium-gate-' + item['tag'])
+            item['worktree'] = wt
+        if not os.path.isdir(os.path.join(wt, '.git')):
+            sh(['git', '-C', REPO, 'fetch', 'origin', br], timeout=300)
+            r = sh(['git', '-C', REPO, 'worktree', 'add', wt, br], timeout=300)
+            if r.returncode != 0:
+                return None, 'worktree add failed: %s' % (r.stderr or '')[-300:]
+        want = item.get('commit')
+        if want:
+            sh(['git', '-C', wt, 'checkout', want], timeout=120)
+            r = sh(['git', '-C', wt, 'rev-parse', 'HEAD'], timeout=60)
+            return wt, (r.stdout.strip() if r.returncode == 0 else 'unknown')
+        st = sh(['git', '-C', wt, 'status', '--short'], timeout=60)
         if st.returncode == 0 and not st.stdout.strip():
-            sh(['git', '-C', wt, 'checkout', br])
-            sh(['git', '-C', wt, 'merge', '--ff-only', 'origin/' + br])
-            r = sh(['git', '-C', wt, 'rev-parse', 'HEAD'])
-            head = r.stdout.strip() if r.returncode == 0 else head
-    return wt, head
+            sh(['git', '-C', wt, 'checkout', br], timeout=120)
+            sh(['git', '-C', wt, 'merge', '--ff-only', 'origin/' + br], timeout=300)
+        r = sh(['git', '-C', wt, 'rev-parse', 'HEAD'], timeout=60)
+        return wt, (r.stdout.strip() if r.returncode == 0 else 'unknown')
+    except Exception as e:
+        return None, 'worktree error: %s' % str(e)[:300]
 
 
 def build_branch(item):
     """Build the branch binary into its own target dir. Returns (exe, err)."""
     wt, head = ensure_worktree(item)
+    if wt is None:
+        return None, head
     item['commit_built'] = head
     bdir = os.path.join(wt, 'target-gate')
     r = sh(['cargo', 'build', '--release', '--target-dir', bdir,
@@ -214,6 +213,7 @@ def gate_item(item, args, logf):
     W = L = D = 0
     seed0 = item.get('seed', 100)
     ci = 0
+    fails = 0
     max_chunks = item.get('max_chunks', 20)
     while ci < max_chunks:
         if stop_requested():
@@ -226,7 +226,13 @@ def gate_item(item, args, logf):
                         item.get('nodes', 5000), tup)
         if res is None:
             print('%s chunk %d: NO RESULT' % (tag, ci), flush=True)
+            fails += 1
+            ci += 1
+            if fails >= 3:
+                print('%s: 3 consecutive failures, banking UNDECIDED' % tag, flush=True)
+                return 'UNDECIDED', W, L, D
             continue
+        fails = 0
         w, l, d = res
         W, L, D = W + w, L + l, D + d
         v = sprt_llr(W, L, D)
@@ -314,7 +320,13 @@ def main():
             print('skip %s (disabled/done)' % item['tag'], flush=True)
             continue
         t0 = time.time()
-        verdict, w, l, d = gate_item(item, a, logf)
+        try:
+            verdict, w, l, d = gate_item(item, a, logf)
+        except Exception as e:
+            verdict, w, l, d = 'ERROR', 0, 0, 0
+            print('%s CRASHED: %s' % (item['tag'], str(e)[:300]), flush=True)
+            logf.write('%s CRASH: %s\n' % (item['tag'], str(e)[:300]))
+            logf.flush()
         v = sprt_llr(w, l, d)
         row = ('| %s | %s | %s vs main | %s | %d | %d-%d-%d | LLR %+.2f | %s |\n' % (
             item['tag'], time.strftime('%Y-%m-%d'), item['desc'],
