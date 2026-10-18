@@ -53,6 +53,7 @@ fn main() -> ExitCode {
             flag_str(&args, "--net"),
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
+            args.iter().any(|x| x == "--corr"),
         ),
         "match" => match_cmd(
             flag_int(&args, "--games").unwrap_or(20) as u32,
@@ -70,6 +71,8 @@ fn main() -> ExitCode {
             flag_int(&args, "--nodes").map(|n| n as u64),
             flag_int(&args, "--start-game").unwrap_or(1) as u32,
             flag_str(&args, "--out"),
+            args.iter().any(|x| x == "--corr"),
+            args.iter().any(|x| x == "--opp-corr"),
         ),
         "sperft" => sperft_cmd(
             flag_int(&args, "--depth").unwrap_or(8) as u32,
@@ -244,6 +247,16 @@ fn tuple_flag_str(spec: &Option<String>) -> String {
         None => format!("--tuple {DEFAULT_TUP}"),
         Some(s) if s == "none" || s.is_empty() => "--tuple none".to_string(),
         Some(s) => format!("--tuple {s}"),
+    }
+}
+
+fn corr_flag_str(on: bool) -> String {
+    // Re-emit for match children: --corr flows to the opp serve child.
+    // Absent = off (experiments are opt-in on both sides).
+    if on {
+        "--corr".to_string()
+    } else {
+        String::new()
     }
 }
 
@@ -618,6 +631,7 @@ fn serve_cmd(
     net_spec: Option<String>,
     tup_spec: Option<String>,
     tup_native: bool,
+    corr: bool,
 ) -> ExitCode {
     let stdin = io::stdin();
     let mut searcher = Searcher::with_tt_bits(tt_bits);
@@ -640,6 +654,7 @@ fn serve_cmd(
     };
     searcher.set_tuple(owned_tup.as_ref());
     searcher.set_tuple_native(tup_native && owned_tup.is_some());
+    searcher.set_corr(corr);
     let mut current: Option<Board> = None;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -839,6 +854,8 @@ fn match_cmd(
     max_nodes: Option<u64>,
     start_game: u32,
     out: Option<String>,
+    corr: bool,
+    opp_corr: bool,
 ) -> ExitCode {
     // Eval presets, explicit per side — no env vars anywhere:
     // --net = OUR side (in-process), --opp-net = child side (appended to the
@@ -887,6 +904,9 @@ fn match_cmd(
                     }
                     if !with_flags.contains("--tuple") {
                         with_flags = format!("{with_flags} {}", tuple_flag_str(&opp_tup_spec));
+                    }
+                    if opp_corr && !with_flags.contains("--corr") {
+                        with_flags = format!("{with_flags} {}", corr_flag_str(true));
                     }
                     if opp_tup_native && !with_flags.contains("--tuple-native") {
                         with_flags = format!("{with_flags} --tuple-native");
@@ -946,10 +966,12 @@ fn match_cmd(
         searcher.set_sancta(net.as_ref());
         searcher.set_tuple(tup.as_ref());
         searcher.set_tuple_native(tup_native && tup.is_some());
+        searcher.set_corr(corr);
         let mut opp_searcher = Searcher::new(); // for --opp self
         opp_searcher.set_sancta(opp_net.as_ref());
         opp_searcher.set_tuple(opp_tup.as_ref());
         opp_searcher.set_tuple_native(opp_tup_native && opp_tup.is_some());
+        opp_searcher.set_corr(opp_corr);
         let titanium_is_black = game % 2 == 1;
         let mut log = String::new();
         let mut result = None;

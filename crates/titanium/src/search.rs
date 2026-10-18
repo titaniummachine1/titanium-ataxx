@@ -220,6 +220,72 @@ const FLAG_EXACT: u8 = 1;
 const FLAG_LOWER: u8 = 2;
 const FLAG_UPPER: u8 = 3;
 
+/// Correction history (S54 experiment, OFF unless enabled via set_corr):
+/// per-context EMA of (search score - static eval), added to future static
+/// evals. Two cheap O(1) keys: stm piece-diff bucket + empties bucket.
+/// Bounded, reset per game, never stored in TT (TT keeps search scores).
+const CORR_SIZE: usize = 64;
+const CORR_SCALE: i32 = 256;
+const CORR_WMAX: i32 = 128;
+/// Per-entry rails (raw cp): search artifacts beyond this don't teach.
+const CORR_TGT_MAX: i32 = 256;
+const CORR_ENTRY_MAX: i32 = 512;
+/// Applied correction rails (raw cp sum): small nudge, never a verdict.
+const CORR_APPLY_MAX: i32 = 64;
+
+pub struct CorrHist {
+    pd: Box<[i32; CORR_SIZE]>,
+    em: Box<[i32; CORR_SIZE]>,
+}
+
+impl CorrHist {
+    pub fn new() -> Self {
+        CorrHist {
+            pd: Box::new([0; CORR_SIZE]),
+            em: Box::new([0; CORR_SIZE]),
+        }
+    }
+
+    #[inline]
+    fn idx_pd(b: &Board) -> usize {
+        let d = b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32 + 49;
+        ((d / 2).clamp(0, 63)) as usize
+    }
+
+    #[inline]
+    fn idx_em(b: &Board) -> usize {
+        let e = b.empty().count_ones() as usize;
+        (e * CORR_SIZE / 50).min(CORR_SIZE - 1)
+    }
+
+    /// Corrected static eval (stm-relative in, stm-relative out).
+    #[inline]
+    pub fn apply(&self, b: &Board, raw: i32) -> i32 {
+        let c = (self.pd[Self::idx_pd(b)] + self.em[Self::idx_em(b)]) / 4;
+        raw + c.clamp(-CORR_APPLY_MAX, CORR_APPLY_MAX)
+    }
+
+    /// EMA toward (search - static), depth-weighted. Skips mate scores
+    /// (not eval error) and zero diffs (no information).
+    pub fn update(&mut self, b: &Board, best: i32, static_eval: i32, depth: u32) {
+        if best.abs() > MATE_BOUND || static_eval.abs() > MATE_BOUND {
+            return;
+        }
+        let diff = (best - static_eval).clamp(-CORR_TGT_MAX, CORR_TGT_MAX);
+        if diff == 0 {
+            return;
+        }
+        let w = ((depth * depth + 2 * depth + 1) as i32).min(CORR_WMAX);
+        for (tab, idx) in [
+            (&mut *self.pd, Self::idx_pd(b)),
+            (&mut *self.em, Self::idx_em(b)),
+        ] {
+            let e = tab[idx];
+            tab[idx] = (e + w * (diff - e) / CORR_SCALE).clamp(-CORR_ENTRY_MAX, CORR_ENTRY_MAX);
+        }
+    }
+}
+
 /// Fixed-size transposition table, power-of-two entry count. Depth-0 EXACT
 /// entries double as the eval cache (Ataxx transpositions repeat a lot).
 pub struct Tt {
@@ -371,6 +437,9 @@ pub struct Searcher<'a> {
     /// Tuple-native eval mode: skip E2/E4 scans, mat+PST+tempo+tuples only.
     /// False by default (full hand eval + optional additive tuples).
     tup_native: bool,
+    /// Correction history (None = OFF, zero-cost branch). Owned tables,
+    /// reset per game; never merged into weights or TT.
+    corr: Option<CorrHist>,
     /// Per-ply move/acc buffers, reused across searches (no per-search
     /// alloc: MoveStack is ~72KB of lists + acc, was rebuilt per search).
     stack: MoveStack,
@@ -411,6 +480,7 @@ impl<'a> Searcher<'a> {
             sancta: None,
             tuple: None,
             tup_native: false,
+            corr: None,
             stack: MoveStack::new(),
         }
     }
@@ -433,6 +503,22 @@ impl<'a> Searcher<'a> {
         self.tup_native = native;
     }
 
+    /// Correction-history tables, off by default. Enabled searchers learn
+    /// per-context eval biases within a game; disabled = main behavior.
+    pub fn set_corr(&mut self, on: bool) {
+        self.corr = on.then(CorrHist::new);
+    }
+
+    /// Raw static eval plus correction (if enabled). Single call site shape
+    /// so both negamax static-eval points stay consistent.
+    #[inline]
+    fn corrected(&self, b: &Board, raw: i32) -> i32 {
+        match &self.corr {
+            Some(c) => c.apply(b, raw),
+            None => raw,
+        }
+    }
+
     /// Override the clock (wasm builds inject `performance.now()`).
     pub fn set_time_source(&mut self, f: fn() -> f64) {
         self.time_src = f;
@@ -444,6 +530,9 @@ impl<'a> Searcher<'a> {
         self.tt.clear();
         *self.killers = [(0, 0); MAX_PLY];
         *self.history = [[0; 49]; 2];
+        if self.corr.is_some() {
+            self.corr = Some(CorrHist::new());
+        }
     }
 
     #[inline]
@@ -522,10 +611,11 @@ impl<'a> Searcher<'a> {
         // OFF = single branch to classical, zero-cost.
         // forward_ready(acc, stm) is ALREADY stm-relative (like evaluate) —
         // no negation (that was the 0-50 bug: double-negated white nodes).
-        let static_eval = match self.sancta {
+        let raw = match self.sancta {
             Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
             None => evaluate(b, self.tuple, self.tup_native),
         };
+        let static_eval = self.corrected(b, raw);
 
         // Reverse futility pruning (autaxx, exact form): standing pat is so
         // far below alpha that even a generous error margin cannot recover
@@ -581,11 +671,12 @@ impl<'a> Searcher<'a> {
             // multiplicities, so len>0 always — but double-pass positions
             // have no children to search: score the pass-through.
             if list.is_empty() {
-                let static_eval = match self.sancta {
+                let raw = match self.sancta {
                     Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
                     None => evaluate(b, self.tuple, self.tup_native),
                 };
-                self.finish_node(b, alpha_orig, beta, static_eval, 0xFFFF, depth, ply);
+                let static_eval = self.corrected(b, raw);
+                self.finish_node(b, alpha_orig, beta, static_eval, 0xFFFF, depth, ply, static_eval);
                 return static_eval;
             }
         }
@@ -662,7 +753,7 @@ impl<'a> Searcher<'a> {
                 }
             }
         }
-        self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply);
+        self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply, raw);
         best
     }
 
@@ -680,6 +771,7 @@ impl<'a> Searcher<'a> {
     }
 
     /// TT store at the end of a node (skipped when the clock cut it short).
+    /// Also feeds the correction-history EMA: (search - static) per context.
     #[inline]
     fn finish_node(
         &mut self,
@@ -690,9 +782,13 @@ impl<'a> Searcher<'a> {
         best_mv: u32,
         depth: u32,
         ply: u32,
+        static_eval: i32,
     ) {
         if self.stop {
             return;
+        }
+        if let Some(c) = &mut self.corr {
+            c.update(b, best, static_eval, depth);
         }
         let flag = if best <= alpha_orig {
             FLAG_UPPER
