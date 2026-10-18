@@ -71,23 +71,20 @@ pub struct SearchParams {
 
 impl Default for SearchParams {
     fn default() -> Self {
-        // Defaults REVERTED to pre-R1 values 2026-10-18: R1 thetas
-        // (RFP1 189, NullMaxFill 29, LMRR2 5) showed +67 CI but only
-        // LLR +1.86 = UNDECIDED under SPRT law v3. They stay available
-        // via setoption for proper SPRT proving; defaults ship only
-        // what SPRT passed. Previous: RFP 330/189/491/754, NullR 4,
-        // NMT 12, NMF 29, LMR 9/2/5 (R1, unproven).
+        // CANDIDATE (exp/search-r1params): R1 alignment thetas. Screen
+        // 119-81 LLR +1.86, never behind in 200g vs main defaults.
+        // Gated on this branch; merges only on tripwire + approval.
         SearchParams {
             tempo: 150,
             contact_pen: 15,
             multicap_pen: 20,
-            rfp: [257, 347, 478, 774],
-            null_r: 3,
-            null_min_targets: 11,
-            null_max_fill: 52,
+            rfp: [330, 189, 491, 754],
+            null_r: 4,
+            null_min_targets: 12,
+            null_max_fill: 29,
             lmr_split: 9,
             lmr_r1: 2,
-            lmr_r2: 3,
+            lmr_r2: 5,
             lmr_mode: 0,
             lmr_half: 4,
             lmr_sub: 0,
