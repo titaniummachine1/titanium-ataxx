@@ -702,6 +702,12 @@ fn serve_cmd(
                 let dflt = if i == 0 { 0 } else if i < 9 { 2 } else { 3 };
                 out_line(&format!("option name LMRT{i} type spin default {dflt} min 0 max 8"));
             }
+            out_line("option name LMRGap1 type spin default 2000000000 min 0 max 2000000000");
+            out_line("option name LMRGap2 type spin default 2000000000 min 0 max 2000000000");
+            for i in 0..16 {
+                let dflt = if i == 0 { 0 } else if i < 9 { 2 } else { 3 };
+                out_line(&format!("option name LMRT{i} type spin default {dflt} min 0 max 8"));
+            }
             out_line("uaiok");
         } else if t == "isready" {
             out_line("readyok");

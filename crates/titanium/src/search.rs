@@ -71,6 +71,11 @@ pub struct SearchParams {
     // 1D tuned function of move-index (Stockfish-style, no inference cost).
     // Defaults replicate flat (idx0=0, idx1-8=2, idx9+=3).
     pub lmr_tab: [u32; 16],
+    /// Score-gap kickers (mode 2 only): extra +1 reduction when a move's
+    /// ordering score trails the best by more than gap1/gap2. Perceived
+    /// cost at ordering time, not inference. Defaults OFF (huge).
+    pub lmr_gap1: i32,
+    pub lmr_gap2: i32,
 }
 
 impl Default for SearchParams {
@@ -96,6 +101,8 @@ impl Default for SearchParams {
             lmr_half: 4,
             lmr_sub: 0,
             lmr_tab: [0, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3],
+            lmr_gap1: 2000000000,
+            lmr_gap2: 2000000000,
         }
     }
 }
@@ -496,6 +503,10 @@ impl<'a> Searcher<'a> {
             "LMRMode" => self.params.lmr_mode = val.clamp(0, 2) as u32,
             "LMRHalf" => self.params.lmr_half = val.max(1) as u32,
             "LMRSub" => self.params.lmr_sub = val.max(0) as u32,
+            "LMRGap1" => self.params.lmr_gap1 = val as i32,
+            "LMRGap2" => self.params.lmr_gap2 = val as i32,
+            "LMRGap1" => self.params.lmr_gap1 = val as i32,
+            "LMRGap2" => self.params.lmr_gap2 = val as i32,
             _ => return false,
         }
         true
@@ -686,14 +697,26 @@ impl<'a> Searcher<'a> {
         let mut best = i32::MIN;
         let mut best_mv: u32 = 0xFFFF;
         let mut move_idx = 0usize;
+        let mut best_ord = 0i32;
+        let mut best_ord_set = false;
         loop {
-            let m = {
+            let (m, m_ord) = {
                 let list = &mut self.stack.lists[ply as usize];
                 if list.is_empty() {
                     break;
                 }
-                list.pop_best()
+                list.pop_best_scored()
             };
+            // Reference = best NON-TT ordering score (TT's 1e9 sentinel
+            // would swamp every gap). First move goes full window anyway.
+            if !best_ord_set && m_ord < 1_000_000_000 {
+                best_ord = m_ord;
+                best_ord_set = true;
+            }
+            // Score-gap kicker (user idea): how much worse this move looked
+            // than the best at ordering time (1 = best). Big gap = reduce
+            // more. Tunable thresholds; zero-cost OFF when gap small.
+            let gap = best_ord.saturating_sub(m_ord);
 
             // PVS + universal LMR (autaxx): first move full window full
             // depth; every later move scouts with a null window at a reduced
@@ -729,8 +752,17 @@ impl<'a> Searcher<'a> {
                         .saturating_sub(self.params.lmr_sub as u64)
                         .min(base) as u32
                 } else {
-                    // Table (mode 2): tuned 1D function r = tab[idx].
-                    let r = self.params.lmr_tab[move_idx.min(15)];
+                    // Table (mode 2): tuned 1D function r = tab[idx],
+                    // plus score-gap kicker: moves that looked much worse
+                    // than the best at ordering time reduce more.
+                    // Gap thresholds tunable; OFF when gap small.
+                    let mut r = self.params.lmr_tab[move_idx.min(15)];
+                    if gap > self.params.lmr_gap1 {
+                        r += 1;
+                    }
+                    if gap > self.params.lmr_gap2 {
+                        r += 1;
+                    }
                     depth.saturating_sub(1 + r)
                 };
                 score = -self.negamax(
