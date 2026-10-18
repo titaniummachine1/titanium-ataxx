@@ -168,6 +168,15 @@ def stop_requested():
 
 
 def run_chunk(item, exe_b, book, games, seed, out, workers, nodes, tup):
+    if item.get('cloud') is not None:
+        job = {'a_exe': item['exe'], 'b_exe': exe_b, 'tup': tup,
+               'book': book, 'games': games, 'nodes': nodes,
+               'movetime': 0, 'seed': seed, 'workers': workers,
+               'out': out}
+        try:
+            return item['cloud'].run_match(job)
+        except Exception as e:
+            print('cloud failed (%s); local fallback' % str(e)[:160], flush=True)
     cmd = [sys.executable, os.path.join('training', 'book_gate.py'),
            '--book', book, '--games', str(games),
            '--titanium', item['exe'], '--targs', 'serve', '--tup', tup,
@@ -246,6 +255,12 @@ def main():
                     help='skip idle wait, gate immediately')
     ap.add_argument('--only', default='',
                     help='gate only this item tag (manual trigger)')
+    ap.add_argument('--commit', default='',
+                    help='pin a specific commit instead of branch HEAD (default: latest)')
+    ap.add_argument('--cloud', action='store_true',
+                    help='MANUAL ONLY: run matches on Modal cloud (default: local '
+                         'background). Needs training/cloud_backend.py configured; '
+                         'falls back to local with a warning otherwise.')
     a = ap.parse_args()
 
     if a.only:
@@ -275,9 +290,22 @@ def main():
     if os.path.exists(STOP):
         os.remove(STOP)
     logf = open(os.path.join(REPO, 'logs', 'auto_gate.log'), 'a')
+    cloud = None
+    if a.cloud:
+        try:
+            sys.path.insert(0, os.path.join(REPO, 'training'))
+            import cloud_backend as cb
+            cloud = cb
+            print('CLOUD backend active (manual override)', flush=True)
+        except Exception as e:
+            print('cloud requested but backend missing (%s); local fallback' % e, flush=True)
     for item in queue:
         if a.only and item['tag'] != a.only:
             continue
+        if a.commit:
+            item['commit'] = a.commit
+        if cloud is not None:
+            item['cloud'] = cloud
         if stop_requested():
             print('STOP requested, exiting queue', flush=True)
             break
