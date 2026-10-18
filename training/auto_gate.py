@@ -265,6 +265,7 @@ def main():
 
     if a.only:
         a.force = True
+    os.makedirs(os.path.join(REPO, 'logs'), exist_ok=True)
 
     if not a.force:
         print('watching CPU: need <%g%% for %g min (reset at >=%g%%)' % (
