@@ -5,12 +5,14 @@
   "branch": "exp/search-r1params",
   "worktree": "C:/gitProjects/titanium-gate-r1",
   "main_exe": "C:/gitProjects/titanium-main/target/release/titanium-cli.exe",
-  "tup": "C:\\gitProjects\\engines\\titan_champ.tup",
+  "tup": "C:/gitProjects/engines/titan_champ.tup",
   "books": [
-   "data/nnue/book100u.txt",
-   "data/nnue/book100v.txt",
-   "data/nnue/book100w.txt",
-   "data/nnue/book100x.txt"
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100u.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100v.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100w.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100x.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100y.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100z.txt"
   ],
   "games": 200,
   "nodes": 5000,
@@ -24,12 +26,14 @@
   "branch": "exp/search-hyperlmr",
   "worktree": "C:/gitProjects/titanium-gate-hyper",
   "main_exe": "C:/gitProjects/titanium-main/target/release/titanium-cli.exe",
-  "tup": "C:\\gitProjects\\engines\\titan_champ.tup",
+  "tup": "C:/gitProjects/engines/titan_champ.tup",
   "books": [
-   "data/nnue/book100u.txt",
-   "data/nnue/book100v.txt",
-   "data/nnue/book100w.txt",
-   "data/nnue/book100x.txt"
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100u.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100v.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100w.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100x.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100y.txt",
+   "C:/gitProjects/titanium-ataxx/data/nnue/book100z.txt"
   ],
   "games": 200,
   "nodes": 5000,
