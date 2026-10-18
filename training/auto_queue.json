@@ -1,0 +1,40 @@
+[
+ {
+  "tag": "r1params-ext",
+  "desc": "R1 search thetas vs main, SPRT extension (prior screen 119-81 LLR +1.86)",
+  "branch": "exp/search-r1params",
+  "worktree": "C:\\gitProjects\\titanium-ataxx",
+  "main_exe": "C:\\gitProjects\\titanium-main\\target\\release\\titanium-cli.exe",
+  "tup": "C:\\gitProjects\\engines\\titan_champ.tup",
+  "books": [
+   "data/nnue/book100u.txt",
+   "data/nnue/book100v.txt",
+   "data/nnue/book100w.txt",
+   "data/nnue/book100x.txt"
+  ],
+  "games": 200,
+  "nodes": 5000,
+  "max_chunks": 20,
+  "seed": 200,
+  "enabled": true
+ },
+ {
+  "tag": "hyperlmr",
+  "desc": "Hyperbolic LMR (Moonbird curve) vs flat (screen 101-99 LLR -0.22)",
+  "branch": "exp/search-hyperlmr",
+  "worktree": "C:\\gitProjects\\titanium-ataxx",
+  "main_exe": "C:\\gitProjects\\titanium-main\\target\\release\\titanium-cli.exe",
+  "tup": "C:\\gitProjects\\engines\\titan_champ.tup",
+  "books": [
+   "data/nnue/book100u.txt",
+   "data/nnue/book100v.txt",
+   "data/nnue/book100w.txt",
+   "data/nnue/book100x.txt"
+  ],
+  "games": 200,
+  "nodes": 5000,
+  "max_chunks": 20,
+  "seed": 300,
+  "enabled": true
+ }
+]
