@@ -59,11 +59,13 @@ def cpu_pct():
         out = subprocess.run(
             ['typeperf', r'\Processor(_Total)\% Processor Time', '-sc', '1'],
             capture_output=True, text=True, timeout=30).stdout
-        m = re.findall(r'"([\d.,]+)"', out)
-        if m:
-            return float(m[-1].replace(',', '.'))
+        # data line looks like: "10/18/2026 22:12:47.826","12.151063"
+        for line in reversed(out.strip().splitlines()):
+            if '","' in line:
+                val = line.rsplit('","', 1)[1].strip().strip('"')
+                return float(val.replace(',', '.'))
     except Exception as e:
-        print('typeperf failed: %s' % str(e)[:120], flush=True)
+        print('typeperf failed: %s' % str(e)[:160], flush=True)
     try:
         out = subprocess.run(
             ['wmic', 'cpu', 'get', 'loadpercentage', '/value'],
