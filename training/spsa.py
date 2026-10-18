@@ -32,10 +32,13 @@ PARAMS = [
     ('RFP1', 189, 0, 2000, 50.0, 100.0),
     ('RFP2', 491, 0, 2000, 70.0, 140.0),
     ('RFP3', 754, 0, 2000, 100.0, 200.0),
-    # Intent ordering weights (game-SPSA scale: a/c = 2 per R1).
-    ('JumpEscape', 1500, 0, 10000, 500.0, 1000.0),
-    ('JumpAttack', 600, 0, 10000, 500.0, 1000.0),
-    ('JumpGamble', 800, 0, 10000, 500.0, 1000.0),
+    # Intent ordering weights (TIER-CROSSING: ordering is a step function
+    # of tier gaps (capture 1k-8k, killer 100k) — c must span tiers or the
+    # gradient is exactly zero. First attempt c=500/a=1000: 25 iters, thetas
+    # moved 0.17 total, scores pure noise. c=2500 crosses tiers.
+    ('JumpEscape', 1500, 0, 10000, 2500.0, 5000.0),
+    ('JumpAttack', 600, 0, 10000, 2500.0, 5000.0),
+    ('JumpGamble', 800, 0, 10000, 2500.0, 5000.0),
 ]
 
 
