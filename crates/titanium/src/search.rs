@@ -121,11 +121,11 @@ impl Default for SearchParams {
             lmr_gap1: 2000000000,
             lmr_gap2: 2000000000,
             pcut_depth: 5,
-            pcut_margin: 250,
+            pcut_margin: 2000000000, // OFF (S55pcut3: pooled +7 neutral, unproven — ship only SPRT-passed)
             pcut_reduce: 3,
-            jump_escape: 1500,
-            jump_attack: 600,
-            jump_gamble: 800,
+            jump_escape: 0, // OFF (S55intent2: rejected -63 at 1500/600/800)
+            jump_attack: 0,
+            jump_gamble: 0,
             null_rdiv: 0,
         }
     }
