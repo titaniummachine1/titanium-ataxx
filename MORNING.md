@@ -1,5 +1,21 @@
 # MORNING 2026-10-19 — overnight shift report
 
+## !!! READ FIRST: the working line is missing O1 (must rebase before any merge)
+- Commit 8cdbb6b (exp/uai-protocol, "zero behavior change") REBUILT search.rs from a
+  template WITHOUT the S42 O1 hole-aware jump ordering (+110..+270). Everything tonight
+  (all screens) ran O1-less. Self-play verdicts are internally valid (same binary both
+  sides) but absolute magnitudes may shift on the O1 base, and ORDERING mechanisms
+  (intent) interact directly with O1's ordering — intent must be RETESTED with O1 present.
+- Parity clean-tree vs sterile-main (73a859d, has O1): 94-106 (af) + 97-103 (ag) =
+  191-209/400, LLR -1.71. Explained (missing O1), but note the gap is only -16, not -110:
+  the main-vs-intent diff is 301+/150- (more than just O1+my blocks) — REVIEW the full
+  diff in the morning; something else may differ (stale sterile binary? other dropped code?).
+- Morning step 0: rebase working line onto main (restore O1 + tree2 default eval if
+  applicable), re-verify parity ≈100-100, THEN re-screen probcut/intent/dynr deltas.
+  Do NOT merge anything until parity holds.
+- Eval note: screens used --tuple titan_champ.tup explicitly (both sides, consistent).
+  Main now defaults to tupS55tree.tup (73a859d). Confirm which eval the morning gates use.
+
 ## TL;DR (read this, then LEDGER tail)
 - **ProbCut: artifact found + fixed, mechanism neutral.** The 163-37 was INTEGER OVERFLOW
   (`beta + margin` wraps at INF-beta PV nodes; the OFF-switch margin 2e9 was the loaded gun).
