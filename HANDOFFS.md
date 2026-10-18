@@ -1,3 +1,11 @@
+## STATE FOR NEW SESSION (2026-10-19 MORNING - OVERNIGHT SHIFT IN PROGRESS)
+- Branches: exp/search-probcut (2223603, binary in target/release = pcut build), exp/search-lmrcurve (aace280, has night_shift.py + Curve PARAMS + ledger S55pcut). Worktree starts night on lmrcurve, driver restores probcut at end.
+- S55pcut: 163-37(z) / 102-98(y) / 98-102(x) @5k. Pooled +75 but hetero -> PARKED per v4 (x-leg behind flips presumption). Defaults untouched. Open: why is z tactical-favorable? Study z-positions motif before any retry.
+- S55lmrtab: 60-iter table tune NO convergence -> SCREEN-FAIL, nothing folded. Curve (mode 3, 4 params) is the retry: night driver builds it to target-curve, smokes, tunes 40 iters --force-mode 3 on deep_fresh, reports only.
+- NIGHT: titan-night task runs logs/run_night.cmd -> training/night_shift.py. Outputs: logs/night.log, logs/night_results.json, logs/NIGHT_REPORT.md, logs/sloss_curve_run.log. Kill switch: create C:\gitProjects\logs\STOP. NOTHING merges/folds overnight (driver has no such code path).
+- Resume: read logs/NIGHT_REPORT.md + LEDGER tail. Then: judge pcut (likely stays parked), screen curve thetas IF tune converged (game screen before any fold!), next ideas queued: ProbCut booked... actually pcut done; remaining backlog: dynamic null R, Texel hand-eval, phase-input training, hole ordering, learned time mgmt.
+- Box notes: Edit tool preserves mtime -> ALWAYS os.utime after edits + verify git diff shows change; python stale __pycache__ after mtime-preserving edits -> delete training/__pycache__ when imports act stale; schtasks 261-char /tr limit; typeperf CPU sensor; target/ is gitignored (safe to checkout branches while a screen runs, but NEVER rebuild into target/release mid-screen - use CARGO_TARGET_DIR elsewhere).
+
 ## STATE FOR NEW SESSION (2026-10-05 S31 PROMOTION PROTOCOL DONE — MAIN STANDS)
 
 - Champ tupS25ow20 vs MAIN 1a27b92 @5k 100g = 25-73-2 (CI [0.174,0.346], -182). Conclusive REJECT, no merge. Self-check pooled to 100g: 45-51-4, identity-consistent. Law 10: no gate stops below 100g.
