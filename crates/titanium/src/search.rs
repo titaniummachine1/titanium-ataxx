@@ -659,7 +659,7 @@ impl<'a> Searcher<'a> {
         if null_allowed
             && ply > 0
             && depth >= self.params.pcut_depth
-            && static_eval >= beta + self.params.pcut_margin
+            && static_eval >= beta.saturating_add(self.params.pcut_margin)
         {
             let plist = b.legal_moves();
             if !plist.is_empty() {
@@ -677,7 +677,7 @@ impl<'a> Searcher<'a> {
                     let (a, z) = self.stack.acc.split_at_mut(ply as usize + 1);
                     net.update_child(&a[ply as usize], &mut z[0], b, &pchild);
                 }
-                let pc_beta = beta + self.params.pcut_margin;
+                let pc_beta = beta.saturating_add(self.params.pcut_margin);
                 let pscore = -self.negamax(
                     &pchild,
                     -pc_beta,
