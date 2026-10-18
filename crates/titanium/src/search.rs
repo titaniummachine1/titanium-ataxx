@@ -659,6 +659,7 @@ impl<'a> Searcher<'a> {
         if null_allowed
             && ply > 0
             && depth >= self.params.pcut_depth
+            && beta.abs() <= MATE
             && static_eval >= beta.saturating_add(self.params.pcut_margin)
         {
             let plist = b.legal_moves();
