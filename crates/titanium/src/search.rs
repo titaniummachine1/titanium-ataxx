@@ -63,10 +63,16 @@ pub struct SearchParams {
     pub lmr_r1: u32,
     pub lmr_r2: u32,
     /// LMR shape: 0 = flat (r1/r2 split, autaxx form), 1 = hyperbolic
-    /// (Moonbird form: reduced = depth*half/(half+idx) - sub). Default flat.
+    /// (Moonbird form: reduced = base*half / (half+idx) - sub).
     pub lmr_mode: u32,
     pub lmr_half: u32,
     pub lmr_sub: u32,
+    /// Late-move pruning (autaxx form): at depth <= lmp_depth, stop after
+    /// lmp_base quiets once a capture was searched (proves captures exist).
+    /// 0 = off. Candidate default ON (branch exp/search-lmp).
+    pub lmp_mode: u32,
+    pub lmp_depth: u32,
+    pub lmp_base: u32,
 }
 
 impl Default for SearchParams {
@@ -91,6 +97,9 @@ impl Default for SearchParams {
             lmr_mode: 0,
             lmr_half: 4,
             lmr_sub: 0,
+            lmp_mode: 1,
+            lmp_depth: 3,
+            lmp_base: 24,
         }
     }
 }
@@ -481,6 +490,9 @@ impl<'a> Searcher<'a> {
             "LMRMode" => self.params.lmr_mode = val.clamp(0, 1) as u32,
             "LMRHalf" => self.params.lmr_half = val.max(1) as u32,
             "LMRSub" => self.params.lmr_sub = val.max(0) as u32,
+            "LMPMode" => self.params.lmp_mode = val.clamp(0, 1) as u32,
+            "LMPDepth" => self.params.lmp_depth = val.max(0) as u32,
+            "LMPBase" => self.params.lmp_base = val.max(0) as u32,
             _ => return false,
         }
         true
@@ -671,6 +683,8 @@ impl<'a> Searcher<'a> {
         let mut best = i32::MIN;
         let mut best_mv: u32 = 0xFFFF;
         let mut move_idx = 0usize;
+        let mut quiets_tried = 0u32;
+        let mut cap_seen = false;
         loop {
             let m = {
                 let list = &mut self.stack.lists[ply as usize];
@@ -679,6 +693,22 @@ impl<'a> Searcher<'a> {
                 }
                 list.pop_best()
             };
+
+            // Late-move pruning (autaxx form): at low depth, once enough
+            // quiets are searched AND a capture exists this node (proven by
+            // having searched one — ordering puts captures first), stop.
+            let is_cap = (b.occ[(b.turn as usize) ^ 1] & RING1[m.to as usize]) != 0;
+            if is_cap {
+                cap_seen = true;
+            } else if self.params.lmp_mode == 1
+                && depth <= self.params.lmp_depth
+                && quiets_tried >= self.params.lmp_base
+                && cap_seen
+            {
+                break;
+            } else {
+                quiets_tried += 1;
+            }
 
             // PVS + universal LMR (autaxx): first move full window full
             // depth; every later move scouts with a null window at a reduced

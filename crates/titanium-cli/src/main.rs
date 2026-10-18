@@ -698,6 +698,9 @@ fn serve_cmd(
             out_line("option name LMRMode type spin default 0 min 0 max 1");
             out_line("option name LMRHalf type spin default 4 min 1 max 16");
             out_line("option name LMRSub type spin default 0 min 0 max 4");
+            out_line("option name LMPMode type spin default 1 min 0 max 1");
+            out_line("option name LMPDepth type spin default 3 min 0 max 8");
+            out_line("option name LMPBase type spin default 24 min 0 max 100");
             out_line("uaiok");
         } else if t == "isready" {
             out_line("readyok");
