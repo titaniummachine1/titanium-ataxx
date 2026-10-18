@@ -40,5 +40,5 @@ __pycache__/
 Thumbs.db
 
 # Shipped champion eval (LAST so it overrides *.tup above): our own SGD
-# weights, 28KB, main runs it by default. Every other blob stays out.
-!/data/nnue/tupS53r0.tup
+# weights, main runs it by default. Every other blob stays out.
+!/data/nnue/tupS54align.tup
