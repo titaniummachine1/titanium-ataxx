@@ -354,6 +354,8 @@ def main():
         row = {'iter': k, 'lp': round(lp, 6), 'lm': round(lm, 6),
                'agree_p': round(agree_p, 4), 'agree_m': round(agree_m, 4)}
         for j, nm in enumerate(names):
+            if pmap[nm][4] == 0:
+                continue  # pinned param (e.g. mode selector): set, not tuned
             g = (lp - lm) / (2 * ck * pmap[nm][4] * plus[j])
             step = ak * pmap[nm][5] * a.ascale * g
             theta[nm] = min(pmap[nm][3], max(pmap[nm][2], theta[nm] - step))
