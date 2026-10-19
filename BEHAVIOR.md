@@ -93,6 +93,13 @@ real memory. Update them the moment something happens, not at the end.
     (same seat, same startpos diverged at move 4). In-process sides get a
     fresh searcher per game; UAI children get `uainewgame`. A gate run
     without per-game resets is VOID.
+13. **GATES RUN BETWEEN GIT REFS ONLY (user order 2026-10-19, fishtest
+    rule).** Both sides run code that exists as a git object — a branch, or
+    a commit — never a dirty worktree, never an untracked binary. Otherwise
+    the exe hash points at nothing and the gate cannot be linked to code,
+    reproduced, or merged. Every gate row records: exe sha + commit hash +
+    net hash on BOTH sides. Rebuild from a clean checkout of the recorded
+    ref and re-hash before the first game; if the hash differs, stop.
 
 ## Mistakes ledger (written when scolded, read before acting)
 

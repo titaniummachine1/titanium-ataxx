@@ -14,7 +14,7 @@ Verify Titanium gate `$ARGUMENTS` (a tag substring, e.g. branch or net tag). The
 
 Steps, in order:
 
-1. Binaries + nets: record exe hash + `.tup` hash on BOTH sides (first question on any strength task). Classical-vs-classical (≈-500 Elo vs net-main) NEVER proves strength.
+1. Binaries + nets + refs: record exe hash + COMMIT hash + `.tup` hash on BOTH sides (first question on any strength task). Both sides must be git refs (branch/commit, never dirty) — rebuild from the ref, re-hash, stop if it differs. Classical-vs-classical (≈-500 Elo vs net-main) NEVER proves strength.
 2. Book + seats: confirm book lines used, both seats per line, 50/50 per side counted from the log — never assumed.
 3. Determinism: spot-check repeated line+seat pairs replay identically; if not, VOID the run and fix the harness.
 4. SPRT: recompute LLR (and Elo + CI); report pooled W-L-D, LLR, verdict verbatim — never upgrade. AHEAD-insufficient → extend; BEHIND → extend (FOMO); conclusive → propose merge/reject FOR THE USER TO CALL.

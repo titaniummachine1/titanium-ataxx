@@ -48,6 +48,8 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
    replay bit-identically or the run is VOID (infra bug).
 7. **CLEAR ENGINE MEMORY EVERY GAME.** `uainewgame` before every gate game,
    both sides — TT/killers/history reset. No reset = VOID run.
+8. **GATES RUN BETWEEN GIT REFS ONLY (fishtest rule).** Both sides = branch
+   or commit, never dirty. Record exe sha + commit hash + net hash both sides.
 8. **ONE variant per binary.** Experiments live on branches, not flags in hot path.
 9. **TRASH UNTIL PROVEN.** Microbenchmarks don't crown — alternating `sperft`
    pairs + real SPRT do. Single/min-of-N probes are jitter.
