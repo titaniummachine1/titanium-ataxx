@@ -16,9 +16,12 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use titanium::{best_move, Board, Move, SearchLimits, Searcher, RING1};
+use titanium::{best_move, now_ms, parallel_search, parallel_search_bz, Board, Move, SearchLimits, Searcher, RING1};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -49,10 +52,17 @@ fn main() -> ExitCode {
         "show" => show_cmd(),
         "genbench" => genbench_cmd(flag_int(&args, "--iters").unwrap_or(200_000) as u64),
         "serve" => serve_cmd(
-            flag_int(&args, "--tt-bits").unwrap_or(20) as usize,
+            flag_int(&args, "--tt-bits").unwrap_or(if args.iter().any(|x| x == "--tournament") {
+                23
+            } else {
+                20
+            }) as usize,
             flag_str(&args, "--net"),
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
+            args.iter().any(|x| x == "--tournament"),
+            flag_int(&args, "--threads").map(|n| n as usize),
+            args.iter().any(|x| x == "--bz-rules"),
         ),
         "match" => match_cmd(
             flag_int(&args, "--games").unwrap_or(20) as u32,
@@ -88,8 +98,9 @@ fn print_help() {
         "titanium-cli - Ataxx engine test harness\n\
          \n\
          USAGE (eval preset = --net <file.s1|none>; NO env vars):\n\
-         \x20 titanium-cli bench [--depth N] [--net F]    search speed benchmark\n\
-         \x20 titanium-cli serve [--net F]                UAI engine (match child)\n\
+          \x20 titanium-cli bench [--depth N] [--net F]    search speed benchmark\n\
+          \x20 titanium-cli serve [--net F] [--tournament] [--threads N]\n\
+          \x20             UAI engine (tournament = autotuned SMP + 128MB TT + auto-ponder)\n\
          \x20 titanium-cli match --games N --opp \"CMD\" [--net F] [--opp-net F]\n\
          \x20             [--time MS --opp-time MS | --nodes N --opp-nodes N]\n\
          \x20             [--out F]                       colors alternate\n\
@@ -641,16 +652,140 @@ fn out_line(s: &str) {
     let _ = o.flush();
 }
 
+/// Work items for the search worker thread. The protocol thread keeps
+/// reading while a search runs (so `stop` / `ponderhit` are honored live);
+/// everything touching the Searcher goes through this FIFO channel.
+enum Job {
+    SetParam(String, i64),
+    SetHash(usize),
+    SetThreads(usize),
+    SetBzRules(bool),
+    NewGame,
+    Go {
+        board: Option<Box<Board>>,
+        limits: SearchLimits,
+        /// Silent jobs (tournament auto-ponder) warm the TT but never emit
+        /// `bestmove` — the GUI never asked for a move on that position.
+        silent: bool,
+    },
+    Quit,
+}
+
+/// Same-position identity for FEN continuity: occ + blockers + side only.
+/// ply/passes are deliberately excluded — the continuous board made via
+/// make() carries the true counters.
+fn board_state_eq(a: &Board, b: &Board) -> bool {
+    a.occ == b.occ && a.blockers == b.blockers && a.turn == b.turn
+}
+
+/// Can `target` be reached from `old` in <= `max_plies` legal plies (real
+/// moves, or a pass when side has none)? Returns that child built via
+/// make() so ply/passes/TT identity carry over — the "site sent a position
+/// instead of the move" continuity rule: never wipe memory when the
+/// position is inside our legal-move set. Empty-cell count strictly falls
+/// per move, so a match is always the true path (no false positives).
+fn reach_board(old: &Board, target: &Board, max_plies: u32) -> Option<Board> {
+    if board_state_eq(old, target) {
+        return Some(*old);
+    }
+    let mut frontier: Vec<Board> = vec![*old];
+    for _ in 1..=max_plies {
+        let mut next: Vec<Board> = Vec::new();
+        for b in &frontier {
+            let list = b.legal_moves();
+            let mut kids: Vec<Board> = Vec::with_capacity(list.len() + 1);
+            for m in list.iter() {
+                kids.push(b.make(m));
+            }
+            if kids.is_empty() {
+                kids.push(b.make_pass());
+            }
+            for c in kids {
+                if board_state_eq(&c, target) {
+                    return Some(c);
+                }
+                next.push(c);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    None
+}
+
+/// Periodic `info` while searching (fn pointer hook on the Searcher).
+fn serve_emit_info(depth: u32, score: i32, nodes: u64, ms: u64) {
+    out_line(&format!(
+        "info depth {depth} score cp {score} nodes {nodes} time {ms}"
+    ));
+}
+
+/// Fixed-window throughput probe: total nodes in a 120ms Lazy-SMP search
+/// from the start position with a fresh 16MB TT.
+fn measure_threads(b: &Board, threads: usize) -> u64 {
+    let mut s = Searcher::with_tt_bits(20);
+    let limits = SearchLimits {
+        time: Some(Duration::from_millis(120)),
+        max_nodes: None,
+        max_depth: u32::MAX,
+    };
+    parallel_search(&mut s, b, &limits, threads).nodes
+}
+
+/// Tournament startup calibration: try 1, 2, 3, ... threads (then 4, 6, 8,
+/// doubling past 8) and stop when adding threads no longer grows total
+/// throughput — never oversubscribe into slowdown. Caps at the machine's
+/// parallelism (and 32). Each probe is ~120ms; the whole sweep is ~1s once
+/// per process start, amortized over the tournament.
+fn autotune_threads() -> usize {
+    let avail = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(32);
+    if avail <= 1 {
+        return 1;
+    }
+    let b = Board::start();
+    let mut cand = vec![1usize, 2, 3];
+    let mut t = 4;
+    while t <= avail {
+        cand.push(t);
+        t = if t < 8 { t + 2 } else { t * 2 };
+    }
+    let mut best_t = 1usize;
+    let mut best_nodes = 1u64;
+    for &n in &cand {
+        if n > avail {
+            break;
+        }
+        let nodes = measure_threads(&b, n).max(1);
+        eprintln!("tournament autotune: threads={n} nodes={nodes}");
+        // Always accept 1/2/3 (ties keep the smaller count); past that,
+        // require a real >5% gain or stop — more threads are oversubscribe.
+        let hurdle = if n <= 3 { best_nodes } else { best_nodes * 105 / 100 };
+        if nodes >= hurdle {
+            best_t = n;
+            best_nodes = best_nodes.max(nodes);
+        } else {
+            break;
+        }
+    }
+    best_t.max(1)
+}
+
 fn serve_cmd(
     tt_bits: usize,
     net_spec: Option<String>,
     tup_spec: Option<String>,
     tup_native: bool,
+    tournament: bool,
+    threads_opt: Option<usize>,
+    bz_rules: bool,
 ) -> ExitCode {
-    let stdin = io::stdin();
-    let mut searcher = Searcher::with_tt_bits(tt_bits);
-    // Eval presets come from --net / --tuple ONLY. Owned tables outlive the
-    // loop; searcher borrows them per-position (no refcount).
+    // Eval presets come from --net / --tuple ONLY. Owned tables move into
+    // the worker thread together with the searcher that borrows them.
     let owned = match load_net_preset(&net_spec) {
         Ok(n) => n,
         Err(e) => {
@@ -658,7 +793,6 @@ fn serve_cmd(
             return ExitCode::FAILURE;
         }
     };
-    searcher.set_sancta(owned.as_ref());
     let owned_tup = match load_tuple_preset(&tup_spec) {
         Ok(t) => t,
         Err(e) => {
@@ -666,9 +800,149 @@ fn serve_cmd(
             return ExitCode::FAILURE;
         }
     };
-    searcher.set_tuple(owned_tup.as_ref());
-    searcher.set_tuple_native(tup_native && owned_tup.is_some());
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let hit_deadline = Arc::new(AtomicU64::new(0));
+    let (tx, rx) = mpsc::channel::<Job>();
+
+    // Thread count: explicit --threads wins; tournament mode autotunes
+    // (1,2,3... while total throughput grows); otherwise single-threaded.
+    let threads: usize = match threads_opt {
+        Some(n) => n.clamp(1, 256),
+        None if tournament => autotune_threads(),
+        None => 1,
+    };
+
+    // The search worker owns the Searcher (nets borrowed from its locals).
+    let sf_worker = Arc::clone(&stop_flag);
+    let hd_worker = Arc::clone(&hit_deadline);
+    let worker = std::thread::spawn(move || {
+        let sf_ctrl = Arc::clone(&sf_worker);
+        let hd_ctrl = Arc::clone(&hd_worker);
+        let mut searcher = Searcher::with_tt_bits(tt_bits);
+        searcher.set_sancta(owned.as_ref());
+        searcher.set_tuple(owned_tup.as_ref());
+        searcher.set_tuple_native(tup_native && owned_tup.is_some());
+        searcher.set_external_control(sf_worker, hd_worker);
+        searcher.set_iteration_hook(serve_emit_info);
+        let mut threads = threads;
+        // Rules selection is a BUILD-TIME monomorphization in the engine
+        // (`search` vs `search_bz`); this bool only picks which compiled
+        // copy runs — never a hot-path branch. Changing it clears the TT:
+        // bounds learned under one rule set are unsound under the other.
+        let mut bz_rules = bz_rules;
+        // Tournament tryhard: after every real move, keep thinking on the
+        // opponent's clock (silent ponder on the post-move board). The warm
+        // TT carries over, so the site never needs to send `ponderhit` —
+        // the next `position` + `go` just converts into a timed search.
+        let auto_ponder = tournament;
+        while let Ok(job) = rx.recv() {
+            match job {
+                Job::SetParam(name, v) => {
+                    searcher.set_param(&name, v);
+                }
+                Job::SetHash(bits) => searcher.set_tt_bits(bits),
+                Job::SetThreads(n) => {
+                    threads = n.clamp(1, 256);
+                }
+                Job::SetBzRules(on) => {
+                    if on != bz_rules {
+                        bz_rules = on;
+                        searcher.reset_for_new_game();
+                    }
+                }
+                Job::NewGame => searcher.reset_for_new_game(),
+                Job::Go {
+                    board,
+                    limits,
+                    silent,
+                } => {
+                    // Fresh search: clear the external switches. A stale
+                    // `stop` aimed at a previous search must not kill this one.
+                    sf_ctrl.store(false, Ordering::Relaxed);
+                    hd_ctrl.store(0, Ordering::Relaxed);
+                    let Some(b) = board else {
+                        eprintln!("serve: go without a position — replying 0000 (desync)");
+                        if !silent {
+                            out_line("bestmove 0000");
+                        }
+                        continue;
+                    };
+                    // Classic early-out: no legal reply and no forced terminal
+                    // score to report. Under BZ rules the search itself owns
+                    // this (root fast path scores the filled-count terminal).
+                    if !bz_rules && (b.game_over() || !b.has_moves(b.turn)) {
+                        if !silent {
+                            out_line("bestmove 0000");
+                        }
+                        continue;
+                    }
+                    // Build-time dispatch: exactly one compiled copy runs.
+                    let r = if bz_rules {
+                        parallel_search_bz(&mut searcher, &b, &limits, threads)
+                    } else {
+                        parallel_search(&mut searcher, &b, &limits, threads)
+                    };
+                    if silent {
+                        // Auto-ponder: TT warmed, nothing to report.
+                        continue;
+                    }
+                    let mv = match r.best {
+                        Some(m) => {
+                            if m.is_clone() {
+                                Board::sq_name(m.to)
+                            } else {
+                                format!("{}{}", Board::sq_name(m.from), Board::sq_name(m.to))
+                            }
+                        }
+                        None => "0000".to_string(),
+                    };
+                    // Final info line (GUIs, logs, search-loss tuning).
+                    out_line(&format!(
+                        "info depth {} score cp {} nodes {} time {}",
+                        r.depth,
+                        r.score,
+                        r.nodes,
+                        r.elapsed.as_millis()
+                    ));
+                    out_line(&format!("bestmove {mv}"));
+                    // Think on the opponent's time: silent infinite search on
+                    // the post-move board. Aborted by the next go/stop/quit
+                    // (pre-Go stop flag); never emits a move of its own.
+                    if auto_ponder {
+                        if let Some(m) = &r.best {
+                            let post = b.make(*m);
+                            if !post.game_over()
+                                && post.has_moves(post.turn)
+                                && !sf_ctrl.load(Ordering::Relaxed)
+                            {
+                                hd_ctrl.store(0, Ordering::Relaxed);
+                                let pl = SearchLimits {
+                                    time: None,
+                                    max_nodes: None,
+                                    max_depth: u32::MAX,
+                                };
+                                if bz_rules {
+                                    let _ = parallel_search_bz(&mut searcher, &post, &pl, threads);
+                                } else {
+                                    let _ = parallel_search(&mut searcher, &post, &pl, threads);
+                                }
+                            }
+                        }
+                    }
+                }
+                Job::Quit => break,
+            }
+        }
+    });
+    out_line(&format!(
+        "info string titanium tournament={tournament} threads={threads} tt_bits={tt_bits}"
+    ));
+
+    let stdin = io::stdin();
     let mut current: Option<Board> = None;
+    // Allocation computed at `go ponder` time, armed as a deadline by
+    // `ponderhit` (pondering runs with no clock until then).
+    let mut pending_alloc_ms: Option<f64> = None;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         let t = line.trim().to_string();
@@ -676,12 +950,21 @@ fn serve_cmd(
             continue;
         }
         if t == "quit" {
+            stop_flag.store(true, Ordering::Relaxed);
+            let _ = tx.send(Job::Quit);
             break;
         }
         if t == "uai" {
             out_line("id name titanium-ataxx");
             out_line("id author titaniummachine1");
-            out_line("option name Hash type spin default 256 min 1 max 16384");
+            out_line(&format!(
+                "option name Hash type spin default {} min 1 max 16384",
+                if tournament { 128 } else { 256 }
+            ));
+            out_line(&format!(
+                "option name Threads type spin default {threads} min 1 max 256"
+            ));
+            out_line("option name BotzoneRules type check default false");
             out_line("option name Tempo type spin default 150 min 0 max 1000");
             out_line("option name ContactPen type spin default 15 min 0 max 200");
             out_line("option name MulticapPen type spin default 20 min 0 max 200");
@@ -725,6 +1008,8 @@ fn serve_cmd(
             out_line("option name CurveCap type spin default 5 min 1 max 8");
             out_line("uaiok");
         } else if t == "isready" {
+            // Answer immediately even mid-search (Stockfish behavior); the
+            // job FIFO still orders config before the next `go`.
             out_line("readyok");
         } else if let Some(rest) = t.strip_prefix("setoption name ") {
             // "setoption name <Name> value <N>": Hash resizes the TT,
@@ -736,12 +1021,22 @@ fn serve_cmd(
                         // MB -> bits: entries are ~16 bytes; bits = log2(mb*2^20/16).
                         let bits = ((mb as f64 * 65536.0).log2().round() as usize)
                             .clamp(10, 26);
-                        searcher.set_tt_bits(bits);
+                        let _ = tx.send(Job::SetHash(bits));
                     }
+                } else if name == "Threads" {
+                    if let Ok(n) = val.trim().parse::<usize>() {
+                        let _ = tx.send(Job::SetThreads(n.clamp(1, 256)));
+                    }
+                } else if name == "BotzoneRules" {
+                    // No-pass Botzone judge rules (stalemate = terminal).
+                    // Default off = classic Ataxx with passes; the Botzone
+                    // bundle hardcodes it on (it has no setoption channel).
+                    let on = matches!(val.trim().to_lowercase().as_str(), "1" | "true" | "on");
+                    let _ = tx.send(Job::SetBzRules(on));
                 } else {
                     match val.trim().parse::<i64>() {
                         Ok(v) => {
-                            searcher.set_param(name, v);
+                            let _ = tx.send(Job::SetParam(name.to_string(), v));
                         }
                         Err(_) => {
                             eprintln!("serve: bad value for {name}");
@@ -750,13 +1045,20 @@ fn serve_cmd(
                 }
             }
         } else if t == "uainewgame" {
-            searcher.reset_for_new_game();
+            let _ = tx.send(Job::NewGame);
         } else if t == "position startpos" || t.starts_with("position startpos ") {
             let mut b = Board::start();
             if let Some(mv) = t.split_once(" moves ") {
                 for tok in mv.1.split_whitespace() {
-                    if let Some(nb) = apply_uai_token(&b, tok) {
-                        b = nb;
+                    match apply_uai_token(&b, tok) {
+                        Some(nb) => b = nb,
+                        None => {
+                            // Desync: never skip silently — log loudly and
+                            // keep replaying best-effort on the stale board.
+                            eprintln!(
+                                "serve: bad move token '{tok}' — position drift, continuing best-effort"
+                            );
+                        }
                     }
                 }
             }
@@ -767,15 +1069,33 @@ fn serve_cmd(
                 Some((f, m)) => (f, Some(m)),
                 None => (fen, None),
             };
-            if let Some(mut b) = Board::from_ataxx_fen(fen_part.trim()) {
-                if let Some(mv) = moves_part {
-                    for tok in mv.split_whitespace() {
-                        if let Some(nb) = apply_uai_token(&b, tok) {
-                            b = nb;
+            match Board::from_ataxx_fen(fen_part.trim()) {
+                Some(mut b) => {
+                    // Continuity rule: sites that *load a position* instead
+                    // of replaying moves must not wipe our memory. If the
+                    // fen is reachable from where we stand within 2 legal
+                    // plies (our move + the opponent reply), adopt that
+                    // child via make() — exact ply/passes, same TT identity.
+                    if let Some(cont) =
+                        current.as_ref().and_then(|old| reach_board(old, &b, 2))
+                    {
+                        b = cont;
+                    }
+                    if let Some(mv) = moves_part {
+                        for tok in mv.split_whitespace() {
+                            match apply_uai_token(&b, tok) {
+                                Some(nb) => b = nb,
+                                None => eprintln!(
+                                    "serve: bad move token '{tok}' after fen — position drift, continuing best-effort"
+                                ),
+                            }
                         }
                     }
+                    current = Some(b);
                 }
-                current = Some(b);
+                None => {
+                    eprintln!("serve: unparseable fen — keeping previous position (desync)");
+                }
             }
         } else if t.starts_with("go") {
             let mut nodes: Option<u64> = None;
@@ -786,6 +1106,7 @@ fn serve_cmd(
             let mut binc: u64 = 0;
             let mut winc: u64 = 0;
             let mut infinite = false;
+            let mut ponder = false;
             let toks: Vec<&str> = t.split_whitespace().collect();
             for (i, k) in toks.iter().enumerate() {
                 match *k {
@@ -797,72 +1118,66 @@ fn serve_cmd(
                     "binc" => binc = toks.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0),
                     "winc" => winc = toks.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0),
                     "infinite" => infinite = true,
+                    "ponder" => ponder = true,
                     _ => {}
                 }
             }
-            // Incremental clock (websites/GUIs): our share = time/30 + inc/2,
-            // mirroring the standard minimal allocation. `infinite` on a
-            // synchronous search clears point limits and falls back to a
-            // bounded depth (stop is acknowledged but not mid-search).
-            if infinite {
-                nodes = None;
-                movetime = None;
-            }
+            // Incremental clock (websites/GUIs): our share = time/30 + inc/2.
             let clock_ms: Option<u64> = match current.as_ref() {
                 Some(b) if movetime.is_none() && (btime.is_some() || wtime.is_some()) => {
-                    let (t, inc) = if b.turn == 0 {
+                    let (tm, inc) = if b.turn == 0 {
                         (btime, binc)
                     } else {
                         (wtime, winc)
                     };
-                    t.map(|ms| (ms / 30 + inc / 2).max(1))
+                    tm.map(|ms| (ms / 30 + inc / 2).max(1))
                 }
                 _ => None,
             };
-            let reply = current
-                .as_ref()
-                .map(|b| {
-                    if b.game_over() || !b.has_moves(b.turn) {
-                        return ("0000".to_string(), None);
-                    }
-                    let limits = SearchLimits {
-                        time: movetime
-                            .filter(|ms| *ms > 0)
-                            .map(Duration::from_millis)
-                            .or_else(|| clock_ms.map(Duration::from_millis)),
-                        max_nodes: nodes,
-                        max_depth: depth.unwrap_or(24),
-                    };
-                    let r = searcher.search(b, &limits);
-                    let mv = match r.best {
-                        Some(m) => {
-                            if m.is_clone() {
-                                Board::sq_name(m.to)
-                            } else {
-                                format!("{}{}", Board::sq_name(m.from), Board::sq_name(m.to))
-                            }
-                        }
-                        None => "0000".to_string(),
-                    };
-                    // Standard UCI info line (GUIs, logs, and score-based
-                    // tooling such as search-loss tuning consume this).
-                    let info = format!(
-                        "info depth {} score cp {} nodes {} time {}",
-                        r.depth,
-                        r.score,
-                        r.nodes,
-                        r.elapsed.as_millis()
-                    );
-                    (mv, Some(info))
-                })
-                .unwrap_or_else(|| ("0000".to_string(), None));
-            if let (_, Some(info)) = &reply {
-                out_line(info);
+            // Stockfish semantics: `go infinite` / `go ponder` / bare `go`
+            // run until `stop` (or ponderhit); a time allotment burns its
+            // FULL budget (hard deadline, no soft early-exit); explicit
+            // `depth`/`nodes` bound first when present.
+            let alloc_ms: Option<u64> = movetime.filter(|ms| *ms > 0).or(clock_ms);
+            let time_ms: Option<u64> = if infinite || ponder {
+                None
+            } else {
+                alloc_ms
+            };
+            pending_alloc_ms = if ponder {
+                alloc_ms.map(|ms| ms as f64)
+            } else {
+                None
+            };
+            let limits = SearchLimits {
+                time: time_ms.map(Duration::from_millis),
+                max_nodes: nodes,
+                max_depth: depth.unwrap_or(u32::MAX),
+            };
+            // Abort any still-running search (double-`go` without `stop`);
+            // the worker clears the flag when it starts this job.
+            stop_flag.store(true, Ordering::Relaxed);
+            let _ = tx.send(Job::Go {
+                board: current.map(Box::new),
+                limits,
+                // GUI-requested searches always report. Silence is only for
+                // the worker's own auto-ponder jobs (created internally).
+                silent: false,
+            });
+        } else if t == "stop" {
+            stop_flag.store(true, Ordering::Relaxed);
+        } else if t == "ponderhit" {
+            // Convert the free ponder search into a timed one: deadline =
+            // now + the allocation computed at `go` time (our clock was
+            // frozen while pondering, so the allotment is still valid).
+            if let Some(alloc) = pending_alloc_ms.take() {
+                hit_deadline.store((now_ms() + alloc) as u64, Ordering::Relaxed);
             }
-            out_line(&format!("bestmove {}", reply.0));
         }
-        // "stop" ignored: searches are synchronous.
     }
+    stop_flag.store(true, Ordering::Relaxed);
+    let _ = tx.send(Job::Quit);
+    let _ = worker.join();
     ExitCode::SUCCESS
 }
 
@@ -1402,4 +1717,51 @@ fn genbench_cmd(iters: u64) -> ExitCode {
     );
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod serve_tests {
+    use super::*;
+
+    #[test]
+    fn continuity_adoption_keeps_counters() {
+        // A site that *loads a position* (FEN) instead of replaying moves
+        // must not wipe memory: reach_board() adopts the make() child, so
+        // ply/passes stay exact even when the FEN string flattened them.
+        let b0 = Board::start();
+        let b1 = b0.make(b0.legal_moves().move_at(0));
+        let b2 = b1.make(b1.legal_moves().move_at(0));
+        let target = Board::from_ataxx_fen(&b2.to_ataxx_fen()).expect("fen");
+        assert_eq!(target.ply, 2, "fen must restore ply");
+        // From two plies back: the "our move + opponent reply" case.
+        let got = reach_board(&b0, &target, 2).expect("reachable in 2 plies");
+        assert_eq!(got.ply, 2);
+        assert_eq!(got.passes, 0);
+        assert!(board_state_eq(&got, &target));
+        // From one ply back: the plain opponent-reply case.
+        let got1 = reach_board(&b1, &target, 2).expect("reachable in 1 ply");
+        assert_eq!(got1.ply, 2);
+        // Three plies ahead: outside the legal-move set -> caller rebuilds.
+        let b3 = b2.make(b2.legal_moves().move_at(0));
+        let t3 = Board::from_ataxx_fen(&b3.to_ataxx_fen()).expect("fen");
+        assert!(reach_board(&b0, &t3, 2).is_none());
+        // Identity: re-sending our own position adopts itself.
+        assert!(reach_board(&b2, &target, 2).is_some());
+    }
+
+    #[test]
+    fn continuity_pass_keeps_counters() {
+        // Full board: side to move has no moves, so the only legal child is
+        // a pass. The site sending the post-pass FEN must adopt make_pass()
+        // and keep ply/passes from the chain (pass counts as a ply).
+        let full = Board::from_ataxx_fen("xoxoxox/oxoxoxo/xoxoxox/oxoxoxo/xoxoxox/oxoxoxo/oxoxoxo x 0 1")
+            .expect("fen");
+        assert!(!full.has_moves(full.turn));
+        let passed = full.make_pass();
+        let target = Board::from_ataxx_fen(&passed.to_ataxx_fen()).expect("fen");
+        let got = reach_board(&full, &target, 1).expect("reachable via pass");
+        assert_eq!(got.ply, 1);
+        assert_eq!(got.passes, 1);
+        assert!(board_state_eq(&got, &target));
+    }
 }

@@ -905,6 +905,28 @@ impl Board {
         }
     }
 
+    /// Botzone-judge terminal: wipeout/full, or EITHER side stuck. The
+    /// platform has no passes — the judge ends the game the moment one side
+    /// cannot move, with the mobile side absorbing every empty square.
+    pub fn bz_over(&self) -> bool {
+        self.is_over() || !self.has_moves(0) || !self.has_moves(1)
+    }
+
+    /// Filled counts under the Botzone stalemate rule: a stuck side keeps
+    /// its stones; the mobile side absorbs every empty square
+    /// (`mobile = SQUARES - blockers - stuck`, exactly the judge's
+    /// `49 - stuck` on blocker-free platform boards). Both stuck (or both
+    /// mobile) → raw counts.
+    pub fn bz_counts(&self) -> (u32, u32) {
+        let (b, w) = self.counts();
+        let fill = SQUARES as u32 - self.blocker_cnt as u32;
+        match (self.has_moves(0), self.has_moves(1)) {
+            (false, false) | (true, true) => (b, w),
+            (false, true) => (b, fill - b),
+            (true, false) => (fill - w, w),
+        }
+    }
+
     /// Parse a 49-char board string (rows top->bottom, chars `.xo#`) plus a
     /// side char `b`/`w`.
     pub fn from_str(s: &str) -> Option<Board> {
@@ -990,9 +1012,12 @@ impl Board {
 
     /// libataxx-style FEN (rows top->bottom, digit runs, then side and two
     /// counters) for talking UAI to other engines: `6o/7/7/7/7/7/x6 x 0 1`.
-    /// Counters carry the game ply exactly (half = ply%2, full = ply/2+1;
-    /// ataxx has no fifty-move rule so the slots are free); a reader that
-    /// ignores them still gets a valid position with ply 0.
+    /// Counters are overloaded to carry our state exactly: half = consecutive
+    /// passes (0..2; ataxx has no halfmove clock so the slot is free), full =
+    /// ply/2 + 1 (ply parity is recoverable from side-to-move, since every
+    /// ply flips the turn). Readers that ignore the counters get a valid
+    /// position with ply 0, as before; foreign halfmove clocks >= 3 read as
+    /// passes 0 (never a false game-over).
     pub fn to_ataxx_fen(&self) -> String {
         let mut rows = Vec::with_capacity(7);
         for r in 0..SIZE {
@@ -1033,14 +1058,16 @@ impl Board {
             "{} {} {} {}",
             rows.join("/"),
             if self.turn == 0 { 'x' } else { 'o' },
-            self.ply % 2,
+            self.passes.min(2),
             self.ply / 2 + 1
         )
     }
 
     /// libataxx-style FEN parser (inverse of `to_ataxx_fen`): rows
     /// top->bottom separated by `/`, digit runs, `x o #`, then side and two
-    /// counters (ignored).
+    /// counters (half = consecutive passes capped to 0..2, full = ply/2+1;
+    /// ply parity comes from side-to-move). Foreign FENs with unused `0 1`
+    /// counters parse as passes 0, ply 0/1 — same as always.
     pub fn from_ataxx_fen(s: &str) -> Option<Board> {
         let mut b = Board {
             occ: [0; 2],
@@ -1096,6 +1123,18 @@ impl Board {
             "x" | "X" | "b" | "B" => 0,
             _ => 1,
         };
+        // Counters: half = consecutive passes (0..2; values >= 3 are a
+        // foreign halfmove clock, read as 0 so we never fake a terminal
+        // position), full = ply/2 + 1. Every ply flips the turn, so the
+        // ply's low bit is exactly side-to-move: ply = 2*(full-1)+turn.
+        let half: u64 = parts.next().and_then(|t| t.parse().ok()).unwrap_or(0);
+        let full: u64 = parts
+            .next()
+            .and_then(|t| t.parse::<u64>().ok())
+            .unwrap_or(1)
+            .min(4096);
+        b.passes = if half <= 2 { half as u8 } else { 0 };
+        b.ply = (2 * full.saturating_sub(1) + u64::from(b.turn == 1)) as u32;
         b.piece_cnt[0] = b.occ[0].count_ones() as u8;
         b.piece_cnt[1] = b.occ[1].count_ones() as u8;
         b.blocker_cnt = b.blockers.count_ones() as u8;

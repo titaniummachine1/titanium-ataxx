@@ -6,6 +6,8 @@
 use crate::board::{dist_union, jump_union, Board, Move, MoveList, RING1, SQUARES};
 use crate::tuple::TupleTable;
 use crate::sancta::{S1Acc, S1Net};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const MATE: i32 = 100_000;
@@ -264,12 +266,21 @@ pub fn evaluate(
         return out;
     }
     // Black-relative balances (negated for white below, like pst).
-    let land_b = enemy_landings(b, 1); // squares white threatens to land on
-    let land_w = enemy_landings(b, 0);
-    score -= p.contact_pen * endangered_count(b, 0, land_b) as i32;
-    score += p.contact_pen * endangered_count(b, 1, land_w) as i32;
-    score -= multicapture_penalty(b, 0, land_b, p.multicap_pen);
-    score += multicapture_penalty(b, 1, land_w, p.multicap_pen);
+    // E2/E4 are computed only when their params are live: the landings
+    // input alone costs two shift-unions per side per node, so a zeroed
+    // term must not pay for its input (SPSA zeroes terms routinely).
+    if p.contact_pen != 0 || p.multicap_pen != 0 {
+        let land_b = enemy_landings(b, 1); // squares white threatens to land on
+        let land_w = enemy_landings(b, 0);
+        if p.contact_pen != 0 {
+            score -= p.contact_pen * endangered_count(b, 0, land_b) as i32;
+            score += p.contact_pen * endangered_count(b, 1, land_w) as i32;
+        }
+        if p.multicap_pen != 0 {
+            score -= multicapture_penalty(b, 0, land_b, p.multicap_pen);
+            score += multicapture_penalty(b, 1, land_w, p.multicap_pen);
+        }
+    }
     if b.turn == 0 {
         score += p.tempo;
     } else {
@@ -386,6 +397,25 @@ fn terminal_score(b: &Board, ply: u32) -> i32 {
     }
 }
 
+/// Botzone-judge terminal score from the side-to-move's perspective: filled
+/// counts (mobile side absorbs empties), so a stalemate of the opponent is
+/// a forced win, not a pass-and-continue. Sign only — same MATE shape.
+fn bz_terminal_score(b: &Board, ply: u32) -> i32 {
+    let (fb, fw) = b.bz_counts();
+    let diff = if b.turn == 0 {
+        fb as i32 - fw as i32
+    } else {
+        fw as i32 - fb as i32
+    };
+    if diff > 0 {
+        MATE - ply as i32
+    } else if diff < 0 {
+        -MATE + ply as i32
+    } else {
+        0
+    }
+}
+
 /// Jump danger bonus (fffasttime evalJump idea): a jump vacates its origin;
 /// coverage computed on the parent (only `from` itself changed, and RING1
 /// holds neighbors only). Returns the score adjustment for the move.
@@ -411,14 +441,124 @@ fn jump_danger(b: &Board, m: Move, p: &SearchParams) -> i32 {
 /// Move scoring is fixed: TT move > killers > captures*W + history, consumed
 /// lazily (repeated argmax — only pays for moves examined before a cutoff).
 
-/// Transposition table entry (24 bytes with padding).
+/// Lock-free transposition table slot shared across Lazy-SMP threads.
+///
+/// Layout (24 bytes, 8-aligned): key tag + packed move/score + packed
+/// depth/flag. The tag stores `key ^ data ^ meta`, so any torn read (two
+/// writers racing on one slot) fails the check and is treated as a miss —
+/// races only ever cost a hit, never correctness. All access is `&self`;
+/// single-threaded overhead is one atomic load per probe (~free on x86_64).
+struct SharedEntry {
+    /// `key ^ data ^ meta` (tear detector), written last (Release).
+    tag: AtomicU64,
+    /// Packed move (low 32) + score-as-u32 (high 32).
+    data: AtomicU64,
+    /// Depth (low 8) + flag (next 8).
+    meta: AtomicU32,
+}
+
+impl SharedEntry {
+    fn empty() -> SharedEntry {
+        SharedEntry {
+            tag: AtomicU64::new(0),
+            data: AtomicU64::new(0),
+            meta: AtomicU32::new(0),
+        }
+    }
+}
+
+/// Decoded TT hit (Copy snapshot — no borrows cross the atomic loads).
 #[derive(Clone, Copy)]
-struct TtEntry {
-    key: u64,
-    mv: u32, // packed Move; 0xFFFF = pass; 0 = none (eval cache entries)
+struct TtHit {
+    mv: u32,
     score: i32,
     depth: u8,
-    flag: u8, // 0 empty, 1 exact, 2 lower, 3 upper
+    flag: u8,
+}
+
+/// Fixed-size transposition table, power-of-two entry count. Depth-0 EXACT
+/// entries double as the eval cache (Ataxx transpositions repeat a lot).
+/// `Send + Sync`: one table is shared by all Lazy-SMP search threads.
+pub struct Tt {
+    buf: Vec<SharedEntry>,
+    mask: usize,
+}
+
+impl Tt {
+    /// `2^bits` entries (bits=20 -> 1M entries, ~24 MB).
+    pub fn new(bits: usize) -> Tt {
+        let size = 1usize << bits.min(24);
+        let mut buf = Vec::with_capacity(size);
+        for _ in 0..size {
+            buf.push(SharedEntry::empty());
+        }
+        Tt { buf, mask: size - 1 }
+    }
+
+    pub fn clear(&self) {
+        for e in self.buf.iter() {
+            e.meta.store(FLAG_EMPTY as u32, Ordering::Relaxed);
+            e.tag.store(0, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn decode(data: u64, meta: u32) -> Option<TtHit> {
+        let flag = ((meta >> 8) & 0xFF) as u8;
+        if flag == FLAG_EMPTY {
+            return None;
+        }
+        Some(TtHit {
+            mv: (data & 0xFFFF_FFFF) as u32,
+            score: ((data >> 32) & 0xFFFF_FFFF) as u32 as i32,
+            depth: (meta & 0xFF) as u8,
+            flag,
+        })
+    }
+
+    #[inline]
+    fn probe(&self, key: u64) -> Option<TtHit> {
+        let e = &self.buf[(key as usize) & self.mask];
+        let tag = e.tag.load(Ordering::Acquire);
+        let data = e.data.load(Ordering::Relaxed);
+        let meta = e.meta.load(Ordering::Relaxed);
+        if tag != key ^ data ^ meta as u64 {
+            return None;
+        }
+        Self::decode(data, meta)
+    }
+
+    #[inline]
+    fn store(&self, key: u64, mv: u32, score: i32, depth: u8, flag: u8) {
+        let e = &self.buf[(key as usize) & self.mask];
+        // Depth-preferred replacement; always replace the same position so
+        // a fresh search overwrites stale bounds. A race here only ever
+        // loses a store, never corrupts (the tag check rejects mixes).
+        let meta = e.meta.load(Ordering::Relaxed);
+        let cur_flag = ((meta >> 8) & 0xFF) as u8;
+        let cur_depth = (meta & 0xFF) as u8;
+        if cur_flag == FLAG_EMPTY || cur_depth <= depth {
+            let data_new = (mv as u64) | ((score as u32 as u64) << 32);
+            let meta_new = (depth as u32) | ((flag as u32) << 8);
+            e.data.store(data_new, Ordering::Relaxed);
+            e.meta.store(meta_new, Ordering::Relaxed);
+            e.tag
+                .store(key ^ data_new ^ meta_new as u64, Ordering::Release);
+        } else {
+            // Same-position refresh: our own stale bound must not survive a
+            // re-search (matters across ponder/game phases sharing one TT).
+            let data = e.data.load(Ordering::Relaxed);
+            let tag = e.tag.load(Ordering::Relaxed);
+            if tag == key ^ data ^ meta as u64 {
+                let data_new = (mv as u64) | ((score as u32 as u64) << 32);
+                let meta_new = (depth as u32) | ((flag as u32) << 8);
+                e.data.store(data_new, Ordering::Relaxed);
+                e.meta.store(meta_new, Ordering::Relaxed);
+                e.tag
+                    .store(key ^ data_new ^ meta_new as u64, Ordering::Release);
+            }
+        }
+    }
 }
 
 const FLAG_EMPTY: u8 = 0;
@@ -426,73 +566,16 @@ const FLAG_EXACT: u8 = 1;
 const FLAG_LOWER: u8 = 2;
 const FLAG_UPPER: u8 = 3;
 
-/// Fixed-size transposition table, power-of-two entry count. Depth-0 EXACT
-/// entries double as the eval cache (Ataxx transpositions repeat a lot).
-pub struct Tt {
-    buf: Vec<TtEntry>,
-    mask: usize,
-}
-
-impl Tt {
-    /// `2^bits` entries (bits=20 -> 1M entries, 24 MB).
-    pub fn new(bits: usize) -> Tt {
-        let size = 1usize << bits.min(24);
-        Tt {
-            buf: vec![
-                TtEntry {
-                    key: 0,
-                    mv: 0,
-                    score: 0,
-                    depth: 0,
-                    flag: FLAG_EMPTY
-                };
-                size
-            ],
-            mask: size - 1,
-        }
-    }
-
-    pub fn clear(&mut self) {
-        for e in self.buf.iter_mut() {
-            e.flag = FLAG_EMPTY;
-        }
-    }
-
-    #[inline]
-    fn probe(&self, key: u64) -> Option<&TtEntry> {
-        let e = &self.buf[(key as usize) & self.mask];
-        if e.flag != FLAG_EMPTY && e.key == key {
-            Some(e)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn store(&mut self, key: u64, mv: u32, score: i32, depth: u8, flag: u8) {
-        let e = &mut self.buf[(key as usize) & self.mask];
-        // Depth-preferred replacement; always replace same position so a
-        // fresh search overwrites stale bounds.
-        if e.flag == FLAG_EMPTY || e.depth <= depth || e.key == key {
-            *e = TtEntry {
-                key,
-                mv,
-                score,
-                depth,
-                flag,
-            };
-        }
-    }
-}
-
 /// Mate-score adjustment: store distance-from-node so entries stay correct
-/// at any retrieval ply.
+/// at any retrieval ply. Saturating: extreme inputs (e.g. an unsearched
+/// i32::MIN reaching the store) clamp instead of overflowing — a tournament
+/// build must never panic (debug) or wrap (release) on a TT store.
 #[inline]
 fn score_to_tt(score: i32, ply: u32) -> i32 {
     if score >= MATE_BOUND {
-        score + ply as i32
+        score.saturating_add(ply as i32)
     } else if score <= -MATE_BOUND {
-        score - ply as i32
+        score.saturating_sub(ply as i32)
     } else {
         score
     }
@@ -501,9 +584,9 @@ fn score_to_tt(score: i32, ply: u32) -> i32 {
 #[inline]
 fn score_from_tt(score: i32, ply: u32) -> i32 {
     if score >= MATE_BOUND {
-        score - ply as i32
+        score.saturating_sub(ply as i32)
     } else if score <= -MATE_BOUND {
-        score + ply as i32
+        score.saturating_add(ply as i32)
     } else {
         score
     }
@@ -518,6 +601,8 @@ pub enum StopReason {
     Time,
     /// Node budget exhausted.
     Nodes,
+    /// External `stop` switch (UAI `stop` / ponder abort) tripped.
+    External,
 }
 
 #[derive(Clone, Debug)]
@@ -561,8 +646,9 @@ pub struct Searcher<'a> {
     /// Monotonic milliseconds. Native builds use `Instant`; wasm builds
     /// inject `performance.now()` (std time does not exist on wasm32).
     time_src: fn() -> f64,
-    /// Transposition table (persists across searches in the same Searcher).
-    tt: Tt,
+    /// Transposition table (persists across searches; the same table is
+    /// shared across Lazy-SMP threads via Arc — lock-free, Send + Sync).
+    tt: Arc<Tt>,
     /// Two killer moves per ply (packed u32 moves), refreshed on cutoffs.
     killers: Box<[(u32, u32); MAX_PLY]>,
     /// History heuristic: [mover][to] cutoff counters, aged per search.
@@ -583,6 +669,24 @@ pub struct Searcher<'a> {
     /// Per-ply move/acc buffers, reused across searches (no per-search
     /// alloc: MoveStack is ~72KB of lists + acc, was rebuilt per search).
     stack: MoveStack,
+    /// External stop switch (UAI `stop`, set from the protocol thread while
+    /// this thread searches): polled every node in check_stop.
+    ext_stop: Option<Arc<AtomicBool>>,
+    /// Ponderhit deadline: absolute ms (via `time_src`), 0 = not hit yet.
+    /// While `go ponder` runs no clock exists; the protocol thread converts
+    /// the search into a timed one by storing `now + allocation` here.
+    ext_deadline: Option<Arc<AtomicU64>>,
+    /// Per-iteration progress hook for UAI `info` lines: called after each
+    /// adopted iteration with (depth, score_cp, nodes, elapsed_ms).
+    on_iter: Option<fn(u32, i32, u64, u64)>,
+    /// Lazy-SMP root stagger: thread i rotates the initial root move order
+    /// by i, so helpers explore different moves first (0 = canonical order,
+    /// the single-threaded default — deterministic).
+    root_shift: usize,
+    // NOTE: rules selection (classic passes vs Botzone no-pass) is a
+    // BUILD-TIME const generic on search/negamax (`search` vs `search_bz`),
+    // never a runtime field — zero hot-path cost either way. Callers pick
+    // the variant: UAI serve defaults classic, the Botzone bundle uses _bz.
 }
 
 /// Monotonic milliseconds since process start (native default time source).
@@ -591,6 +695,12 @@ fn native_now_ms() -> f64 {
     use std::time::Instant;
     static BOOT: OnceLock<Instant> = OnceLock::new();
     BOOT.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
+/// Public view of the searcher's clock (same origin as search deadlines),
+/// for protocol threads computing ponderhit deadlines while search runs.
+pub fn now_ms() -> f64 {
+    native_now_ms()
 }
 
 impl Default for Searcher<'_> {
@@ -614,7 +724,7 @@ impl<'a> Searcher<'a> {
             stop_reason: StopReason::Completed,
             node_limit: None,
             time_src: native_now_ms,
-            tt: Tt::new(bits),
+            tt: Arc::new(Tt::new(bits)),
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[0; 49]; 2]),
             sancta: None,
@@ -622,6 +732,10 @@ impl<'a> Searcher<'a> {
             tup_native: false,
             params: SearchParams::default(),
             stack: MoveStack::new(),
+            ext_stop: None,
+            ext_deadline: None,
+            on_iter: None,
+            root_shift: 0,
         }
     }
 
@@ -711,6 +825,19 @@ impl<'a> Searcher<'a> {
         self.time_src = f;
     }
 
+    /// Wire the cross-thread control switches (UAI `stop` / `ponderhit`).
+    /// The protocol thread stores into these atomics while `search` runs
+    /// on the worker thread — no locking, search only ever reads them.
+    pub fn set_external_control(&mut self, stop: Arc<AtomicBool>, hit_deadline: Arc<AtomicU64>) {
+        self.ext_stop = Some(stop);
+        self.ext_deadline = Some(hit_deadline);
+    }
+
+    /// Per-iteration `info` hook (fn pointer: no captures, no lifetimes).
+    pub fn set_iteration_hook(&mut self, f: fn(u32, i32, u64, u64)) {
+        self.on_iter = Some(f);
+    }
+
     /// Full state reset between games (TT, killers, history) — prevents
     /// cross-game leakage in long matches (titanium binary_match lesson).
     pub fn reset_for_new_game(&mut self) {
@@ -722,7 +849,7 @@ impl<'a> Searcher<'a> {
     /// Resize the transposition table (`2^bits` entries, clamped 10..=26).
     /// Backs the UAI `setoption name Hash` command.
     pub fn set_tt_bits(&mut self, bits: usize) {
-        self.tt = Tt::new(bits.clamp(10, 26));
+        self.tt = Arc::new(Tt::new(bits.clamp(10, 26)));
     }
 
     #[inline]
@@ -734,9 +861,28 @@ impl<'a> Searcher<'a> {
                 return;
             }
         }
+        // External `stop` (UAI stop / ponder abort): one relaxed load per
+        // node — sub-nanosecond, keeps abort latency at the microsecond level.
+        if let Some(flag) = &self.ext_stop {
+            if flag.load(Ordering::Relaxed) {
+                self.stop = true;
+                self.stop_reason = StopReason::External;
+                return;
+            }
+        }
         if self.nodes & 2047 == 0 {
             if let Some(dl) = self.deadline_ms {
                 if (self.time_src)() >= dl {
+                    self.stop = true;
+                    self.stop_reason = StopReason::Time;
+                    return;
+                }
+            }
+            // Ponderhit clock: 0 = still pondering (no clock), else the
+            // absolute deadline the protocol thread computed on ponderhit.
+            if let Some(dl) = &self.ext_deadline {
+                let d = dl.load(Ordering::Relaxed);
+                if d > 0 && (self.time_src)() >= d as f64 {
                     self.stop = true;
                     self.stop_reason = StopReason::Time;
                 }
@@ -745,7 +891,7 @@ impl<'a> Searcher<'a> {
     }
 
     #[inline]
-    fn negamax(
+    fn negamax<const BZ: bool>(
         &mut self,
         b: &Board,
         mut alpha: i32,
@@ -760,7 +906,17 @@ impl<'a> Searcher<'a> {
             return 0;
         }
         debug_assert!((ply as usize) < MAX_PLY);
-        if b.game_over() {
+        // Build-time rules selection (const generic: the dead branch is
+        // compiled out, zero hot-path cost either way).
+        if BZ {
+            // No passes on-platform: stm stuck (or wipeout/full) ends the
+            // game here. Only the side to move needs the mobility scan —
+            // the opponent's was established at the parent, so in-tree nodes
+            // always have a mobile stm until the terminal check trips.
+            if b.is_over() || !b.has_moves(b.turn) {
+                return bz_terminal_score(b, ply);
+            }
+        } else if b.game_over() {
             return terminal_score(b, ply);
         }
 
@@ -845,7 +1001,7 @@ impl<'a> Searcher<'a> {
                     net.update_child(&a[ply as usize], &mut z[0], b, &pchild);
                 }
                 let pc_beta = beta.saturating_add(self.params.pcut_margin);
-                let pscore = -self.negamax(
+                let pscore = -self.negamax::<BZ>(
                     &pchild,
                     -pc_beta,
                     -pc_beta + 1,
@@ -867,7 +1023,9 @@ impl<'a> Searcher<'a> {
         // via SearchParams for the phase study): not right after another
         // null, depth > 2, enough clone targets (mobility), board fill below
         // the phase gate. R = null_r.
-        if null_allowed && depth > 2 {
+        // OFF under Botzone rules (const-eliminated): passing is illegal
+        // there, so the null subtree is fictional and its bounds unsound.
+        if null_allowed && !BZ && depth > 2 {
             let clone_targets = (dist_union(b.occ[b.turn as usize], 1) & b.empty()).count_ones();
             // fill gate as integer: pieces*100 < max_fill*49 (no float div).
             if clone_targets >= self.params.null_min_targets
@@ -885,7 +1043,7 @@ impl<'a> Searcher<'a> {
                 // NMP pass flips stm: sancta acc is color-relative so it
                 // stays valid — just forward the other perspective.
                 // (pass: no stones change, no diff update needed.)
-                let score = -self.negamax(
+                let score = -self.negamax::<BZ>(
                     &child,
                     -beta,
                     -beta + 1,
@@ -994,7 +1152,7 @@ impl<'a> Searcher<'a> {
             let jdanger = jump_danger(b, m, &self.params);
             let mut score;
             if move_idx == 0 {
-                score = -self.negamax(&child, -beta, -alpha, depth - 1, ply + 1, true);
+                score = -self.negamax::<BZ>(&child, -beta, -alpha, depth - 1, ply + 1, true);
                 if self.stop {
                     return 0;
                 }
@@ -1044,7 +1202,7 @@ impl<'a> Searcher<'a> {
                     }
                     depth.saturating_sub(1 + r)
                 };
-                score = -self.negamax(
+                score = -self.negamax::<BZ>(
                     &child,
                     -alpha - 1,
                     -alpha,
@@ -1058,7 +1216,7 @@ impl<'a> Searcher<'a> {
                 if score > alpha && reduced < depth - 1 {
                     // Re-search: scout already wrote child acc in place
                     // (same parent+child), so it is still valid. No rebuild.
-                    score = -self.negamax(
+                    score = -self.negamax::<BZ>(
                         &child,
                         -beta,
                         -alpha,
@@ -1108,7 +1266,7 @@ impl<'a> Searcher<'a> {
     /// TT store at the end of a node (skipped when the clock cut it short).
     #[inline]
     fn finish_node(
-        &mut self,
+        &self,
         b: &Board,
         alpha_orig: i32,
         beta: i32,
@@ -1118,6 +1276,11 @@ impl<'a> Searcher<'a> {
         ply: u32,
     ) {
         if self.stop {
+            return;
+        }
+        if best == i32::MIN {
+            // No move was scored (every move pruned away) — nothing was
+            // learned, so store nothing rather than a garbage bound.
             return;
         }
         let flag = if best <= alpha_orig {
@@ -1133,7 +1296,23 @@ impl<'a> Searcher<'a> {
     /// Iterative deepening root search. Falls back to any legal move.
     /// Whichever limit hits first (nodes / time / depth) stops the search;
     /// partial iterations are discarded, the last completed depth decides.
+    /// Classic Ataxx rules (passes legal). Build-time monomorphization:
+    /// `search_bz` is the identical loop with Botzone no-pass rules, the
+    /// unused branch compiled out in each copy.
     pub fn search(&mut self, b: &Board, limits: &SearchLimits) -> SearchResult {
+        self.search_gen::<false>(b, limits)
+    }
+
+    /// Botzone-judge rules: no passes — stalemate is terminal, null-move off.
+    pub fn search_bz(&mut self, b: &Board, limits: &SearchLimits) -> SearchResult {
+        self.search_gen::<true>(b, limits)
+    }
+
+    fn search_gen<const BZ: bool>(
+        &mut self,
+        b: &Board,
+        limits: &SearchLimits,
+    ) -> SearchResult {
         self.start_ms = (self.time_src)();
         self.nodes = 0;
         self.stop = false;
@@ -1144,6 +1323,19 @@ impl<'a> Searcher<'a> {
             .map(|t| self.start_ms + t.as_secs_f64() * 1000.0);
 
         let mut result = SearchResult::default();
+        // Instant terminal fast path (Botzone rules, const-eliminated in
+        // the classic copy): a full board (O(1) counter check, no bitboard
+        // scan) or a stuck side ends the game on the spot — including a
+        // stuck OPPONENT, which movegen alone would miss (stm still has
+        // moves, so n_root > 0, yet the game is over).
+        // Returns before TT probe / movegen: zero nodes searched.
+        if BZ && b.bz_over() {
+            result.score = bz_terminal_score(b, 0);
+            result.elapsed = self.elapsed();
+            result.nodes = self.nodes;
+            result.stopped_by = Some(StopReason::Completed);
+            return result;
+        }
         // Age the history table so old cutoffs don't dominate forever.
         for row in self.history.iter_mut() {
             for h in row.iter_mut() {
@@ -1160,10 +1352,16 @@ impl<'a> Searcher<'a> {
         }
         let n_root = self.stack.lists[0].len();
         if n_root == 0 {
-            // Pass node: give the caller a meaningful score through the pass.
-            if !b.game_over() {
+            // No legal moves for the side to move.
+            if BZ {
+                // Already game-over on-platform (the judge ends it the
+                // moment a side cannot move): score the filled-count terminal
+                // instead of searching through a pass that can never happen.
+                result.score = bz_terminal_score(b, 0);
+            } else if !b.game_over() {
+                // Pass node: give the caller a meaningful score through the pass.
                 result.score =
-                    -self.negamax(&b.make_pass(), -i32::MAX, i32::MAX, 1, 1, true);
+                    -self.negamax::<BZ>(&b.make_pass(), -i32::MAX, i32::MAX, 1, 1, true);
             }
             result.elapsed = self.elapsed();
             result.nodes = self.nodes;
@@ -1178,20 +1376,21 @@ impl<'a> Searcher<'a> {
                 *m = root.pop_best();
             }
         }
+        // Lazy-SMP stagger: helper threads rotate the initial order so they
+        // explore different moves first (thread 0 keeps canonical order).
+        if n_root > 1 {
+            root_moves[..n_root].rotate_left(self.root_shift % n_root);
+        }
         if let Some(net) = self.sancta {
             net.refresh_root(b, &mut self.stack.acc[0]);
         }
         result.best = Some(root_moves[0]);
 
-        let budget_ms = limits
-            .time
-            .map(|t| t.as_secs_f64() * 1000.0)
-            .unwrap_or(f64::INFINITY);
-        // Iteration cost prediction: project the next iteration as the max
-        // of the last two completed iterations.
-        let mut it_ms: [f64; 2] = [0.0, 0.0];
+        // Full-budget burn: no iteration-cost projection. The hard deadline
+        // in check_stop cuts mid-iteration and partial-iteration adoption
+        // keeps every completed root move — so a 1s allotment runs exactly
+        // 1s (Stockfish-style), not 60-90% of it.
         for depth in 1..=limits.max_depth.max(1) {
-            let iter_start = self.elapsed_ms();
             let mut alpha = i32::MIN + 1;
             let mut best_this = None;
             let mut best_score = i32::MIN;
@@ -1206,7 +1405,7 @@ impl<'a> Searcher<'a> {
                     let (a, z) = self.stack.acc.split_at_mut(1);
                     net.update_child(&a[0], &mut z[0], b, &child);
                 }
-                let mut score = -self.negamax(&child, -i32::MAX, -alpha, depth - 1, 1, true);
+                let mut score = -self.negamax::<BZ>(&child, -i32::MAX, -alpha, depth - 1, 1, true);
                 if self.stop {
                     break;
                 }
@@ -1229,6 +1428,9 @@ impl<'a> Searcher<'a> {
                     result.score = best_score;
                 }
                 result.depth = depth;
+                if let Some(hook) = self.on_iter {
+                    hook(depth, result.score, self.nodes, self.elapsed_ms().max(0.0) as u64);
+                }
                 // Move best move to the front for the next iteration.
                 if !self.stop {
                     if let Some(pos) = (0..n_root).find(|&i| root_moves[i] == m) {
@@ -1238,14 +1440,6 @@ impl<'a> Searcher<'a> {
                 }
             }
             if self.stop {
-                break;
-            }
-            // Predict the next iteration by TIME only.
-            it_ms[1] = it_ms[0];
-            it_ms[0] = self.elapsed_ms() - iter_start;
-            let proj_ms = it_ms[0].max(it_ms[1]);
-            if self.elapsed_ms() + proj_ms > budget_ms {
-                self.stop_reason = StopReason::Time;
                 break;
             }
         }
@@ -1276,6 +1470,108 @@ impl<'a> Searcher<'a> {
 /// One-shot convenience: best move for `board` under `limits`.
 pub fn best_move(b: &Board, limits: &SearchLimits) -> SearchResult {
     Searcher::new().search(b, limits)
+}
+
+/// Lazy-SMP parallel search (tournament mode).
+///
+/// `threads` workers each run the full iterative-deepening loop on the same
+/// board with the same limits, sharing one lock-free TT; per-thread move
+/// ordering is staggered by rotating the root move order. Returns the
+/// deepest result (ties go to thread 0), with node counts summed across
+/// threads. `threads <= 1` runs the calling searcher directly — the exact
+/// single-threaded behavior (deterministic, same TT aging).
+/// Classic Ataxx rules; `parallel_search_bz` is the Botzone-rules copy —
+/// build-time monomorphization, zero hot-path cost either way.
+pub fn parallel_search<'a>(
+    s: &mut Searcher<'a>,
+    b: &Board,
+    limits: &SearchLimits,
+    threads: usize,
+) -> SearchResult {
+    parallel_search_gen::<false>(s, b, limits, threads)
+}
+
+/// Botzone-judge rules: no passes — stalemate is terminal, null-move off.
+pub fn parallel_search_bz<'a>(
+    s: &mut Searcher<'a>,
+    b: &Board,
+    limits: &SearchLimits,
+    threads: usize,
+) -> SearchResult {
+    parallel_search_gen::<true>(s, b, limits, threads)
+}
+
+fn parallel_search_gen<const BZ: bool>(
+    s: &mut Searcher<'_>,
+    b: &Board,
+    limits: &SearchLimits,
+    threads: usize,
+) -> SearchResult {
+    let n = threads.clamp(1, 256);
+    if n == 1 {
+        return s.search_gen::<BZ>(b, limits);
+    }
+    let tt = Arc::clone(&s.tt);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            let per_limits = SearchLimits {
+                time: limits.time,
+                // Split the node budget across workers so the TOTAL stays
+                // near the requested budget (each worker stops at its share).
+                max_nodes: limits.max_nodes.map(|m| (m / n as u64).max(1)),
+                max_depth: limits.max_depth,
+            };
+            let mut w = Searcher {
+                nodes: 0,
+                deadline_ms: None,
+                start_ms: 0.0,
+                stop: false,
+                stop_reason: StopReason::Completed,
+                node_limit: None,
+                time_src: s.time_src,
+                tt: Arc::clone(&tt),
+                killers: Box::new([(0, 0); MAX_PLY]),
+                history: Box::new([[0; 49]; 2]),
+                sancta: s.sancta,
+                tuple: s.tuple,
+                tup_native: s.tup_native,
+                params: s.params,
+                stack: MoveStack::new(),
+                ext_stop: s.ext_stop.clone(),
+                ext_deadline: s.ext_deadline.clone(),
+                // Only thread 0 reports progress (one info stream, like
+                // Stockfish's main-thread-only output).
+                on_iter: if i == 0 { s.on_iter } else { None },
+                root_shift: i,
+            };
+            handles.push(scope.spawn(move || {
+                let r = w.search_gen::<BZ>(b, &per_limits);
+                (i, r)
+            }));
+        }
+        let mut winner: Option<(usize, SearchResult)> = None;
+        let mut total_nodes = 0u64;
+        let mut main_elapsed = Duration::from_secs(0);
+        for h in handles {
+            let (i, r) = h.join().expect("search thread panicked");
+            total_nodes += r.nodes;
+            if i == 0 {
+                main_elapsed = r.elapsed;
+            }
+            let deeper = match &winner {
+                None => true,
+                Some((bi, br)) => r.depth > br.depth || (r.depth == br.depth && i < *bi),
+            };
+            if deeper {
+                winner = Some((i, r));
+            }
+        }
+        let (_, mut w) = winner.expect("at least one search thread");
+        w.nodes = total_nodes;
+        w.elapsed = main_elapsed;
+        w
+    })
 }
 
 #[cfg(test)]
@@ -1378,5 +1674,94 @@ mod tests {
         let r = s.search(&b, &no_time(5));
         let m = r.best.expect("lazy ordering must find a move");
         assert!(b.legal_moves().contains(&m), "{m:?} illegal");
+    }
+
+    #[test]
+    fn smp_two_threads_legal() {
+        // Lazy SMP shares one lock-free TT across workers; the merged
+        // result must be a legal move with summed node counts.
+        let b = Board::start();
+        let mut s = Searcher::with_tt_bits(16);
+        let r = parallel_search(&mut s, &b, &no_time(4), 2);
+        let m = r.best.expect("smp must find a move");
+        assert!(b.legal_moves().contains(&m), "{m:?} illegal");
+        assert!(r.nodes > 0, "node counts must be summed");
+        assert!(r.depth >= 4, "depth {}", r.depth);
+    }
+
+    #[test]
+    fn smp_single_thread_matches_search() {
+        // threads=1 is the exact single-threaded path (deterministic).
+        let b = Board::start();
+        let mut s = Searcher::with_tt_bits(16);
+        let r = parallel_search(&mut s, &b, &no_time(4), 1);
+        assert!(r.best.is_some());
+        assert!(r.depth >= 4);
+    }
+
+    #[test]
+    fn bz_full_board_is_instant_terminal() {
+        // All 49 squares filled: O(1) counter check, zero nodes searched,
+        // MATE from the filled-count diff (25v24, black to move).
+        let rows: Vec<String> = (0..7)
+            .map(|r| {
+                (0..7)
+                    .map(|f| if (r + f) % 2 == 0 { 'x' } else { 'o' })
+                    .collect()
+            })
+            .collect();
+        let s = rows.join("\n") + " b";
+        let b = Board::from_str(&s).unwrap();
+        assert_eq!(b.counts(), (25, 24));
+        assert!(b.bz_over());
+        assert_eq!(b.bz_counts(), (25, 24)); // both stuck -> raw counts
+        let mut se = Searcher::with_tt_bits(16);
+        let r = se.search_bz(&b, &no_time(6));
+        assert_eq!(r.nodes, 0, "full board must search nothing");
+        assert_eq!(r.score, MATE, "black up 25-24");
+        assert!(r.best.is_none());
+    }
+
+    #[test]
+    fn bz_stuck_opponent_is_instant_terminal() {
+        // White boxed into the corner (no legal reply), black mobile: the
+        // game is already over though movegen finds black moves. The judge
+        // gives black every empty square: 48v1 -> MATE, zero nodes.
+        let s = "oxx....\nxxx....\nxxx....\n.......\n.......\n.......\n......x b";
+        let b = Board::from_str(s).unwrap();
+        assert!(b.has_moves(0));
+        assert!(!b.has_moves(1));
+        assert!(b.bz_over());
+        assert_eq!(b.bz_counts(), (48, 1));
+        let mut se = Searcher::with_tt_bits(16);
+        let r = se.search_bz(&b, &no_time(6));
+        assert_eq!(r.nodes, 0, "finished game must search nothing");
+        assert_eq!(r.score, MATE);
+        assert!(r.best.is_none());
+    }
+
+    #[test]
+    fn bz_stuck_side_to_move_loses_by_count() {
+        // Black fully enclosed (same board as the pass-rule test): under
+        // Botzone rules this is a terminal loss, scored by filled counts —
+        // not a pass-and-continue.
+        let board = ".......\n.......\n.......\n.......\n.ooooo.\n.ooooo.\n.ooxoo. b";
+        let b = Board::from_str(board).unwrap();
+        assert!(!b.has_moves(0));
+        assert!(b.has_moves(1));
+        let mut se = Searcher::with_tt_bits(16);
+        let r = se.search_bz(&b, &no_time(4));
+        assert!(r.best.is_none());
+        assert!(r.score < 0, "buried black loses, score {}", r.score);
+    }
+
+    #[test]
+    fn bz_rules_still_terminates_from_start() {
+        // Sanity: full search with BZ rules (null-move off) completes.
+        let b = Board::start();
+        let mut se = Searcher::with_tt_bits(16);
+        let r = se.search_bz(&b, &no_time(4));
+        assert!(r.best.is_some());
+        assert!(r.nodes > 0);
     }
 }
