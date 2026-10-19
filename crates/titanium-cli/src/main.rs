@@ -73,6 +73,8 @@ fn main() -> ExitCode {
             flag_str(&args, "--out"),
             args.iter().any(|x| x == "--corr"),
             args.iter().any(|x| x == "--opp-corr"),
+            flag_str(&args, "--book"),
+            flag_int(&args, "--book-start").unwrap_or(0) as u32,
         ),
         "sperft" => sperft_cmd(
             flag_int(&args, "--depth").unwrap_or(8) as u32,
@@ -857,6 +859,8 @@ fn match_cmd(
     out: Option<String>,
     corr: bool,
     opp_corr: bool,
+    book_spec: Option<String>,
+    book_start: u32,
 ) -> ExitCode {
     // Eval presets, explicit per side — no env vars anywhere:
     // --net = OUR side (in-process), --opp-net = child side (appended to the
@@ -961,8 +965,58 @@ fn match_cmd(
     }
     let _ = fs::write(&path, &report);
 
+    // Paired-book gates (law 11): each book line is played twice in a row
+    // (games 2i-1, 2i share a line; odd/even swaps titanium's color, so
+    // every line runs from BOTH seats). Lines are "<49 chars> <b|w>".
+    let book: Option<Vec<String>> = match book_spec {
+        None => None,
+        Some(p) => match fs::read_to_string(&p) {
+            Ok(text) => {
+                let lines: Vec<String> =
+                    text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                if lines.is_empty() {
+                    eprintln!("match: book {p} is empty");
+                    return ExitCode::FAILURE;
+                }
+                Some(lines)
+            }
+            Err(e) => {
+                eprintln!("match: book {p} unreadable: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    if let Some(lines) = &book {
+        let need = book_start as usize + ((games as usize + 1) / 2);
+        if lines.len() < need {
+            eprintln!(
+                "match: book has {} lines but games {start_game}..{} need {need} from offset {book_start}",
+                lines.len(),
+                start_game + games - 1
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     for game in start_game..start_game + games {
-        let mut b = Board::start();
+        // Book position (paired: two consecutive games share a line), or
+        // startpos when no book. Bad lines fail fast — never silently skip.
+        let mut b = match &book {
+            None => Board::start(),
+            Some(lines) => {
+                let idx = book_start as usize + ((game - start_game) as usize / 2);
+                match Board::from_str(&lines[idx]) {
+                    Some(pos) => pos,
+                    None => {
+                        eprintln!("match: book line {} does not parse: {:?}", idx + 1, lines[idx]);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+        };
+        let book_idx: Option<usize> = book
+            .as_ref()
+            .map(|_| book_start as usize + ((game - start_game) as usize / 2));
         // Law 12: clear engine memory every game. In-process sides get a
         // fresh searcher below; the UAI child MUST get uainewgame or its
         // killers/history leak across games, flip LMR/PVS tie-breaks and
@@ -1058,8 +1112,12 @@ fn match_cmd(
             tally.1 += 1;
             format!("opponent wins {bl}-{wh}")
         };
+        let book_tag = match book_idx {
+            Some(i) => format!("book {i} "),
+            None => String::new(),
+        };
         let game_line = format!(
-            "-- game {game}: titanium={titanium_color} opp={opp_color}: {line} ({} plies)\n{}\n",
+            "-- game {game}: {book_tag}titanium={titanium_color} opp={opp_color}: {line} ({} plies)\n{}\n",
             b.ply, log
         );
         report.push_str(&game_line);
