@@ -601,6 +601,17 @@ mod tests {
         t3.has_enriched = true;
         assert!(!t3.has_q2);
         assert_eq!(t3.forward(&b), 0);
+        // The flag is load-bearing, not dead code: same nonzero weights
+        // score differently with the flag on vs off (future training that
+        // fills q2 automatically takes the full slow path — no silent
+        // lobotomy). And zero weights score the same either way.
+        let mut t4 = TupleTable::zeros();
+        t4.has_enriched = true;
+        t4.has_q2 = true; // all-zero table, flag forced on
+        assert_eq!(t4.forward(&b), t3.forward(&b));
+        t2.has_q2 = false; // nonzero weights, flag forced off
+        assert_eq!(t2.forward(&b), 0);
+        assert_ne!(t2.forward(&b), 7);
     }
 
     #[test]
