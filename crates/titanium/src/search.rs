@@ -108,6 +108,11 @@ pub struct SearchParams {
     pub jump_danger: i32,
     pub jump_hole: i32,
     pub jump_safe: i32,
+    /// Cold-jump ordering penalty (fffasttime geneBranch core, ordering-only
+    /// version): a jump whose landing converts nothing AND whose vacated
+    /// origin is hotter (foe eyes) than covered (own stones) is ranked down.
+    /// Prune version (skip entirely) is the escalation if this shows signal.
+    pub jump_cold: i32,
 }
 
 impl Default for SearchParams {
@@ -149,6 +154,7 @@ impl Default for SearchParams {
             jump_danger: 120,
             jump_hole: 100,
             jump_safe: 0,
+            jump_cold: 600,
         }
     }
 }
@@ -294,6 +300,21 @@ fn score_into(
             let conn =
                 (b.occ[b.turn as usize] & RING1[m.from as usize]).count_ones() as i32;
             score -= ORD_JUMP_PEN + conn * ORD_JUMP_CONN;
+            // Cold jumps (fffasttime geneBranch core, ordering-only): a
+            // jump that converts nothing AND vacates a hole the enemy eyes
+            // harder than we cover ranks down. Prune-version is the
+            // escalation if this shows signal.
+            if p.jump_cold != 0 {
+                let to_c = (RING1[m.to as usize] & opp).count_ones();
+                if to_c == 0 {
+                    let ring = RING1[m.from as usize];
+                    let cc = (ring & opp).count_ones();
+                    let cr = (ring & b.occ[b.turn as usize]).count_ones() as i32;
+                    if cc as i32 > cr {
+                        score -= p.jump_cold;
+                    }
+                }
+            }
             // Intent-aware jumps (user idea): escape / attack / gamble.
             if intent_on {
                 let from_c = (RING1[m.from as usize] & opp).count_ones();
@@ -617,6 +638,7 @@ impl<'a> Searcher<'a> {
             "JumpDanger" => self.params.jump_danger = val as i32,
             "JumpHole" => self.params.jump_hole = val as i32,
             "JumpSafe" => self.params.jump_safe = val as i32,
+            "JumpCold" => self.params.jump_cold = val as i32,
             _ => return false,
         }
         true
