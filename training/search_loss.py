@@ -26,7 +26,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import place_bench as pb
 
-EXE = os.path.join('target-loss', 'release', 'titanium-cli.exe')
+EXE = os.path.join('target', 'release', 'titanium-cli.exe')
 CHAMP = r'C:\gitProjects\engines\titan_champ.tup'
 NPZ = os.path.join('data', 'nnue', 'cache12M.npz')
 
@@ -64,6 +64,10 @@ PARAMS = [
     ('PCutMargin', 250, 0, 2000, 100.0, 5000000.0),
     ('PCutDepth', 5, 3, 8, 1.0, 2000.0),
     ('PCutReduce', 3, 1, 6, 1.0, 2000.0),
+    ('CurveBase', 2, 0, 6, 1.0, 3000.0),
+    ('CurveSlope', 6, 0, 64, 4.0, 12000.0),
+    ('CurveDepth', 2, 0, 64, 4.0, 12000.0),
+    ('CurveCap', 5, 1, 8, 1.0, 3000.0),
 ]
 
 
@@ -273,6 +277,12 @@ def main():
     ap.add_argument('--seed', type=int, default=7)
     ap.add_argument('--ascale', type=float, default=1.0,
                     help='global step multiplier (R2 refinement: 0.3)')
+    ap.add_argument('--force-mode', type=int, default=-1,
+                    help='override pinned LMRMode for this run (e.g. 3 = curve)')
+    ap.add_argument('--lamb', type=float, default=0.0,
+                    help='outcome-blend weight (lambda): target WDL = '
+                         'lamb*outcome + (1-lamb)*sigmoid(deep); rows without '
+                         'outcome use pure search. Blended back through logit.')
     a = ap.parse_args()
 
     names = [p[0] for p in PARAMS]
@@ -280,6 +290,11 @@ def main():
         want = set(x.strip() for x in a.params.split(','))
         names = [n for n in names if n in want]
     pmap = {p[0]: p for p in PARAMS}
+    if a.force_mode >= 0:
+        pmap['LMRMode'] = ('LMRMode', a.force_mode, a.force_mode,
+                           a.force_mode, 0.0, 0.0)
+        if 'LMRMode' not in names:
+            names.append('LMRMode')
     if os.path.exists(a.state):
         st = json.load(open(a.state))
         theta = st['theta']
@@ -287,12 +302,21 @@ def main():
     else:
         theta = {p[0]: float(p[1]) for p in PARAMS}
         k0 = 0
+    if a.force_mode >= 0:
+        theta['LMRMode'] = float(a.force_mode)
     print('building dataset...', flush=True)
     if a.jsonl:
         ds = []
         for line in open(a.jsonl):
             d = json.loads(line)
-            ds.append((d['fen'], float(d['deep'])))
+            w = 1.0 / (1.0 + math.exp(-float(d['deep']) / 400.0))
+            if a.lamb > 0 and 'outcome' in d and d['outcome'] is not None:
+                w = a.lamb * float(d['outcome']) + (1.0 - a.lamb) * w
+                w = min(1.0 - 1e-6, max(1e-6, w))
+                deep_eff = 400.0 * math.log(w / (1.0 - w))
+            else:
+                deep_eff = float(d['deep'])
+            ds.append((d['fen'], deep_eff))
         rng = random.Random(a.seed)
         rng.shuffle(ds)
         print('fresh-deep dataset: %d positions from %s' % (len(ds), a.jsonl), flush=True)

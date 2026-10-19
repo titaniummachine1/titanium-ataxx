@@ -695,7 +695,7 @@ fn serve_cmd(
             out_line("option name LMRSplit type spin default 9 min 1 max 40");
             out_line("option name LMRR1 type spin default 2 min 0 max 6");
             out_line("option name LMRR2 type spin default 3 min 0 max 6");
-            out_line("option name LMRMode type spin default 0 min 0 max 2");
+            out_line("option name LMRMode type spin default 0 min 0 max 3");
             out_line("option name LMRHalf type spin default 4 min 1 max 16");
             out_line("option name LMRSub type spin default 0 min 0 max 4");
             for i in 0..16 {
@@ -711,6 +711,10 @@ fn serve_cmd(
             out_line("option name JumpAttack type spin default 0 min 0 max 10000");
             out_line("option name JumpGamble type spin default 0 min 0 max 10000");
             out_line("option name NullRDiv type spin default 0 min 0 max 16");
+            out_line("option name CurveBase type spin default 2 min 0 max 6");
+            out_line("option name CurveSlope type spin default 6 min 0 max 64");
+            out_line("option name CurveDepth type spin default 2 min 0 max 64");
+            out_line("option name CurveCap type spin default 5 min 1 max 8");
             out_line("uaiok");
         } else if t == "isready" {
             out_line("readyok");
