@@ -60,6 +60,18 @@ Iron laws unchanged: main untouchable; proven-ahead merges only; 5k = quality, t
 
 ## BUGS FOUND/FIXED TONIGHT
 
+- **FUSED-BAG q2 OFFSET (Wq2fix, critical)**: q2 indices were materialized as AR2+Q (0..9215)
+  with no SP_OFF['q2']=29160 addition -> q2 table NEVER trained (explains champ q2 0.0% and the
+  tuple.rs "tree training never touched it" note) and q2 lookups polluted singles/pairsH.
+  Inherited from the S50 fused-bag refactor (train_modern.py line 758). Fixed in both trainers;
+  verifier re-proved bit-identical vs corrected reference. Epoch 1 of tonightA (buggy q2) is the
+  warm start for the fixed continuation (log logs/tonightA2_stream.log).
+- i8 quantization note: exported .tup rounds to integers; sub-0.5 in-memory drift disappears
+  (a 24-step smoke exported byte-identical to its init). Never judge short runs by net bytes.
+- Naming trap for future commands: in paths like `data\nnue\tsmoke3.tup`, a mistyped `\t`
+  silently becomes a separator + 't' filename (visible only if the target name starts with t).
+  Prefer forward slashes in tool commands.
+
 - `train_stream.py` materialize32 initially used `AR` (missing *81) for singles — the historical
   S37 corruption signature. Fixed; verified bit-identical vs reference concat (5000 real rows,
   0/0 mismatches) after also fixing pair width (80 cols total, not 160).

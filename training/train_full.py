@@ -757,7 +757,7 @@ def main():
         sp = [(AR * 81 + F)]
         for d in active:
             sp.append((SP_OFF[SP_DIR[d]] + F[:, XA[d]] + 81 * F[:, YA[d]]).reshape(F.shape[0], -1))
-        sp.append((AR2 + Qb.astype(np.int64)))
+        sp.append((SP_OFF['q2'] + AR2 + Qb.astype(np.int64)))
         sp.append((SP_OFF['envus'] + EUb.astype(np.int64)))
         sp.append((SP_OFF['envthem'] + ETb.astype(np.int64)))
         sp.append(((SP_OFF['mobus'] + MUb.astype(np.int64))).reshape(F.shape[0], -1))

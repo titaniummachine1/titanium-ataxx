@@ -97,7 +97,7 @@ def materialize32(F, Q, EUS, ETH, MUS, MTH, CUS, CTH, VUS, VTH, active):
             np.add(F32[:, xa], 81 * F32[:, ya], out=SP[:, c:c + w], casting='unsafe')
             np.add(SP[:, c:c + w], SP_OFF[SP_DIR[d]], out=SP[:, c:c + w], casting='unsafe')
             c += w
-        np.add(Q, AR2, out=SP[:, c:c + 36], casting='unsafe')
+        np.add(Q, AR2 + SP_OFF['q2'], out=SP[:, c:c + 36], casting='unsafe')
         c += 36
         np.add(EUS, SP_OFF['envus'], out=SP[:, c:c + 49], casting='unsafe')
         c += 49
