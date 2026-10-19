@@ -3,7 +3,7 @@
 //! Search order: TT probe -> eval cache (depth 0) -> move scoring
 //! (TT move > killers > captures*W + history) -> lazy selection -> alpha-beta.
 
-use crate::board::{dist_union, jump_union, Board, Move, MoveList, RING1, SQUARES};
+use crate::board::{dist_union, jump_union, Board, Move, MoveList, RING1, RING2, SQUARES};
 use crate::tuple::TupleTable;
 use crate::sancta::{S1Acc, S1Net};
 use std::time::Duration;
@@ -144,6 +144,11 @@ pub fn evaluate(b: &Board, tup: Option<&TupleTable>, native_tup: bool) -> i32 {
 }
 
 /// Score moves in place: TT move > killers > captures*W + history.
+/// Fused generation + scoring (winter-clean W6): one pass over targets —
+/// captures computed ONCE per target (not once per move), clone-ness known
+/// from the generation loop (no RING1 shift-test per move). Same move SET,
+/// same ORDER, same SCORES as generate-then-score (enforced by node-count
+/// parity on sperft + the lazy-ordering test) — the tree cannot tell.
 /// Free function (not a method) so negamax can borrow the move stack
 /// mutably while reading killers/history immutably — no split-borrow
 /// fight, no unsafe, no clone.
@@ -156,38 +161,59 @@ fn score_into(
     killers: &[(u32, u32); MAX_PLY],
     history: &[[u32; 49]; 2],
 ) {
-    b.legal_moves_dedup_into(list);
+    list.clear();
+    let me = b.me();
     let opp = b.opp();
+    let me_occ = b.occ[b.turn as usize];
+    let mut targets = b.targets(b.turn);
     let (k1, k2) = killers[ply as usize];
     let hist = &history[b.turn as usize];
     let mut tt_index = usize::MAX;
-    for i in 0..list.len() {
-        let m = list.move_at(i);
-        let packed = m.to_u32();
-        if packed == tt_mv {
-            tt_index = i;
-            list.set_score(i, i32::MAX / 2);
-            continue;
+    // Inline push with the shared per-move tail (TT/killer/history).
+    // Same formula as the old two-pass version, bit for bit.
+    while targets != 0 {
+        let to = targets.trailing_zeros() as u8;
+        targets &= targets - 1;
+        let caps = (opp & RING1[to as usize]).count_ones() as i32 * ORD_CAPTURE_UNIT;
+        let clones = me & RING1[to as usize];
+        if clones != 0 {
+            let from = clones.trailing_zeros() as u8;
+            let packed = Move { from, to }.to_u32();
+            let score = if packed == tt_mv {
+                tt_index = list.len();
+                ORD_TT
+            } else {
+                let mut s = caps + ORD_CLONE_BONUS;
+                if packed == k1 || packed == k2 {
+                    s += ORD_KILLER;
+                }
+                s + (hist[to as usize] as i32).min(ORD_HISTORY_MAX)
+            };
+            list.push(Move { from, to });
+            list.set_score(list.len() - 1, score);
         }
-        let mut score = (opp & RING1[m.to as usize]).count_ones() as i32 * ORD_CAPTURE_UNIT;
-        // Clone preference: a clone nets one more stone than a jump and
-        // leaves the origin defended ("duplicate as much as you can").
-        // (exp/ab A tested no-asymmetry: 41-55, keep preference.)
-        if m.is_clone() {
-            score += ORD_CLONE_BONUS;
-        } else {
-            // exp/ab O1 (hole-aware jumps): a jump vacates its origin —
-            // leaving a connected origin breaks formation, so penalty
-            // scales with own stones adjacent to the origin square.
-            let conn =
-                (b.occ[b.turn as usize] & RING1[m.from as usize]).count_ones() as i32;
-            score -= ORD_JUMP_PEN + conn * ORD_JUMP_CONN;
+        let mut jumps = me & RING2[to as usize];
+        while jumps != 0 {
+            let from = jumps.trailing_zeros() as u8;
+            jumps &= jumps - 1;
+            let packed = Move { from, to }.to_u32();
+            let score = if packed == tt_mv {
+                tt_index = list.len();
+                ORD_TT
+            } else {
+                // exp/ab O1 (hole-aware jumps): a jump vacates its origin —
+                // leaving a connected origin breaks formation, so penalty
+                // scales with own stones adjacent to the origin square.
+                let conn = (me_occ & RING1[from as usize]).count_ones() as i32;
+                let mut s = caps - ORD_JUMP_PEN - conn * ORD_JUMP_CONN;
+                if packed == k1 || packed == k2 {
+                    s += ORD_KILLER;
+                }
+                s + (hist[to as usize] as i32).min(ORD_HISTORY_MAX)
+            };
+            list.push(Move { from, to });
+            list.set_score(list.len() - 1, score);
         }
-        if packed == k1 || packed == k2 {
-            score += ORD_KILLER;
-        }
-        score += (hist[m.to as usize] as i32).min(ORD_HISTORY_MAX);
-        list.set_score(i, score);
     }
     if tt_index != usize::MAX && tt_index != 0 {
         list.swap(tt_index, 0);
