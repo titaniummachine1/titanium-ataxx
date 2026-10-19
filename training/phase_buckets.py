@@ -1,62 +1,64 @@
 #!/usr/bin/env python3
-"""Phase census + 4-bucket split by empty squares (position-intrinsic).
-P0 open 40-49, P1 early-mid 28-39, P2 late-mid 14-27, P3 end 0-13.
+"""Phase buckets on PIECES-on-board (monotonic game clock, user-ordered).
+Bucket count is NOT fixed: use --buckets k (equal-width over observed range)
+and pick k by the bisect rule (finest k with every bucket >=5% of rows AND
+neighboring buckets behaviorally distinct). See bisect_phases.py.
 Usage:
-  python training/phase_buckets.py --census data/nnue/cache12M_clean.npz
-  python training/phase_buckets.py --split data/nnue/cache12M_clean.npz
-    --outdir data/nnue/phases12m   (writes p0..p3.npz + census.txt)
+  python training/phase_buckets.py --census data/nnue/X.npz
+  python training/phase_buckets.py --split data/nnue/X.npz --buckets 8 \
+      --outdir data/nnue/phX  (writes b0..b{k-1}.npz + census.txt)
 """
 import argparse
 import os
 
 import numpy as np
 
-BUCKETS = [(40, 49, 'P0-open'), (28, 39, 'P1-emid'),
-           (14, 27, 'P2-lmid'), (0, 13, 'P3-end')]
+
+def bucket_edges(pieces, k):
+    lo, hi = int(pieces.min()), int(pieces.max())
+    edges = np.linspace(lo, hi + 1, k + 1, dtype=int)
+    return [(int(edges[i]), int(edges[i + 1]) - 1) for i in range(k)]
 
 
-def empties(o0, o1):
-    n = len(o0)
-    c0 = np.unpackbits(np.ascontiguousarray(o0).view(np.uint8)).reshape(n, 64).sum(1)
-    c1 = np.unpackbits(np.ascontiguousarray(o1).view(np.uint8)).reshape(n, 64).sum(1)
-    return 49 - c0 - c1
+def popcnt(a):
+    a = np.ascontiguousarray(a)
+    return np.unpackbits(a.view(np.uint8)).reshape(len(a), 64).sum(1)
 
 
-def census(path):
+def census(path, k=8):
     z = np.load(path, mmap_mode='r')
-    o0 = np.asarray(z['occ0']).ravel()
-    o1 = np.asarray(z['occ1']).ravel()
-    n = len(o0)
-    e = empties(o0, o1)
-    print('%s n=%d' % (os.path.basename(path), n))
-    out = {}
-    for lo, hi, nm in BUCKETS:
-        m = (e >= lo) & (e <= hi)
-        out[nm] = int(m.sum())
-        print('  %s empties %2d-%2d: %8d (%5.1f%%)' %
-              (nm, lo, hi, int(m.sum()), 100 * m.mean()))
+    n = len(z[list(z.keys())[0]])
+    pieces = popcnt(np.asarray(z['occ0']).ravel()[:n]) + \
+        popcnt(np.asarray(z['occ1']).ravel()[:n])
+    print('%s n=%d pieces %d..%d' % (os.path.basename(path), n,
+                                     int(pieces.min()), int(pieces.max())))
+    out = []
+    for bi, (lo, hi) in enumerate(bucket_edges(pieces, k)):
+        m = (pieces >= lo) & (pieces <= hi)
+        out.append((bi, lo, hi, int(m.sum())))
+        print('  b%d pieces %2d-%2d: %8d (%5.1f%%)' %
+              (bi, lo, hi, int(m.sum()), 100 * m.sum() / max(n, 1)))
     return out
 
 
-def split(path, outdir):
+def split(path, outdir, k):
     os.makedirs(outdir, exist_ok=True)
     z = np.load(path, mmap_mode='r')
     keys = list(z.keys())
     n = len(z[keys[0]])
     o0 = np.asarray(z['occ0']).ravel()[:n]
     o1 = np.asarray(z['occ1']).ravel()[:n]
-    e = empties(o0, o1)
+    pieces = popcnt(o0) + popcnt(o1)
     with open(os.path.join(outdir, 'census.txt'), 'w') as cf:
-        cf.write('source=%s n=%d\n' % (path, n))
-        for bi, (lo, hi, nm) in enumerate(BUCKETS):
-            m = np.where((e >= lo) & (e <= hi))[0]
-            kw = {k: np.asarray(z[k]).ravel()[:n][m] for k in keys}
-            fp = os.path.join(outdir, 'p%d.npz' % bi)
+        cf.write('source=%s n=%d k=%d key=pieces\n' % (path, n, k))
+        for bi, (lo, hi) in enumerate(bucket_edges(pieces, k)):
+            m = np.where((pieces >= lo) & (pieces <= hi))[0]
+            kw = {kk: np.asarray(z[kk]).ravel()[:n][m] for kk in keys}
+            fp = os.path.join(outdir, 'b%d.npz' % bi)
             np.savez_compressed(fp, **kw)
-            cf.write('%s empties %d-%d: %d (%.1f%%)\n' %
-                     (nm, lo, hi, len(m), 100 * len(m) / max(n, 1)))
-            print('%s -> %d rows' % (fp, len(m)), flush=True)
-    print('census written', flush=True)
+            cf.write('b%d pieces %d-%d: %d (%.1f%%)\n' %
+                     (bi, lo, hi, len(m), 100 * len(m) / max(n, 1)))
+            print('wrote %s (%d)' % (fp, len(m)), flush=True)
 
 
 def main():
@@ -64,12 +66,13 @@ def main():
     ap.add_argument('--census', default='')
     ap.add_argument('--split', default='')
     ap.add_argument('--outdir', default='')
+    ap.add_argument('--buckets', type=int, default=8)
     a = ap.parse_args()
     if a.census:
-        census(a.census)
+        census(a.census, a.buckets)
     if a.split:
         assert a.outdir
-        split(a.split, a.outdir)
+        split(a.split, a.outdir, a.buckets)
 
 
 if __name__ == '__main__':

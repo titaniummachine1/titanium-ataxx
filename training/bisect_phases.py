@@ -40,6 +40,7 @@ def main():
         # normalize outcome to [0,1] if it looks like [-1,1]
         if out.min() < 0:
             out = (out + 1.0) / 2.0
+    verdict = None
     for k in (2, 4, 8, 16):
         edges = np.linspace(lo, hi + 1, k + 1, dtype=int)
         print('--- k=%d ---' % k)
@@ -57,6 +58,9 @@ def main():
                 if out is not None]
         print('  min_share=%.1f%% max_neighbor_gap=%.3f' %
               (100 * minshare, max(gaps) if gaps else float('nan')))
+        if verdict is None and minshare >= 0.05:
+            verdict = k
+    print('VERDICT: finest k with every bucket >=5%% = %s' % verdict)
 
 
 if __name__ == '__main__':
