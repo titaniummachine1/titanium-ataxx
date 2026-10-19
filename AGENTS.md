@@ -31,7 +31,9 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 1. **MAIN IS UNTOUCHABLE.** Work on `exp/*` only. No local main edits, ever.
 2. **TIME CROWNS — but NODES CAN MERGE.** Intelligence-only change (speed
    provably untouched): 5k-node gate CAN merge alone (fairest, zero clock
-   noise). Speed affected: 100ms AND 200ms BOTH must win; 5k is diagnosis.
+   noise). Speed affected: chosen time controls (50/100/200ms per gate,
+   both chosen legs must win); 5k is diagnosis.
+   **STOCKFISH STACKING:** main absorbs EVERY proven gain, however small.
 3. **MAIN IS ALWAYS STRONGEST.** Nothing merges (code or weights) without a
    sufficient-games gate proving the new build stronger. Straddling CI =
    EXTEND, never merge, never reject on the bound alone.

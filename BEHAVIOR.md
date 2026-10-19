@@ -29,9 +29,16 @@ real memory. Update them the moment something happens, not at the end.
     untouched: identical sperft nodes or bench/sperft parity): the 5k-node
     gate CAN merge alone. Fixed nodes = both sides think identical trees =
     zero clock noise, the fairest most precise gate. No time gate owed.
-    (b) speed affected (any NPS change): BOTH realistic time gates (100ms
-    AND 200ms) must win with a discernible pattern — speed must convert.
-    The 5k leg is then the quality DIAGNOSIS (did decisions change?).
+    (b) speed affected (any NPS change): the time crown must be won at the
+    CHOSEN controls — 50ms and/or 100ms legs (200ms for confirmation); the
+    exact legs are chosen per gate and BOTH chosen legs must win with a
+    discernible pattern — speed must convert. The 5k leg is then the quality
+    DIAGNOSIS (did decisions change?).
+    (c) STOCKFISH STACKING (user law 2026-10-19): main absorbs EVERYTHING
+    proven better, however small. Ten stacked +5 gains beat one +50 swing
+    that never lands. Iterative improvement is the whole strategy: prove a
+    gain, merge it, climb. No gain is too small to merge; no merge without
+    proof.
     Neutral/dry does NOT merge — no proof of stronger, no merge. Any
     regression at the required gates = NO merge. Even the smallest gain
     counts, but it must be REAL and repeatable: when in doubt, run more
@@ -53,7 +60,10 @@ real memory. Update them the moment something happens, not at the end.
     book), never merge early. BEHIND → EXTEND too (FOMO: fear of missing
     out on Elo — a buried gem rejects at our peril); reject ONLY on a
     conclusive CI below 0.5 AND user confirmation (same as merges: user
-    calls every merge AND every rejection). An inconclusive gate is an
+    calls every merge AND every rejection). REJECTION IS FOR THE
+    UNDOUBTEDLY WORSE: proven worse than main beyond doubt. Anything with
+    potential — faster, stronger, or better in any way, even tiny — PARKS
+    for more gate, never rejects. An inconclusive gate is an
     order to SPEND MORE GATE, not a verdict.
 9. **ENGINE ADAPTS TO NET.** Never damage an experimental net to make it fit
     main: no stripping sections, no converting formats, no rewriting blobs
