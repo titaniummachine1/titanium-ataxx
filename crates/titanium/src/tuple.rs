@@ -485,13 +485,18 @@ impl TupleTable {
             s += self.capn_them[mt.min(8) as usize] as i32;
         }
         // Conversion-kernel keys per square (foe pattern, NEIGH_POS order).
+        // NOTE (PARKED, not rejected): BMI2 PEXT tried, hoisted detect —
+        // 0.88/0.93 vs 0.98/1.00 scalar on this CPU (latency-bound in the
+        // real loop; micro still 702M vs 99M/s). Scalar stays default.
+        // Proof `pext_matches_loop` + genbench PEXT micro stay prepared
+        // for retest (other CPUs, restructured loops). Rejection is only
+        // for what makes the engine worse — this is parked for FOMO.
         let mut sq = 0usize;
         while sq < 49 {
-            let ku = conv_key(ot, sq);
+            let (ku, kt) = (conv_key(ot, sq), conv_key(ou, sq));
             if ku != 0 {
                 s += self.conv_us[ku] as i32;
             }
-            let kt = conv_key(ou, sq);
             if kt != 0 {
                 s += self.conv_them[kt] as i32;
             }
