@@ -9,7 +9,9 @@ use std::time::Duration;
 use crate::board::{Board, Move};
 use crate::search::{Searcher, SearchLimits};
 
-const MOVETIME_MS: u64 = 700;
+const MOVETIME_MS: u64 = 800;
+/// First turn of the game gets the platform's 2x time (2000ms budget).
+const MOVETIME_FIRST_MS: u64 = 1500;
 
 fn sq_xy(sq: u8) -> (i32, i32) {
     ((sq % 7) as i32, (sq / 7) as i32)
@@ -111,9 +113,17 @@ fn main() {
         println!("-1 -1 -1 -1");
         return;
     }
+    // First turn of the game: platform grants 2x time. Detect: no history
+    // was replayed (only the initial position seen).
+    let first_turn = seen.len() <= 2;
+    let budget = if first_turn {
+        MOVETIME_FIRST_MS
+    } else {
+        MOVETIME_MS
+    };
     let mut searcher = Searcher::new();
     let limits = SearchLimits {
-        time: Some(Duration::from_millis(MOVETIME_MS)),
+        time: Some(Duration::from_millis(budget)),
         max_nodes: None,
         max_depth: 64,
     };
