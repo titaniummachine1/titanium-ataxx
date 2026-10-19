@@ -990,6 +990,9 @@ impl Board {
 
     /// libataxx-style FEN (rows top->bottom, digit runs, then side and two
     /// counters) for talking UAI to other engines: `6o/7/7/7/7/7/x6 x 0 1`.
+    /// Counters carry the game ply exactly (half = ply%2, full = ply/2+1;
+    /// ataxx has no fifty-move rule so the slots are free); a reader that
+    /// ignores them still gets a valid position with ply 0.
     pub fn to_ataxx_fen(&self) -> String {
         let mut rows = Vec::with_capacity(7);
         for r in 0..SIZE {
@@ -1027,9 +1030,11 @@ impl Board {
             rows.push(row);
         }
         format!(
-            "{} {} 0 1",
+            "{} {} {} {}",
             rows.join("/"),
-            if self.turn == 0 { 'x' } else { 'o' }
+            if self.turn == 0 { 'x' } else { 'o' },
+            self.ply % 2,
+            self.ply / 2 + 1
         )
     }
 
@@ -1584,6 +1589,45 @@ mod tests {
                     }
                 }
                 assert_eq!(b.pst, want, "incremental pst diverged");
+                let moves = b.legal_moves();
+                if moves.is_empty() {
+                    b = b.make_pass();
+                    continue;
+                }
+                b = b.make(moves.move_at((rng() % moves.len() as u64) as usize));
+            }
+        }
+    }
+
+    #[test]
+    fn fen_roundtrip_matches_live_board() {
+        // TEMPORARY diagnostic: FEN-built boards must equal moves-built ones
+        // on every field, or TT keys / mate distances / pass state diverge
+        // between `position fen` and `position startpos moves ...` paths.
+        let mut state: u64 = 0x123456789ABCDEF;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..30 {
+            let mut b = Board::start();
+            for _ in 0..80 {
+                if b.game_over() {
+                    break;
+                }
+                let f = b.to_ataxx_fen();
+                let r = Board::from_ataxx_fen(&f).expect("fen parse failed");
+                assert_eq!(r.occ, b.occ, "occ diverged at fen {f}");
+                assert_eq!(r.turn, b.turn, "turn diverged at fen {f}");
+                assert_eq!(r.passes, b.passes, "passes diverged at fen {f}");
+                assert_eq!(r.ply, b.ply, "ply diverged at fen {f}");
+                assert_eq!(r.piece_cnt, b.piece_cnt, "counts diverged at fen {f}");
+                assert_eq!(r.blockers, b.blockers, "blockers diverged at fen {f}");
+                assert_eq!(r.blocker_cnt, b.blocker_cnt, "blocker_cnt diverged at fen {f}");
+                assert_eq!(r.pst, b.pst, "pst diverged at fen {f}");
+                assert_eq!(r.hash, b.hash, "hash diverged at fen {f}");
                 let moves = b.legal_moves();
                 if moves.is_empty() {
                     b = b.make_pass();

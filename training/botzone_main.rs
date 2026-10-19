@@ -18,27 +18,45 @@ fn sq_xy(sq: u8) -> (i32, i32) {
 }
 
 fn main() {
-    let mut input = String::new();
-    if io::stdin().read_to_string(&mut input).is_err() {
-        return;
-    }
-    let nums: Vec<i64> = input
+    // Read exactly what the protocol sends (no EOF dependence):
+    // turnID, then 2*(turnID-1) history lines, then the current opp line.
+    // (The wiki mentions trailing data/globaldata lines; we ignore them.)
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+    let first: String = lines.next().map_or(String::new(), |l| l.unwrap_or_default());
+    let turn_id: usize = first
         .split_whitespace()
-        .filter_map(|s| s.parse::<i64>().ok())
-        .collect();
-    if nums.is_empty() {
-        return;
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let mut nums: Vec<i64> = Vec::with_capacity(4 * (2 * turn_id - 1));
+    while nums.len() < 4 * (2 * turn_id - 1) {
+        match lines.next() {
+            Some(Ok(l)) => {
+                for s in l.split_whitespace() {
+                    if let Ok(v) = s.parse::<i64>() {
+                        nums.push(v);
+                    }
+                    if nums.len() >= 4 * (2 * turn_id - 1) {
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
     }
-    let turn_id = nums[0].max(1) as usize;
-    let rest = &nums[1..];
-    // history: (turn_id-1) pairs of (opp, own), then current opp move.
+    while nums.len() < 4 * (2 * turn_id - 1) {
+        nums.push(-1);
+    }
     let mut idx = 0usize;
+    // history: (turn_id-1) pairs of (opp, own), then current opp move.
     let take = |idx: &mut usize| -> (i64, i64, i64, i64) {
         let v = (
-            *rest.get(*idx).unwrap_or(&-1),
-            *rest.get(*idx + 1).unwrap_or(&-1),
-            *rest.get(*idx + 2).unwrap_or(&-1),
-            *rest.get(*idx + 3).unwrap_or(&-1),
+            *nums.get(*idx).unwrap_or(&-1),
+            *nums.get(*idx + 1).unwrap_or(&-1),
+            *nums.get(*idx + 2).unwrap_or(&-1),
+            *nums.get(*idx + 3).unwrap_or(&-1),
         );
         *idx += 4;
         v
