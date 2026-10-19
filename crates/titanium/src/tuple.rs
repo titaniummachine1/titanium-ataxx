@@ -252,7 +252,16 @@ impl TupleTable {
             }
             t.has_enriched = true;
         }
-        if buf[0..4] == TUP6_MAGIC {
+        // TUP7 files carry capn/conv sections before pa (same layout as
+        // TUP6 + pa appended: every TUP7 blob on disk is 726440 bytes, which
+        // is exactly TUP6-size + pa). The old check read them for TUP6_MAGIC
+        // only, so on TUP7 the pa table loaded 1060 bytes shifted (all 80
+        // tables scrambled) and trained capn/conv weights were dropped.
+        // has_capconv gates on content below (all-zero sections stay off).
+        // Length-guarded: a hypothetical section-less TUP7 still loads.
+        let has_cc_sections = buf[0..4] == TUP6_MAGIC
+            || (buf[0..4] == TUP7_MAGIC && buf.len() - o >= 9 * 2 * 2 + 256 * 2 * 2 + PA_PATTERNS);
+        if has_cc_sections {
             for table in [&mut t.capn_us, &mut t.capn_them].iter_mut() {
                 for v in table.iter_mut() {
                     need(o, 2)?;
@@ -267,7 +276,12 @@ impl TupleTable {
                     o += 2;
                 }
             }
-            t.has_capconv = true;
+            // Content-gated like has_q2 (W4 pattern): all-zero sections add
+            // exactly 0, so the tree skips them bit-identically.
+            t.has_capconv = t.capn_us.iter().any(|&w| w != 0)
+                || t.capn_them.iter().any(|&w| w != 0)
+                || t.conv_us.iter().any(|&w| w != 0)
+                || t.conv_them.iter().any(|&w| w != 0);
         }
         if buf[0..4] == TUP7_MAGIC {
             for v in t.pa.iter_mut() {
