@@ -297,6 +297,11 @@ impl TupleTable {
     pub fn forward_fast(&self, b: &Board, land_me: u64, land_opp: u64) -> i32 {
         let (sq_blocks, sq_n) = &SQ_BLOCKS;
         let mut blocks = [0u8; 36];
+        // Quat 2x2 indices fused into the same stone passes (was 3 extra
+        // traversals in forward_enriched). Guarded: non-enriched tables
+        // (v4) skip the quat work entirely.
+        let mut q = [0u8; 36];
+        let enr = self.has_enriched;
         let mut stones = b.me();
         while stones != 0 {
             let sq = stones.trailing_zeros() as usize;
@@ -306,6 +311,9 @@ impl TupleTable {
             while k < n {
                 let (a, mult) = sq_blocks[sq][k];
                 blocks[a as usize] += mult; // own digit 1
+                if enr {
+                    q[a as usize] += qmult(mult);
+                }
                 k += 1;
             }
         }
@@ -318,7 +326,24 @@ impl TupleTable {
             while k < n {
                 let (a, mult) = sq_blocks[sq][k];
                 blocks[a as usize] += 2 * mult; // enemy digit 2
+                if enr {
+                    q[a as usize] += 2 * qmult(mult);
+                }
                 k += 1;
+            }
+        }
+        if enr {
+            let mut bb = b.blockers;
+            while bb != 0 {
+                let sq = bb.trailing_zeros() as usize;
+                bb &= bb - 1;
+                let n = sq_n[sq] as usize;
+                let mut k = 0usize;
+                while k < n {
+                    let (a, mult) = sq_blocks[sq][k];
+                    q[a as usize] += 3 * qmult(mult); // blocker digit 3
+                    k += 1;
+                }
             }
         }
         let mut s = self.bias;
@@ -354,7 +379,7 @@ impl TupleTable {
             }
         }
         if self.has_enriched {
-            s += self.forward_enriched(b, &blocks);
+            s += self.forward_enriched(b, &q);
         }
         if self.has_capconv {
             s += self.forward_capconv(b, land_me, land_opp);
@@ -362,50 +387,13 @@ impl TupleTable {
         s
     }
 
-    /// S38 enriched families: quat 2x2 splat + per-stone env tallies +
-    /// mobility. Indices mirror training/train_tuple.py exactly (q2_indices,
-    /// env_tables, mob_tables). Skips mirror the zero-constraints.
-    fn forward_enriched(&self, b: &Board, _blocks: &[u8; 36]) -> i32 {
+    /// S38 enriched families: quat 2x2 table + per-stone env tallies +
+    /// mobility. The quat splat now arrives prebuilt (`q`, fused into
+    /// forward_fast's stone passes). Indices mirror training/train_tuple.py
+    /// exactly (q2_indices, env_tables, mob_tables). Skips mirror the
+    /// zero-constraints.
+    fn forward_enriched(&self, b: &Board, q: &[u8; 36]) -> i32 {
         let mut s: i32 = 0;
-        // Q2 quat splat (base-4 digits; blocker digit 3).
-        let (sq_blocks, sq_n) = &SQ_BLOCKS;
-        let mut q = [0u8; 36];
-        let mut stones = b.me();
-        while stones != 0 {
-            let sq = stones.trailing_zeros() as usize;
-            stones &= stones - 1;
-            let n = sq_n[sq] as usize;
-            let mut k = 0usize;
-            while k < n {
-                let (a, m3) = sq_blocks[sq][k];
-                q[a as usize] += qmult(m3);
-                k += 1;
-            }
-        }
-        stones = b.opp();
-        while stones != 0 {
-            let sq = stones.trailing_zeros() as usize;
-            stones &= stones - 1;
-            let n = sq_n[sq] as usize;
-            let mut k = 0usize;
-            while k < n {
-                let (a, m3) = sq_blocks[sq][k];
-                q[a as usize] += 2 * qmult(m3);
-                k += 1;
-            }
-        }
-        stones = b.blockers;
-        while stones != 0 {
-            let sq = stones.trailing_zeros() as usize;
-            stones &= stones - 1;
-            let n = sq_n[sq] as usize;
-            let mut k = 0usize;
-            while k < n {
-                let (a, m3) = sq_blocks[sq][k];
-                q[a as usize] += 3 * qmult(m3);
-                k += 1;
-            }
-        }
         for (a, idx) in q.iter().enumerate() {
             if *idx != 0 {
                 s += self.q2[a][*idx as usize] as i32;
