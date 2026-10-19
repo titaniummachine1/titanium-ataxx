@@ -716,7 +716,7 @@ fn serve_cmd(
             out_line("option name JumpSafe type spin default 0 min 0 max 2000");
             out_line("option name JumpCold type spin default 0 min 0 max 10000");
             out_line("option name JumpPrune type spin default 0 min 0 max 1");
-            for i in 0..8 {
+            for i in 0..12 {
                 out_line(&format!("option name BucketBias{i} type spin default 0 min -2000 max 2000"));
             }
             out_line("option name CurveBase type spin default 2 min 0 max 6");
