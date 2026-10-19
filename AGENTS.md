@@ -38,9 +38,10 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
    sufficient-games gate proving the new build stronger. Straddling CI =
    EXTEND, never merge, never reject on the bound alone.
 4. **NEVER REJECT ON A DIP — EXTEND BOTH WAYS.** Ahead-but-insufficient →
-   EXTEND, never merge early. Behind → EXTEND too (FOMO). Reject only on
-   conclusive CI below 0.5 AND user confirmation (user calls every merge
-   AND every rejection).
+   EXTEND, never merge early. Behind → EXTEND too (FOMO). Elo/score tells
+   ahead from behind (most important metric) — the gate proves DIRECTION
+   (better/worse), never magnitude. Reject only on conclusive CI below 0.5
+   AND user confirmation (user calls every merge AND every rejection).
 5. **NO GATE STOPS BELOW 100 GAMES.** Every leg ≥100g, then extend on straddle.
 6. **GATES ARE BY SEAT + PAIRED BOOK.** Exactly 50/50 per side from log;
    every book line (`data/nnue/book50k.txt`) from BOTH seats. Win-both-seats

@@ -6,7 +6,7 @@ Verify Titanium gate `$ARGUMENTS` (a tag substring, e.g. branch or net tag). The
 
 **WHICH gate proves it (law 6):** intelligence-only change (speed provably untouched: identical sperft nodes) → the 5k-node gate CAN merge alone (fairest, most precise, zero clock noise). Speed affected (any NPS change) → BOTH time gates (100ms AND 200ms) must win; 5k is then the quality diagnosis only.
 
-**SPRT always (law 8):** LLR H0 elo≤0 vs H1 elo≥20, PASS at ≥ +2.94. AHEAD but insufficient → EXTEND (more games, fresh book), never merge early. BEHIND → EXTEND too (FOMO: buried gems reject at our peril). Reject ONLY on conclusive CI below 0.5 AND user confirmation. User calls every merge AND every rejection. An inconclusive gate is an order to spend more gate, never a verdict.
+**SPRT always (law 8):** LLR H0 elo≤0 vs H1 elo≥20, PASS at ≥ +2.94. Elo/score is the metric that tells ahead from behind — the gate proves DIRECTION (better/worse than main), never magnitude. AHEAD but insufficient → EXTEND (more games, fresh book), never merge early. BEHIND → EXTEND too (FOMO: buried gems reject at our peril). Reject ONLY on conclusive CI below 0.5 AND user confirmation. User calls every merge AND every rejection. An inconclusive gate is an order to spend more gate, never a verdict.
 
 **Paired book + seats (law 11):** every gate game runs on the prepared book (`data/nnue/book50k.txt`); each line played from BOTH seats by BOTH engines. Win-both-seats = real edge (even 1 point is signal, especially fixed-nodes). Split = parity. Every leg ≥100 games (law 10), exactly 50/50 black/white per side verified FROM THE LOG.
 

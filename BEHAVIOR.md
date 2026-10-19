@@ -56,10 +56,13 @@ real memory. Update them the moment something happens, not at the end.
     the quality diagnosis.
 8. **NEVER REJECT ON A DIP — EXTEND BOTH WAYS (SPRT gate law, user order
     2026-10-19).** Every gate is SPRT (LLR H0 elo≤0 vs H1 elo≥20, PASS at
-    ≥ +2.94). AHEAD but proof insufficient → EXTEND (more games, fresh
-    book), never merge early. BEHIND → EXTEND too (FOMO: fear of missing
-    out on Elo — a buried gem rejects at our peril); reject ONLY on a
-    conclusive CI below 0.5 AND user confirmation (same as merges: user
+    ≥ +2.94). Elo/score IS the metric — it tells ahead from behind and it
+    is the most important number on the board — but the gate proves
+    DIRECTION (better or worse than main), never magnitude (no one proves
+    "how much Elo it gained"). AHEAD but proof insufficient → EXTEND (more
+    games, fresh book), never merge early. BEHIND → EXTEND too (FOMO: fear
+    of missing out on Elo — a buried gem rejects at our peril); reject ONLY
+    on a conclusive CI below 0.5 AND user confirmation (same as merges: user
     calls every merge AND every rejection). REJECTION IS FOR THE
     UNDOUBTEDLY WORSE: proven worse than main beyond doubt. Anything with
     potential — faster, stronger, or better in any way, even tiny — PARKS

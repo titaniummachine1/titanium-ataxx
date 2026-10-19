@@ -1,3 +1,9 @@
+## STATE FOR NEW SESSION (2026-10-19 WINTER-CLEAN MERGED — MAIN IS STRONGEST, READ THIS ONLY)
+
+- Main @`a85871f` (= `73a859d` + winter-clean: W1/W2/W4, +26% champ NPS 0.95→~1.16, nodes bit-identical 912555). Strongest = main + `data/nnue/tupS55tree.tup` (`F66A00FE…899D7C`). Merge basis: ahead every leg (5k 51-51-2 identity / t100 53-48-3 / t200 109-95-4), never behind in any leg — user judgment merge, NOT an SPRT pass (pooled LLR +0.47). Full record: LEDGER Wgate*/Wmerge rows; gate logs `logs/gate_wc_*.txt`.
+- Next: fresh `exp/*` off new main for further winter cleaning (danger-tally walks, hit-rate study on 98%-zero sections, NodeSets revisit). Parked: exp/winter-sets (neutral), PEXT (loses here). Doctrine unchanged: BEHAVIOR laws 6-13, gate.md, AGENTS §3. Branch exp/winter-clean kept as history; do not build on it.
+- Box: verify `tasklist` empty at session start. PS 5.1 only (no head/sed/tail/grep/wmic). Edit preserves mtime → `os.utime` after edits. LEDGER.md CRLF → append via python.
+
 ## STATE FOR NEW SESSION (2026-10-19 WINTER-CLEAN: +26% CHAMP NPS, GATES VOID, DOCTRINE ENGRAVED — READ THIS, NOTHING ELSE, THEN VERIFY)
 
 - Branch: `exp/winter-clean` (= W1 landings-share +3-5% + W2 quat-fusion +10% + W4 has_q2-skip +15%, ALL merged here; champ sperft 0.95 → ~1.20 Mnps, nodes bit-identical 912555 everywhere). Main UNTOUCHED @`73a859d`. Strongest = main + `data/nnue/tupS55tree.tup` (sha256 `F66A00FE…899D7C`).
