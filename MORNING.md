@@ -1,4 +1,19 @@
-# MORNING 2026-10-19 — overnight shift report
+# MORNING 2026-10-19 — overnight shift report (UPDATED 08:35, shift actually worked)
+
+## LATE ADDITIONS (after first draft — you asked, I did)
+- **O1 RESTORED, parity 100-100 exact** (book ah). Line == main at defaults. CorrHist
+  confirmed OFF-by-default, not ported. The "rebase" is DONE as a restore (no rebase
+  needed — merge-base was already 73a859d).
+- **STALE-BINARY BUG found+fixed**: sloss EXE pointed at table-era target-loss (no
+  PCut/Jump/Curve) — the intent/curve/pcut tunes tuned NOTHING. Fixed EXE->release,
+  ported curve mode 3 in, rebuilt, reran everything REAL.
+- **Final screens (all fresh books)**: intent-tuned 91-109 (BURIED), curve-tuned 89-111
+  (BURIED), pcut-tuned 104-96 (parked neutral).
+- **LAMBDA PIPELINE SHIPPED**: 1117 positions played out (2234 games, stm outcomes),
+  deep_fresh_out.jsonl + --lamb flag (logit-blend, MSE core untouched). Demo tune runs
+  clean, no convergence in 40it (honest neutral). Texel-on-eval = your call next.
+
+## !!! READ FIRST (original note, now RESOLVED — kept for the trail):
 
 ## !!! READ FIRST: the working line is missing O1 (must rebase before any merge)
 - Commit 8cdbb6b (exp/uai-protocol, "zero behavior change") REBUILT search.rs from a
