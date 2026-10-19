@@ -1,4 +1,32 @@
-# MORNING 2026-10-19 — overnight shift report (UPDATED 08:35, shift actually worked)
+# MORNING 2026-10-19 — overnight shift report (UPDATED 11:45, Botzone haul banked)
+
+## BOTZONE HAUL (user-fed, all pulled)
+- **Ranklist mapped**: atx 2674 (NN+tree search, ceiling) > KataGo-derivatives ~2380 >
+  pure-search fffasttime 1999 > hce hand-crafted 1977 > AutaxxNNUE 1914 > students.
+- **fffasttime/AI-ataxx full source pulled** (mined: staged eval w/ trained tables,
+  evalJump 9x9 tuned bonus, geneBranch danger-pruning, bucketed search, 1s time split
+  0.88/0.30, root randomization). Jump-danger tax tried: 27-173 BURIED. Cold ordering:
+  98-102 parked. Jump prune: 28-172 BURIED. fffasttime context doesn't transfer to us.
+- **KataAtaxx CPU package ON DISK** (332MB, boots: KataGo v1.12.4 GTP; 86MB transformer
+  net b12c384...; engine.cfg loopPassRule=LOOPDRAW_PASSSCORING). GTP integration queued:
+  needs coordinate mapping + config + wrapper test. Sparring partner + teacher.
+- **KataGomo training recipe captured** (selfplay->shuffle->Muon->export ONNX; dataset on
+  modelscope). Needs 2xGPU Linux; reference only.
+- **petersn/AtaxxZero pulled** (rules/engine/UAI/MCTS): independently CONFIRMS Botzone
+  end rules (single-stuck = empties to mobile side + score); UAI-compatible with us.
+- **Botzone protocol mapped + bridge built** (training/botzone.py): simple-protocol <->
+  UAI, coord mapping verified, repetition guard (conservative vs judge), pass handling.
+  Self-test: full 146-ply game, all legal. Entry needs YOUR account+submit (Local AI or
+  code upload) — bridge is ready.
+- **Judge source analyzed** (you pasted it): repetition = TRANSITION match = instant loss;
+  mid-game -1 = INVALIDMOVE (judge ends before asking, so unreachable); 400-turn cap;
+  empty-fill confirmed; wipeout immediate. Bridge guard is a safe superset. No engine
+  rule change needed for entry (only for optimal endgame play).
+- **Blocked**: bulk matchpacks (host down, 502), single-match logs (need login/API),
+  hce/sotax/waffle/evo/loker-wrapper sources (not found on GitHub).
+- **Rule divergence filed**: our pass-and-continue vs Botzone single-stuck-end. Affects
+  endgame eval accuracy under Botzone rules only; our gates internally consistent.
+  Botzone-rules search mode queued, not implemented.
 
 ## LATE ADDITIONS (after first draft — you asked, I did)
 - **O1 RESTORED, parity 100-100 exact** (book ah). Line == main at defaults. CorrHist
