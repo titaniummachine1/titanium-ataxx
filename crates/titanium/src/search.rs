@@ -138,6 +138,10 @@ const ORD_KILLER: i32 = 100_000;
 const ORD_CAPTURE_UNIT: i32 = 1000; // per conversion, max 8
 const ORD_CLONE_BONUS: i32 = 500;
 const ORD_JUMP_PEN: i32 = 500;
+/// O1 (hole-aware jumps, S42, merged): a jump vacates its origin — leaving
+/// a connected origin breaks formation, so penalty scales with own stones
+/// adjacent to the origin square.
+const ORD_JUMP_CONN: i32 = 250;
 const ORD_HISTORY_MAX: i32 = 90_000;
 const _: () = assert!(ORD_HISTORY_MAX + 8 * ORD_CAPTURE_UNIT + ORD_CLONE_BONUS < ORD_KILLER);
 const _: () = assert!(ORD_KILLER < ORD_TT);
@@ -263,7 +267,11 @@ fn score_into(
         if m.is_clone() {
             score += ORD_CLONE_BONUS;
         } else {
-            score -= ORD_JUMP_PEN;
+            // O1: hole-aware jumps — vacating a connected origin breaks
+            // formation (restored from main; was dropped by uai-protocol).
+            let conn =
+                (b.occ[b.turn as usize] & RING1[m.from as usize]).count_ones() as i32;
+            score -= ORD_JUMP_PEN + conn * ORD_JUMP_CONN;
             // Intent-aware jumps (user idea): escape / attack / gamble.
             if intent_on {
                 let from_c = (RING1[m.from as usize] & opp).count_ones();
