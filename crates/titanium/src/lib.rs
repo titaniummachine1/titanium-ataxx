@@ -20,6 +20,6 @@ pub use board::{
 };
 #[cfg(target_arch = "x86_64")]
 pub use board::extract8_pext;
-pub use search::{best_move, SearchLimits, SearchResult, Searcher, StopReason};
+pub use search::{best_move, evaluate, SearchLimits, SearchResult, Searcher, StopReason};
 pub use sancta::{S1Net, S1Acc, S1_L1, S1_H2, S1N_V3};
 pub use tuple::{TupleTable, DIR_COUNTS, PAIR_PATTERNS, TUP_MAGIC};

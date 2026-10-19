@@ -81,6 +81,15 @@ fn main() -> ExitCode {
             flag_int(&args, "--games").unwrap_or(8) as usize,
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
+            flag_int(&args, "--reps").unwrap_or(1) as usize,
+        ),
+        "evalbench" => evalbench_cmd(
+            flag_int(&args, "--iters").unwrap_or(200) as u64,
+            flag_int(&args, "--positions").unwrap_or(5000) as usize,
+            flag_str(&args, "--tuple"),
+            args.iter().any(|x| x == "--tuple-native"),
+            flag_str(&args, "--book"),
+            flag_int(&args, "--batches").unwrap_or(20) as usize,
         ),
         _ => {
             print_help();
@@ -1172,7 +1181,7 @@ fn sperft_positions(n: usize) -> Vec<Board> {
 /// Search-throughput benchmark ("perft for the search"): fixed depth, no
 /// time limit, deterministic position suite. Node counts are reproducible,
 /// nps tracks search optimizations (TT, ordering, eval).
-fn sperft_cmd(depth: u32, positions: usize, tup_spec: Option<String>, tup_native: bool) -> ExitCode {
+fn sperft_cmd(depth: u32, positions: usize, tup_spec: Option<String>, tup_native: bool, reps: usize) -> ExitCode {
     let suite = sperft_positions(positions);
     let tup = match load_tuple_preset(&tup_spec) {
         Ok(t) => t,
@@ -1182,11 +1191,14 @@ fn sperft_cmd(depth: u32, positions: usize, tup_spec: Option<String>, tup_native
         }
     };
     println!(
-        "Search benchmark: fixed depth {depth}, {} positions, 1M-entry TT\n",
-        suite.len()
+        "Search benchmark: fixed depth {depth}, {} positions, 1M-entry TT ({} reps)\n",
+        suite.len(),
+        reps.max(1)
     );
 
-    {
+    let mut first_nodes = 0u64;
+    let mut mnps: Vec<f64> = Vec::new();
+    for r in 0..reps.max(1) {
         let mut total_nodes = 0u64;
         let mut total_time = 0.0f64;
         for (i, b) in suite.iter().enumerate() {
@@ -1199,19 +1211,128 @@ fn sperft_cmd(depth: u32, positions: usize, tup_spec: Option<String>, tup_native
                 max_depth: depth,
             };
             let t = Instant::now();
-            let r = searcher.search(b, &limits);
+            let res = searcher.search(b, &limits);
             let dt = t.elapsed().as_secs_f64();
-            total_nodes += r.nodes;
+            total_nodes += res.nodes;
             total_time += dt;
             let _ = i;
         }
-        println!(
-            "  {:>12} nodes  {:>8.2} s  {:>8.2} Mnps",
-            total_nodes,
-            total_time,
-            total_nodes as f64 / total_time / 1_000_000.0
-        );
+        // Node identity: determinism is the tripwire — any drift means the
+        // tree changed (behavior change, not a speedup) and the numbers lie.
+        if r == 0 {
+            first_nodes = total_nodes;
+        } else if total_nodes != first_nodes {
+            eprintln!(
+                "sperft: NODE DRIFT rep {r}: {total_nodes} vs {first_nodes} — tree changed, numbers VOID"
+            );
+            return ExitCode::FAILURE;
+        }
+        mnps.push(total_nodes as f64 / total_time / 1_000_000.0);
     }
+    mnps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean = mnps.iter().sum::<f64>() / mnps.len() as f64;
+    let var = mnps.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / mnps.len() as f64;
+    println!(
+        "  {:>12} nodes  mean {:>8.2} Mnps  std {:>5.2}  min {:>8.2}  max {:>8.2}  median {:>8.2}",
+        first_nodes,
+        mean,
+        var.sqrt(),
+        mnps[0],
+        mnps[mnps.len() - 1],
+        mnps[mnps.len() / 2],
+    );
+    ExitCode::SUCCESS
+}
+
+// ---------- evalbench ----------
+
+/// Isolated eval benchmark (answers "is the eval itself faster?").
+/// Runs `evaluate` (full hand eval + tuple term, the exact tree call) over
+/// a fixed corpus of mid-game positions, many reps: high signal, no tree
+/// noise, no clock-limit variance. The wrapping checksum proves the two
+/// binaries under comparison compute IDENTICAL scores — a speed claim with
+/// a different checksum is a behavior change, not an optimization.
+/// Corpus: fixed-seed playouts, plies 5..60 mixed (opening/mid/endgame).
+/// Compare A/B by alternating runs and reading ns/eval + checksum.
+fn evalbench_cmd(
+    iters: u64,
+    npos: usize,
+    tup_spec: Option<String>,
+    tup_native: bool,
+    book_spec: Option<String>,
+    batches: usize,
+) -> ExitCode {
+    let tup = match load_tuple_preset(&tup_spec) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("evalbench: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Corpus: prepared book lines (OUR dataset, real positions) or fixed-seed
+    // playouts. Book format "<49 chars> <b|w>" parses via Board::from_str.
+    let mut corpus = Vec::new();
+    if let Some(p) = book_spec {
+        let text = std::fs::read_to_string(&p).unwrap_or_else(|e| {
+            eprintln!("evalbench: book {p} unreadable: {e}");
+            std::process::exit(1);
+        });
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()).take(npos.max(1)) {
+            match Board::from_str(line) {
+                Some(b) => corpus.push(b),
+                None => {
+                    eprintln!("evalbench: bad book line");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    } else {
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        for _ in 0..npos.max(1) {
+            let plies = 5 + (rng.next() % 56) as u32;
+            corpus.push(random_position(&mut rng, plies));
+        }
+    }
+    if corpus.is_empty() {
+        eprintln!("evalbench: empty corpus");
+        return ExitCode::FAILURE;
+    }
+    // Warmup (page in tables, settle clocks) — not timed.
+    let mut warm = 0i64;
+    for b in corpus.iter() {
+        warm = warm.wrapping_add(titanium::evaluate(b, tup.as_ref(), tup_native) as i64);
+    }
+    // Batched timing: microsecond precision per batch, statistics over runs.
+    let nb = batches.max(1);
+    let per = (iters / nb as u64).max(1);
+    let mut ns: Vec<f64> = Vec::with_capacity(nb);
+    let mut sum = 0i64;
+    for _ in 0..nb {
+        let t = Instant::now();
+        for _ in 0..per {
+            for b in corpus.iter() {
+                sum = sum.wrapping_add(titanium::evaluate(b, tup.as_ref(), tup_native) as i64);
+            }
+        }
+        let n = per * corpus.len() as u64;
+        ns.push(t.elapsed().as_secs_f64() * 1e9 / n as f64);
+    }
+    ns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean = ns.iter().sum::<f64>() / ns.len() as f64;
+    let var = ns.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / ns.len() as f64;
+    println!(
+        "evalbench: {} positions x {} iters ({} batches), checksum {:#x} (warm {:#x})\n  mean {:8.1} ns/eval  std {:6.1}  min {:8.1}  max {:8.1}  median {:8.1}",
+        corpus.len(),
+        per * nb as u64,
+        nb,
+        sum as u64,
+        warm as u64,
+        mean,
+        var.sqrt(),
+        ns[0],
+        ns[ns.len() - 1],
+        ns[ns.len() / 2],
+    );
     ExitCode::SUCCESS
 }
 
