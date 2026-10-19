@@ -60,6 +60,19 @@ real memory. Update them the moment something happens, not at the end.
     verified from the log, not assumed from the game count. Paired openings
     (same line, both seats) when the harness supports books; until then,
     alternation + balance check is the floor.
+12. **NO PROMOTION WITHOUT SATURATED FULL TRAINING; NO REJECTION WITHOUT
+    SATURATION OR PROOF (user law 2026-10-19).** Any trained artifact
+    (weights, buckets, eval constants, tables) has NO chance of promotion
+    until a FULL training run is finished and saturated (loss plateaued
+    across epochs + validation confirms, not a smoke test or 40-iter tune).
+    Symmetrically: nothing trained is REJECTED until saturated either —
+    it stays PARKED. The only exits before saturation are (a) a decisive
+    GAME verdict (gate loss with CI clear of 0.5, e.g. the -346 Texel or
+    the -323 jump tax — play proves what curves can't), or (b) proof the
+    idea cannot improve (mechanistic argument, not impatience). Partial
+    training, cherry-picked best-iters, and "looks flat" are never verdicts.
+    This law exists because R1 thetas were folded then reverted, and sloss
+    best-iters repeatedly lied (+67 real once, noise every other time).
 
 ## Mistakes ledger (written when scolded, read before acting)
 
