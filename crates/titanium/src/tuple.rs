@@ -314,7 +314,15 @@ impl TupleTable {
         // it too — bit-identical, the table adds 0 everywhere (has_q2).
         let mut q = [0u8; 36];
         let enr_q = self.has_enriched && self.has_q2;
-        let mut stones = b.me();
+        // ENV tallies fused into the same passes (was 2 extra traversals
+        // in forward_enriched). Same ring counts, same indices — the loop
+        // just moves. Guarded by has_enriched (v4 tables read zeros).
+        let enr = self.has_enriched;
+        let ou = b.me();
+        let ot = b.opp();
+        let blk = b.blockers;
+        let mut s_env: i32 = 0;
+        let mut stones = ou;
         while stones != 0 {
             let sq = stones.trailing_zeros() as usize;
             stones &= stones - 1;
@@ -328,8 +336,17 @@ impl TupleTable {
                 }
                 k += 1;
             }
+            if enr {
+                let ring = RING1[sq];
+                let o = (ring & ou).count_ones();
+                let e = (ring & ot).count_ones();
+                let bl = (ring & blk).count_ones();
+                if o | e | bl != 0 {
+                    s_env += self.env_us[env_index(sq, o, e, bl)] as i32;
+                }
+            }
         }
-        stones = b.opp();
+        stones = ot;
         while stones != 0 {
             let sq = stones.trailing_zeros() as usize;
             stones &= stones - 1;
@@ -342,6 +359,15 @@ impl TupleTable {
                     q[a as usize] += 2 * qmult(mult);
                 }
                 k += 1;
+            }
+            if enr {
+                let ring = RING1[sq];
+                let o = (ring & ot).count_ones();
+                let e = (ring & ou).count_ones();
+                let bl = (ring & blk).count_ones();
+                if o | e | bl != 0 {
+                    s_env += self.env_them[env_index(sq, o, e, bl)] as i32;
+                }
             }
         }
         if enr_q {
@@ -391,7 +417,7 @@ impl TupleTable {
             }
         }
         if self.has_enriched {
-            s += self.forward_enriched(b, &q);
+            s += s_env + self.forward_enriched(b, &q);
         }
         if self.has_capconv {
             s += self.forward_capconv(b, land_me, land_opp);
@@ -399,11 +425,11 @@ impl TupleTable {
         s
     }
 
-    /// S38 enriched families: quat 2x2 table + per-stone env tallies +
-    /// mobility. The quat splat now arrives prebuilt (`q`, fused into
-    /// forward_fast's stone passes). Indices mirror training/train_tuple.py
-    /// exactly (q2_indices, env_tables, mob_tables). Skips mirror the
-    /// zero-constraints.
+    /// S38 enriched families: quat 2x2 table + mobility. The quat splat
+    /// arrives prebuilt (`q`) and the env tallies arrive pre-summed
+    /// (`s_env`) — both fused into forward_fast's stone passes. Indices
+    /// mirror training/train_tuple.py exactly (q2_indices, env_tables,
+    /// mob_tables). Skips mirror the zero-constraints.
     fn forward_enriched(&self, b: &Board, q: &[u8; 36]) -> i32 {
         let mut s: i32 = 0;
         // All-zero q2 (champ) skips here — bit-identical, adds 0.
@@ -414,35 +440,12 @@ impl TupleTable {
                 }
             }
         }
-        // ENV per-stone tallies (own stones -> env_us, enemy -> env_them).
+        // ENV per-stone tallies now pre-summed in forward_fast (same ring
+        // counts, same indices — the loop just moved; see s_env).
+        // MOB phase x counts.
         let ou = b.me();
         let ot = b.opp();
         let blk = b.blockers;
-        let mut stones = ou;
-        while stones != 0 {
-            let sq = stones.trailing_zeros() as usize;
-            stones &= stones - 1;
-            let ring = RING1[sq];
-            let o = (ring & ou).count_ones();
-            let e = (ring & ot).count_ones();
-            let bl = (ring & blk).count_ones();
-            if o | e | bl != 0 {
-                s += self.env_us[env_index(sq, o, e, bl)] as i32;
-            }
-        }
-        stones = ot;
-        while stones != 0 {
-            let sq = stones.trailing_zeros() as usize;
-            stones &= stones - 1;
-            let ring = RING1[sq];
-            let o = (ring & ot).count_ones();
-            let e = (ring & ou).count_ones();
-            let bl = (ring & blk).count_ones();
-            if o | e | bl != 0 {
-                s += self.env_them[env_index(sq, o, e, bl)] as i32;
-            }
-        }
-        // MOB phase x counts.
         let total = ou | ot | blk;
         let empty = !total & crate::board::FULL;
         let phase = total.count_ones().min(49) as usize;
