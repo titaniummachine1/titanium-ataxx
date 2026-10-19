@@ -679,17 +679,22 @@ pub struct Board {
 impl Board {
     /// Standard start: black bottom-left, white top-right, black to move.
     pub fn start() -> Board {
-        Board {
-            occ: [bit_of(6 * 7), bit_of(6)],
+        // Standard 4-corner opening (global consensus, Botzone/libataxx):
+        // black a7+g1 (sq 0, 48), white g7+a1 (sq 6, 42), black to move.
+        let mut b = Board {
+            occ: [bit_of(0) | bit_of(48), bit_of(6) | bit_of(42)],
             blockers: 0,
             turn: 0,
             passes: 0,
             ply: 0,
-            piece_cnt: [1, 1],
+            piece_cnt: [2, 2],
             blocker_cnt: 0,
-            hash: ZOB_PIECE[0][42] ^ ZOB_PIECE[1][6],
-            pst: PST[6 * 7] - PST[6],
-        }
+            hash: 0,
+            pst: 0,
+        };
+        b.hash = ZOB_PIECE[0][0] ^ ZOB_PIECE[0][48] ^ ZOB_PIECE[1][6] ^ ZOB_PIECE[1][42];
+        b.pst = PST[0] + PST[48] - PST[6] - PST[42];
+        b
     }
 
     #[inline]
@@ -1228,25 +1233,20 @@ mod tests {
 
     #[test]
     fn corner_geometry() {
-        // From a1: clones a2 b2 b1; jumps a3 b3 c3 c2 c1 (full 5x5 ring,
-        // knight offsets included). 8 moves total.
+        // Four-corner start, black to move: targets = union of both black
+        // corners' rings (3 clones + 5 jumps each, disjoint), masked empty.
         let b = Board::start();
         let targets = b.targets(0);
-        let expect = bit_of(35)  // a2
-            | bit_of(36)         // b2
-            | bit_of(43)         // b1
-            | bit_of(28)         // a3
-            | bit_of(29)         // b3
-            | bit_of(30)         // c3
-            | bit_of(37)         // c2
-            | bit_of(44);        // c1
-        assert_eq!(targets, expect, "a1 targets must be 3 clones + 5 jumps");
+        let mut want = RING1[0] | RING2[0] | RING1[48] | RING2[48];
+        want &= b.empty();
+        assert_eq!(targets, want);
+        assert_eq!(targets.count_ones(), 16, "2 corners x 8 targets");
     }
 
     #[test]
     fn start_has_8_moves() {
-        // One corner piece each: 3 clones + 5 jumps.
-        assert_eq!(Board::start().legal_moves().len(), 8);
+        // Four-corner start, black to move: 2 stones x (3 clones + 5 jumps).
+        assert_eq!(Board::start().legal_moves().len(), 16);
     }
 
     #[test]

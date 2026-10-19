@@ -355,7 +355,8 @@ mod tests {
         let b0 = Board::start();
         let mut sc = [[0i16; S1_L1]; 2];
         let v0 = net.evaluate(&b0, 0, &mut sc);
-        let b1 = b0.make(crate::board::Move { from: 42, to: 33 });
+        // Black corner clone g1->f1 (legal on 4-corner startpos).
+        let b1 = b0.make(crate::board::Move { from: 48, to: 47 });
         let v1 = net.evaluate(&b1, 1, &mut sc);
         assert!(v1 != v0, "position-sensitive: {v0} vs {v1}");
     }

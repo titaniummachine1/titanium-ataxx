@@ -11,7 +11,8 @@ weights, zero-init (initial pred == base only).
 
 Base eval is ported EXACTLY from search.rs/board.rs (integer bit ops on
 uint64, same constants). Start-position assertion guards both ports at once:
-base_stm(startpos) == 150 and anchor (5,0) index == 9 (mirrors the Rust tests).
+4-corner start, base_stm(startpos) == 150 (tempo only) and anchor (5,0)
+index == 18 (mirrors the Rust tests).
 
 Usage:
   python3 training/train_tuple.py --rows 5000 --epochs 2          # smoke
@@ -165,7 +166,7 @@ assert (0, 30, 32) in PAIRS  # H ((5,0),(5,2)), mirrors Rust test
 
 
 def block_indices(own, enm):
-    """(n,36) ternary indices. Must give anchor(5,0)==9 on startpos."""
+    """(n,36) ternary indices. Must give anchor(5,0)==18 on startpos."""
     n = len(own)
     out = np.zeros((n, 36), dtype=np.int64)
     for a, cells in enumerate(CELLS):
@@ -302,14 +303,18 @@ def main():
     base = base_eval_stm(occ0, occ1, blk, stm, simple=(a.base == 'simple'))
     print('base[%s] eval %.0fs  mean %+.1f  std %.1f'
           % (a.base, time.time() - t0, base.mean(), base.std()), flush=True)
-    # startpos guard: black a1 + white g7, black to move -> 150
-    assert abs(base_eval_stm(np.array([np.uint64(1 << 42)]), np.array([np.uint64(1 << 6)]),
+    # startpos guard: 4-corner start (black a7+g1, white g7+a1),
+    # black to move -> 150 (tempo only: PST/material cancel, no contacts).
+    assert abs(base_eval_stm(np.array([np.uint64(1 << 0) | (np.uint64(1) << 48)]),
+                             np.array([np.uint64(1 << 6) | (np.uint64(1) << 42)]),
                              np.array([np.uint64(0)]), np.array([0]),
                              simple=(a.base == 'simple'))[0] - 150.0) < 1e-9
-    bi = block_indices(np.array([np.uint64(1 << 42)]), np.array([np.uint64(1 << 6)]))
-    assert int(bi[0, 5 * 6 + 0]) == 9 and int(bi[0, 0 * 6 + 5]) == 6, bi[0]
-    assert int(bi.sum()) == 15
-    print('port guards OK (base 150, anchors 9/6)', flush=True)
+    bi = block_indices(np.array([np.uint64(1 << 0) | (np.uint64(1) << 48)]),
+                       np.array([np.uint64(1 << 6) | (np.uint64(1) << 42)]))
+    assert int(bi[0, 5 * 6 + 0]) == 18 and int(bi[0, 0 * 6 + 5]) == 6, bi[0]
+    assert int(bi[0, 0 * 6 + 0]) == 1 and int(bi[0, 5 * 6 + 5]) == 27, bi[0]
+    assert int(bi.sum()) == 52
+    print('port guards OK (base 150, anchors 18/6/1/27 sum 52)', flush=True)
 
     t0 = time.time()
     feats = block_indices(own, enm)

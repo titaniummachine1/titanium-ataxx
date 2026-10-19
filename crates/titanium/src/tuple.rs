@@ -500,17 +500,23 @@ mod tests {
 
     #[test]
     fn startpos_block_indices() {
-        // Cross-language anchor guard (mirrored in train_tuple.py): black
-        // a1 + white g7, black to move. Anchor (5,0) -> 9 (own digit 1 in
-        // 3rd cell), anchor (0,5) -> 6 (enemy digit 2 in 2nd cell).
+        // Cross-language anchor guard (mirrored in train_tuple.py):
+        // 4-corner start, black to move. Non-empty anchors (row-major
+        // 2x2 cells, base-3 own=1/enemy=2):
+        // (0,0)->1 black a7, (0,5)->6 white g7, (5,0)->18 white a1,
+        // (5,5)->27 black g1. Sum = 52.
         let b = Board::start();
         for a in 0..36 {
             let idx = block2_index(b.occ[0], b.occ[1], a);
             let (r, c) = (a / 6, a % 6);
-            let want = if r == 5 && c == 0 {
-                9
+            let want = if r == 0 && c == 0 {
+                1
             } else if r == 0 && c == 5 {
                 6
+            } else if r == 5 && c == 0 {
+                18
+            } else if r == 5 && c == 5 {
+                27
             } else {
                 0
             };
@@ -598,25 +604,27 @@ mod tests {
 
     #[test]
     fn per_anchor_pair_spot() {
-        // Startpos: H pair ((5,0),(5,2)) = global pair 20, feats 9+0.
+        // Startpos: H pair ((5,0),(5,2)) = global pair 20, feats 18+0
+        // (anchor 30 sees white a1 -> index 18, anchor 32 empty).
         // Rigged per-anchor entry must be picked exactly there.
         let b = Board::start();
         let mut t = TupleTable::zeros();
         t.has_pa = true;
-        t.pa[20 * PAIR_PATTERNS + 9] = 5;
+        t.pa[20 * PAIR_PATTERNS + 18] = 5;
         assert_eq!(t.forward(&b), 5);
     }
 
     #[test]
     fn startpos_pair_spot() {
-        // Startpos: only anchors (5,0) idx 9 and (0,5) idx 6 non-empty.
-        // H pair ((5,0),(5,2)) = anchors 30,32: b1=9, b2=0 -> index 9.
+        // Startpos anchors: (0,0) idx 1, (5,5) idx 27, (0,5) idx 6,
+        // (5,0) idx 18. H pair ((5,0),(5,2)) = anchors 30,32:
+        // b1=18, b2=0 -> index 18.
         let (pairs, _) = &PAIR_BLOCKS;
         assert_eq!(pairs[0][5 * 4 + 0], (30, 32));
         let b = Board::start();
         let own = b.me();
         let enemy = b.opp();
-        assert_eq!(block2_index(own, enemy, 30), 9);
+        assert_eq!(block2_index(own, enemy, 30), 18);
         assert_eq!(block2_index(own, enemy, 32), 0);
     }
 }
