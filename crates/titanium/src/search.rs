@@ -118,6 +118,28 @@ pub struct SearchParams {
     /// hole while a conversion exists elsewhere. move_idx>=2 guard keeps
     /// the top two ordered moves safe. 0/1, default OFF.
     pub jump_prune: u32,
+    /// Phase buckets by STONE COUNT (bisection verdict k=8 on 148k fresh
+    /// selfplay positions: finest k with every bucket >=5% rows; R^2 keeps
+    /// climbing but buckets starve past 8). Boundaries (upper-inclusive):
+    /// [9,15,20,26,32,37,43,INF] over total pieces. Per-bucket output bias,
+    /// all zero = OFF. Stockfish-style: bucket id selects optimized values.
+    pub bucket_bias: [i32; 8],
+}
+
+/// Phase-bucket boundaries (upper-inclusive total piece counts) from the
+/// k=8 bisection verdict. Stockfish-style: bucket id selects the optimized
+/// value set (here: output bias per bucket).
+pub const BUCKET_BOUNDS: [u32; 8] = [9, 15, 20, 26, 32, 37, 43, u32::MAX];
+
+/// Bucket index for a total stone count (O(1), branchless-ish linear scan
+/// over 8 bounds — negligible vs movegen).
+#[inline]
+pub fn phase_bucket(pieces: u32) -> usize {
+    let mut b = 0;
+    while b < 7 && pieces > BUCKET_BOUNDS[b] {
+        b += 1;
+    }
+    b
 }
 
 impl Default for SearchParams {
@@ -161,6 +183,7 @@ impl Default for SearchParams {
             jump_safe: 0,
             jump_cold: 0, // OFF (S55jcold: parked neutral -7, unproven)
             jump_prune: 0, // OFF (S55jprune: buried -315)
+            bucket_bias: [0; 8], // OFF (S55bucket: tune decides)
         }
     }
 }
@@ -258,6 +281,10 @@ pub fn evaluate(
     if let Some(t) = tup {
         out += t.forward(b);
     }
+    // Phase-bucket bias (k=8 bisection on pieces): phase-dependent eval
+    // correction. All zeros = OFF.
+    let pieces = b.piece_cnt[0] as u32 + b.piece_cnt[1] as u32;
+    out += p.bucket_bias[phase_bucket(pieces)];
     out
 }
 
@@ -601,8 +628,18 @@ impl<'a> Searcher<'a> {
     /// Set one tunable parameter by UAI option name. Returns false for
     /// unknown names. Powers SPSA without rebuilds.
     pub fn set_param(&mut self, name: &str, val: i64) -> bool {
-        // LMR table cells LMRT0..LMRT15 (tunable 1D reduction function).
-        if let Some(idx) = name.strip_prefix("LMRT") {
+    // LMR table cells BucketBiasi (tunable phase-bucket biases).
+    if let Some(idx) = name.strip_prefix("BucketBias") {
+        if let Ok(i) = idx.parse::<usize>() {
+            if i < 8 {
+                self.params.bucket_bias[i] = val.clamp(-2000, 2000) as i32;
+                return true;
+            }
+        }
+        return false;
+    }
+    // LMR table cells LMRT0..LMRT15 (tunable 1D reduction function).
+    if let Some(idx) = name.strip_prefix("LMRT") {
             if let Ok(i) = idx.parse::<usize>() {
                 if i < 16 {
                     self.params.lmr_tab[i] = val.clamp(0, 8) as u32;
