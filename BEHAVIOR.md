@@ -48,9 +48,12 @@ real memory. Update them the moment something happens, not at the end.
 7. **MAIN IS ALWAYS STRONGEST (Stockfish rule, adopted 2026-10-05 from
     QuoridorBestAI).** Nothing merges to main — code or weights — without a
     sufficient-games gate proving the new build STRONGER (pair-mean +
-    paired-bootstrap CI clears 0.5). "Sufficient" is sized until the CI is
-    decisive; a straddling CI EXTENDS the gate, it never merges and never
-    rejects on the bound alone. Identical-decision proofs (perft, fixed-node
+    paired-bootstrap CI clears 0.5). Record the estimated Elo gain every
+    leg — it is data — but promotion proves AHEAD (objectively better,
+    stronger; CI clears 0.5 / SPRT pass), never the exact number. No one
+    proves "+23"; we prove "ahead". Extend until ahead is proven.
+    "Sufficient" is sized until the CI is decisive; a straddling CI EXTENDS
+    the gate, it never merges and never rejects on the bound alone. Identical-decision proofs (perft, fixed-node
     parity) excuse nothing: strength is proven by games, and only games.
     Extends law 6: time gates (100ms AND 200ms) are the crown, 5k nodes is
     the quality diagnosis.
