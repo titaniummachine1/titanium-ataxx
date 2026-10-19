@@ -1518,6 +1518,36 @@ mod tests {
     }
 
     #[test]
+    fn pext_matches_loop() {
+        // BMI2 PEXT must agree with the portable loop for every square and
+        // every 8-bit pattern (tuple conv_key relies on this for a PEXT
+        // fast path — any mismatch would silently change eval scores).
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !std::arch::is_x86_feature_detected!("bmi2") {
+                return;
+            }
+            for sq in 0..SQUARES as u8 {
+                for pat in 0..256usize {
+                    let mut occ = 0u64;
+                    let s = sq as usize;
+                    let cnt = NEIGH_CNT[s] as usize;
+                    for i in 0..cnt {
+                        if pat & (1 << i) != 0 {
+                            occ |= 1u64 << NEIGH_POS[s][i];
+                        }
+                    }
+                    assert_eq!(
+                        unsafe { extract8_pext(occ, sq) },
+                        extract8(occ, sq),
+                        "pext mismatch sq {sq} pat {pat}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn make_equals_make_via_lut() {
         // Deterministic fuzz: random playouts, every move applied both ways.
         let mut state: u64 = 0x9E3779B97F4A7C15;

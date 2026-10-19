@@ -133,8 +133,12 @@ pub fn evaluate(b: &Board, tup: Option<&TupleTable>, native_tup: bool) -> i32 {
     let mut out = if b.turn == 0 { score } else { -score };
     // Tuple term is stm-relative by construction: add after the flip.
     // None branch = zero-cost OFF (single predictable branch).
+    // forward_fast reuses this eval's landing sets (bit-identical scores,
+    // zero recompute — capconv's land_u/land_t ARE land_w/land_b per side).
     if let Some(t) = tup {
-        out += t.forward(b);
+        let land_me = if b.turn == 0 { land_w } else { land_b };
+        let land_opp = if b.turn == 0 { land_b } else { land_w };
+        out += t.forward_fast(b, land_me, land_opp);
     }
     out
 }

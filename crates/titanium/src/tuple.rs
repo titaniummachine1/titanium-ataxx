@@ -58,6 +58,11 @@ pub struct TupleTable {
     mob_us: Box<[i16; MOB_PATTERNS]>,
     mob_them: Box<[i16; MOB_PATTERNS]>,
     has_enriched: bool,
+    /// Load-time allzero flag: the whole q2 quat family is exactly 0
+    /// (champ TUP7: 9216/9216 zero — tree training never touched it).
+    /// Skipping its splat + table is bit-identical (adds 0). Same idea as
+    /// the idx0 training constraint, but discovered at load, not train.
+    has_q2: bool,
     capn_us: Box<[i16; 9]>,
     capn_them: Box<[i16; 9]>,
     conv_us: Box<[i16; 256]>,
@@ -134,6 +139,7 @@ impl TupleTable {
             mob_us: Box::new([0; MOB_PATTERNS]),
             mob_them: Box::new([0; MOB_PATTERNS]),
             has_enriched: false,
+            has_q2: false,
             capn_us: Box::new([0; 9]),
             capn_them: Box::new([0; 9]),
             conv_us: Box::new([0; 256]),
@@ -213,6 +219,7 @@ impl TupleTable {
             mob_us: Box::new([0; MOB_PATTERNS]),
             mob_them: Box::new([0; MOB_PATTERNS]),
             has_enriched: false,
+            has_q2: false,
             capn_us: Box::new([0; 9]),
             capn_them: Box::new([0; 9]),
             conv_us: Box::new([0; 256]),
@@ -270,6 +277,10 @@ impl TupleTable {
             }
             t.has_pa = true;
         }
+        // Load-time sparsity flags (winter-clean W4): whole-zero families
+        // are skipped bit-identically in the tree (they add 0 by definition).
+        // One scan at load; the tree then branches on constants per net.
+        t.has_q2 = t.q2.iter().any(|a| a.iter().any(|&w| w != 0));
         Ok(t)
     }
 
@@ -279,8 +290,30 @@ impl TupleTable {
     /// exactly 0 (training constraint) and are skipped in the sums.
     #[inline]
     pub fn forward(&self, b: &Board) -> i32 {
+        // Test/standalone path: compute both sides' landings locally, then
+        // share them with capconv. The search tree uses `forward_fast`
+        // (evaluate's landings passed in — zero recompute, bit-identical).
+        let ou = b.me();
+        let ot = b.opp();
+        let empty = !ou & !ot & !b.blockers & crate::board::FULL;
+        let land_me = empty & (dist_union(ou, 1) | jump_union(ou));
+        let land_opp = empty & (dist_union(ot, 1) | jump_union(ot));
+        self.forward_fast(b, land_me, land_opp)
+    }
+
+    /// Tree path: `land_me`/`land_opp` are evaluate's already-computed
+    /// landing sets (same position, same sets — no recompute). Bit-identical
+    /// to `forward` (enforced by `forward_fast_matches_forward` test).
+    #[inline]
+    pub fn forward_fast(&self, b: &Board, land_me: u64, land_opp: u64) -> i32 {
         let (sq_blocks, sq_n) = &SQ_BLOCKS;
         let mut blocks = [0u8; 36];
+        // Quat 2x2 indices fused into the same stone passes (was 3 extra
+        // traversals in forward_enriched). Guarded: non-enriched tables
+        // (v4) skip the quat work entirely; all-zero q2 (champ TUP7) skips
+        // it too — bit-identical, the table adds 0 everywhere (has_q2).
+        let mut q = [0u8; 36];
+        let enr_q = self.has_enriched && self.has_q2;
         let mut stones = b.me();
         while stones != 0 {
             let sq = stones.trailing_zeros() as usize;
@@ -290,6 +323,9 @@ impl TupleTable {
             while k < n {
                 let (a, mult) = sq_blocks[sq][k];
                 blocks[a as usize] += mult; // own digit 1
+                if enr_q {
+                    q[a as usize] += qmult(mult);
+                }
                 k += 1;
             }
         }
@@ -302,7 +338,24 @@ impl TupleTable {
             while k < n {
                 let (a, mult) = sq_blocks[sq][k];
                 blocks[a as usize] += 2 * mult; // enemy digit 2
+                if enr_q {
+                    q[a as usize] += 2 * qmult(mult);
+                }
                 k += 1;
+            }
+        }
+        if enr_q {
+            let mut bb = b.blockers;
+            while bb != 0 {
+                let sq = bb.trailing_zeros() as usize;
+                bb &= bb - 1;
+                let n = sq_n[sq] as usize;
+                let mut k = 0usize;
+                while k < n {
+                    let (a, mult) = sq_blocks[sq][k];
+                    q[a as usize] += 3 * qmult(mult); // blocker digit 3
+                    k += 1;
+                }
             }
         }
         let mut s = self.bias;
@@ -338,61 +391,27 @@ impl TupleTable {
             }
         }
         if self.has_enriched {
-            s += self.forward_enriched(b, &blocks);
+            s += self.forward_enriched(b, &q);
         }
         if self.has_capconv {
-            s += self.forward_capconv(b);
+            s += self.forward_capconv(b, land_me, land_opp);
         }
         s
     }
 
-    /// S38 enriched families: quat 2x2 splat + per-stone env tallies +
-    /// mobility. Indices mirror training/train_tuple.py exactly (q2_indices,
-    /// env_tables, mob_tables). Skips mirror the zero-constraints.
-    fn forward_enriched(&self, b: &Board, _blocks: &[u8; 36]) -> i32 {
+    /// S38 enriched families: quat 2x2 table + per-stone env tallies +
+    /// mobility. The quat splat now arrives prebuilt (`q`, fused into
+    /// forward_fast's stone passes). Indices mirror training/train_tuple.py
+    /// exactly (q2_indices, env_tables, mob_tables). Skips mirror the
+    /// zero-constraints.
+    fn forward_enriched(&self, b: &Board, q: &[u8; 36]) -> i32 {
         let mut s: i32 = 0;
-        // Q2 quat splat (base-4 digits; blocker digit 3).
-        let (sq_blocks, sq_n) = &SQ_BLOCKS;
-        let mut q = [0u8; 36];
-        let mut stones = b.me();
-        while stones != 0 {
-            let sq = stones.trailing_zeros() as usize;
-            stones &= stones - 1;
-            let n = sq_n[sq] as usize;
-            let mut k = 0usize;
-            while k < n {
-                let (a, m3) = sq_blocks[sq][k];
-                q[a as usize] += qmult(m3);
-                k += 1;
-            }
-        }
-        stones = b.opp();
-        while stones != 0 {
-            let sq = stones.trailing_zeros() as usize;
-            stones &= stones - 1;
-            let n = sq_n[sq] as usize;
-            let mut k = 0usize;
-            while k < n {
-                let (a, m3) = sq_blocks[sq][k];
-                q[a as usize] += 2 * qmult(m3);
-                k += 1;
-            }
-        }
-        stones = b.blockers;
-        while stones != 0 {
-            let sq = stones.trailing_zeros() as usize;
-            stones &= stones - 1;
-            let n = sq_n[sq] as usize;
-            let mut k = 0usize;
-            while k < n {
-                let (a, m3) = sq_blocks[sq][k];
-                q[a as usize] += 3 * qmult(m3);
-                k += 1;
-            }
-        }
-        for (a, idx) in q.iter().enumerate() {
-            if *idx != 0 {
-                s += self.q2[a][*idx as usize] as i32;
+        // All-zero q2 (champ) skips here — bit-identical, adds 0.
+        if self.has_q2 {
+            for (a, idx) in q.iter().enumerate() {
+                if *idx != 0 {
+                    s += self.q2[a][*idx as usize] as i32;
+                }
             }
         }
         // ENV per-stone tallies (own stones -> env_us, enemy -> env_them).
@@ -442,23 +461,21 @@ impl TupleTable {
     /// conversion-kernel LUT keys (foe pattern in NEIGH_POS bit order).
     /// Stateless (position-only) so TT stays sound. Skips mirror the
     /// zero-constraints (0 entries).
-    fn forward_capconv(&self, b: &Board) -> i32 {
+    fn forward_capconv(&self, b: &Board, land_me: u64, land_opp: u64) -> i32 {
         let ou = b.me();
         let ot = b.opp();
         let mut s: i32 = 0;
-        // Max conversion available per side.
-        let empty = !ou & !ot & !b.blockers & crate::board::FULL;
-        let land_u = empty & (dist_union(ou, 1) | jump_union(ou));
-        let land_t = empty & (dist_union(ot, 1) | jump_union(ot));
+        // Max conversion available per side (landing sets shared with the
+        // caller — evaluate already computed these exact bitboards).
         let mut mu = 0u32;
-        let mut ls = land_u;
+        let mut ls = land_me;
         while ls != 0 {
             let sq = ls.trailing_zeros() as usize;
             ls &= ls - 1;
             mu = mu.max((ot & RING1[sq]).count_ones());
         }
         let mut mt = 0u32;
-        ls = land_t;
+        ls = land_opp;
         while ls != 0 {
             let sq = ls.trailing_zeros() as usize;
             ls &= ls - 1;
@@ -471,13 +488,18 @@ impl TupleTable {
             s += self.capn_them[mt.min(8) as usize] as i32;
         }
         // Conversion-kernel keys per square (foe pattern, NEIGH_POS order).
+        // NOTE (PARKED, not rejected): BMI2 PEXT tried, hoisted detect —
+        // 0.88/0.93 vs 0.98/1.00 scalar on this CPU (latency-bound in the
+        // real loop; micro still 702M vs 99M/s). Scalar stays default.
+        // Proof `pext_matches_loop` + genbench PEXT micro stay prepared
+        // for retest (other CPUs, restructured loops). Rejection is only
+        // for what makes the engine worse — this is parked for FOMO.
         let mut sq = 0usize;
         while sq < 49 {
-            let ku = conv_key(ot, sq);
+            let (ku, kt) = (conv_key(ot, sq), conv_key(ou, sq));
             if ku != 0 {
                 s += self.conv_us[ku] as i32;
             }
-            let kt = conv_key(ou, sq);
             if kt != 0 {
                 s += self.conv_them[kt] as i32;
             }
@@ -571,8 +593,25 @@ mod tests {
         // a1 own 3rd cell -> 16, b1 foe 4th cell -> 2*64=128: idx = 144.
         let mut t2 = TupleTable::zeros();
         t2.has_enriched = true;
+        t2.has_q2 = true;
         t2.q2[30][144] = 7;
         assert_eq!(t2.forward(&b), 7);
+        // All-zero q2 skips bit-identically (W4 load-time flag).
+        let mut t3 = TupleTable::zeros();
+        t3.has_enriched = true;
+        assert!(!t3.has_q2);
+        assert_eq!(t3.forward(&b), 0);
+        // The flag is load-bearing, not dead code: same nonzero weights
+        // score differently with the flag on vs off (future training that
+        // fills q2 automatically takes the full slow path — no silent
+        // lobotomy). And zero weights score the same either way.
+        let mut t4 = TupleTable::zeros();
+        t4.has_enriched = true;
+        t4.has_q2 = true; // all-zero table, flag forced on
+        assert_eq!(t4.forward(&b), t3.forward(&b));
+        t2.has_q2 = false; // nonzero weights, flag forced off
+        assert_eq!(t2.forward(&b), 0);
+        assert_ne!(t2.forward(&b), 7);
     }
 
     #[test]
@@ -594,6 +633,34 @@ mod tests {
         t2.has_capconv = true;
         t2.conv_us[72] = 11;
         assert_eq!(t2.forward(&b), 11);
+    }
+
+    #[test]
+    fn forward_fast_matches_forward() {
+        // Shared-landings tree path must score bit-identically to the
+        // standalone path (which computes landings locally).
+        let mut t = TupleTable::zeros();
+        t.has_capconv = true;
+        t.capn_us[2] = 7;
+        t.capn_them[3] = -5;
+        t.conv_us[72] = 11;
+        t.conv_them[9] = -3;
+        let positions = [
+            Board::start(),
+            Board::from_str(
+                "...................................o......xo..... b",
+            )
+            .unwrap(),
+        ];
+        for b in positions {
+            let want = t.forward(&b);
+            let ou = b.me();
+            let ot = b.opp();
+            let empty = !ou & !ot & !b.blockers & crate::board::FULL;
+            let land_me = empty & (dist_union(ou, 1) | jump_union(ou));
+            let land_opp = empty & (dist_union(ot, 1) | jump_union(ot));
+            assert_eq!(t.forward_fast(&b, land_me, land_opp), want);
+        }
     }
 
     #[test]

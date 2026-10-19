@@ -1,3 +1,11 @@
+## STATE FOR NEW SESSION (2026-10-19 WINTER-CLEAN: +26% CHAMP NPS, GATES VOID, DOCTRINE ENGRAVED — READ THIS, NOTHING ELSE, THEN VERIFY)
+
+- Branch: `exp/winter-clean` (= W1 landings-share +3-5% + W2 quat-fusion +10% + W4 has_q2-skip +15%, ALL merged here; champ sperft 0.95 → ~1.20 Mnps, nodes bit-identical 912555 everywhere). Main UNTOUCHED @`73a859d`. Strongest = main + `data/nnue/tupS55tree.tup` (sha256 `F66A00FE…899D7C`).
+- Gate status: 5k leg (47-51-2) + t100 partial (47 games) are VOID — harness never sent `uainewgame`, opp killers/history leaked (same seat diverged move 4). Fix committed on this branch; 4g probe proves same-seat pairs replay bit-identically. Re-gate owed: needs --book support in match (book50k.txt exists; runner only on old tournament branch) + rerun 5k/t100/t200 ≥100g each.
+- Doctrine (engraved this session, never re-litigate): node-gates CAN merge for intelligence-only changes; speed changes need chosen time controls (50/100/200ms, both chosen legs must win); SPRT always — extend when ahead-insufficient AND when behind (FOMO); reject ONLY undoubtedly-worse + user confirms (user calls every merge AND rejection); paired book mandatory, win-both-seats = real edge; uainewgame every game or VOID; Stockfish stacking (merge every proven gain, however small). Full text: BEHAVIOR.md laws 6-12, `.opencode/commands/gate.md`, AGENTS.md §3.
+- Parked (never rejected): exp/winter-sets NodeSets (speed-neutral), PEXT conv_key (loses on this CPU, micro+proof kept), search-buckets stash (SMP+BZ batch + dirt). Pending user calls: merge-to-main (needs full gate), book support, re-gate launch, W5 hit-rate study (env/mob/pa 98-99% zero — measure what fires).
+- Box rules: NOTHING runs now (verify `tasklist` at session start; VS update was the mystery load). PS 5.1: no head/sed/tail/grep/wmic — use Select-Object/Select-String/Get-CimInstance. Edit preserves mtime → `os.utime` after EVERY edit. LEDGER.md is CRLF — append via python, never Edit. Stash list holds pre-winter dirt — do not pop blindly.
+
 ## STATE FOR NEW SESSION (2026-10-05 S31 PROMOTION PROTOCOL DONE — MAIN STANDS)
 
 - Champ tupS25ow20 vs MAIN 1a27b92 @5k 100g = 25-73-2 (CI [0.174,0.346], -182). Conclusive REJECT, no merge. Self-check pooled to 100g: 45-51-4, identity-consistent. Law 10: no gate stops below 100g.
