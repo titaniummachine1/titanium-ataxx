@@ -77,7 +77,8 @@ fn main() -> ExitCode {
         "sperft" => sperft_cmd(
             flag_int(&args, "--depth").unwrap_or(8) as u32,
             flag_int(&args, "--games").unwrap_or(8) as usize,
-            flag_str(&args, "--ordering"),
+            flag_str(&args, "--tuple"),
+            args.iter().any(|x| x == "--tuple-native"),
         ),
         _ => {
             print_help();
@@ -1105,8 +1106,15 @@ fn sperft_positions(n: usize) -> Vec<Board> {
 /// Search-throughput benchmark ("perft for the search"): fixed depth, no
 /// time limit, deterministic position suite. Node counts are reproducible,
 /// nps tracks search optimizations (TT, ordering, eval).
-fn sperft_cmd(depth: u32, positions: usize, _ordering: Option<String>) -> ExitCode {
+fn sperft_cmd(depth: u32, positions: usize, tup_spec: Option<String>, tup_native: bool) -> ExitCode {
     let suite = sperft_positions(positions);
+    let tup = match load_tuple_preset(&tup_spec) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("sperft: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     println!(
         "Search benchmark: fixed depth {depth}, {} positions, 1M-entry TT\n",
         suite.len()
@@ -1117,6 +1125,8 @@ fn sperft_cmd(depth: u32, positions: usize, _ordering: Option<String>) -> ExitCo
         let mut total_time = 0.0f64;
         for (i, b) in suite.iter().enumerate() {
             let mut searcher = Searcher::with_tt_bits(20);
+            searcher.set_tuple(tup.as_ref());
+            searcher.set_tuple_native(tup_native && tup.is_some());
             let limits = SearchLimits {
                 time: None,
                 max_nodes: None,
