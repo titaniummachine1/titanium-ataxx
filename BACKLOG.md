@@ -11,6 +11,19 @@ Iron laws unchanged: main untouchable; proven-ahead merges only; 5k = quality, t
   Log `logs/tonightA_stream.log`. Task `TitaniumNightA`. Ckpt `data/nnue/tonightA_ep{ep}.tup`.
   Gate owed: 5k paired book 104g vs main ea0bdf5 + tupS55tree (candidate binary = exp/tonight, non-native tuple).
 
+## RESULTS TONIGHT (2026-10-20 ~02:00)
+
+- Full retrain (tonightA_fixed): val 10080.9 -> 7331.9 over 5 passes; all families trained
+  (q2 21.5% nz, D1/D2 54/60%, mob 28/24%, pa 25.9% nz L1 162k), singles/pairsH/V near-stable.
+- 5k ladder vs main ea0bdf5 (2008+ games, paired book, speed parity proven):
+  - C0 (SP+env/mob; heads zeroed): 1009-972-27, 0.509, +6 Elo, CI [0.487,0.531], LLR -1.16
+    -> PARITY-STRADDLE: park (no merge, no reject).
+  - C1 (q2 active): -30 Elo straddle -> park/extend; q2 costs ~15% NPS.
+  - C2 (q2+capconv+pa): 0.399, CI [0.305,0.493] -> REJECT CANDIDATE (user confirms).
+- Insight: 5k legs are ~17s/104g; fixed-node gates are deterministic under CPU load -> large-N
+  SPRT (2000g in ~10 min) is now the standard for any close call.
+- Run B (outcome-weight 0.1, champ init) training now; gate B0 = heads-zeroed variant next.
+
 ## QUEUED (in order)
 
 1. **Gate A** (after training): rebuild candidate + main from clean refs; 4 shards x 26g,
