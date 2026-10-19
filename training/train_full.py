@@ -518,8 +518,10 @@ def main():
     # artifacts, and cache12M has 12.4M rows to spare.
     MATE_CAP = 5000.0
     raw_t = z['teacher'].astype(np.float64) if 'teacher' in z else None
+    keep = np.ones(len(occ0), dtype=bool)
     if raw_t is not None:
         bad = ~np.isfinite(raw_t) | (np.abs(raw_t) > MATE_CAP)
+        keep = ~bad
         if bad.any():
             print('mate-spike filter: dropping %d/%d rows (|teacher|>%.0f)'
                   % (int(bad.sum()), len(raw_t), MATE_CAP), flush=True)
@@ -700,7 +702,7 @@ def main():
     # S21f: trust high-visit rows (wsum weights, mean-normalized). Absent in
     # old caches -> uniform weights (backward compatible).
     if 'wsum' in z:
-        sw = z['wsum'].astype(np.float64)
+        sw = z['wsum'].astype(np.float64)[keep]
         if a.rows:
             sw = sw[sel]
         sw = np.clip(sw, 0, None)
