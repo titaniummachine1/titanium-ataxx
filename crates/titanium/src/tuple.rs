@@ -287,10 +287,15 @@ impl TupleTable {
             }
             // Content-gated like has_q2 (W4 pattern): all-zero sections add
             // exactly 0, so the tree skips them bit-identically.
-            t.has_capconv = t.capn_us.iter().any(|&w| w != 0)
-                || t.capn_them.iter().any(|&w| w != 0)
-                || t.conv_us.iter().any(|&w| w != 0)
-                || t.conv_them.iter().any(|&w| w != 0);
+            // SPLIT VARIANT (exp/winter-tup7pa): capconv FORCED off for TUP7
+            // only (TUP6 keeps its gate) to isolate the pa-offset fix: is the
+            // poison in pa or in capconv? Sections still READ (offsets must
+            // advance) but never used on TUP7.
+            t.has_capconv = (buf[0..4] == TUP6_MAGIC)
+                && (t.capn_us.iter().any(|&w| w != 0)
+                    || t.capn_them.iter().any(|&w| w != 0)
+                    || t.conv_us.iter().any(|&w| w != 0)
+                    || t.conv_them.iter().any(|&w| w != 0));
         }
         if buf[0..4] == TUP7_MAGIC {
             for v in t.pa.iter_mut() {
