@@ -1,3 +1,22 @@
+## STATE FOR NEW SESSION (2026-10-19 NIGHT CLOSE — TUP7 LOADER FIXED, RETRAINS DEAD, NN ANALYZED, PATH OUT)
+
+- Branch: exp/winter-tup7fix @a8672a3 (pushed). Main @a85871f = winter-clean merged (+26% NPS). Strongest = main + tupS55tree.tup (F66A00FE). Working tree CLEAN. Nothing running (2 idle python.exe orphans from count_gate — kill if needed).
+- TUP7 loader bug: PROVEN + FIXED on this branch (1b65c49 + 45f060e). Engine skipped capn/conv on TUP7, shifted pa 1060B. Fix loads correctly, content-gated has_capconv (W4 pattern). Parked UNMERGED — unearthed weights test worse (gate 86-118-4 = -54 Elo). Correct code, starved of good weights.
+- Three retrains ALL DEAD (frozen base verified byte-identical, harness sound):
+  r1 (tuple-teacher, 2M rows, 6ep): -141 REJECT. r1pa (pa-only): -61 straddle. r1dag (dag-teacher, 3ep): -611, LLR -5.82, 3-101-0 — CONVINCING REJECT. Pattern: residual distillation onto proven-frozen base memorizes noise. Val improved every time while gates collapsed (val-lies x3).
+- NN ANALYSIS (this session, from tupS55tree.tup binary):
+  Core = singles (95.9% nonzero, 2.9KB) + pairs (37.7%, 26KB) — carries all knowledge.
+  Dead/sparse = q2 (0.0%, never trained), env (1.9%), mob (0.3%), pa (0.13% — 678 of 524880 values!). capconv = capn (4/18 nonzero) + conv (29-40%). The pa section is 72% of file size but 0.13% alive. Freeze base -> heads have nothing to learn -> noise.
+- Dataset: cache12M (12.2M rows, mates excluded). Piece distribution: opening <=8 = 5%, midgame = 84%, endgame 30+ = 11%. capconv/pa fire in volatile transitions (opening/endgame) — starved of data.
+- PATH OUT (ordered by cost, user decision needed):
+  (1) FEATURE AUDIT (1hr): correlate capconv/pa activations with outcomes. If no correlation, pivot to engine work.
+  (2) FULL RETRAIN (don't freeze base): warm-start champ, unfreeze all, dag-teacher --blend 0.9. Base adapts alongside heads.
+  (3) OUTCOME GROUNDING (untried): use out column (real game results) instead of teacher scores. S21g ban was on sum_outcome (not real), out IS real.
+  (4) BALANCED DATA (overnight): self-play with noise (exploration), collect opening/endgame positions, label dag-5k.
+- Parked never rejected: NodeSets, PEXT, W5/W6/W7, loader fix, all retrained nets. Main untouched.
+- LEDGER tail has duplicate Wr1dag2/Wnight/Wbucket2 rows (cosmetic, from garbled patch). Dedupe when convenient.
+- Do NOT merge anything to main without user call. Do NOT train capconv/pa on frozen base again — proven dead.
+
 ## STATE FOR NEW SESSION (2026-10-19 WINTER-CLEAN MERGED — MAIN IS STRONGEST, READ THIS ONLY)
 
 - Main @`a85871f` (= `73a859d` + winter-clean: W1/W2/W4, +26% champ NPS 0.95→~1.16, nodes bit-identical 912555). Strongest = main + `data/nnue/tupS55tree.tup` (`F66A00FE…899D7C`). Merge basis: ahead every leg (5k 51-51-2 identity / t100 53-48-3 / t200 109-95-4), never behind in any leg — user judgment merge, NOT an SPRT pass (pooled LLR +0.47). Full record: LEDGER Wgate*/Wmerge rows; gate logs `logs/gate_wc_*.txt`.
