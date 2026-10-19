@@ -201,6 +201,8 @@ def main():
     eng = Engine(a.exe, eargs)
     eng.setup()
     fen = to_fen(cells, 0 if me == 1 else 1)
+    log('Q turn=%d cells=%s' % (turn, ''.join('.xo'[v] if v < 3 else '#' for v in cells)))
+    log('Q fen=%s' % fen)
     best = eng.query(fen, movetime=None if a.nodes else a.movetime,
                      nodes=a.nodes or None)
     eng.quit()

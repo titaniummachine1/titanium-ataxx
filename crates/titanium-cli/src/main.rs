@@ -679,7 +679,7 @@ fn serve_cmd(
             break;
         }
         if t == "uai" {
-            out_line("id name Titanium Ataxx");
+            out_line("id name titanium-ataxx");
             out_line("id author titaniummachine1");
             out_line("option name Hash type spin default 256 min 1 max 16384");
             out_line("option name Tempo type spin default 150 min 0 max 1000");
