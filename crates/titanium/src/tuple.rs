@@ -279,6 +279,22 @@ impl TupleTable {
     /// exactly 0 (training constraint) and are skipped in the sums.
     #[inline]
     pub fn forward(&self, b: &Board) -> i32 {
+        // Test/standalone path: compute both sides' landings locally, then
+        // share them with capconv. The search tree uses `forward_fast`
+        // (evaluate's landings passed in — zero recompute, bit-identical).
+        let ou = b.me();
+        let ot = b.opp();
+        let empty = !ou & !ot & !b.blockers & crate::board::FULL;
+        let land_me = empty & (dist_union(ou, 1) | jump_union(ou));
+        let land_opp = empty & (dist_union(ot, 1) | jump_union(ot));
+        self.forward_fast(b, land_me, land_opp)
+    }
+
+    /// Tree path: `land_me`/`land_opp` are evaluate's already-computed
+    /// landing sets (same position, same sets — no recompute). Bit-identical
+    /// to `forward` (enforced by `forward_fast_matches_forward` test).
+    #[inline]
+    pub fn forward_fast(&self, b: &Board, land_me: u64, land_opp: u64) -> i32 {
         let (sq_blocks, sq_n) = &SQ_BLOCKS;
         let mut blocks = [0u8; 36];
         let mut stones = b.me();
@@ -341,7 +357,7 @@ impl TupleTable {
             s += self.forward_enriched(b, &blocks);
         }
         if self.has_capconv {
-            s += self.forward_capconv(b);
+            s += self.forward_capconv(b, land_me, land_opp);
         }
         s
     }
@@ -442,23 +458,21 @@ impl TupleTable {
     /// conversion-kernel LUT keys (foe pattern in NEIGH_POS bit order).
     /// Stateless (position-only) so TT stays sound. Skips mirror the
     /// zero-constraints (0 entries).
-    fn forward_capconv(&self, b: &Board) -> i32 {
+    fn forward_capconv(&self, b: &Board, land_me: u64, land_opp: u64) -> i32 {
         let ou = b.me();
         let ot = b.opp();
         let mut s: i32 = 0;
-        // Max conversion available per side.
-        let empty = !ou & !ot & !b.blockers & crate::board::FULL;
-        let land_u = empty & (dist_union(ou, 1) | jump_union(ou));
-        let land_t = empty & (dist_union(ot, 1) | jump_union(ot));
+        // Max conversion available per side (landing sets shared with the
+        // caller — evaluate already computed these exact bitboards).
         let mut mu = 0u32;
-        let mut ls = land_u;
+        let mut ls = land_me;
         while ls != 0 {
             let sq = ls.trailing_zeros() as usize;
             ls &= ls - 1;
             mu = mu.max((ot & RING1[sq]).count_ones());
         }
         let mut mt = 0u32;
-        ls = land_t;
+        ls = land_opp;
         while ls != 0 {
             let sq = ls.trailing_zeros() as usize;
             ls &= ls - 1;
@@ -594,6 +608,34 @@ mod tests {
         t2.has_capconv = true;
         t2.conv_us[72] = 11;
         assert_eq!(t2.forward(&b), 11);
+    }
+
+    #[test]
+    fn forward_fast_matches_forward() {
+        // Shared-landings tree path must score bit-identically to the
+        // standalone path (which computes landings locally).
+        let mut t = TupleTable::zeros();
+        t.has_capconv = true;
+        t.capn_us[2] = 7;
+        t.capn_them[3] = -5;
+        t.conv_us[72] = 11;
+        t.conv_them[9] = -3;
+        let positions = [
+            Board::start(),
+            Board::from_str(
+                "...................................o......xo..... b",
+            )
+            .unwrap(),
+        ];
+        for b in positions {
+            let want = t.forward(&b);
+            let ou = b.me();
+            let ot = b.opp();
+            let empty = !ou & !ot & !b.blockers & crate::board::FULL;
+            let land_me = empty & (dist_union(ou, 1) | jump_union(ou));
+            let land_opp = empty & (dist_union(ot, 1) | jump_union(ot));
+            assert_eq!(t.forward_fast(&b, land_me, land_opp), want);
+        }
     }
 
     #[test]
