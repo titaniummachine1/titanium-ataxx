@@ -26,12 +26,21 @@ Iron laws unchanged: main untouchable; proven-ahead merges only; 5k = quality, t
    SP bag for epochs >1. Literature: arXiv 2505.05605 (Pinterest 2025), 2110.04844 (FA-SGD).
 4. **Run D — EMA weights**: maintain shadow w <- d*w + (1-d)*w every N steps; export EMA net.
    Cheap, usually helps tables; compare vs A by gate.
-5. **C1 zero-heads export** (loader-neutral): zero capn/conv/pa sections of tonightA.tup
-   (byte offsets from TUP7 layout) -> gate vs main isolates SP-family gains from loader-fix gains.
-   Prepare only if full-net gate is ambiguous.
-6. **Deep labeling at night end** (CPU after gates): dump_dag12m.py --chunks 16 ->
-   label_chunks.py --workers 6 --nodes 5000 --tuple tupS25ow20.tup --tuple-native -> join12m.py.
-   Creates fresh exploration/opening-balanced data (openings starved: <=8 pieces 5% of cache).
+5. **Candidate ladder (merge-cleanliness order)**: from the final net export three variants with
+   training/zero_sections.py:
+   - **C0 = zero q2+capconv+pa**: old-loader-safe AND speed-identical to champ (has_q2 all-zero
+     skip path identical; env/mob compute cost content-independent). Intelligence-only change ->
+     5k gate can merge alone; prove NPS parity with sperft alternating pairs.
+   - **C1 = zero capconv+pa**: adds q2 knowledge, pays the quat splat per node -> needs t100 leg.
+   - **C2 = full net**: needs the loader fix (exp/tonight) and t100.
+   Gate order C0 -> C1 -> C2 (each vs main ea0bdf5 + tupS55tree).
+6. **Deep labeling at night end** (CPU after gates): MEASURED 2026-10-19 23:47: `label --nodes
+   20000` = 34.7 pos/s/worker (2000 pos in 57.6s). Full 12.4M relabel: 20k ~16.6h, 10k ~8.3h,
+   5k ~4.1h (6 workers). So full-scale deep relabel does not fit a night. Better choices:
+   (a) 20k relabel of a 1.5-2M hard/high-wsum subset (~2-2.7h) — S22 lesson says spend on rows;
+   (b) 5k relabel with tupS55tree = self-distillation refresh (~4h, echo-chamber risk);
+   (c) spend the time on Run B/extra training variants instead. Decide after gates.
+   Pipeline script ready: scripts/night_label.ps1 (copies relab12m bases -> labels -> joins).
 
 ## RESEARCH NOTES (actionable)
 
