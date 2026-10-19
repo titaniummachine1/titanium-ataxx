@@ -58,6 +58,11 @@ pub struct TupleTable {
     mob_us: Box<[i16; MOB_PATTERNS]>,
     mob_them: Box<[i16; MOB_PATTERNS]>,
     has_enriched: bool,
+    /// Load-time allzero flag: the whole q2 quat family is exactly 0
+    /// (champ TUP7: 9216/9216 zero — tree training never touched it).
+    /// Skipping its splat + table is bit-identical (adds 0). Same idea as
+    /// the idx0 training constraint, but discovered at load, not train.
+    has_q2: bool,
     capn_us: Box<[i16; 9]>,
     capn_them: Box<[i16; 9]>,
     conv_us: Box<[i16; 256]>,
@@ -134,6 +139,7 @@ impl TupleTable {
             mob_us: Box::new([0; MOB_PATTERNS]),
             mob_them: Box::new([0; MOB_PATTERNS]),
             has_enriched: false,
+            has_q2: false,
             capn_us: Box::new([0; 9]),
             capn_them: Box::new([0; 9]),
             conv_us: Box::new([0; 256]),
@@ -213,6 +219,7 @@ impl TupleTable {
             mob_us: Box::new([0; MOB_PATTERNS]),
             mob_them: Box::new([0; MOB_PATTERNS]),
             has_enriched: false,
+            has_q2: false,
             capn_us: Box::new([0; 9]),
             capn_them: Box::new([0; 9]),
             conv_us: Box::new([0; 256]),
@@ -270,6 +277,10 @@ impl TupleTable {
             }
             t.has_pa = true;
         }
+        // Load-time sparsity flags (winter-clean W4): whole-zero families
+        // are skipped bit-identically in the tree (they add 0 by definition).
+        // One scan at load; the tree then branches on constants per net.
+        t.has_q2 = t.q2.iter().any(|a| a.iter().any(|&w| w != 0));
         Ok(t)
     }
 
@@ -299,9 +310,10 @@ impl TupleTable {
         let mut blocks = [0u8; 36];
         // Quat 2x2 indices fused into the same stone passes (was 3 extra
         // traversals in forward_enriched). Guarded: non-enriched tables
-        // (v4) skip the quat work entirely.
+        // (v4) skip the quat work entirely; all-zero q2 (champ TUP7) skips
+        // it too — bit-identical, the table adds 0 everywhere (has_q2).
         let mut q = [0u8; 36];
-        let enr = self.has_enriched;
+        let enr_q = self.has_enriched && self.has_q2;
         let mut stones = b.me();
         while stones != 0 {
             let sq = stones.trailing_zeros() as usize;
@@ -311,7 +323,7 @@ impl TupleTable {
             while k < n {
                 let (a, mult) = sq_blocks[sq][k];
                 blocks[a as usize] += mult; // own digit 1
-                if enr {
+                if enr_q {
                     q[a as usize] += qmult(mult);
                 }
                 k += 1;
@@ -326,13 +338,13 @@ impl TupleTable {
             while k < n {
                 let (a, mult) = sq_blocks[sq][k];
                 blocks[a as usize] += 2 * mult; // enemy digit 2
-                if enr {
+                if enr_q {
                     q[a as usize] += 2 * qmult(mult);
                 }
                 k += 1;
             }
         }
-        if enr {
+        if enr_q {
             let mut bb = b.blockers;
             while bb != 0 {
                 let sq = bb.trailing_zeros() as usize;
@@ -394,9 +406,12 @@ impl TupleTable {
     /// zero-constraints.
     fn forward_enriched(&self, b: &Board, q: &[u8; 36]) -> i32 {
         let mut s: i32 = 0;
-        for (a, idx) in q.iter().enumerate() {
-            if *idx != 0 {
-                s += self.q2[a][*idx as usize] as i32;
+        // All-zero q2 (champ) skips here — bit-identical, adds 0.
+        if self.has_q2 {
+            for (a, idx) in q.iter().enumerate() {
+                if *idx != 0 {
+                    s += self.q2[a][*idx as usize] as i32;
+                }
             }
         }
         // ENV per-stone tallies (own stones -> env_us, enemy -> env_them).
@@ -578,8 +593,14 @@ mod tests {
         // a1 own 3rd cell -> 16, b1 foe 4th cell -> 2*64=128: idx = 144.
         let mut t2 = TupleTable::zeros();
         t2.has_enriched = true;
+        t2.has_q2 = true;
         t2.q2[30][144] = 7;
         assert_eq!(t2.forward(&b), 7);
+        // All-zero q2 skips bit-identically (W4 load-time flag).
+        let mut t3 = TupleTable::zeros();
+        t3.has_enriched = true;
+        assert!(!t3.has_q2);
+        assert_eq!(t3.forward(&b), 0);
     }
 
     #[test]
