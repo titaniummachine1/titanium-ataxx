@@ -49,6 +49,9 @@ def main():
     ap.add_argument('--rows', type=int, default=400000)
     ap.add_argument('--seed', type=int, default=11)
     ap.add_argument('--split', type=float, default=0.875)
+    ap.add_argument('--target', default='resid', choices=['resid', 'out'],
+                    help='resid = teacher-base (what the net trains on); '
+                         'out = real game result - base (outcome grounding signal).')
     a = ap.parse_args()
 
     z = np.load(a.cache)
@@ -60,8 +63,10 @@ def main():
     blk = z['blk'][sel].astype(np.uint64)
     stm = z['stm'][sel].astype(np.uint8)
     teacher = z['teacher'][sel].astype(np.float64)
+    out_col = z['out'][sel].astype(np.float64) if 'out' in z else np.full(len(sel), 0.5)
     keep = np.isfinite(teacher) & (np.abs(teacher) <= 5000.0)
     occ0, occ1, blk, stm, teacher = occ0[keep], occ1[keep], blk[keep], stm[keep], teacher[keep]
+    out_col = out_col[keep]
     n = len(occ0)
     print('sample %d rows (kept %d after mate filter) of %d' % (a.rows, n, n_all), flush=True)
 
@@ -70,8 +75,14 @@ def main():
     enm = np.where(is_b, occ1, occ0)
 
     base = T.base_eval_stm(occ0, occ1, blk, stm)
-    resid = (teacher - base).astype(np.float64)
-    print('resid mean %+.1f std %.1f' % (resid.mean(), resid.std()), flush=True)
+    if a.target == 'out':
+        outcome_cp = np.clip((out_col * 2.0 - 1.0) * 1000.0, -1500.0, 1500.0)
+        resid = (outcome_cp - base).astype(np.float64)
+        print('target OUT-base (real result): mean %+.1f std %.1f (out means %.3f, base mean %+.1f)'
+              % (resid.mean(), resid.std(), out_col.mean(), base.mean()), flush=True)
+    else:
+        resid = (teacher - base).astype(np.float64)
+        print('resid mean %+.1f std %.1f' % (resid.mean(), resid.std()), flush=True)
 
     cut = int(n * a.split)
     r_tr, r_va = resid[:cut], resid[cut:]
