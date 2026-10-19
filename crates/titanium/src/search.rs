@@ -113,6 +113,11 @@ pub struct SearchParams {
     /// origin is hotter (foe eyes) than covered (own stones) is ranked down.
     /// Prune version (skip entirely) is the escalation if this shows signal.
     pub jump_cold: i32,
+    /// Jump prune (fffasttime geneBranch core): skip outright (not just
+    /// reduce) a non-converting jump that vacates a hotter-than-covered
+    /// hole while a conversion exists elsewhere. move_idx>=2 guard keeps
+    /// the top two ordered moves safe. 0/1, default OFF.
+    pub jump_prune: u32,
 }
 
 impl Default for SearchParams {
@@ -155,6 +160,7 @@ impl Default for SearchParams {
             jump_hole: 100,
             jump_safe: 0,
             jump_cold: 600,
+            jump_prune: 0,
         }
     }
 }
@@ -639,6 +645,7 @@ impl<'a> Searcher<'a> {
             "JumpHole" => self.params.jump_hole = val as i32,
             "JumpSafe" => self.params.jump_safe = val as i32,
             "JumpCold" => self.params.jump_cold = val as i32,
+            "JumpPrune" => self.params.jump_prune = val.clamp(0, 1) as u32,
             _ => return false,
         }
         true
@@ -883,6 +890,22 @@ impl<'a> Searcher<'a> {
         let mut move_idx = 0usize;
         let mut best_ord = 0i32;
         let mut best_ord_set = false;
+        // Prune bait: max converts over legal moves, computed once per
+        // node (zero-cost when JumpPrune is OFF).
+        let maxe: u32 = if self.params.jump_prune != 0 {
+            let mut me2 = 0u32;
+            let ll = &self.stack.lists[ply as usize];
+            for i in 0..ll.len() {
+                let mm = ll.move_at(i);
+                let c = (b.opp() & RING1[mm.to as usize]).count_ones();
+                if c > me2 {
+                    me2 = c;
+                }
+            }
+            me2
+        } else {
+            0
+        };
         loop {
             let (m, m_ord) = {
                 let list = &mut self.stack.lists[ply as usize];
@@ -901,6 +924,22 @@ impl<'a> Searcher<'a> {
             // than the best at ordering time (1 = best). Big gap = reduce
             // more. Tunable thresholds; zero-cost OFF when gap small.
             let gap = best_ord.saturating_sub(m_ord);
+
+            // Jump prune (fffasttime geneBranch): a non-converting jump
+            // that vacates a hotter-than-covered hole while a conversion
+            // exists elsewhere is skipped outright. move_idx>=2 keeps the
+            // top two ordered moves safe; popped moves guarantee progress.
+            if self.params.jump_prune != 0 && move_idx >= 2 && !m.is_clone() {
+                let to_c = (b.opp() & RING1[m.to as usize]).count_ones();
+                if to_c == 0 && maxe >= 1 {
+                    let ring = RING1[m.from as usize];
+                    let cc = (ring & b.opp()).count_ones() as i32;
+                    let cr = (ring & b.occ[b.turn as usize]).count_ones() as i32;
+                    if cc > cr {
+                        continue;
+                    }
+                }
+            }
 
             // PVS + universal LMR (autaxx): first move full window full
             // depth; every later move scouts with a null window at a reduced

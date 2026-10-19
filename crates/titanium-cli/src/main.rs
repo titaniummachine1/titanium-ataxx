@@ -715,6 +715,7 @@ fn serve_cmd(
             out_line("option name JumpHole type spin default 100 min 0 max 2000");
             out_line("option name JumpSafe type spin default 0 min 0 max 2000");
             out_line("option name JumpCold type spin default 600 min 0 max 10000");
+            out_line("option name JumpPrune type spin default 0 min 0 max 1");
             out_line("option name CurveBase type spin default 2 min 0 max 6");
             out_line("option name CurveSlope type spin default 6 min 0 max 64");
             out_line("option name CurveDepth type spin default 2 min 0 max 64");
