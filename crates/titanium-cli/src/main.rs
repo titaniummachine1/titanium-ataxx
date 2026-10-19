@@ -963,6 +963,14 @@ fn match_cmd(
 
     for game in start_game..start_game + games {
         let mut b = Board::start();
+        // Law 12: clear engine memory every game. In-process sides get a
+        // fresh searcher below; the UAI child MUST get uainewgame or its
+        // killers/history leak across games, flip LMR/PVS tie-breaks and
+        // break determinism (caught 2026-10-19: same seat diverged move 4).
+        // A gate run without this reset is VOID.
+        if let Some(o) = &mut opp {
+            o.send("uainewgame");
+        }
         let mut searcher = Searcher::new(); // fresh TT per game
         searcher.set_sancta(net.as_ref());
         searcher.set_tuple(tup.as_ref());

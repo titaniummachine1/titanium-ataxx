@@ -22,18 +22,21 @@ real memory. Update them the moment something happens, not at the end.
 5. **TRASH UNTIL PROVEN.** Every prior claim is trash until re-measured on the
    current branch. Microbenchmarks don't crown — tree NPS (bench/sperft,
    back-to-back alternating) does.
-6. **Merge policy (user law 2026-09-21 v2 — supersedes "neutral→MERGE"):**
-   merge ONLY what is proven STRONGER beyond reasonable doubt. Proof =
-   BOTH realistic time gates (100ms AND 200ms) won with a discernible
-   pattern (32g minimum, win holds across colors/shards — not coin-flip
-   variance). The 5k-node gate is the quality DIAGNOSIS: per-node may be
-   weaker and the change still merges IF both time gates win (speed
-   legitimately compensates). Neutral/dry does NOT merge anymore — no
-   proof of stronger, no merge. Any regression at the time gates = NO
-   merge. Even the smallest gain counts, but it must be REAL and
-   repeatable: when in doubt, run more games, never merge on vibes.
-   Direction of travel is only forward — we prove each kept change
-   didn't make the engine worse.
+6. **Merge policy (user law 2026-09-21 v2 + 2026-10-19 node-merge rule):**
+    merge ONLY what is proven STRONGER beyond reasonable doubt. WHICH gate
+    proves it depends on what changed:
+    (a) intelligence-only (eval knowledge, net weights — speed provably
+    untouched: identical sperft nodes or bench/sperft parity): the 5k-node
+    gate CAN merge alone. Fixed nodes = both sides think identical trees =
+    zero clock noise, the fairest most precise gate. No time gate owed.
+    (b) speed affected (any NPS change): BOTH realistic time gates (100ms
+    AND 200ms) must win with a discernible pattern — speed must convert.
+    The 5k leg is then the quality DIAGNOSIS (did decisions change?).
+    Neutral/dry does NOT merge — no proof of stronger, no merge. Any
+    regression at the required gates = NO merge. Even the smallest gain
+    counts, but it must be REAL and repeatable: when in doubt, run more
+    games, never merge on vibes. Direction of travel is only forward —
+    we prove each kept change didn't make the engine worse.
 
 7. **MAIN IS ALWAYS STRONGEST (Stockfish rule, adopted 2026-10-05 from
     QuoridorBestAI).** Nothing merges to main — code or weights — without a
@@ -44,22 +47,42 @@ real memory. Update them the moment something happens, not at the end.
     parity) excuse nothing: strength is proven by games, and only games.
     Extends law 6: time gates (100ms AND 200ms) are the crown, 5k nodes is
     the quality diagnosis.
-8. **NEVER REJECT ON A DIP.** An inconclusive gate is an order to SPEND MORE
-    GATE (more games), not a verdict. Reject only on a conclusive CI below
-    0.5; promote only on a conclusive CI above it.
+8. **NEVER REJECT ON A DIP — EXTEND BOTH WAYS (SPRT gate law, user order
+    2026-10-19).** Every gate is SPRT (LLR H0 elo≤0 vs H1 elo≥20, PASS at
+    ≥ +2.94). AHEAD but proof insufficient → EXTEND (more games, fresh
+    book), never merge early. BEHIND → EXTEND too (FOMO: fear of missing
+    out on Elo — a buried gem rejects at our peril); reject ONLY on a
+    conclusive CI below 0.5 AND user confirmation (same as merges: user
+    calls every merge AND every rejection). An inconclusive gate is an
+    order to SPEND MORE GATE, not a verdict.
 9. **ENGINE ADAPTS TO NET.** Never damage an experimental net to make it fit
     main: no stripping sections, no converting formats, no rewriting blobs
     to satisfy a loader. A net main cannot load yet waits for its wiring +
     parity proof; it is never cut down. Reads (hash, load-for-eval, carve a
-    copy for verification) are free.
+    copy for verification) are free. Load-time allzero skips (W4 has_q2
+    pattern) are NOT damage: the code path stays intact and nonzero
+    weights automatically take the full path — no silent lobotomy, ever.
+    Training may fill any section later and the engine follows.
 10. **NO GATE STOPS BELOW 100 GAMES (user law 2026-10-05).** Identity is
     not a reason to stop small: expecting ~50% never justifies a sub-100
     gate. Every gate leg runs to >=100 games, then extends on a straddle.
-11. **GATES ARE BY SEAT (user law 2026-10-05).** Sides swap colors every
-    game (odd/even) — every leg ends exactly 50/50 black/white per side,
-    verified from the log, not assumed from the game count. Paired openings
-    (same line, both seats) when the harness supports books; until then,
-    alternation + balance check is the floor.
+11. **GATES ARE BY SEAT + PAIRED BOOK (user law 2026-10-05, book rule
+    2026-10-19).** Sides swap colors every game (odd/even) — every leg ends
+    exactly 50/50 black/white per side, verified from the log, not assumed
+    from the game count. Every gate game runs on the prepared book
+    (`data/nnue/book50k.txt`): each book line is played from BOTH seats by
+    BOTH engines. Win-both-seats of a line = real edge in that situation,
+    not noise — even a 1-point margin is measurable signal. Split seats =
+    parity. Fixed nodes are deterministic: same line + same seats MUST
+    replay bit-identically; any divergence is an INFRA BUG (stop, fix,
+    re-gate — never explain away).
+12. **CLEAR ENGINE MEMORY EVERY GAME (user order 2026-10-19).** `uainewgame`
+    before every gate game, both sides, no exceptions — TT, killers,
+    history reset. Cross-game state leaks ordering hints (killers/history
+    flip LMR/PVS tie-breaks) and breaks determinism: caught 2026-10-19
+    (same seat, same startpos diverged at move 4). In-process sides get a
+    fresh searcher per game; UAI children get `uainewgame`. A gate run
+    without per-game resets is VOID.
 
 ## Mistakes ledger (written when scolded, read before acting)
 
@@ -82,6 +105,12 @@ real memory. Update them the moment something happens, not at the end.
   only record titanium-cli match results. Added S3moonX row.
 - General: if basic git/bench ops fail, the code is hyper-unmaintainable and
   I pay for it — purge, don't patch. Simplicity is the metric.
+- 2026-10-19: match harness never sent `uainewgame` — opp child carried
+  killers/history across gate games, flipping LMR/PVS tie-breaks so same
+  seat + same startpos diverged at move 4 (games 1/3 identical, game 5
+  split). Lesson: VOID any gate without per-game resets (law 12); the
+  determinism self-check (same line + seat replays bit-identically) is the
+  tripwire. Fixed same session.
 
 ## Checkpoints (save tokens: doc at end of each TA block, then answer short)
 
