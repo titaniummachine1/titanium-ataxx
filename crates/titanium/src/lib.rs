@@ -15,7 +15,7 @@ pub mod tuple;
 
 pub use board::{
     bit_of, dist_union, infect_direct, infect_via_lut, extract8, jump_union, perft_bb, Board, Move,
-    MoveList, CONVERT8, NEIGH_CNT, NEIGH_POS, REACH, RING1, RING2, ZOB_BLOCK, ZOB_PIECE, ZOB_SIDE,
+    MoveList, CONV_BIT, CONVERT8, NEIGH_CNT, NEIGH_POS, REACH, RING1, RING2, ZOB_BLOCK, ZOB_PIECE, ZOB_SIDE,
     BLACK, BLOCKER, EMPTY, FULL, MAX_MOVES, SIZE, SQUARES, WHITE,
 };
 #[cfg(target_arch = "x86_64")]

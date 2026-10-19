@@ -487,19 +487,44 @@ impl TupleTable {
         if mt != 0 {
             s += self.capn_them[mt.min(8) as usize] as i32;
         }
-        // Conversion-kernel keys per square (foe pattern, NEIGH_POS order).
-        // NOTE (PARKED, not rejected): BMI2 PEXT tried, hoisted detect —
-        // 0.88/0.93 vs 0.98/1.00 scalar on this CPU (latency-bound in the
-        // real loop; micro still 702M vs 99M/s). Scalar stays default.
-        // Proof `pext_matches_loop` + genbench PEXT micro stay prepared
-        // for retest (other CPUs, restructured loops). Rejection is only
-        // for what makes the engine worse — this is parked for FOMO.
+        // Conversion-kernel keys, inverted accumulation (W7): instead of
+        // visiting all 49 squares and looping each square's neighbors (with
+        // a taken-or-not branch per neighbor), walk each foe stone's ring
+        // once and OR the precomputed bit (CONV_BIT). OR commutes, so keys
+        // are bit-identical (exhaustive test below + node parity) while the
+        // inner loop halves (~120 vs ~245 ops) and all branches vanish.
+        // (Supersedes parked PEXT: same win, no BMI2 lottery.)
+        let mut ku_keys = [0u8; 49];
+        let mut foe = ot;
+        while foe != 0 {
+            let s = foe.trailing_zeros() as usize;
+            foe &= foe - 1;
+            let mut nb = RING1[s];
+            while nb != 0 {
+                let t = nb.trailing_zeros() as usize;
+                nb &= nb - 1;
+                ku_keys[t] |= 1 << crate::board::CONV_BIT[t][s];
+            }
+        }
+        let mut kt_keys = [0u8; 49];
+        foe = ou;
+        while foe != 0 {
+            let s = foe.trailing_zeros() as usize;
+            foe &= foe - 1;
+            let mut nb = RING1[s];
+            while nb != 0 {
+                let t = nb.trailing_zeros() as usize;
+                nb &= nb - 1;
+                kt_keys[t] |= 1 << crate::board::CONV_BIT[t][s];
+            }
+        }
         let mut sq = 0usize;
         while sq < 49 {
-            let (ku, kt) = (conv_key(ot, sq), conv_key(ou, sq));
+            let ku = ku_keys[sq] as usize;
             if ku != 0 {
                 s += self.conv_us[ku] as i32;
             }
+            let kt = kt_keys[sq] as usize;
             if kt != 0 {
                 s += self.conv_them[kt] as i32;
             }
@@ -633,6 +658,37 @@ mod tests {
         t2.has_capconv = true;
         t2.conv_us[72] = 11;
         assert_eq!(t2.forward(&b), 11);
+    }
+
+    #[test]
+    fn inverted_conv_matches_loop() {
+        // Stone-outward accumulation must equal the square-inward loop for
+        // every square and every 8-bit foe pattern (OR commutes — same
+        // bits, different visit order). 49 x 256, runs in ms.
+        for sq in 0..crate::board::SQUARES {
+            for pat in 0..256usize {
+                let mut occ = 0u64;
+                for i in 0..crate::board::NEIGH_CNT[sq] as usize {
+                    if pat & (1 << i) != 0 {
+                        occ |= 1u64 << crate::board::NEIGH_POS[sq][i];
+                    }
+                }
+                let want = conv_key(occ, sq);
+                let mut keys = [0u8; 49];
+                let mut foe = occ;
+                while foe != 0 {
+                    let s = foe.trailing_zeros() as usize;
+                    foe &= foe - 1;
+                    let mut nb = crate::board::RING1[s];
+                    while nb != 0 {
+                        let t = nb.trailing_zeros() as usize;
+                        nb &= nb - 1;
+                        keys[t] |= 1 << crate::board::CONV_BIT[t][s];
+                    }
+                }
+                assert_eq!(keys[sq] as usize, want, "sq {sq} pat {pat}");
+            }
+        }
     }
 
     #[test]

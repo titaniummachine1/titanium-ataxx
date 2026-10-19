@@ -333,6 +333,27 @@ const NEIGH_TABLES: ([[u8; 8]; SQUARES], [u8; SQUARES]) = {
 pub const NEIGH_POS: [[u8; 8]; SQUARES] = NEIGH_TABLES.0;
 pub const NEIGH_CNT: [u8; SQUARES] = NEIGH_TABLES.1;
 
+/// Inverse neighbor-bit layout (winter-clean W7): `CONV_BIT[t][s]` = the key
+/// bit for foe stone `s` in landing square `t`'s conversion pattern
+/// (valid only for `s` in `RING1[t]`). Lets conversion keys accumulate
+/// stone-outward (foe stone -> its ring) instead of square-inward (49
+/// squares x neighbor loop with a branch per neighbor): same bits OR-ed
+/// in a different order — identical keys, no branches. 49x49 u8 L1-resident.
+pub static CONV_BIT: [[u8; SQUARES]; SQUARES] = {
+    let mut t = [[0u8; SQUARES]; SQUARES];
+    let mut sq = 0usize;
+    while sq < SQUARES {
+        let mut i = 0usize;
+        while i < NEIGH_TABLES.1[sq] as usize {
+            let s = NEIGH_TABLES.0[sq][i] as usize;
+            t[sq][s] = i as u8;
+            i += 1;
+        }
+        sq += 1;
+    }
+    t
+};
+
 /// Single universal conversion table: input is the 8-bit enemy pattern
 /// around a landing square (bit i = NEIGH_POS[sq][i] holds an enemy), output
 /// is which neighbor slots convert. Square-independent — infection depends
