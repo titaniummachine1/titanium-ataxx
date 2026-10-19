@@ -156,11 +156,11 @@ impl Default for SearchParams {
             lmr_cdepth: 2,
             lmr_ccap: 5,
             null_rdiv: 0,
-            jump_danger: 120,
-            jump_hole: 100,
+            jump_danger: 0, // OFF (S55jdanger: buried -323)
+            jump_hole: 0, // OFF (S55jdanger: buried -323)
             jump_safe: 0,
-            jump_cold: 600,
-            jump_prune: 0,
+            jump_cold: 0, // OFF (S55jcold: parked neutral -7, unproven)
+            jump_prune: 0, // OFF (S55jprune: buried -315)
         }
     }
 }
