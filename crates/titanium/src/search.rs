@@ -100,6 +100,14 @@ pub struct SearchParams {
     /// Dynamic nullmove R (Stockfish form): R = min(null_r +
     /// depth/null_rdiv, 6). null_rdiv = 0 keeps flat R (current).
     pub null_rdiv: u32,
+    /// Jump danger bonus (fffasttime evalJump idea): a jump vacates its
+    /// origin; if the enemy eyes the hole (cc) with no own cover (cr),
+    /// the move is taxed. score += safe - danger*cc - (hole if cr==0).
+    /// Applied once per jump at the making node. Tunable, defaults OFF-ish
+    /// (screen decides; start values mirror evalJump scale x100cp).
+    pub jump_danger: i32,
+    pub jump_hole: i32,
+    pub jump_safe: i32,
 }
 
 impl Default for SearchParams {
@@ -138,6 +146,9 @@ impl Default for SearchParams {
             lmr_cdepth: 2,
             lmr_ccap: 5,
             null_rdiv: 0,
+            jump_danger: 120,
+            jump_hole: 100,
+            jump_safe: 0,
         }
     }
 }
@@ -318,6 +329,28 @@ fn terminal_score(b: &Board, ply: u32) -> i32 {
         -MATE + ply as i32
     } else {
         0
+    }
+}
+
+/// Jump danger bonus (fffasttime evalJump idea): a jump vacates its origin;
+/// coverage computed on the parent (only `from` itself changed, and RING1
+/// holds neighbors only). Returns the score adjustment for the move.
+#[inline]
+fn jump_danger(b: &Board, m: Move, p: &SearchParams) -> i32 {
+    if m.is_clone() || (p.jump_danger == 0 && p.jump_hole == 0 && p.jump_safe == 0) {
+        return 0;
+    }
+    let ring = RING1[m.from as usize];
+    let cc = (ring & b.occ[1 - b.turn as usize]).count_ones() as i32;
+    if cc > 0 {
+        let cr = (ring & b.occ[b.turn as usize]).count_ones() as i32;
+        let mut adj = -p.jump_danger * cc;
+        if cr <= 0 {
+            adj -= p.jump_hole;
+        }
+        adj
+    } else {
+        p.jump_safe
     }
 }
 
@@ -581,6 +614,9 @@ impl<'a> Searcher<'a> {
             "CurveDepth" => self.params.lmr_cdepth = val.clamp(0, 64) as u32,
             "CurveCap" => self.params.lmr_ccap = val.clamp(1, 8) as u32,
             "NullRDiv" => self.params.null_rdiv = val.clamp(0, 16) as u32,
+            "JumpDanger" => self.params.jump_danger = val as i32,
+            "JumpHole" => self.params.jump_hole = val as i32,
+            "JumpSafe" => self.params.jump_safe = val as i32,
             _ => return false,
         }
         true
@@ -854,6 +890,10 @@ impl<'a> Searcher<'a> {
                 let (a, z) = self.stack.acc.split_at_mut(ply as usize + 1);
                 net.update_child(&a[ply as usize], &mut z[0], b, &child);
             }
+            // Jump danger (fffasttime evalJump): the vacated origin's
+            // coverage, computed on the parent (only `from` itself changed).
+            // Once per jump at the making node; zero-cost OFF at 0/0/0.
+            let jdanger = jump_danger(b, m, &self.params);
             let mut score;
             if move_idx == 0 {
                 score = -self.negamax(&child, -beta, -alpha, depth - 1, ply + 1, true);
@@ -933,6 +973,9 @@ impl<'a> Searcher<'a> {
                     }
                 }
             }
+            // Jump danger (fffasttime): tax/subsidize the returned score
+            // once per jump at the making node.
+            score += jdanger;
             move_idx += 1;
 
             if score > best {
@@ -1065,10 +1108,12 @@ impl<'a> Searcher<'a> {
                     let (a, z) = self.stack.acc.split_at_mut(1);
                     net.update_child(&a[0], &mut z[0], b, &child);
                 }
-                let score = -self.negamax(&child, -i32::MAX, -alpha, depth - 1, 1, true);
+                let mut score = -self.negamax(&child, -i32::MAX, -alpha, depth - 1, 1, true);
                 if self.stop {
                     break;
                 }
+                // Same jump-danger adjustment as interior nodes.
+                score += jump_danger(b, m, &self.params);
                 if score > best_score {
                     best_score = score;
                     best_this = Some(m);
