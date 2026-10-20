@@ -1,47 +1,26 @@
 import argparse
+import concurrent.futures as cf
 import os
+import re
 import subprocess
 import sys
 import time
 
+RE_BEST = re.compile(r'bestmove\s+(\S+)\s+score\s+(-?\d+)')
 
-class Engine:
-    def __init__(self, exe, args):
-        self.p = subprocess.Popen([exe] + args, stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                  text=True, bufsize=1)
-        self.send('uai')
-        self.wait('uaiok')
-        self.send('isready')
-        self.wait('readyok')
 
-    def send(self, line):
-        self.p.stdin.write(line + '\n')
-        self.p.stdin.flush()
-
-    def wait(self, token):
-        while True:
-            line = self.p.stdout.readline()
-            if not line:
-                raise RuntimeError('engine died waiting for ' + token)
-            if line.strip().startswith(token):
-                return line.strip()
-
-    def best(self, fen, nodes):
-        self.send('uainewgame')
-        self.send('position fen ' + fen)
-        self.send('go nodes %d' % nodes)
-        return self.wait('bestmove').split()[1]
-
-    def close(self):
-        try:
-            self.send('quit')
-        except Exception:
-            pass
-        try:
-            self.p.kill()
-        except Exception:
-            pass
+def run_one(exe, board, nodes, tup, native):
+    cmd = [exe, 'bestmove', board, '--nodes', str(nodes), '--tuple', tup]
+    if native:
+        cmd.append('--tuple-native')
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=600).stdout
+    except Exception:
+        return None, None
+    m = RE_BEST.search(out)
+    if not m:
+        return None, None
+    return m.group(1), int(m.group(2))
 
 
 def main():
@@ -50,40 +29,47 @@ def main():
     ap.add_argument('--net', default='data/nnue/tupS55tree.tup')
     ap.add_argument('--tuple-native', action='store_true', default=True)
     ap.add_argument('--fens', default='data/nnue/golden_src/lab_00.txt')
-    ap.add_argument('--limit', type=int, default=200)
+    ap.add_argument('--extra', nargs='*', default=[])
+    ap.add_argument('--limit', type=int, default=400)
     ap.add_argument('--shallow', type=int, default=5000)
     ap.add_argument('--deep', type=int, default=200000)
+    ap.add_argument('--workers', type=int, default=4)
     ap.add_argument('--out', default='logs/pv_probe.csv')
     a = ap.parse_args()
 
-    fens = []
-    with open(a.fens) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                fens.append(line)
-            if len(fens) >= a.limit:
-                break
-    args = ['serve', '--tuple', a.net]
-    if a.tuple_native:
-        args.append('--tuple-native')
-    e = Engine(a.exe, args)
-    agree = 0
+    boards = []
+    for path in [a.fens] + a.extra:
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        boards.append(line)
+        except FileNotFoundError:
+            pass
+    boards = boards[:a.limit]
+    print('positions %d, shallow %d deep %d workers %d' % (len(boards), a.shallow, a.deep, a.workers), flush=True)
+
+    def job(board):
+        sm, ss = run_one(a.exe, board, a.shallow, a.net, a.tuple_native)
+        dm, ds = run_one(a.exe, board, a.deep, a.net, a.tuple_native)
+        return board, sm, ss, dm, ds
+
     t0 = time.time()
     rows = []
-    for fen in fens:
-        m_s = e.best(fen, a.shallow)
-        m_d = e.best(fen, a.deep)
-        ok = (m_s == m_d)
-        agree += int(ok)
-        rows.append('%s\t%s\t%s\t%d' % (fen, m_s, m_d, int(ok)))
-    e.close()
+    agree = 0
+    with cf.ThreadPoolExecutor(max_workers=a.workers) as ex:
+        for board, sm, ss, dm, ds in ex.map(job, boards):
+            ok = sm is not None and dm is not None and sm == dm
+            agree += int(ok)
+            rows.append((board, sm, ss, dm, ds, int(ok)))
+    n = len(rows)
     with open(a.out, 'w') as f:
-        f.write('fen\tshallow\tdeep\tagree\n')
-        f.write('\n'.join(rows) + '\n')
-    n = len(fens)
-    print('positions %d  agreement %.3f (%d/%d)  %.0fs -> %s'
-          % (n, agree / max(n, 1), agree, n, time.time() - t0, a.out), flush=True)
+        f.write('board\tshallow_move\tshallow_score\tdeep_move\tdeep_score\tagree\n')
+        for r in rows:
+            f.write('%s\t%s\t%s\t%s\t%s\t%d\n' % r)
+    print('agreement %.3f (%d/%d) in %.0fs -> %s'
+          % (agree / max(n, 1), agree, n, time.time() - t0, a.out), flush=True)
 
 
 if __name__ == '__main__':

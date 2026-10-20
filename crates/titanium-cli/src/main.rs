@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use titanium::{best_move, Board, Move, SearchLimits, Searcher, RING1};
+use titanium::{Board, Move, SearchLimits, Searcher, RING1};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,6 +39,9 @@ fn main() -> ExitCode {
         "bestmove" => bestmove_cmd(
             positional_str(&args).or_else(|| Some(Board::start().to_string())),
             flag_int(&args, "--time").map(|ms| ms as u64),
+            flag_int(&args, "--nodes").map(|n| n as u64),
+            flag_str(&args, "--tuple"),
+            args.iter().any(|x| x == "--tuple-native"),
         ),
         "label" => label_cmd(
             flag_int(&args, "--nodes").unwrap_or(20000) as u64,
@@ -484,7 +487,13 @@ fn label_cmd(nodes: u64, tup_spec: Option<String>, tup_native: bool) -> ExitCode
 
 // ---------- bestmove ----------
 
-fn bestmove_cmd(board: Option<String>, time_ms: Option<u64>) -> ExitCode {
+fn bestmove_cmd(
+    board: Option<String>,
+    time_ms: Option<u64>,
+    max_nodes: Option<u64>,
+    tup_spec: Option<String>,
+    tup_native: bool,
+) -> ExitCode {
     let Some(text) = board else {
         eprintln!("bestmove: missing board string");
         return ExitCode::FAILURE;
@@ -494,12 +503,22 @@ fn bestmove_cmd(board: Option<String>, time_ms: Option<u64>) -> ExitCode {
         return ExitCode::FAILURE;
     };
     println!("{}", b.pretty());
+    let owned_tup = match load_tuple_preset(&tup_spec) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("bestmove: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut searcher = Searcher::new();
+    searcher.set_tuple(owned_tup.as_ref());
+    searcher.set_tuple_native(tup_native && owned_tup.is_some());
     let limits = SearchLimits {
         time: time_ms.map(Duration::from_millis),
-        max_nodes: None,
+        max_nodes,
         max_depth: 24,
     };
-    let r = best_move(&b, &limits);
+    let r = searcher.search(&b, &limits);
     if b.game_over() {
         println!("game over: {}", outcome(&b));
         return ExitCode::SUCCESS;
