@@ -1,3 +1,16 @@
+## FINAL 2026-10-20 ~09:55 (session close)
+
+- exp/tonight (pushed). MAIN UNTOUCHED ea0bdf5. Strongest = main + tupS55tree (F66A00FE).
+- ONLINE600 (per-step search-in-the-loop, 0.5 outcome, regret weights): leg A 1000g +14 (CI [0.489,0.550], LLR +0.63), leg B 1000g -13 (LLR -3.83) -> pooled 2000g 981-980-39 = 0.500, LLR -3.20 -> PARITY. No merge.
+- All eval retrains parity/negative: C0 +6 (2008g), A0 +6, B0 -15, C0gold +2, D0 -38, E0 -24, C1 -30, C2 -71 (rejected), PD -3, bucket -86 (rejected). 5k-label/value-only line is exhausted.
+- Measured brain/teacher facts: 5k-vs-200k move disagreement 47pct; 200k/1M 73pct; 1M/2M 75pct; 2M/4M 77.5pct; all-three 62.5pct. Agreement with deep teacher improves while Elo does not. pa/capconv fit teacher but have ~0 outcome signal. Piece-count bucketing: teacher R2 .11, outcome .0015; additive correction -86.
+- Fixed: S50 fused-bag q2 offset bug (q2 never trained; polluted singles/pairsH).
+- Ladder @5k (proper gates, 0 forfeits): autaxx +54 over us, Moonbird +485, Sanctaphraxx far below; KataAtaxx CPU/ONNX downloaded (GTP->UAI adapter needed).
+- Delivered: RAM-bounded streaming trainer; full-family trainer with q2 fix; feature/outcome/bucket audits; golden-dose pipeline (top-wsum and disagreement/1M variants); TUP8 bucket loader+eval (branch-only); bestmove --nodes/--tuple; exact move applier; online_step.py (per-step search-in-loop); export_sqlite.py provenance (nodes_used/depth/share/engine+net hashes); docs/GOLDEN_DOSE.md and docs/EVAL_FAILURES.md (includes owner's train-on-Elo/ES idea).
+- Data on disk (gitignored): cache12M_golden(3pct)/golden6/golden10/disagree(3pct); golden.npz (1200 @500k); disagree1m.npz (531); converged.npz (243); trees.npz (degenerate, 14 nodes - retired); nets tonightA-E, A0/B0/C0/D0/E0, PD0, bucket, online600(+_0); all gate logs.
+- NEXT (do first): dataset quality - dedup cache12M by position, filter rails/inconsistent labels, reweight wsum softly (power .3, capped), rebalance phases; then a fixed-subset LR/batch/optimizer sweep with 5k gates; SPSA/ES on eval scalars (owner Elo-loss idea) with antithetic paired-book games; tune online loop (regret scale, outcome blend); KataAtaxx adapter.
+- Cleanup done: scheduled tasks removed, runners in logs/, no training running.
+
 ## MORNING STATUS 2026-10-20 06:35 (all jobs finished)
 
 - D0 (outcome 0.25 + 6pct golden dose): 5k 1000g = 438-547-15, 0.446, -38 Elo, CI [0.415,0.476], LLR -7.92 -> CONCLUSIVE BELOW (reject candidate, needs user).
