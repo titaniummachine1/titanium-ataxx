@@ -154,6 +154,52 @@ mined rows at 500k-1M nodes is ~10-40 min with 6 workers — the definition of a
 Caveat from the record: lightly searched labels hurt; only CONVERGED deep labels help
 (best-move share high / stable across depths). Mine with verification, not one shot.
 
+## 3d. Tree tightening / PV distillation (owner idea, 2026-10-20)
+
+Idea: when a deep search produces a PV line, train the evaluation on that line so the eval
+"tightens" toward the PV; then a shallower search is more likely to reproduce the same PV.
+
+Research grounding:
+- Supervised distillation of strong engines into AlphaZero-shaped nets works and is cheap
+  ("Distilling AlphaZero on one GPU", 2026): 5M labeled positions -> 1810, 30M -> 2009,
+  deeper search at play time + deeper training -> 2301. No self-play loop required.
+- AlphaZero/Lc0 train the policy toward SEARCH VISIT distributions, not the single PV move;
+  the PV is the sharpest part but not the whole signal.
+- WARNING (arXiv 2609.37447, efficient self-play under limited compute): "closeness to a deep
+  policy does not measure how much a target will improve the next network. Easy-to-predict
+  targets can agree with deeper search while teaching little." Their controller improved
+  policy agreement but produced WORSE learning. This is exactly the val-lies/agreement-lies
+  pattern we measured tonight (C0/C1 agree better with the deep teacher, do not win games).
+- Therefore: PV tightening must be (a) restricted to CONVERGED deep searches, (b) dosed small
+  (3-10%), (c) outcome-anchored, and (d) promoted only by games, never by agreement.
+
+Concrete Ataxx form:
+1. Probe set: positions where shallow (5k) and deep (200k-1M) best moves DIFFER. Measure
+   shallow->deep agreement before/after training as a diagnostic only.
+2. Targets on PV rows: value = deep search value (optionally 0.75 search + 0.25 outcome).
+   Add a margin term: make the eval of the PV child exceed its siblings by a calibrated
+   margin (ranking/pairwise loss on (PV move, alternative moves) after each move).
+3. Oversample PV/disagreement rows (golden dose) and dedup by position.
+4. Track: (i) agreement on held-out probes (diagnostic), (ii) gate vs previous champion at
+   5k and time controls (the only promotion evidence).
+5. The point is not to imitate the deep move per se: it is to move the eval's decision
+   boundary so shallow search stops needing the deep tree to find the same move — more
+   strength per node, which is what time-control gates reward.
+
+### Owner ratio (2026-10-20)
+
+Effort split: **>=50% on outcome-anchored value**, the remainder on deep/PV precision
+("golden dose" as Apex found). Rationale: while tightening the eval to fit a deeper PV, the
+net must not lose much on predicting the actual game outcome — the outcome anchor is what
+stops the echo chamber.
+
+Experiment grid queued tonight:
+- Run C: outcome-weight 0.50, golden dose 3% (3% tested first, Apex best was 10%).
+- Run D (queued): outcome-weight 0.25 (Quoridor 0.75 search / 0.25 outcome doctrine),
+  golden dose 6% — tests the dose axis at the doctrine blend.
+Both warm-start from champ, blend 1.0 (pure teacher column, deep labels on golden rows),
+promotion by 5k gates on fresh paired-book lines only.
+
 ## 4. Where tonight's evidence fits
 
 - Full-corpus 5k-node retrain (tonightA_fixed, all families): 5k gate vs main = +6 Elo at
