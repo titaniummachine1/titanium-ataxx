@@ -210,6 +210,23 @@ Run C/D test whether the anchor still helps through grounding/regularization. If
 outcome anchor toward short-continuation/backward-start positions (Quoridor doctrine) where
 outcomes are near-factual, instead of raising the global outcome weight.
 
+### Implementation sketch (next session)
+
+1. CLI: add `--nodes N --tuple PATH [--tuple-native]` to `bestmove` (it currently takes only
+   `--time`). Small, tools-only change; build with `cargo build --release -p titanium-cli`.
+   Then a position list can be probed: shallow best move (5k) vs deep best move (200k-1M).
+2. Mine disagreements: positions where shallow != deep. Store (board, shallow_move, deep_move,
+   shallow_score, deep_score). Cost: ~0.3 s/position at 200k nodes, ~1.4 s at 1M (single core).
+3. Label alternatives (per-move deep values) for the mined positions only: run `bestmove`-style
+   search with the deep budget on every legal move (sweep), or reuse an MCTS-style visit export
+   if added later. Keep only converged values (best-move share high across two budgets).
+4. Loss: value term (0.5 outcome + 0.5 deep score) + margin term on mined rows:
+   loss += margin_w * relu(margin - (V(pv_child) - V(best_alternative)))
+   where V is the eval of the resulting position (base + tuple), pv_child = position after the
+   deep PV move. This directly teaches the eval to prefer the deep decision, not just its value.
+5. Dose: mined/PV rows at 3-10% (golden dose); dedup; outcome anchor always on.
+6. Gate only by games (5k for quality, 100/200ms for the crown). Agreement probes are diagnostics.
+
 ## 4. Where tonight's evidence fits
 
 - Full-corpus 5k-node retrain (tonightA_fixed, all families): 5k gate vs main = +6 Elo at
