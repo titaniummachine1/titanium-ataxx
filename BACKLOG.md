@@ -108,6 +108,15 @@ Iron laws unchanged: main untouchable; proven-ahead merges only; 5k = quality, t
   (Botzone #2, 2383). Autaxx/Sanctaphraxx builds work: autaxx needs the llvm-mingw bin on PATH
   for its DLLs; Sanctaphraxx runs standalone.
 
+## DATA INFRA (started)
+
+- `training/export_sqlite.py` writes any cache to SQLite/libSQL (Turso-compatible): positions
+  with occ0/occ1/blk/stm, teacher, outcome, sc, wsum, source, **nodes_used, depth,
+  best_move_share, engine_sha256, net_sha256** + indexes. Verified on golden.npz (1200 rows,
+  engine 06E02C7D, net F66A00FE). JSON stays Botzone-only; Turso/libSQL is the training store.
+- Golden cache builder (`make_golden_cache.py`) multiplies golden wsum instead of literal
+  duplication when a weight-share is wanted; repeats are kept for Apex-style 20x writes.
+
 ## BUGS FOUND/FIXED TONIGHT
 
 - **FUSED-BAG q2 OFFSET (Wq2fix, critical)**: q2 indices were materialized as AR2+Q (0..9215)
