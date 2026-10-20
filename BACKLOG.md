@@ -27,6 +27,9 @@ Iron laws unchanged: main untouchable; proven-ahead merges only; 5k = quality, t
   directional negative; per law never reject on a dip, extend later).
 - Clean 6-epoch retrain (scheduled A re-fire, fixed q2): val 7192.9 best; A0 gate 5k 1000g fresh
   = 502-486-12, +6 Elo, CI [0.477,0.539], LLR -0.72 -> PARITY. 5k-label paradigm exhausted.
+- Agreement (align20k): champ 124.4/corr .8604; A 110.7/.8463; B 111.4/.8437; C ep1 116.2/.8500
+  -> every retrain fits the deep teacher better on mean error yet none wins games. Agreement is
+  a diagnostic, not a promotion metric (confirmed).
 - GOLDEN DOSE built: 1200 unique top-wsum positions deep-labelled @500k nodes (champ, native);
   cache12M_golden = 12.42M rows, dose 3% (repeat 20, wsum ~16x). Run C = outcome 0.50 +
   blend 1.0, 2 epochs from champ (user ratio: >=50% outcome anchor, rest deep/PV precision).
