@@ -103,8 +103,8 @@ def apply_move(occ0, occ1, blk, stm, token):
     for s in RING[to]:
         if (enm >> s) & 1:
             conv |= 1 << s
-    new_own &= ~conv
-    new_enm = (enm & ~conv) | conv
+    new_own |= conv
+    new_enm = enm & ~conv
     if stm == 0:
         return new_own, new_enm, blk, 1
     return new_enm, new_own, blk, 0
