@@ -1,3 +1,18 @@
+## STATE FOR NEW SESSION (2026-10-20 ~02:25 NIGHT SESSION — GOLDEN DOSE ERA BEGINS)
+
+- Branch exp/tonight @ 49ca738 (pushed; docs/GOLDEN_DOSE.md added). Main untouched (ea0bdf5). Strongest still main + tupS55tree (F66A00FE).
+- Tonight gates (5k nodes, paired book, uainewgame, fresh lines; cand exe 06E02C7D = bb79eaf, main exe B3422646 = ea0bdf5):
+  (1) C0 (A2 net, 5 ep incl buggy-q2 epoch 1): 2008g 1009-972-27, +6 Elo, CI [0.487,0.531], LLR -1.16 -> PARITY.
+  (2) A0 (clean 6-ep retrain from champ, fixed q2, all families): 1000g 502-486-12, +6, CI [0.477,0.539], LLR -0.72 -> PARITY.
+  (3) B0 (outcome-weight 0.10, 3 ep): 1000g 471-515-14, -15, CI [0.447,0.509], LLR -4.18 -> PARKED (straddle; directional negative).
+  (4) C (outcome 0.50 + 3pct golden dose, 2 ep): auto-gate scheduled 02:34 (logs/gate_c0g_5k_*). (5) D (outcome 0.25 + 6pct golden dose): scheduled 02:35 (logs/tonightD_stream.log).
+- KEY: 5k-label training is EXHAUSTED (6 clean epochs = parity). Trained extra heads hurt (C1 -30, C2 -71 conclusive). Agreement probe: retrains fit align20k better (110-111 vs 124 mean|d|) but do NOT win -> agreement lies, confirmed.
+- GOLDEN DOSE pipeline built/verified: 1200 unique top-wsum positions, deep labels @500k nodes (champ, tuple-native), golden.npz teacher mean -83 std 2887, dosed caches 3pct/6pct (repeat 20/40, wsum ~16x). Scripts: training/dump_topwsum.py, make_golden_cache.py, label_chunks.py. Docs: docs/GOLDEN_DOSE.md (Apex/Ace recipe + pack1/pack2 schema; Stockfish; Quoridor teacher doctrine exact>outcome>search, 0.75/0.25; replay-until-learn; tree tightening; owner ratio >=50pct outcome anchor).
+- EXTERNAL LADDER @5k with candidate+champ: autaxx 1.0 10-20 (autaxx stronger at equal nodes!), Moonbird 1.1.0 1-19, Sanctaphraxx 0.1.11 2-0. KataAtaxx CPU 20260501 release downloaded 331MB (GTP engine ataxx7x_cpu.exe, ONNX; needs GTP->UAI adapter). autaxx needs llvm-mingw bin on PATH for DLLs.
+- Toolchain: llvm-mingw C:\gitProjects\toolchains\llvm-mingw-20261006-ucrt-x86_64 (clang++/g++/make); pip cmake+py7zr; cargo (sanctaphraxx built). No MSVC/Nim.
+- Morning: read C/D gates (logs/gate_c0g_5k_*.txt + logs/gate_d0_5k_*.txt / c_autogate.log), decide dose axis; any arm with LLR >= +2.94 and positive CI is a user-approval candidate (nets are loader+speed-neutral C0 form). Then GTP->UAI adapter for KataAtaxx (above-2000 calibration), PV-margin/tree-tightening next, Turso provenance schema (nodes_used + engine/net hashes) per user order.
+- Box: drive long jobs via SCHTASKS (tool calls interrupt during long waits). LEDGER rows added tonight: Wq2fix, Wfeataudit2, WstreamA, WtrainA2, Wc0-Wc2, WgateSpeed, WtrainA6, Wa0, Wb0, Wgolden, Wladder1.
+
 ## STATE FOR NEW SESSION (2026-10-19 NIGHT CLOSE — TUP7 LOADER FIXED, RETRAINS DEAD, NN ANALYZED, PATH OUT)
 
 - Branch: exp/winter-tup7fix @a8672a3 (pushed). Main @a85871f = winter-clean merged (+26% NPS). Strongest = main + tupS55tree.tup (F66A00FE). Working tree CLEAN. Nothing running (2 idle python.exe orphans from count_gate — kill if needed).

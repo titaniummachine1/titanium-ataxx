@@ -89,6 +89,18 @@ Iron laws unchanged: main untouchable; proven-ahead merges only; 5k = quality, t
 - Training speed reality: chunked featurization amortizes (12.7s/M rows vs 67s/M at 100k
   chunks); full 12.2M epoch ~5 min (feat 155s + mat 20s + train 120s).
 
+## EXTERNAL LADDER (2026-10-20, 5k nodes, paired book, uainewgame)
+
+- Titanium (candidate exe exp/tonight + champ F66A00FE) vs **autaxx 1.0** (built from source with
+  llvm-mingw): 10-20 over 30 games (lines 4000-4014) -> autaxx is stronger at equal nodes than
+  the "autaxx ~1800-1900 matches Titanium" assumption suggests.
+- vs **Moonbird 1.1.0**: 1-19 over 20 games (lines 4030-4039) -> consistent with the 0-100 history.
+- vs **Sanctaphraxx 0.1.11** (cargo build): 2-0 (small sample; it is an early work-in-progress).
+- **KataAtaxx 20260501** CPU/ONNX release downloaded (331MB, engine_cpu/ataxx7x_cpu.exe, GTP
+  engine + JRE + ONNX weights). Needs a GTP->UAI adapter to play in our harness; high value
+  (Botzone #2, 2383). Autaxx/Sanctaphraxx builds work: autaxx needs the llvm-mingw bin on PATH
+  for its DLLs; Sanctaphraxx runs standalone.
+
 ## BUGS FOUND/FIXED TONIGHT
 
 - **FUSED-BAG q2 OFFSET (Wq2fix, critical)**: q2 indices were materialized as AR2+Q (0..9215)
