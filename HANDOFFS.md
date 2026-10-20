@@ -1,3 +1,12 @@
+## MORNING STATUS 2026-10-20 06:35 (all jobs finished)
+
+- D0 (outcome 0.25 + 6pct golden dose): 5k 1000g = 438-547-15, 0.446, -38 Elo, CI [0.415,0.476], LLR -7.92 -> CONCLUSIVE BELOW (reject candidate, needs user).
+- E0 (outcome 0.25 + 10pct golden dose): 5k 1000g = 455-524-21, 0.466, -24 Elo, CI [0.435,0.496], LLR -5.61 -> CONCLUSIVE BELOW (reject candidate).
+- Dose response: 3pct + outcome 0.50 = +2 (parity); 6pct = -38; 10pct = -24. Value-only golden dosing does not convert; higher dose hurts.
+- Nothing running; box idle. Latest commit 3168647 on exp/tonight (pushed). Main untouched (ea0bdf5).
+- Awaiting user calls: C2 (-71), D0 (-38), E0 (-24) reject confirmations. C0-golden (+2) and B0 (-15) stay parked per FOMO.
+- NEXT LEVER (ready): PV-margin decision-boundary training (docs/GOLDEN_DOSE.md 3d + implementation sketch): add --nodes/--tuple to bestmove, mine shallow-vs-deep disagreements, value target 0.5 outcome + margin loss forcing the deep PV move. Then KataAtaxx GTP->UAI adapter and Turso dataset promotion.
+
 ## UPDATE 2026-10-20 ~02:40
 
 - C0-golden (outcome 0.50 + 3pct golden dose) 5k gate: 495-488-17 over 1000g fresh lines 3108-3607, +2 Elo, CI [0.473,0.534], LLR -1.23 -> PARITY. Full 5k ladder is now: C0 +6 (2008g), A0 +6, B0 -15, C0g +2, C1 -30, C2 -71 (conclusive). Every value-only retrain variant is noise-level vs champ.
