@@ -1,3 +1,9 @@
+## UPDATE 2026-10-20 ~02:40
+
+- C0-golden (outcome 0.50 + 3pct golden dose) 5k gate: 495-488-17 over 1000g fresh lines 3108-3607, +2 Elo, CI [0.473,0.534], LLR -1.23 -> PARITY. Full 5k ladder is now: C0 +6 (2008g), A0 +6, B0 -15, C0g +2, C1 -30, C2 -71 (conclusive). Every value-only retrain variant is noise-level vs champ.
+- Run D (outcome 0.25 + 6pct golden) training since 02:35; auto-gate at 03:05 (waits for EXIT then exports D0 + 1000g gate). Run E (outcome 0.25 + 10pct golden) scheduled 03:15, auto-gate 03:50.
+- Implication: value-only golden dosing does not move 5k strength. Next lever is decision-boundary training (PV margin loss: force shallow search to prefer the deep PV move, not just fit its value) — needs per-move deep labels via the UAI serve path; documented in docs/GOLDEN_DOSE.md 3d.
+
 ## STATE FOR NEW SESSION (2026-10-20 ~02:25 NIGHT SESSION — GOLDEN DOSE ERA BEGINS)
 
 - Branch exp/tonight @ 49ca738 (pushed; docs/GOLDEN_DOSE.md added). Main untouched (ea0bdf5). Strongest still main + tupS55tree (F66A00FE).
