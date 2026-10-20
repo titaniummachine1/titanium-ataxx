@@ -200,6 +200,16 @@ Experiment grid queued tonight:
 Both warm-start from champ, blend 1.0 (pure teacher column, deep labels on golden rows),
 promotion by 5k gates on fresh paired-book lines only.
 
+### Ataxx-specific warning measured tonight
+
+On the 1200 mined top-wsum positions, corr(deep-search teacher, real outcome_cp) = **+0.029**
+(out mean 0.502). The most-visited positions are early/midgame, where the final result is not
+determined: deep search evaluates strategy, not the flip avalanche that decides the game.
+Consequence: a >=50% outcome-anchored value target is deliberately noisy on such positions;
+Run C/D test whether the anchor still helps through grounding/regularization. If not, move the
+outcome anchor toward short-continuation/backward-start positions (Quoridor doctrine) where
+outcomes are near-factual, instead of raising the global outcome weight.
+
 ## 4. Where tonight's evidence fits
 
 - Full-corpus 5k-node retrain (tonightA_fixed, all families): 5k gate vs main = +6 Elo at

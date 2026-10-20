@@ -30,6 +30,10 @@ Iron laws unchanged: main untouchable; proven-ahead merges only; 5k = quality, t
 - Agreement (align20k): champ 124.4/corr .8604; A 110.7/.8463; B 111.4/.8437; C ep1 116.2/.8500
   -> every retrain fits the deep teacher better on mean error yet none wins games. Agreement is
   a diagnostic, not a promotion metric (confirmed).
+- Golden labels vs real outcomes: corr(deep teacher, outcome_cp) = +0.029 on the 1200 mined
+  positions (out mean 0.502). Top-wsum positions are early/midgame where the result is not
+  determined -> the >=50% outcome anchor the owner ordered is intentionally noisy; Run C/D test
+  whether it still helps via regularization/grounding. (Ataxx volatility: flip avalanches.)
 - GOLDEN DOSE built: 1200 unique top-wsum positions deep-labelled @500k nodes (champ, native);
   cache12M_golden = 12.42M rows, dose 3% (repeat 20, wsum ~16x). Run C = outcome 0.50 +
   blend 1.0, 2 epochs from champ (user ratio: >=50% outcome anchor, rest deep/PV precision).
