@@ -1,3 +1,11 @@
+## BOTZONE ATAXX SUBMITTED 2026-10-20 (late)
+
+- Bot: titanium_ataxx_PL, id 6ad7c69fbdad901f323ed0ca, version 6ad7c69fbdad901f323ed0cb, RANKED.
+- Flags: simpleio=true, enable_keep_running=true (long-live). Net uploaded: /nnue/tupS55tree.tup (726440B, HEAD verified).
+- Source: C:/gitProjects/botzoo/titanium-ataxx-v1.rs (patched): loads champ net data/nnue/tupS55tree.tup (non-native), long-live loop (TT/killers persist across turns, reset at turnID 1), 4-corner start, BZ rules + repetition guard, 23-bit TT (~197MB peak), 800ms/1500ms first move.
+- KataAtaxx strength probe: task TitaniumKataGate running 2 games vs the CPU/ONNX release via training/kata_bridge.py (setfen + two-stage jumps). Measured: KataGo ignores maxTime (5.8s/move at movetime 1000) and visits barely matter (10-13s/move at 100-400 visits), ~19s model load. Result pending logs/ladder_kata_2g.txt.
+- Next: verify first ranked matches/compile; if long-live desyncs, set simpleio/keep false (same binary handles EOF); add ponder thread; monitor Elo.
+
 ## FINAL 2026-10-20 ~09:55 (session close)
 
 - exp/tonight (pushed). MAIN UNTOUCHED ea0bdf5. Strongest = main + tupS55tree (F66A00FE).
