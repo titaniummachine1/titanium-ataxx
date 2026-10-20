@@ -26,10 +26,13 @@ Baseline = main `ea0bdf5` + champ `tupS55tree.tup` (F66A00FE).
    R2 vs residual) but carry ~zero real-outcome signal (pa +0.0007); extra heads trained on that
    target are noise that hurts (C1 -30, C2 -71).
 3. **The deep teacher is not converged.** bestmove stability: identical at fixed budget
-   (150/150, deterministic) but **200k vs 1M agree only 72.7%**. Child re-search favors the
-   1M move's child only 57.6% of the time (median +28 cp). A target that changes with depth
-   cannot be trusted as a policy label; the Quoridor doctrine demands N=3 unanimity for search
-   labels for exactly this reason.
+   (150/150, deterministic) but depth changes the move: **200k vs 1M 72.7%**, **1M vs 2M 75%**,
+   **2M vs 4M 77.5%**, **all three budgets agree only 62.5%** (40 positions, 1M/2M/4M).
+   Child re-search favors the 1M move's child only 57.6% of the time (median +28 cp).
+   A target that keeps changing with depth cannot be trusted as a policy label; the Quoridor
+   doctrine demands N=3 unanimity for search labels for exactly this reason, and only ~62% of
+   positions qualify even across 1M/2M/4M (deterministic repeats are identical, so unanimity
+   must be across BUDGETS, not repeats).
 4. **Value-only targets cannot move decisions directly.** Cloning is the only move that changes
    piece count; a per-count additive correction therefore acts as a clone/jump bias. Fitting the
    teacher's per-phase residual and adding it scored -86 Elo: the correction taught "clone more",
