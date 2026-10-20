@@ -27,6 +27,9 @@ pub const TUP_MAGIC: [u8; 4] = *b"TUP4";
 pub const TUP5_MAGIC: [u8; 4] = *b"TUP5";
 pub const TUP6_MAGIC: [u8; 4] = *b"TUP6";
 pub const TUP7_MAGIC: [u8; 4] = *b"TUP7";
+pub const TUP8_MAGIC: [u8; 4] = *b"TUP8";
+/// Piece-count bucket offsets (1..=49 used; index 0 constrained 0).
+pub const BUCKETS: usize = 50;
 /// 8-cell ternary pair patterns per direction table.
 pub const PAIR_PATTERNS: usize = 81 * 81;
 /// Geometry pair counts per direction (H, V, D1, D2).
@@ -70,6 +73,8 @@ pub struct TupleTable {
     has_capconv: bool,
     pa: Box<[i8; PA_PATTERNS]>,
     has_pa: bool,
+    bucket: Box<[i16; BUCKETS]>,
+    has_bucket: bool,
 }
 
 /// Per-anchor pair entries (80 pairs x 6561 ternary patterns).
@@ -147,6 +152,8 @@ impl TupleTable {
             has_capconv: false,
             pa: Box::new([0; PA_PATTERNS]),
             has_pa: false,
+            bucket: Box::new([0; BUCKETS]),
+            has_bucket: false,
         }
     }
 
@@ -159,11 +166,12 @@ impl TupleTable {
             || (buf[0..4] != TUP_MAGIC
                 && buf[0..4] != TUP5_MAGIC
                 && buf[0..4] != TUP6_MAGIC
-                && buf[0..4] != TUP7_MAGIC)
+                && buf[0..4] != TUP7_MAGIC
+                && buf[0..4] != TUP8_MAGIC)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "bad .tup magic (want TUP4/TUP5/TUP6/TUP7)",
+                "bad .tup magic (want TUP4/TUP5/TUP6/TUP7/TUP8)",
             ));
         }
         let rd32 = |o: usize| i32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
@@ -227,8 +235,10 @@ impl TupleTable {
             has_capconv: false,
             pa: Box::new([0; PA_PATTERNS]),
             has_pa: false,
+            bucket: Box::new([0; BUCKETS]),
+            has_bucket: false,
         };
-        if buf[0..4] == TUP5_MAGIC || buf[0..4] == TUP6_MAGIC || buf[0..4] == TUP7_MAGIC {
+        if buf[0..4] == TUP5_MAGIC || buf[0..4] == TUP6_MAGIC || buf[0..4] == TUP7_MAGIC || buf[0..4] == TUP8_MAGIC {
             for a in t.q2.iter_mut() {
                 for v in a.iter_mut() {
                     need(o, 2)?;
@@ -269,7 +279,7 @@ impl TupleTable {
             ));
         }
         let has_cc_sections =
-            buf[0..4] == TUP6_MAGIC || buf[0..4] == TUP7_MAGIC;
+            buf[0..4] == TUP6_MAGIC || buf[0..4] == TUP7_MAGIC || buf[0..4] == TUP8_MAGIC;
         if has_cc_sections {
             for table in [&mut t.capn_us, &mut t.capn_them].iter_mut() {
                 for v in table.iter_mut() {
@@ -292,13 +302,26 @@ impl TupleTable {
                 || t.conv_us.iter().any(|&w| w != 0)
                 || t.conv_them.iter().any(|&w| w != 0);
         }
-        if buf[0..4] == TUP7_MAGIC {
+        if buf[0..4] == TUP7_MAGIC || buf[0..4] == TUP8_MAGIC {
             for v in t.pa.iter_mut() {
                 need(o, 1)?;
                 *v = buf[o] as i8;
                 o += 1;
             }
             t.has_pa = true;
+        }
+        if buf[0..4] == TUP8_MAGIC {
+            if buf.len() - o != BUCKETS * 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "TUP8 size mismatch (want TUP7 + piece-count buckets)",
+                ));
+            }
+            for v in t.bucket.iter_mut() {
+                *v = rd16(o);
+                o += 2;
+            }
+            t.has_bucket = t.bucket.iter().any(|&w| w != 0);
         }
         // Load-time sparsity flags (winter-clean W4): whole-zero families
         // are skipped bit-identically in the tree (they add 0 by definition).
@@ -418,6 +441,9 @@ impl TupleTable {
         }
         if self.has_capconv {
             s += self.forward_capconv(b, land_me, land_opp);
+        }
+        if self.has_bucket {
+            s += self.bucket[(b.me() | b.opp()).count_ones() as usize] as i32;
         }
         s
     }
