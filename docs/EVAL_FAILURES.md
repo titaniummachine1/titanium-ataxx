@@ -59,6 +59,21 @@ Baseline = main `ea0bdf5` + champ `tupS55tree.tup` (F66A00FE).
   the terminal (backward starts); own-search is dense initialization; N=3 unanimity; outcome
   k>=3 continuations; promotion only by games.
 
+## Owner ideas to keep on record
+
+- **Train straight on Elo**: play self-play at 5k nodes, treat each batch of games as one step of an
+  epoch, and use the Elo/outcome change over ~1000 games as the loss. This is the true objective
+  (game results, not a proxy). Practically it is gradient-free / REINFORCE-style: the gate itself
+  measures the reward. Noisy and sample-hungry, but unbiased. A cheap first version is SPSA/ES on a
+  small parameter subset (eval scalars, temps, a few hundred table rows) with antithetic pairs, using
+  paired-book games as the reward; a full version would use ES on the tuple table with a large game
+  budget. Expensive, but it is the only path that optimizes what we actually care about.
+- **Tree tightening / PV matching**: train on a deep PV so shallow search reproduces it. Blocked by
+  teacher convergence measured above (62.5% all-three agreement); only viable on converged subsets.
+- **Search-in-the-loop (implemented)**: per-step regeneration of 5k labels with the current net
+  (`training/online_step.py`), outcome-anchored, regret-weighted. This is the practical version of
+  the "train on Elo" loop for the eval: on-policy data, gate decides.
+
 ## Next experiments (ordered)
 
 1. **Converged-teacher mining**: N=3 unanimity at 1M+ (fresh process/TT) -> keep only positions
