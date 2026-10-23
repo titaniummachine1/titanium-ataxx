@@ -1,16 +1,24 @@
 # Titanium on Botzone (Python driver + Rust engine library)
 
+Simulator modes: `--mode oneshot` (default, fresh process per move) and `--mode long`.
+
 Design: **Python owns Botzone, Rust owns the game.** `titanium_botzone.py` parses the long-live Simple-IO
 requests, replays the game after a restart, keeps the clock and the watchdog, and talks to the engine only
 through a tiny C ABI (`crates/titanium-ffi`): `ti_new / ti_new_game / ti_apply / ti_search(budget_ms) / ti_stop / ti_stats`.
 The engine knows nothing about the Botzone protocol.
 
-## Time policy
-Limits on the Python long-live setting (site config `[6, 4]`): **12 s first move, 4 s later moves.**
-Every move searches for `limit - 50 ms - time already spent since the request arrived - 2 ms`, using the whole
-budget (the Botzone search variant has no early exit). A watchdog thread calls `ti_stop` 12 ms after the
-budget as a last resort. Measured at the true limits: first move 11.89 s, later moves 3.949 s (margin
-50.7-51.9 ms); engine overshoot past its own budget median 1.0 ms, max 2.8 ms (162 scaled moves).
+## Time policy (default: ONE-SHOT, 6 s per move)
+The bot is configured WITHOUT a long-lived session: Botzone starts a fresh process for every move and sends the
+whole game history each time (turn count, then request/response lines). The driver replays it into the engine
+(`ti_apply` validates every move) and searches for `6000 ms - 50 ms - process age - 2 ms`. The process age is read
+from the OS (Windows `GetProcessTimes`, Linux `/proc/self/stat`), so interpreter start-up is charged exactly.
+The first move also gets 6 s (an older note mentioned a doubled 12 s first move; that is unverified and a wrong
+guess means a time-out loss; `TI_FIRST_MS=12000` enables it once confirmed). The long-live variant remains
+available with `TI_MODE=long` (12 s first / 4 s later, hash table kept between moves).
+Search uses the whole budget (the Botzone variant has no early exit); a watchdog calls `ti_stop` 12 ms after the budget.
+Measured at the true limit (6 s): every move finished at 5.912 s from process spawn to exit, margin 87.5 ms;
+engine overshoot past its own budget median 1.0 ms, max 1.2 ms. At a scaled clock: 105 moves, worst margin 39 ms.
+Trade-off: no hash table carry-over between moves (fresh process), in exchange for 6 s instead of 4 s per move.
 
 ## Rules handled in the engine (Botzone judge)
 No passes; the game ends the moment either side cannot move and the mobile side absorbs the empties
@@ -29,12 +37,13 @@ A build for AVX2/BMI2 CPUs was measured and is NOT faster (1.14 vs 1.14 Mnps), s
 ## Local test (Botzone simulator: judge rules, greedy opponent, long-live message format)
 ```
 python botzone/sim_local.py --lib target/release/titanium_ffi.dll --net <tupS57v2.tup> --games 6 --scale 0.05
-python botzone/sim_local.py --lib target/release/titanium_ffi.dll --net <tupS57v2.tup> --games 2 --scale 1 --max-driver-moves 3
+python botzone/sim_local.py --lib target/release/titanium_ffi.dll --net <tupS57v2.tup> --games 2 --scale 1 --max-driver-moves 3   # true 6 s limit
+# add --mode long for the long-live variant
 ```
 
 ## Files to upload (new names, so the currently ranked bot keeps working)
 `data/titanium_v2.so` -> storage `/titanium_v2.so`; `data/nnue/tupS57v2.tup` -> storage `/nnue/tupS57v2.tup`;
-`titanium_botzone.py` as the new bot version (Python, Simple IO, long-live). Memory: TT 22 bits is ~100 MB.
+`titanium_botzone.py` as the new bot version (Python, Simple IO, **long-live OFF**, time limit 6 s). Memory: TT 22 bits is ~100 MB.
 
 ## Not verified here
 The Linux `.so` was not executed (no WSL distro / Docker engine on the dev box); it is the same source as the

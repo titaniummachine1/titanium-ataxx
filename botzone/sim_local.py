@@ -128,8 +128,52 @@ def read_response(proc):
         lines.append(l)
 
 
+def run_game_oneshot(args, driver_black):
+    """Fresh process per driver move; the whole history is sent each time (Botzone non-long-live Simple IO)."""
+    env = dict(os.environ, TI_DEBUG="1", TI_MODE="oneshot", TI_LIB=args.lib, TI_NET=args.net,
+               TI_TIME_SCALE=str(args.scale), TI_TT_BITS=str(args.tt_bits))
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "titanium_botzone.py")
+    g = Game()
+    drv_side = 0 if driver_black else 1
+    reqs = [(-1, -1, -1, -1)] if driver_black else []    # opponent moves as seen by the driver (requests)
+    resps = []                                              # driver's own moves (responses)
+    margins, times, over, dmoves, wd = [], [], [], 0, 0
+    while not g.over():
+        if g.turn == drv_side:
+            k = len(resps) + 1
+            lines = ["%d" % k]
+            for i in range(k):
+                lines.append("%d %d %d %d" % reqs[i])
+                if i < k - 1:
+                    lines.append("%d %d %d %d" % resps[i])
+            limit = 6000 * args.scale
+            t = time.perf_counter()
+            r = subprocess.run([sys.executable, script], input="\n".join(lines) + "\n", capture_output=True, text=True, env=env, timeout=120)
+            el = (time.perf_counter() - t) * 1000
+            mv = tuple(int(v) for v in r.stdout.split("\n")[0].split())
+            g.play(mv)
+            resps.append(mv)
+            margins.append(limit - el)
+            times.append(el)
+            dmoves += 1
+            for l in r.stderr.splitlines():
+                if "over=" in l:
+                    over.append(float(l.split("over=")[1].split()[0]))
+                if "watchdog=" in l:
+                    wd += int(l.split("watchdog=")[1])
+            if args.max_driver_moves and dmoves >= args.max_driver_moves:
+                break
+        else:
+            m = greedy(g)
+            reqs.append(m)
+            g.play(m)
+    return drv_side, g.score(), margins, times, dmoves, g.over(), over, wd
+
+
 def run_game(args, driver_black):
-    env = dict(os.environ, TI_DEBUG="1", TI_LIB=args.lib, TI_NET=args.net, TI_TIME_SCALE=str(args.scale), TI_TT_BITS=str(args.tt_bits))
+    if args.mode == "oneshot":
+        return run_game_oneshot(args, driver_black)
+    env = dict(os.environ, TI_DEBUG="1", TI_MODE="long", TI_LIB=args.lib, TI_NET=args.net, TI_TIME_SCALE=str(args.scale), TI_TT_BITS=str(args.tt_bits))
     proc = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "titanium_botzone.py")],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, env=env)
     g = Game()
@@ -181,6 +225,7 @@ def main():
     ap.add_argument("--tt-bits", type=int, default=22)
     ap.add_argument("--max-driver-moves", type=int, default=0)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--mode", default="oneshot", choices=["oneshot", "long"])
     args = ap.parse_args()
     random.seed(args.seed)
     all_margins = []

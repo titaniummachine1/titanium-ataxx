@@ -1,4 +1,4 @@
-"""Titanium Ataxx -- Botzone Python (long-live, Simple IO) driver.
+"""Titanium Ataxx -- Botzone Python (Simple IO) driver. Default mode: ONE-SHOT (a fresh process per move,\n6 s limit, the whole game history is sent every time). Set TI_MODE=long for the long-live variant.\n\nOriginal description:
 
 All Botzone logic lives HERE: request parsing, game replay after a restart, the clock, the safety
 margin and the watchdog. The engine is a plain shared library (titanium_ffi) that only knows
@@ -8,10 +8,9 @@ next to the bot):
     data/nnue/tupS57v2.tup      evaluation net (726440 B)
 Local testing overrides (environment): TI_LIB, TI_NET, TI_TT_BITS, TI_TIME_SCALE.
 
-Time policy: for every move the driver knows its limit (first move 12 s, later moves 4 s on the
-Python long-live setting), subtracts a 50 ms safety margin and the time already spent since the
-request arrived, and searches for the rest. A watchdog thread calls ti_stop shortly after the
-budget as a last resort.
+Time policy: for every move the driver knows its limit (one-shot: 6 s every move; long-live: 12 s first,
+4 s later), subtracts a 50 ms safety margin and the time already spent (one-shot: since the process
+started), and searches for the rest. A watchdog thread calls ti_stop shortly after the budget as a last resort.
 """
 import ctypes
 import os
@@ -22,8 +21,14 @@ import time
 T_START = time.perf_counter()
 
 MARKER = ">>>BOTZONE_REQUEST_KEEP_RUNNING<<<"
-FIRST_LIMIT_MS = 12000      # first move (site Python config [6, 4]: 6 s normal, first doubled)
-TURN_LIMIT_MS = 4000        # later moves in long-live mode
+MODE = os.environ.get("TI_MODE", "oneshot")   # "oneshot" (default) or "long"
+if MODE == "long":
+    FIRST_LIMIT_MS, TURN_LIMIT_MS = 12000, 4000    # long-live: first move doubled, later moves 4 s
+else:
+    # One-shot: 6 s per move. The first move is deliberately NOT given the doubled 12 s seen in older
+    # notes (unverified): a wrong guess there is a time-out loss. Set TI_FIRST_MS=12000 to use it.
+    FIRST_LIMIT_MS = int(os.environ.get("TI_FIRST_MS", "6000"))
+    TURN_LIMIT_MS = 6000
 SAFETY_MS = 50              # always finish at least this much before the limit
 STARTUP_MS = 120            # interpreter start + imports happen before T_START; charged to move 1
 OUT_RESERVE_MS = 2          # printing / pipe latency
@@ -32,6 +37,33 @@ SCALE = float(os.environ.get("TI_TIME_SCALE", "1.0"))   # tests only: shrink all
 DEBUG = os.environ.get("TI_DEBUG") == "1"               # per-move timing detail on stderr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def process_age_ms():
+    """Wall-clock age of this process in ms (interpreter start-up counts against the move clock).
+    Windows: GetProcessTimes creation time. Linux: /proc/self/stat start time vs /proc/uptime.
+    Returns None if unavailable (a fixed allowance is charged instead)."""
+    try:
+        if os.name == "nt":
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            c, e, kt, ut = (wintypes.FILETIME() for _ in range(4))
+            if not k32.GetProcessTimes(k32.GetCurrentProcess(), ctypes.byref(c), ctypes.byref(e), ctypes.byref(kt), ctypes.byref(ut)):
+                return None
+            created = ((c.dwHighDateTime << 32) | c.dwLowDateTime) / 1e7 - 11644473600.0   # FILETIME -> unix seconds
+            return max(0.0, (time.time() - created) * 1000.0)
+        with open("/proc/self/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        start_ticks = int(fields[19])                      # field 22 overall (starttime), 0-based 19 after the comm field
+        with open("/proc/uptime") as f:
+            up = float(f.read().split()[0])
+        return max(0.0, (up - start_ticks / os.sysconf("SC_CLK_TCK")) * 1000.0)
+    except Exception:
+        return None
+
+
+PROC_AGE_MS = process_age_ms()
 
 
 def log(msg):
@@ -158,10 +190,15 @@ def main():
     for i in range(0, len(flat), 4):
         apply_move(flat[i:i + 4])
     first = True
-    t_origin = T_START - STARTUP_MS / 1000.0     # the clock for move 1 started before Python did
+    # The clock started before Python did: charge the real process age when the OS can tell us.
+    startup_ms = PROC_AGE_MS if PROC_AGE_MS is not None else STARTUP_MS
+    t_origin = T_START - startup_ms / 1000.0
+    if DEBUG:
+        log("process age at start %.0f ms (%s)" % (startup_ms, "measured" if PROC_AGE_MS is not None else "assumed"))
+    oneshot = MODE != "long"
     while True:
         limit_ms = (FIRST_LIMIT_MS if first else TURN_LIMIT_MS) * SCALE
-        t0 = t_origin if first else rd.t_req
+        t0 = t_origin if (first or oneshot) else rd.t_req
         spent_ms = (time.perf_counter() - t0) * 1000.0
         budget = int(limit_ms - SAFETY_MS * min(1.0, SCALE * 4) - OUT_RESERVE_MS - spent_ms)
         budget = max(5, budget)
@@ -186,11 +223,14 @@ def main():
             lib.ti_stats(engine, ctypes.byref(stats))
             dbg = "d%d n%d t%.0f s%d%s" % (stats.depth, stats.nodes, (time.perf_counter() - t0) * 1000.0, stats.score,
                                            " rep" if stats.repetition_override else "")
-            sys.stdout.write("%d %d %d %d\n%s\n\n\n%s\n" % (mv[0], mv[1], mv[2], mv[3], dbg, MARKER))
+            tail = "" if oneshot else "\n\n\n%s" % MARKER
+            sys.stdout.write("%d %d %d %d\n%s%s\n" % (mv[0], mv[1], mv[2], mv[3], dbg, tail))
         else:
             # no legal move: the judge ends the game before asking; answer anyway so we never hang
-            sys.stdout.write("-1 -1 -1 -1\nno-move\n\n\n%s\n" % MARKER)
+            sys.stdout.write("-1 -1 -1 -1\nno-move%s\n" % ("" if oneshot else "\n\n\n" + MARKER))
         sys.stdout.flush()
+        if oneshot:
+            return
         first = False
         req = rd.ints(4)
         if req is None:
