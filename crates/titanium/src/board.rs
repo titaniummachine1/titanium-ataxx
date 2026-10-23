@@ -893,6 +893,46 @@ impl Board {
         }
     }
 
+    /// Botzone-judge terminal: wipeout/full, or EITHER side stuck. The
+    /// platform has no passes: the judge ends the game the moment one side
+    /// cannot move, with the mobile side absorbing every empty square.
+    pub fn bz_over(&self) -> bool {
+        self.is_over() || !self.has_moves(0) || !self.has_moves(1)
+    }
+
+    /// Filled counts under the Botzone stalemate rule: a stuck side keeps
+    /// its stones; the mobile side absorbs every empty square
+    /// (`mobile = SQUARES - blockers - stuck`, the judge's `49 - stuck` on
+    /// blocker-free boards). Both stuck (or both mobile) -> raw counts.
+    pub fn bz_counts(&self) -> (u32, u32) {
+        let (b, w) = self.counts();
+        let fill = SQUARES as u32 - self.blocker_cnt as u32;
+        match (self.has_moves(0), self.has_moves(1)) {
+            (false, false) | (true, true) => (b, w),
+            (false, true) => (b, fill - b),
+            (true, false) => (fill - w, w),
+        }
+    }
+
+    /// Standard 4-corner opening used by Botzone/libataxx: black a7+g1
+    /// (sq 0, 48), white g7+a1 (sq 6, 42), black to move.
+    pub fn botzone_start() -> Board {
+        let mut b = Board {
+            occ: [bit_of(0) | bit_of(48), bit_of(6) | bit_of(42)],
+            blockers: 0,
+            turn: 0,
+            passes: 0,
+            ply: 0,
+            piece_cnt: [2, 2],
+            blocker_cnt: 0,
+            hash: 0,
+            pst: 0,
+        };
+        b.hash = ZOB_PIECE[0][0] ^ ZOB_PIECE[0][48] ^ ZOB_PIECE[1][6] ^ ZOB_PIECE[1][42];
+        b.pst = PST[0] + PST[48] - PST[6] - PST[42];
+        b
+    }
+
     /// Parse a 49-char board string (rows top->bottom, chars `.xo#`) plus a
     /// side char `b`/`w`.
     pub fn from_str(s: &str) -> Option<Board> {

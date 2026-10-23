@@ -206,6 +206,21 @@ fn terminal_score(b: &Board, ply: u32) -> i32 {
     }
 }
 
+/// Botzone-judge terminal score from the side-to-move's perspective: filled
+/// counts (the mobile side absorbs empties), so a stalemate of the opponent
+/// is a forced win, not a pass-and-continue. Same MATE shape as `terminal_score`.
+fn bz_terminal_score(b: &Board, ply: u32) -> i32 {
+    let (fb, fw) = b.bz_counts();
+    let diff = if b.turn == 0 { fb as i32 - fw as i32 } else { fw as i32 - fb as i32 };
+    if diff > 0 {
+        MATE - ply as i32
+    } else if diff < 0 {
+        -MATE + ply as i32
+    } else {
+        0
+    }
+}
+
 /// Move scoring is fixed: TT move > killers > captures*W + history, consumed
 /// lazily (repeated argmax — only pays for moves examined before a cutoff).
 
@@ -425,6 +440,9 @@ pub struct Searcher<'a> {
     /// Monotonic milliseconds. Native builds use `Instant`; wasm builds
     /// inject `performance.now()` (std time does not exist on wasm32).
     time_src: fn() -> f64,
+    /// Optional external stop request (set from another thread, e.g. a driver
+    /// watchdog). Polled on the same 2048-node cadence as the clock.
+    ext_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Transposition table (persists across searches in the same Searcher).
     tt: Tt,
     /// Two killer moves per ply (packed u32 moves), refreshed on cutoffs.
@@ -478,6 +496,7 @@ impl<'a> Searcher<'a> {
             stop_reason: StopReason::Completed,
             node_limit: None,
             time_src: native_now_ms,
+            ext_stop: None,
             tt: Tt::new(bits),
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[0; 49]; 2]),
@@ -523,6 +542,13 @@ impl<'a> Searcher<'a> {
         }
     }
 
+    /// Attach an external stop flag: when it reads `true` the running search
+    /// stops at the next poll (<= 2048 nodes) and returns its best completed
+    /// depth. The flag is never cleared by the engine.
+    pub fn set_stop_flag(&mut self, f: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
+        self.ext_stop = f;
+    }
+
     /// Override the clock (wasm builds inject `performance.now()`).
     pub fn set_time_source(&mut self, f: fn() -> f64) {
         self.time_src = f;
@@ -549,6 +575,13 @@ impl<'a> Searcher<'a> {
             }
         }
         if self.nodes & 2047 == 0 {
+            if let Some(f) = &self.ext_stop {
+                if f.load(std::sync::atomic::Ordering::Relaxed) {
+                    self.stop = true;
+                    self.stop_reason = StopReason::Time;
+                    return;
+                }
+            }
             if let Some(dl) = self.deadline_ms {
                 if (self.time_src)() >= dl {
                     self.stop = true;
@@ -559,7 +592,7 @@ impl<'a> Searcher<'a> {
     }
 
     #[inline]
-    fn negamax(
+    fn negamax<const BZ: bool>(
         &mut self,
         b: &Board,
         mut alpha: i32,
@@ -574,7 +607,14 @@ impl<'a> Searcher<'a> {
             return 0;
         }
         debug_assert!((ply as usize) < MAX_PLY);
-        if b.game_over() {
+        // Build-time rules selection (const generic: the dead branch is
+        // compiled out, zero hot-path cost either way).
+        if BZ {
+            // No passes on-platform: stm stuck (or wipeout/full) ends the game.
+            if b.is_over() || !b.has_moves(b.turn) {
+                return bz_terminal_score(b, ply);
+            }
+        } else if b.game_over() {
             return terminal_score(b, ply);
         }
 
@@ -637,7 +677,7 @@ impl<'a> Searcher<'a> {
         // after another null, depth > 2, enough clone targets (mobility),
         // board not too full (forced-pass danger zone). R = 3.
         // (exp/ab B: R = 2 pooled 108-84-8, straddles, parked for 3rd leg.)
-        if null_allowed && depth > 2 {
+        if null_allowed && !BZ && depth > 2 {
             let clone_targets = (dist_union(b.occ[b.turn as usize], 1) & b.empty()).count_ones();
             // fill < 0.54 as integer: pieces*50 < 26*49 (no per-node float div).
             if clone_targets >= 11
@@ -647,7 +687,7 @@ impl<'a> Searcher<'a> {
                 // NMP pass flips stm: sancta acc is color-relative so it
                 // stays valid — just forward the other perspective.
                 // (pass: no stones change, no diff update needed.)
-                let score = -self.negamax(
+                let score = -self.negamax::<BZ>(
                     &child,
                     -beta,
                     -beta + 1,
@@ -709,14 +749,14 @@ impl<'a> Searcher<'a> {
             }
             let mut score;
             if move_idx == 0 {
-                score = -self.negamax(&child, -beta, -alpha, depth - 1, ply + 1, true);
+                score = -self.negamax::<BZ>(&child, -beta, -alpha, depth - 1, ply + 1, true);
                 if self.stop {
                     return 0;
                 }
             } else {
                 let r: u32 = if move_idx < 9 { 2 } else { 3 };
                 let reduced = depth.saturating_sub(1 + r);
-                score = -self.negamax(
+                score = -self.negamax::<BZ>(
                     &child,
                     -alpha - 1,
                     -alpha,
@@ -730,7 +770,7 @@ impl<'a> Searcher<'a> {
                 if score > alpha && reduced < depth - 1 {
                     // Re-search: scout already wrote child acc in place
                     // (same parent+child), so it is still valid. No rebuild.
-                    score = -self.negamax(
+                    score = -self.negamax::<BZ>(
                         &child,
                         -beta,
                         -alpha,
@@ -808,6 +848,16 @@ impl<'a> Searcher<'a> {
     /// Whichever limit hits first (nodes / time / depth) stops the search;
     /// partial iterations are discarded, the last completed depth decides.
     pub fn search(&mut self, b: &Board, limits: &SearchLimits) -> SearchResult {
+        self.search_gen::<false>(b, limits)
+    }
+
+    /// Same search under the Botzone judge's rules (no passes; either side
+    /// stuck ends the game, mobile side absorbs the empties; NMP off).
+    pub fn search_bz(&mut self, b: &Board, limits: &SearchLimits) -> SearchResult {
+        self.search_gen::<true>(b, limits)
+    }
+
+    fn search_gen<const BZ: bool>(&mut self, b: &Board, limits: &SearchLimits) -> SearchResult {
         self.start_ms = (self.time_src)();
         self.nodes = 0;
         self.stop = false;
@@ -818,6 +868,16 @@ impl<'a> Searcher<'a> {
             .map(|t| self.start_ms + t.as_secs_f64() * 1000.0);
 
         let mut result = SearchResult::default();
+        // Instant terminal fast path (Botzone rules): a full board or a stuck
+        // side (including a stuck OPPONENT, which movegen alone would miss)
+        // ends the game on the spot: zero nodes searched.
+        if BZ && b.bz_over() {
+            result.score = bz_terminal_score(b, 0);
+            result.elapsed = self.elapsed();
+            result.nodes = self.nodes;
+            result.stopped_by = Some(StopReason::Completed);
+            return result;
+        }
         // Age the history table so old cutoffs don't dominate forever.
         for row in self.history.iter_mut() {
             for h in row.iter_mut() {
@@ -834,10 +894,13 @@ impl<'a> Searcher<'a> {
         }
         let n_root = self.stack.lists[0].len();
         if n_root == 0 {
-            // Pass node: give the caller a meaningful score through the pass.
-            if !b.game_over() {
+            if BZ {
+                // Already game-over on-platform: score the filled-count terminal.
+                result.score = bz_terminal_score(b, 0);
+            } else if !b.game_over() {
+                // Pass node: give the caller a meaningful score through the pass.
                 result.score =
-                    -self.negamax(&b.make_pass(), -i32::MAX, i32::MAX, 1, 1, true);
+                    -self.negamax::<BZ>(&b.make_pass(), -i32::MAX, i32::MAX, 1, 1, true);
             }
             result.elapsed = self.elapsed();
             result.nodes = self.nodes;
@@ -880,7 +943,7 @@ impl<'a> Searcher<'a> {
                     let (a, z) = self.stack.acc.split_at_mut(1);
                     net.update_child(&a[0], &mut z[0], b, &child);
                 }
-                let score = -self.negamax(&child, -i32::MAX, -alpha, depth - 1, 1, true);
+                let score = -self.negamax::<BZ>(&child, -i32::MAX, -alpha, depth - 1, 1, true);
                 if self.stop {
                     break;
                 }
@@ -1050,5 +1113,96 @@ mod tests {
         let r = s.search(&b, &no_time(5));
         let m = r.best.expect("lazy ordering must find a move");
         assert!(b.legal_moves().contains(&m), "{m:?} illegal");
+    }
+
+    // ---- Botzone-rules search (ported from the Botzone bundle) ----
+
+    #[test]
+    fn bz_full_board_is_instant_terminal() {
+        let rows: Vec<String> = (0..7)
+            .map(|r| (0..7).map(|f| if (r + f) % 2 == 0 { 'x' } else { 'o' }).collect())
+            .collect();
+        let s = rows.join("
+") + " b";
+        let b = Board::from_str(&s).unwrap();
+        assert_eq!(b.counts(), (25, 24));
+        assert!(b.bz_over());
+        assert_eq!(b.bz_counts(), (25, 24)); // both stuck -> raw counts
+        let mut se = Searcher::with_tt_bits(16);
+        let r = se.search_bz(&b, &no_time(6));
+        assert_eq!(r.nodes, 0, "full board must search nothing");
+        assert_eq!(r.score, MATE, "black up 25-24");
+        assert!(r.best.is_none());
+    }
+
+    #[test]
+    fn bz_stuck_opponent_is_instant_terminal() {
+        // White boxed into the corner (no legal reply), black mobile: game over,
+        // black gets every empty square: 48v1 -> MATE, zero nodes.
+        let s = "oxx....
+xxx....
+xxx....
+.......
+.......
+.......
+......x b";
+        let b = Board::from_str(s).unwrap();
+        assert!(b.has_moves(0));
+        assert!(!b.has_moves(1));
+        assert!(b.bz_over());
+        assert_eq!(b.bz_counts(), (48, 1));
+        let mut se = Searcher::with_tt_bits(16);
+        let r = se.search_bz(&b, &no_time(6));
+        assert_eq!(r.nodes, 0, "finished game must search nothing");
+        assert_eq!(r.score, MATE);
+        assert!(r.best.is_none());
+    }
+
+    #[test]
+    fn bz_stuck_side_to_move_loses_by_count() {
+        let board = ".......
+.......
+.......
+.......
+.ooooo.
+.ooooo.
+.ooxoo. b";
+        let b = Board::from_str(board).unwrap();
+        assert!(!b.has_moves(0));
+        assert!(b.has_moves(1));
+        let mut se = Searcher::with_tt_bits(16);
+        let r = se.search_bz(&b, &no_time(4));
+        assert!(r.best.is_none());
+        assert!(r.score < 0, "buried black loses, score {}", r.score);
+    }
+
+    #[test]
+    fn bz_rules_still_terminates_from_start() {
+        let b = Board::botzone_start();
+        assert_eq!(b.counts(), (2, 2));
+        assert_eq!(b.legal_moves().len(), 16 * 1 + 0, "2 stones x (3 clones + 5 jumps)");
+        let mut se = Searcher::with_tt_bits(16);
+        let r = se.search_bz(&b, &no_time(4));
+        assert!(r.best.is_some());
+        assert!(r.nodes > 0);
+    }
+
+    #[test]
+    fn external_stop_flag_cuts_the_search() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let flag = Arc::new(AtomicBool::new(false));
+        let b = Board::botzone_start();
+        let mut se = Searcher::with_tt_bits(16);
+        se.set_stop_flag(Some(flag.clone()));
+        // unflagged: depth-8 search runs well past 2048 nodes
+        let free = se.search(&b, &no_time(8));
+        assert!(free.nodes > 20_000, "baseline nodes {}", free.nodes);
+        // flagged from the start: stops at the first poll (<= 2048 nodes) but still returns a move
+        flag.store(true, Ordering::Relaxed);
+        se.reset_for_new_game();
+        let cut = se.search(&b, &no_time(30));
+        assert!(cut.nodes <= 4096, "stopped late: {} nodes", cut.nodes);
+        assert!(cut.best.is_some());
     }
 }
