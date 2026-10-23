@@ -67,6 +67,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "titanium-ffi"
+version = "0.1.0"
+dependencies = [
+ "titanium",
+]
+
+[[package]]
 name = "titanium-wasm"
 version = "0.1.0"
 dependencies = [
