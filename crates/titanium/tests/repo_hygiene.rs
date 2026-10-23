@@ -58,6 +58,7 @@ const EXEMPT: &[&str] = &[
     // Every other blob stays untracked (the *.tup rule above still bites).
     "data/nnue/tups55tree.tup", // lowercase: reason() compares against lowercased paths
     "data/nnue/tups56twostage.tup", // S56 two-stage champ
+    "data/nnue/tups57v2.tup", // S57 Ataxx-relabeled WDL teacher (gated +46 @5k)
 ];
 
 fn glob_match(pattern: &str, name: &str) -> bool {

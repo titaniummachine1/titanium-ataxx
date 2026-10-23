@@ -43,3 +43,4 @@ Thumbs.db
 # weights, 28KB, main runs it by default. Every other blob stays out.
 !/data/nnue/tupS55tree.tup
 !/data/nnue/tupS56twostage.tup
+!/data/nnue/tupS57v2.tup
