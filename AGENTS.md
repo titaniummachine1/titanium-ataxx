@@ -15,8 +15,8 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 
 ## 2. Where the strongest engine lives (do not guess)
 
-- `main @ 73a859d` + default net `data/nnue/tupS55tree.tup` (726440 B,
-  sha256 `F66A00FE…899D7C`) is the STRONGEST. `main` default eval IS that net.
+- `main @ ea0bdf5` + default net `data/nnue/tupS56twostage.tup` (726440 B,
+  sha256 `36346A67…1F29AC`) is the STRONGEST. `main` default eval IS that net.
 - THIS folder is usually on an `exp/*` branch (e.g. `exp/search-buckets`),
   which defaults to CLASSICAL hand-eval (`net: none`) ≈ **-500 Elo** vs
   net-main. Classical-vs-classical gates NEVER prove strength.
