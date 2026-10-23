@@ -1,0 +1,269 @@
+//! C ABI for the Titanium engine, Botzone rules. The engine knows NOTHING about the Botzone
+//! protocol: the Python driver parses requests, owns the clock, and calls
+//!   ti_new -> ti_new_game -> { ti_apply(opponent move) ; ti_search(budget_ms) } *
+//! Everything here is single-threaded except `ti_stop`, which only flips an atomic flag and may be
+//! called from any thread while `ti_search` runs.
+use std::ffi::CStr;
+use std::os::raw::c_char;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use titanium::board::{Board, Move};
+use titanium::search::{SearchLimits, Searcher, StopReason};
+use titanium::tuple::TupleTable;
+
+pub const ABI_VERSION: u32 = 1;
+const DEFAULT_TT_BITS: u32 = 22;
+
+pub struct TiEngine {
+    board: Board,
+    /// hashes of every position reached this game (repetition guard)
+    seen: Vec<u64>,
+    searcher: Searcher<'static>,
+    stop: Arc<AtomicBool>,
+    stats: TiStats,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TiStats {
+    pub nodes: u64,
+    pub elapsed_us: u64,
+    pub score: i32,
+    pub depth: u32,
+    /// 0 completed, 1 time, 2 nodes, 3 other
+    pub stopped_by: u32,
+    /// 1 if the repetition guard replaced the engine's move
+    pub repetition_override: u32,
+}
+
+#[no_mangle]
+pub extern "C" fn ti_abi_version() -> u32 {
+    ABI_VERSION
+}
+
+/// Create an engine. `net_path` = path to a TUP tuple net; NULL = classical hand eval (weak!).
+/// Returns NULL if a net path is given but cannot be loaded (never silently falls back).
+/// `tt_bits` = log2 of hash entries (0 -> 22, ~100 MB); each entry is 24 bytes.
+#[no_mangle]
+pub extern "C" fn ti_new(net_path: *const c_char, tt_bits: u32) -> *mut TiEngine {
+    let bits = if tt_bits == 0 { DEFAULT_TT_BITS } else { tt_bits.clamp(12, 26) } as usize;
+    let mut searcher: Searcher<'static> = Searcher::with_tt_bits(bits);
+    if !net_path.is_null() {
+        let p = unsafe { CStr::from_ptr(net_path) }.to_string_lossy().into_owned();
+        match TupleTable::load(&p) {
+            Ok(t) => {
+                let t: &'static TupleTable = Box::leak(Box::new(t));
+                searcher.set_tuple(Some(t));
+            }
+            Err(_) => return std::ptr::null_mut(),
+        }
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    searcher.set_stop_flag(Some(stop.clone()));
+    let board = Board::botzone_start();
+    Box::into_raw(Box::new(TiEngine { seen: vec![board.hash], board, searcher, stop, stats: TiStats::default() }))
+}
+
+#[no_mangle]
+pub extern "C" fn ti_free(e: *mut TiEngine) {
+    if !e.is_null() {
+        unsafe { drop(Box::from_raw(e)) };
+    }
+}
+
+/// Reset to the Botzone 4-corner start (black a7+g1, white g7+a1, black to move); clears hash
+/// table, killers, history and the repetition list.
+#[no_mangle]
+pub extern "C" fn ti_new_game(e: *mut TiEngine) {
+    if e.is_null() {
+        return;
+    }
+    let e = unsafe { &mut *e };
+    e.board = Board::botzone_start();
+    e.seen.clear();
+    e.seen.push(e.board.hash);
+    e.searcher.reset_for_new_game();
+    e.stop.store(false, Ordering::Relaxed);
+}
+
+/// Apply a move given in Botzone coordinates (x = file 0..6, y = row 0..6, sq = y*7 + x).
+/// Returns 1 = applied, 0 = ignored (the "-1 -1 -1 -1" start marker), -1 = illegal / unparsable
+/// (the board is NOT modified, so the caller can resync by replaying the game).
+#[no_mangle]
+pub extern "C" fn ti_apply(e: *mut TiEngine, x0: i32, y0: i32, x1: i32, y1: i32) -> i32 {
+    if e.is_null() {
+        return -1;
+    }
+    let e = unsafe { &mut *e };
+    if x0 < 0 && y0 < 0 && x1 < 0 && y1 < 0 {
+        return 0;
+    }
+    if !((0..=6).contains(&x0) && (0..=6).contains(&y0) && (0..=6).contains(&x1) && (0..=6).contains(&y1)) {
+        return -1;
+    }
+    let m = Move { from: (y0 * 7 + x0) as u8, to: (y1 * 7 + x1) as u8 };
+    if !e.board.legal_moves().contains(&m) {
+        return -1;
+    }
+    e.board = e.board.make(m);
+    e.seen.push(e.board.hash);
+    1
+}
+
+/// Number of legal moves for the side to move (0 = game over / no move).
+#[no_mangle]
+pub extern "C" fn ti_legal_count(e: *mut TiEngine) -> i32 {
+    if e.is_null() {
+        return -1;
+    }
+    unsafe { &*e }.board.legal_moves().len() as i32
+}
+
+/// Ask a running `ti_search` to stop at its next poll (<= 2048 nodes, ~2 ms). Safe from any thread.
+#[no_mangle]
+pub extern "C" fn ti_stop(e: *mut TiEngine) {
+    if !e.is_null() {
+        unsafe { &*e }.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Search the current position for at most `budget_ms` (wall clock, absolute) and write the move
+/// to out[0..4] = x0,y0,x1,y1. Plays the move on the internal board.
+/// Returns 1 = move written, 0 = no legal move (out = -1s), -1 = bad arguments.
+#[no_mangle]
+pub extern "C" fn ti_search(e: *mut TiEngine, budget_ms: u64, out: *mut i32) -> i32 {
+    if e.is_null() || out.is_null() {
+        return -1;
+    }
+    let e = unsafe { &mut *e };
+    let list = e.board.legal_moves();
+    if list.is_empty() || e.board.bz_over() {
+        unsafe {
+            for i in 0..4 {
+                *out.add(i) = -1;
+            }
+        }
+        return 0;
+    }
+    e.stop.store(false, Ordering::Relaxed);
+    let limits = SearchLimits { time: Some(Duration::from_millis(budget_ms.max(1))), max_nodes: None, max_depth: u32::MAX };
+    let r = e.searcher.search_bz(&e.board, &limits);
+    let mut mv = r.best.unwrap_or_else(|| list.move_at(0));
+    let mut overridden = 0u32;
+    // Judge rule: a repeated position loses. If the engine's move re-creates a position already
+    // seen this game, play the non-repeating move that wins the most discs instead.
+    if e.seen.contains(&e.board.make(mv).hash) {
+        let mut best: Option<(i32, Move)> = None;
+        for i in 0..list.len() {
+            let m = list.move_at(i);
+            let c = e.board.make(m);
+            if e.seen.contains(&c.hash) {
+                continue;
+            }
+            let me = e.board.turn as usize;
+            let gain = c.piece_cnt[me] as i32 - c.piece_cnt[1 - me] as i32;
+            if best.map_or(true, |(g, _)| gain > g) {
+                best = Some((gain, m));
+            }
+        }
+        if let Some((_, m)) = best {
+            mv = m;
+            overridden = 1;
+        }
+    }
+    unsafe {
+        *out.add(0) = (mv.from % 7) as i32;
+        *out.add(1) = (mv.from / 7) as i32;
+        *out.add(2) = (mv.to % 7) as i32;
+        *out.add(3) = (mv.to / 7) as i32;
+    }
+    e.board = e.board.make(mv);
+    e.seen.push(e.board.hash);
+    e.stats = TiStats {
+        nodes: r.nodes,
+        elapsed_us: r.elapsed.as_micros() as u64,
+        score: r.score,
+        depth: r.depth,
+        stopped_by: match r.stopped_by {
+            Some(StopReason::Completed) | None => 0,
+            Some(StopReason::Time) => 1,
+            Some(StopReason::Nodes) => 2,
+            #[allow(unreachable_patterns)]
+            _ => 3,
+        },
+        repetition_override: overridden,
+    };
+    1
+}
+
+/// Copy the stats of the last `ti_search` into `out`.
+#[no_mangle]
+pub extern "C" fn ti_stats(e: *mut TiEngine, out: *mut TiStats) {
+    if e.is_null() || out.is_null() {
+        return;
+    }
+    unsafe { *out = (*e).stats };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn play_one(e: *mut TiEngine, budget: u64) -> [i32; 4] {
+        let mut out = [0i32; 4];
+        assert_eq!(ti_search(e, budget, out.as_mut_ptr()), 1);
+        out
+    }
+
+    #[test]
+    fn abi_and_bad_net_path() {
+        assert_eq!(ti_abi_version(), 1);
+        let bad = CString::new("definitely/not/a/net.tup").unwrap();
+        assert!(ti_new(bad.as_ptr(), 14).is_null(), "a missing net must not silently fall back");
+    }
+
+    #[test]
+    fn selfplay_is_legal_and_validated() {
+        let a = ti_new(std::ptr::null(), 16);
+        let b = ti_new(std::ptr::null(), 16);
+        ti_new_game(a);
+        ti_new_game(b);
+        assert_eq!(ti_legal_count(a), 16);
+        assert_eq!(ti_apply(a, -1, -1, -1, -1), 0, "start marker ignored");
+        for ply in 0..60 {
+            let (me, other) = if ply % 2 == 0 { (a, b) } else { (b, a) };
+            if ti_legal_count(me) == 0 {
+                break;
+            }
+            let m = play_one(me, 5);
+            assert_eq!(ti_apply(other, m[0], m[1], m[2], m[3]), 1, "move {m:?} rejected at ply {ply}");
+        }
+        // an illegal move is refused and leaves the board untouched
+        let n = ti_legal_count(a);
+        assert_eq!(ti_apply(a, 0, 0, 6, 6), -1);
+        assert_eq!(ti_legal_count(a), n);
+        ti_free(a);
+        ti_free(b);
+    }
+
+    #[test]
+    fn stop_flag_returns_fast_with_a_move() {
+        let e = ti_new(std::ptr::null(), 16);
+        ti_new_game(e);
+        let t = std::time::Instant::now();
+        let mut out = [0i32; 4];
+        // budget is huge, but the stop flag is raised from another thread
+        let ptr = e as usize;
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            ti_stop(ptr as *mut TiEngine);
+        });
+        assert_eq!(ti_search(e, 10_000, out.as_mut_ptr()), 1);
+        h.join().unwrap();
+        assert!(t.elapsed().as_millis() < 500, "stop took {} ms", t.elapsed().as_millis());
+        ti_free(e);
+    }
+}

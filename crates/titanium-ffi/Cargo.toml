@@ -1,0 +1,12 @@
+[package]
+name = "titanium-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C ABI for the Titanium Ataxx engine (Botzone Python driver loads this via ctypes)"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+titanium = { path = "../titanium" }

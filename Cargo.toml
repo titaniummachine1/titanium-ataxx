@@ -4,6 +4,7 @@ members = [
     "crates/titanium",
     "crates/titanium-cli",
     "crates/titanium-wasm",
+    "crates/titanium-ffi",
 ]
 
 [profile.release]

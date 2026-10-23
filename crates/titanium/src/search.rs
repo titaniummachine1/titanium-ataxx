@@ -979,7 +979,10 @@ impl<'a> Searcher<'a> {
             it_ms[1] = it_ms[0];
             it_ms[0] = self.elapsed_ms() - iter_start;
             let proj_ms = it_ms[0].max(it_ms[1]);
-            if self.elapsed_ms() + proj_ms > budget_ms {
+            // Botzone variant: no early exit. The clock is a hard limit there, so use all of it;
+            // a deeper iteration cut by the deadline still contributes its completed root moves
+            // (partial-iteration adoption above). Classic search keeps the prediction rule.
+            if !BZ && self.elapsed_ms() + proj_ms > budget_ms {
                 self.stop_reason = StopReason::Time;
                 break;
             }
