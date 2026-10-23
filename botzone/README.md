@@ -23,7 +23,10 @@ Trade-off: no hash table carry-over between moves (fresh process), in exchange f
 ## Rules handled in the engine (Botzone judge)
 No passes; the game ends the moment either side cannot move and the mobile side absorbs the empties
 (`Board::bz_over`, `bz_counts`, `Searcher::search_bz`); 4-corner start (`Board::botzone_start`); a move that
-would repeat an earlier position is replaced by the non-repeating move that wins the most discs.
+would be rejected by the judge as a repetition is replaced by the allowed move that wins the most discs.
+The repetition rule is the judge's exact one (placement snapshots; a move is illegal iff the latest snapshot equals an earlier one and
+the move produces the same successor snapshot as then), verified against the reference judge `judge_ref.h` (Ataxx_CPP repo) with
+`botzone/judge_check/` : 57,951 legal-move checks (656 judge-rejected repetitions), 5,546 illegal-move checks, 0 mismatches.
 The normal (non-Botzone) search is bit-identical to main (same node counts).
 
 ## Build
@@ -44,6 +47,12 @@ python botzone/sim_local.py --lib target/release/titanium_ffi.dll --net <tupS57v
 ## Files to upload (new names, so the currently ranked bot keeps working)
 `data/titanium_v2.so` -> storage `/titanium_v2.so`; `data/nnue/tupS57v2.tup` -> storage `/nnue/tupS57v2.tup`;
 `titanium_botzone.py` as the new bot version (Python, Simple IO, **long-live OFF**, time limit 6 s). Memory: TT 22 bits is ~100 MB.
+
+## Verified facts from Botzone's own wiki (Bot page / Ataxx page)
+Default 1 s and 256 MB per run; the FIRST turn of a match gets double time; Python gets a 6x multiplier (so 6 s, 12 s first turn);
+evaluation machines are x86-64 Ubuntu 16.04 with ONE usable core (our engine is single-threaded). The first move is nevertheless
+kept at 6 s on purpose. Ataxx rules: black moves first, 4-corner start (black (0,0),(6,6); white (6,0),(0,6)), no passes (game ends when
+a side cannot move, empties go to the side that can), wipeout wins, game ends at 400 turns, repetition rule as above.
 
 ## Not verified here
 The Linux `.so` was not executed (no WSL distro / Docker engine on the dev box); it is the same source as the
