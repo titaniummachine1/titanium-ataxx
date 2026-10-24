@@ -15,7 +15,7 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 
 ## 2. Where the strongest engine lives (do not guess)
 
-- **UPDATE 2026-10-24 (read with HANDOFFS top entry): strongest is still main 298b7ae + S57. A real NNUE is in progress on branch `exp/nnue` (worktree `C:\gitProjects\nnue-ataxx`, uncommitted). Its design must follow `docs/NET_ANALYSIS.md` (what Kata/Ataxx_CPP/Moonbird/autaxx/Stockfish look at, anchor test, policies). Titanium 5k labels = BASE stage data, KataGo = TEACHER.**
+- **UPDATE 2026-10-24 (read with HANDOFFS top entry): strongest is still main 298b7ae + S57. A real NNUE is in progress on branch `exp/nnue` (worktree `C:\gitProjects\nnue-ataxx`, committed locally 02c3f29). Its design must follow `docs/NET_ANALYSIS.md` (what Kata/Ataxx_CPP/Moonbird/autaxx/Stockfish look at, anchor test, policies). Titanium 5k labels = BASE stage data, KataGo = TEACHER.**
 - **UPDATE 2026-10-23 (supersedes the bullet below): strongest = `main-ataxx` 298b7ae (S57) + net `data/nnue/final_v2_wdl_ep8.tup` (sha 53F2B29C, main default name tupS57v2.tup). Dataset v3 plan + the Ataxx_CPP/Kata findings: `docs/AXNET_PROBE.md` (read it for any teacher/eval/dataset work).**
 - `main @ 73a859d` + default net `data/nnue/tupS55tree.tup` (726440 B,
   sha256 `F66A00FE…899D7C`) is the STRONGEST. `main` default eval IS that net.
