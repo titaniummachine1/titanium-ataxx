@@ -28,6 +28,8 @@ def main():
     ap.add_argument("--time", type=int, default=None, help="ms per move, both sides")
     ap.add_argument("--nodes", type=int, default=None, help="titanium nodes (opp gets --opp-time)")
     ap.add_argument("--opp-time", type=int, default=1000)
+    ap.add_argument("--opp-nodes", type=int, default=None, help="opp nodes per move (equal-node gates)")
+    ap.add_argument("--exe", default=EXE, help="Titanium binary under test (default: main)")
     ap.add_argument("--games", type=int, default=100)
     ap.add_argument("--shards", type=int, default=4)
     ap.add_argument("--book-base", type=int, default=0)
@@ -38,13 +40,13 @@ def main():
     procs = []
     for i in range(a.shards):
         out = "logs/gate_%s_s%d.txt" % (a.tag, i)
-        cmd = [EXE, "match", "--games", str(per), "--tuple", NET, "--opp-tuple", NET, "--opp", a.opp_cmd,
+        cmd = [a.exe, "match", "--games", str(per), "--tuple", NET, "--opp-tuple", NET, "--opp", a.opp_cmd,
                "--book", "data/nnue/book50k.txt", "--book-start", str(a.book_base + i * lines),
                "--start-game", "1", "--out", out]
         if a.time:
             cmd += ["--time", str(a.time), "--opp-time", str(a.time)]
         else:
-            cmd += ["--nodes", str(a.nodes), "--opp-time", str(a.opp_time)]
+            cmd += ["--nodes", str(a.nodes)] + (["--opp-nodes", str(a.opp_nodes)] if a.opp_nodes else ["--opp-time", str(a.opp_time)])
         procs.append(subprocess.Popen(cmd, cwd=ROOT, stdout=open("logs/gate_%s_s%d.stdout" % (a.tag, i), "w"),
                                       stderr=subprocess.STDOUT))
     for p in procs:

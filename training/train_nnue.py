@@ -88,6 +88,14 @@ class Split:
             self.rows = np.nonzero(self.is_kata)[0]
         self.w = z["wsum"].astype(np.float32)
         self.keep = keep_mask
+        # stage-target part without the outcome mix, for the lambda schedule (target = lam * tpart + (1 - lam) * outcome)
+        self.tpart = (ti if stage == "base" else z["teacher_p3"].astype(np.float32)).astype(np.float32)
+        # S57 eval per row EXACTLY as the engine computes it (logit units), for the v2 skip term:
+        # `titanium-cli s57dump --in data/nnue/nnfeat/<split> --out data/nnue/s57/<split>.f32 --tuple <S57 .tup>`.
+        # (The Python tuple forward differs from the engine's by ~66 cp mean, docs/NET_ANALYSIS.md section 27.)
+        s57p = "%s/../s57/%s.f32" % (FEAT, split)
+        self.s57 = np.fromfile(s57p, dtype="<f4") if os.path.exists(s57p) else np.zeros(n, np.float32)
+        assert len(self.s57) == n, "s57 sidecar rows != dataset rows"
 
     def compact(self, rows):
         """In-RAM copy restricted to `rows` (sorted), so random batches never page-fault the 13 GB index file.
@@ -112,7 +120,7 @@ class Split:
         c.off = np.zeros(len(ln) + 1, np.int64)
         np.cumsum(ln, out=c.off[1:])
         assert c.off[-1] == len(c.idx)
-        for k in ("bucket", "target", "w", "kata", "is_kata", "outcome"):
+        for k in ("bucket", "target", "w", "kata", "is_kata", "outcome", "tpart", "s57"):
             setattr(c, k, getattr(self, k)[rows])
         c.keep = self.keep
         c.rows = np.arange(len(rows)) if len(self.rows) == len(self.target) else np.nonzero(np.isin(rows, self.rows))[0]
@@ -135,6 +143,51 @@ class Split:
         return (torch.from_numpy(ix), torch.from_numpy(offs), torch.from_numpy(self.bucket[rows]),
                 torch.from_numpy(self.target[rows]), torch.from_numpy(self.w[rows]))
 
+    def extra(self, rows):
+        """lambda-schedule parts and the S57 skip input for the same rows as batch()"""
+        return (torch.from_numpy(self.tpart[rows]), torch.from_numpy(self.outcome[rows]), torch.from_numpy(self.s57[rows]))
+
+
+class NNUE2(nn.Module):
+    """v2 (D65): feature transformer W per perspective (shared weights), CReLU, Stockfish pairwise product (W -> W/2
+    per perspective), concat (side to move first) -> 8 phase buckets: L1 -> L2, output reads BOTH hidden layers (skip),
+    + PSQT-style linear skip over the features + S57 tuple eval (logit units) times a per-bucket weight.
+    Output layer and PSQT start at zero and the S57 weight at 1, so the untrained net IS S57 and training learns the
+    residual (what S57 misses)."""
+
+    def __init__(self, W=1024, L1=16, L2=32, pairwise=True):
+        super().__init__()
+        self.W, self.L1, self.L2, self.pairwise = W, L1, L2, pairwise
+        self.ft = nn.EmbeddingBag(NUM_FEATS, W, mode="sum")
+        nn.init.normal_(self.ft.weight, 0.0, 0.02)
+        self.ftb = nn.Parameter(torch.full((W,), 0.3 if not pairwise else 0.5))
+        self.psqt = nn.EmbeddingBag(NUM_FEATS, NB, mode="sum")
+        nn.init.zeros_(self.psqt.weight)
+        din = W if pairwise else 2 * W
+        self.l1 = nn.Linear(din, L1 * NB)
+        self.l2 = nn.Linear(L1, L2 * NB)
+        self.out = nn.Linear(L1 + L2, NB)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+        self.s57w = nn.Parameter(torch.ones(NB))
+
+    def forward(self, ix, offs, bucket, s57=None):
+        n = len(bucket)
+        a = (self.ft(ix, offs) + self.ftb).clamp(0, 1)
+        if self.pairwise:
+            h = self.W // 2
+            a = a[:, :h] * a[:, h:]
+        x = torch.cat([a[0::2], a[1::2]], 1)
+        ar = torch.arange(n)
+        h1 = self.l1(x).view(n, NB, self.L1)[ar, bucket].clamp(0, 1)
+        h2 = self.l2(h1).view(n, NB, self.L2)[ar, bucket].clamp(0, 1)
+        o = self.out(torch.cat([h1, h2], 1))[ar, bucket]
+        ps = self.psqt(ix, offs)
+        y = o + 0.5 * (ps[0::2] - ps[1::2])[ar, bucket]
+        if s57 is not None:
+            y = y + self.s57w[bucket] * s57
+        return y
+
 
 class NNUE(nn.Module):
     def __init__(self, W=256, L1=16, L2=32):
@@ -149,7 +202,7 @@ class NNUE(nn.Module):
         self.l2 = nn.Linear(L1, L2 * NB)
         self.out = nn.Linear(L2, NB)
 
-    def forward(self, ix, offs, bucket):
+    def forward(self, ix, offs, bucket, s57=None):
         n = len(bucket)
         a = self.ft(ix, offs) + self.ftb
         x = torch.cat([a[0::2], a[1::2]], 1).clamp(0, 1)
@@ -213,7 +266,7 @@ def evaluate(model, sp, bs=65536):
         for i in range(0, len(sp.rows), bs):
             r = sp.rows[i:i + bs]
             ix, off, bk, _, _ = sp.batch(r)
-            preds.append(torch.sigmoid(model(ix, off, bk)).numpy())
+            preds.append(torch.sigmoid(model(ix, off, bk, sp.extra(r)[2])).numpy())
     model.train()
     p = np.concatenate(preds)
     r = sp.rows
@@ -251,6 +304,10 @@ def parser():
     ap.add_argument("--ema", type=float, default=0.999, help="EMA decay per step (0 = off)")
     ap.add_argument("--warmup", type=int, default=200, help="linear LR warmup steps")
     ap.add_argument("--metric", default="mse_target", help="val metric that decides the best checkpoint")
+    ap.add_argument("--arch", choices=["v1", "v2"], default="v1", help="v2 = D65 (pairwise, hidden skips, S57 skip)")
+    ap.add_argument("--no-pairwise", action="store_true", help="v2 without the pairwise product (ablation arm)")
+    ap.add_argument("--lam-start", type=float, default=0.75, help="weight of the stage target vs outcome at step 0")
+    ap.add_argument("--lam-end", type=float, default=0.75, help="... at the last step (linear schedule)")
     return ap
 
 
@@ -289,9 +346,13 @@ def run(a, trial=None):
         tr.rows = np.sort(rng.choice(tr.rows_all, min(a.rows, len(tr.rows_all)), replace=False))
     print("stage %s | train rows %d | val rows %d | drop [%s] | load %.0fs | free %.1f GB"
           % (a.stage, len(tr.rows), len(va.rows), a.drop, time.time() - t0, free_gb()), flush=True)
-    model = NNUE(W=a.width)
+    mk = (lambda: NNUE2(W=a.width, pairwise=not a.no_pairwise)) if a.arch == "v2" else (lambda: NNUE(W=a.width))
+    model = mk()
     opt = make_opt(model, a)
-    ema = NNUE(W=a.width) if a.ema > 0 else None
+    ema = mk() if a.ema > 0 else None
+    if a.arch == "v2":
+        print("arch v2: W %d pairwise %s | lambda %.2f -> %.2f | s57 skip mean %.3f std %.3f (zeros = sidecar missing)"
+              % (a.width, not a.no_pairwise, a.lam_start, a.lam_end, float(tr.s57.mean()), float(tr.s57.std())), flush=True)
     st = None
     ep0, done_chunks, hist = 1, set(), []
     resume = a.out + ".resume.pt"
@@ -328,15 +389,24 @@ def run(a, trial=None):
                 print("RAM GUARD: %.1f GB free < %.1f -> saved resume, exit" % (free_gb(), a.min_free_gb), flush=True)
                 return
             rows = tr.rows[ci * a.chunk:(ci + 1) * a.chunk]
-            rows = rows[np.random.default_rng(ep_seed + int(ci)).permutation(len(rows))]
+            perm = np.random.default_rng(ep_seed + int(ci)).permutation(len(rows))
+            # chunk -> RAM with plain file reads (compact), never batches through the 13 GB memmap: mapped pages pin
+            # in the working set (law 21, MISTAKES 19). tr.rows is sorted, so sub row j == rows[j] and sub.batch(perm)
+            # yields exactly the batches tr.batch(rows[perm]) did (resume-consistent).
+            sub = tr.compact(rows)
             for i in range(0, len(rows), a.bs):
                 step = (ep - 1) * steps_per_epoch + (ci_n * a.chunk + i) // a.bs
                 lr = a.lr_min + 0.5 * (a.lr - a.lr_min) * (1 + math.cos(math.pi * min(step / total_steps, 1.0)))
                 lr *= min(1.0, (step + 1) / max(a.warmup, 1))
                 for g in opt.param_groups:
                     g["lr"] = lr
-                ix, off, bk, t, w = tr.batch(rows[i:i + a.bs])
-                p = torch.sigmoid(model(ix, off, bk))
+                ix, off, bk, t, w = sub.batch(perm[i:i + a.bs])
+                tp, oc, s57 = sub.extra(perm[i:i + a.bs])
+                if a.lam_start != 0.75 or a.lam_end != 0.75:
+                    frac = min(step / max(total_steps, 1), 1.0)
+                    lam = a.lam_start + (a.lam_end - a.lam_start) * frac
+                    t = lam * tp + (1 - lam) * oc
+                p = torch.sigmoid(model(ix, off, bk, s57))
                 loss = ((p - t).abs().pow(2.5) * w).sum() / w.sum()
                 opt.zero_grad()
                 loss.backward()
@@ -345,6 +415,7 @@ def run(a, trial=None):
                     ema_update(ema, model, a.ema)
                 tl += float(loss) * float(w.sum())
                 tw += float(w.sum())
+            del sub
             done_chunks.add(int(ci))
             print("  ep %d chunk %d/%d loss %.6f lr %.2e %.0fs free %.1fGB" % (
                 ep, len(done_chunks), len(order), tl / max(tw, 1e-9), lr, time.time() - te, free_gb()), flush=True)

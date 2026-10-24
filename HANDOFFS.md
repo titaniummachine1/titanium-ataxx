@@ -1,3 +1,60 @@
+## PROMOTED 2026-10-24 late: main = 653d9a1 (TUP7 eval fix), PUSHED. STRONGEST = main 653d9a1 + S57 (tupS57v2.tup 53F2B29C)
+- Gates vs old main 298b7ae, same S57: 5k +77 (400g), 100 ms +45 (400g), 50 ms +26 (800g), all PASS; Moonbird odds +53. LEDGER PROMOTE-tup7fix.
+- main exe rebuilt (45537061), bench d8 a1a2 13 / 10844 nodes. Speed not optimised yet (~2.4x slower per node than 298b7ae).
+- The NNUE teacher run (D64) is RUNNING again (resumed at chunk 16, epoch 1). Epoch 1 done: val Kata-TD MSE .0587 (EMA)
+  vs S57 .0663 vs base start .0686; level with Ataxx_CPP's raw value from 25 empties up, behind at <= 24 (NET_ANALYSIS 29).
+- LEVER QUEUE (main = champion, branches try to beat it; side branches for exploration):
+  1. finish v1 teacher (3 epochs) -> export -> gate the NNUE vs main @5k (exp/nnue has the tuple fix; NNUE side --tuple S57 not
+     needed for v1, use --tuple none on the nnue side as before) -> 100/50 ms legs if ahead.
+  2. v2 big (D65: W 1024 + pairwise + hidden skips + engine-exact S57 skip, data/nnue/s57/*.f32 built with the fixed engine),
+     base then teacher; capacity aimed at <= 24 empties.
+  3. relabel the base data with current main 653d9a1 + S57 (~20% closer to Kata, NET_ANALYSIS 28; ~14 h on 8 workers).
+  4. speed recovery for the tuple fix (after strength levers; profile capconv + env loop).
+  5. root-move ordering by Ataxx_CPP policy (NET_ANALYSIS 22).
+
+## ENGINE BUG FOUND 2026-10-24 late: main plays TUP7 tuple nets != how they were trained (docs/NET_ANALYSIS.md section 27)
+- Engine TUP7 loader skipped capn/conv and read `pa` 1060 bytes early (S53..S57); trainer zero-constraint only block 0 while
+  the engine skipped state 0 of every block; env defined per stone in the engine vs every square in the trainer.
+  Engine S57 vs trained S57: 66 cp mean, corr .963.
+- FIX: branch exp/tup7-fix 653d9a1 (worktree C:/gitProjects/tup7fix-ataxx, from main 298b7ae, only tuple.rs). Parity after fix
+  0 cp on every family (training/tuple_parity.py). Same fix also in the exp/nnue worktree (uncommitted there).
+- GATE 5k DONE: fixed vs main, same S57, 400 paired games: **239-152-9, 0.609, +77 Elo, CI [0.5625,0.6538], PASS**; won both
+  seats (121-76-3 / 118-76-6). A/A control same harness 197-197-6 = 0.500 exactly. LEDGER Wtup7fix.
+- MOONBIRD: equal 5k nodes both lose ~8-192; at odds Ti 5k vs Moonbird 300 nodes: fixed 63-134-3 (0.323) vs main 52-148-0
+  (0.260) on the same lines = fixed +53 Elo vs the same outside engine. LEDGER WmoonTup7.
+- 100 ms time leg: training/run_tup7fix_gate_100ms.bat -> logs/gate_tup7fix100ms_p*.txt (running at the time of writing).
+- Fixed eval ~2.4x slower per node. User: strength first, speed later. Merge into main needs the user's explicit approval.
+- Follow-up: all titanium_cp base labels in the datasets were produced by the BUGGY engine eval (main 5k search); a relabel
+  with the fixed engine is a candidate data improvement (not started).
+- v2 skip: engine-exact S57 via `titanium-cli s57dump` (exp/nnue) -> data/nnue/s57/{split}.f32; val done, train/test owed
+  (rebuild with the FIXED engine).
+- The D64 teacher run is paused at a resume checkpoint for the gate (same command resumes).
+
+## RUNNING 2026-10-24 late: NNUE v1 TEACHER stage on Kata TD (user go: "do what's best" -> option A)
+- One job: `python training/train_nnue.py --stage teacher --init data/nnue/nnue_pbt/best_base.pt --out data/nnue/nnue_teacher_v1
+  --epochs 4 --lr 1e-3 --lr-min 2e-5 --bs 4096 --width 256 --opt ranger --wd 3e-7 --la-k 8 --la-alpha 0.56 --ema 0.9995 --threads 4
+  --min-free-gb 1.5`, log logs/train_nnue_teacher_v1.txt, resumable (same command continues from data/nnue/nnue_teacher_v1.resume.pt).
+- Pre-checks: audit_final.py --suffix _v3 ok=true (33,891,139 rows); teacher rows 20,662,234, teacher_p3 no NaN, in [0,1]; feature rows
+  == npz rows; smoke 1 chunk: val Kata-TD MSE .0684 -> .0652 (S57 reference on the same val Kata rows .0663). ~37 min/epoch, ~7 GB free.
+- Next after it ends: compare val mse_kata_td with S57 .0663; if better -> export + parity + 5k-node gate (gate_nnue.py, needs go).
+- Not done: S57-skip variant (D63) not built; this run is the plain v1 architecture.
+
+## RESEARCH BLOCK 2026-10-24 evening: what decides value and move choice (READ docs/WHAT_MATTERS.md FIRST)
+No engine change, nothing merged; main 298b7ae + S57 untouched. All new files UNCOMMITTED on exp/tonight.
+- Ranked summary: docs/WHAT_MATTERS.md. Evidence: docs/NET_ANALYSIS.md Part 3 sections 12-24. Decision proposal D63 (unsigned).
+- VALUE: stone PERMANENCE (cannot be converted next move) is worth 2.5-3x to Kata's value head (colour-flip test); Moonbird env/pattern
+  tables next; reach/2-ply/parity ~0. S57's static eval already holds this cheap knowledge: all cheap groups close only 13-33% of
+  its gap to a deep net (Ataxx_CPP). Missing part is DEEP and endgame-heavy (Kata ~70% PASSSCORING rule mismatch NOT separated).
+- POLICY: cheap features cap at ~31% top-1 / 60% top-3 on Kata's full move (2-ply material 30%/53%). Kata jumps with doomed stones (92%)
+  and trades material for safety. Root ordering: Ataxx_CPP one-pass policy finds Titanium's 1M-node move 44% (Ti@1k 37%, Ti@5k 47%).
+- INTERNALS: block 0 = exposure/gain units (single neurons), block 1 = reach (distance-2 heads), value built up to block 11; no score or
+  ownership targets in Kata's data; its ownership head is untrained.
+- New scripts (training/): probe_kata_deep.py, probe_kata_flip.py, kata_choice_model.py, kata_why_moves.py, kata_look_*.py,
+  screen_features.py, s57_residual.py, root_order_probe.py. Logs in logs/ (probe_kata_*, kata_choice_model*, screen_features, s57_residual, root_order_probe).
+- PROPOSAL D63 (needs user go): NNUE v2 = S57 tuple skip + hidden layers on the residual + Kata-TD teacher stage + cheap permanence inputs;
+  D61 anchor/threat/jump-2ply demoted to ablation arms. Separate search lever: Ataxx_CPP root policy ordering (gate at 5k nodes).
+- Not analysed: what Kata blocks 3-11 compute; rule-mismatch share of the endgame gap; any Elo for any of this.
+
 ## STATE AT END OF SESSION 2026-10-24 (READ THIS FIRST; supersedes the 2 'RUNNING' entries it replaced)
 NOTHING IS RUNNING. Nothing merged. main (298b7ae, S57 net final_v2_wdl_ep8.tup sha 53F2B29C) untouched and still strongest.
 

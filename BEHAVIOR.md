@@ -285,3 +285,4 @@ real memory. Update them the moment something happens, not at the end.
     strong engines apart (source, exact eval reproduction, internals, VALUES AND
     POLICIES) and test each design choice against them. State what was not
     analysed; never call research done with gaps (docs/NET_ANALYSIS.md).
+23. **STANDING SIGN-OFF (user 2026-10-24).** Verbatim: "I sign every potential proposal bro as long as it wins do what you think is best ... we're trying to make it strongest". Agent proposals to BUILD, TRAIN, ABLATE may proceed without a per-step go; record each as a DECISIONS row citing this law. Still binding: one job at a time, RAM rules (21), dataset audit before training (14), gates by laws 3-6/10. 'As long as it wins' = a passed gate; merging into MAIN still needs the user's explicit approval naming branch + net (laws 1, 10).

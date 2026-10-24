@@ -15,6 +15,7 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 
 ## 2. Where the strongest engine lives (do not guess)
 
+- **UPDATE 2026-10-24 late: STRONGEST = main 653d9a1 (pushed) + S57 tupS57v2.tup (53F2B29C).** 653d9a1 = the engine now evaluates TUP7 nets exactly as trained (NET_ANALYSIS section 27; +77 @5k, +45 @100ms, +26 @50ms vs 298b7ae). Any tuple-net work must keep training/tuple_parity.py at 0 cp.
 - **UPDATE 2026-10-24 (read with HANDOFFS top entry): strongest is still main 298b7ae + S57. A real NNUE is in progress on branch `exp/nnue` (worktree `C:\gitProjects\nnue-ataxx`, committed locally 02c3f29). Its design must follow `docs/NET_ANALYSIS.md` (what Kata/Ataxx_CPP/Moonbird/autaxx/Stockfish look at, anchor test, policies). Titanium 5k labels = BASE stage data, KataGo = TEACHER.**
 - **UPDATE 2026-10-23 (supersedes the bullet below): strongest = `main-ataxx` 298b7ae (S57) + net `data/nnue/final_v2_wdl_ep8.tup` (sha 53F2B29C, main default name tupS57v2.tup). Dataset v3 plan + the Ataxx_CPP/Kata findings: `docs/AXNET_PROBE.md` (read it for any teacher/eval/dataset work).**
 - `main @ 73a859d` + default net `data/nnue/tupS55tree.tup` (726440 B,
@@ -72,6 +73,10 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 12. **(2026-10-24, BEHAVIOR 19-22)** Titanium 5k labels = BASE data, KataGo = TEACHER;
     no spiralling (one plan, explicit go); protect the 16 GB box (RAM checks, no 13 GB memmap);
     research before building (values AND policies of the strong engines, docs/NET_ANALYSIS.md).
+13. **(2026-10-24, BEHAVIOR 23) STANDING SIGN-OFF:** the user signs every agent proposal "as long as it wins":
+    build / train / ablate without a per-step go (log a DECISIONS row); one job at a time, RAM + audit rules stay;
+    merging into main still needs explicit user approval naming branch + net after a passed gate.
+    Ranked "what matters" summary for any eval/NNUE work: docs/WHAT_MATTERS.md.
 
 ## 4. Rules: two of them (do not mix)
 

@@ -15,7 +15,8 @@
 - `TRAINING_METHODS.md` — local-minima avoidance, compute-efficiency rules.
 - `PIPELINE_AUDIT.md` — dataset pipeline audit record.
 - `ADVERSARY_TRAINING.md` — how Ataxx_CPP/KataAtaxx/Moonbird/atx train; our path.
-- `NET_ANALYSIS.md` — 2026-10-24: what Kata/Ataxx_CPP/Moonbird/autaxx/Stockfish look at (values, internals, POLICIES, anchor test) + NNUE v2 decisions. READ FIRST for any eval/NNUE work.
+- `WHAT_MATTERS.md` — ranked one-page summary: what decides VALUE and MOVE CHOICE (measured on KataAtaxx), and what follows for the NNUE. READ FIRST.
+- `NET_ANALYSIS.md` — 2026-10-24: what Kata/Ataxx_CPP/Moonbird/autaxx/Stockfish look at (values, internals, POLICIES, anchor test) + NNUE v2 decisions; Part 3 = Kata internals, policy, choice model, flip test, value screen.
 - `KATA_FIRST_V3.md` — dataset v3: Kata TD labels on Kata rows, Titanium base labels on own rows.
 - `AXNET_PROBE.md` — 2026-10-23 Ataxx_CPP/Kata investigation: graft, arenas, policy-vs-value ladders, v3 dataset finding (READ FIRST for teacher/eval work).
 - `EVAL_FAILURES.md`, `GOLDEN_DOSE.md` — dead eval lines (value-only dosing does not convert).
