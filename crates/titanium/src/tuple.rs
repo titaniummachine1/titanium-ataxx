@@ -252,7 +252,9 @@ impl TupleTable {
             }
             t.has_enriched = true;
         }
-        if buf[0..4] == TUP6_MAGIC {
+        // TUP7 = TUP6 + per-anchor pairs: it CARRIES capn/conv too (training/train_full.py dump: ... capn, conv, pa).
+        // Reading capn/conv only for TUP6 skipped them for every TUP7 net and read `pa` 1060 bytes early.
+        if buf[0..4] == TUP6_MAGIC || buf[0..4] == TUP7_MAGIC {
             for table in [&mut t.capn_us, &mut t.capn_them].iter_mut() {
                 for v in table.iter_mut() {
                     need(o, 2)?;
@@ -276,6 +278,12 @@ impl TupleTable {
                 o += 1;
             }
             t.has_pa = true;
+        }
+        if o != buf.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{path}: .tup has {} unread trailing bytes (layout mismatch)", buf.len() - o),
+            ));
         }
         // Load-time sparsity flags (winter-clean W4): whole-zero families
         // are skipped bit-identically in the tree (they add 0 by definition).
@@ -359,10 +367,10 @@ impl TupleTable {
             }
         }
         let mut s = self.bias;
+        // Every block's state 0 (empty 2x2) has its own trained weight: the trainer's zero constraint only ever
+        // zeroed block 0 (train_stream zero_constrained sp[0]), so skipping idx 0 dropped 35 learned weights.
         for (a, idx) in blocks.iter().enumerate() {
-            if *idx != 0 {
-                s += self.single[a][*idx as usize] as i32;
-            }
+            s += self.single[a][*idx as usize] as i32;
         }
         let (pairs, _) = &PAIR_BLOCKS;
         for d in 0..4 {
@@ -408,38 +416,25 @@ impl TupleTable {
         let mut s: i32 = 0;
         // All-zero q2 (champ) skips here — bit-identical, adds 0.
         if self.has_q2 {
+            // same as the single table: q2[a][0] is trained for every block except block 0
             for (a, idx) in q.iter().enumerate() {
-                if *idx != 0 {
-                    s += self.q2[a][*idx as usize] as i32;
-                }
+                s += self.q2[a][*idx as usize] as i32;
             }
         }
-        // ENV per-stone tallies (own stones -> env_us, enemy -> env_them).
+        // ENV ring tallies on EVERY square (stone or empty), exactly as training/train_full.py env_tables builds them:
+        // env_us[sq][own][foe][blk] and env_them[sq][foe][own][blk] (perspective swapped). The old per-stone loop
+        // (own stones -> env_us, enemy stones -> env_them) did not match the trained definition.
         let ou = b.me();
         let ot = b.opp();
         let blk = b.blockers;
-        let mut stones = ou;
-        while stones != 0 {
-            let sq = stones.trailing_zeros() as usize;
-            stones &= stones - 1;
+        for sq in 0..49usize {
             let ring = RING1[sq];
             let o = (ring & ou).count_ones();
             let e = (ring & ot).count_ones();
             let bl = (ring & blk).count_ones();
             if o | e | bl != 0 {
                 s += self.env_us[env_index(sq, o, e, bl)] as i32;
-            }
-        }
-        stones = ot;
-        while stones != 0 {
-            let sq = stones.trailing_zeros() as usize;
-            stones &= stones - 1;
-            let ring = RING1[sq];
-            let o = (ring & ot).count_ones();
-            let e = (ring & ou).count_ones();
-            let bl = (ring & blk).count_ones();
-            if o | e | bl != 0 {
-                s += self.env_them[env_index(sq, o, e, bl)] as i32;
+                s += self.env_them[env_index(sq, e, o, bl)] as i32;
             }
         }
         // MOB phase x counts.
