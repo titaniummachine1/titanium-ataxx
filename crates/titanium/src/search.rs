@@ -3,6 +3,9 @@
 //! Search order: TT probe -> eval cache (depth 0) -> move scoring
 //! (TT move > killers > captures*W + history) -> lazy selection -> alpha-beta.
 
+/// exp/nnue-speed: static-eval cache entries (2^16 x 16 B = 1 MiB per searcher).
+const ECACHE_BITS: usize = 16;
+
 use crate::board::{dist_union, jump_union, Board, Move, MoveList, RING1, SQUARES};
 use crate::tuple::TupleTable;
 use crate::nnue::Nnue;
@@ -454,6 +457,10 @@ pub struct Searcher<'a> {
     time_src: fn() -> f64,
     /// Transposition table (persists across searches in the same Searcher).
     tt: Tt,
+    /// exp/nnue-speed: static-eval cache (position hash -> raw eval). The eval is a pure function of the position, so a
+    /// hit returns exactly what a recomputation would: search is bit-identical, only faster (iterative deepening
+    /// re-evaluates ~42% of positions). Cleared on new game and whenever the eval source changes.
+    ecache: Box<[(u64, i32)]>,
     /// Two killer moves per ply (packed u32 moves), refreshed on cutoffs.
     killers: Box<[(u32, u32); MAX_PLY]>,
     /// History heuristic: [mover][to] cutoff counters, aged per search.
@@ -508,6 +515,7 @@ impl<'a> Searcher<'a> {
             node_limit: None,
             time_src: native_now_ms,
             tt: Tt::new(bits),
+            ecache: vec![(0u64, i32::MIN); 1 << ECACHE_BITS].into_boxed_slice(),
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[[0; 49]; 49]; 2]),
             sancta: None,
@@ -523,22 +531,26 @@ impl<'a> Searcher<'a> {
     /// duration; zero-cost OFF (None branch).
     pub fn set_sancta(&mut self, net: Option<&'a S1Net>) {
         self.sancta = net;
+        self.clear_ecache();
     }
 
     /// Attach an n-tuple table (None = pure hand eval). Borrowed for the
     /// search duration; zero-cost OFF (None branch).
     pub fn set_nnue(&mut self, n: Option<&'a Nnue>) {
         self.nnue = n;
+        self.clear_ecache();
     }
 
     pub fn set_tuple(&mut self, t: Option<&'a TupleTable>) {
         self.tuple = t;
+        self.clear_ecache();
     }
 
     /// Tuple-native eval mode (skip E2/E4 scans). Predictable branch,
     /// ~free; the mode it selects is the fast one.
     pub fn set_tuple_native(&mut self, native: bool) {
         self.tup_native = native;
+        self.clear_ecache();
     }
 
     /// Correction-history tables, off by default. Enabled searchers learn
@@ -549,8 +561,24 @@ impl<'a> Searcher<'a> {
 
     /// Static eval of a non-sancta node: the NNUE when one is loaded (exp/nnue), else the tuple/classical eval.
     /// Every static eval goes through here (node entry AND the futility child eval) so pruning and leaves agree.
+    fn clear_ecache(&mut self) {
+        self.ecache.fill((0, i32::MIN));
+    }
+
     #[inline]
-    fn leaf_eval(&self, b: &Board) -> i32 {
+    fn leaf_eval(&mut self, b: &Board) -> i32 {
+        let slot = (b.hash as usize) & ((1 << ECACHE_BITS) - 1);
+        let (k, v) = self.ecache[slot];
+        if k == b.hash && v != i32::MIN {
+            return v;
+        }
+        let v = self.leaf_eval_raw(b);
+        self.ecache[slot] = (b.hash, v);
+        v
+    }
+
+    #[inline]
+    fn leaf_eval_raw(&self, b: &Board) -> i32 {
         match self.nnue {
             // v2 nets carry an S57 skip input (the tuple eval of the same board); v1 ignores it
             Some(nn) if nn.v2 => nn.eval(b, evaluate(b, self.tuple, self.tup_native)),
@@ -578,6 +606,7 @@ impl<'a> Searcher<'a> {
     /// cross-game leakage in long matches (titanium binary_match lesson).
     pub fn reset_for_new_game(&mut self) {
         self.tt.clear();
+        self.clear_ecache();
         *self.killers = [(0, 0); MAX_PLY];
         *self.history = [[[0; 49]; 49]; 2];
         if self.corr.is_some() {
