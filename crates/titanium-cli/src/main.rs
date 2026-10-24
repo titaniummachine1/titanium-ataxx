@@ -46,6 +46,9 @@ fn main() -> ExitCode {
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
         ),
+        "nnbench" => nnbench_cmd(flag_str(&args, "--boards"), flag_str(&args, "--tuple")),
+        "nndump" => nndump_cmd(flag_str(&args, "--in"), flag_str(&args, "--out")),
+        "nneval" => nneval_cmd(flag_str(&args, "--nnue"), flag_str(&args, "--boards")),
         "play" => play_cmd(flag_int(&args, "--time").unwrap_or(1000) as u64),
         "show" => show_cmd(),
         "genbench" => genbench_cmd(flag_int(&args, "--iters").unwrap_or(200_000) as u64),
@@ -76,6 +79,8 @@ fn main() -> ExitCode {
             args.iter().any(|x| x == "--opp-corr"),
             flag_str(&args, "--book"),
             flag_int(&args, "--book-start").unwrap_or(0) as u32,
+            flag_str(&args, "--nnue"),
+            flag_str(&args, "--opp-nnue"),
         ),
         "sperft" => sperft_cmd(
             flag_int(&args, "--depth").unwrap_or(8) as u32,
@@ -442,6 +447,167 @@ fn default_log_path() -> PathBuf {
 // impossible (different positions = different keys); the shared table just
 // caches transpositions across rows. Killers/history carry as ordering
 // hints only (matched moves are always legal here or ignored).
+/// exp/nnue training dump. Input `<in>.occ0` / `<in>.occ1` (u64 LE) and `<in>.stm` (u8), one entry per dataset row.
+/// Output `<out>.cnt` (u8, two per row: side to move first, then opponent) and `<out>.idx` (u16 LE feature indices,
+/// concatenated in the same order). The trainer reads exactly what the engine computes (crate::nnfeat).
+fn nndump_cmd(inp: Option<String>, out: Option<String>) -> ExitCode {
+    use std::io::BufWriter;
+    use titanium::nnfeat::{self, MAX_ACTIVE, NUM_FEATS};
+    let (Some(inp), Some(out)) = (inp, out) else {
+        eprintln!("nndump: --in PREFIX --out PREFIX required");
+        return ExitCode::FAILURE;
+    };
+    assert!(NUM_FEATS <= u16::MAX as usize);
+    let rd = |ext: &str| fs::read(format!("{inp}.{ext}")).unwrap_or_else(|e| panic!("nndump: {inp}.{ext}: {e}"));
+    let (o0, o1, stm) = (rd("occ0"), rd("occ1"), rd("stm"));
+    let n = stm.len();
+    assert!(o0.len() == 8 * n && o1.len() == 8 * n, "nndump: occ/stm length mismatch");
+    let mut cnt = BufWriter::with_capacity(1 << 20, fs::File::create(format!("{out}.cnt")).expect("cnt"));
+    let mut idx = BufWriter::with_capacity(1 << 24, fs::File::create(format!("{out}.idx")).expect("idx"));
+    let mut buf = [0u32; MAX_ACTIVE];
+    let mut total = 0u64;
+    let t0 = Instant::now();
+    for i in 0..n {
+        let mut b = Board::start();
+        b.occ = [
+            u64::from_le_bytes(o0[8 * i..8 * i + 8].try_into().unwrap()),
+            u64::from_le_bytes(o1[8 * i..8 * i + 8].try_into().unwrap()),
+        ];
+        b.blockers = 0;
+        b.turn = stm[i];
+        for side in [b.turn as usize, 1 - b.turn as usize] {
+            let k = nnfeat::features(&b, side, nnfeat::ALL_GROUPS, &mut buf);
+            cnt.write_all(&[k as u8]).unwrap();
+            for &f in &buf[..k] {
+                idx.write_all(&(f as u16).to_le_bytes()).unwrap();
+            }
+            total += k as u64;
+        }
+        if i % 5_000_000 == 0 && i > 0 {
+            eprintln!("nndump: {i}/{n} rows, {:.0}s", t0.elapsed().as_secs_f64());
+        }
+    }
+    cnt.flush().unwrap();
+    idx.flush().unwrap();
+    println!("nndump: {n} rows, {total} indices ({:.1} per perspective), {:.0}s", total as f64 / (2.0 * n as f64),
+             t0.elapsed().as_secs_f64());
+    ExitCode::SUCCESS
+}
+
+/// exp/nnue parity check: lines "<49 chars> <b|w> <expected cp>" (export_nnue.py .ref.txt) -> max |diff|.
+fn nneval_cmd(nn: Option<String>, boards: Option<String>) -> ExitCode {
+    let (Some(nn), Some(boards)) = (nn, boards) else {
+        eprintln!("nneval: --nnue FILE --boards FILE required");
+        return ExitCode::FAILURE;
+    };
+    let net = match titanium::nnue::Nnue::load(&nn) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("nneval: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let text = fs::read_to_string(&boards).expect("boards");
+    let (mut n, mut worst, mut sum) = (0, 0i32, 0i64);
+    for line in text.lines() {
+        let mut parts: Vec<&str> = line.split_whitespace().collect();
+        let Some(want) = parts.pop().and_then(|x| x.parse::<i32>().ok()) else { continue };
+        let Some(b) = Board::from_str(&parts.join(" ")) else { continue };
+        let d = (net.eval(&b) - want).abs();
+        worst = worst.max(d);
+        sum += d as i64;
+        n += 1;
+    }
+    println!("nneval: {n} positions, max |rust - torch| = {worst} cp, mean {:.3} cp", sum as f64 / n.max(1) as f64);
+    if worst <= 1 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// exp/nnue speed probe: per-eval cost of each feature group, of an accumulator refresh (random int16 weights,
+/// width 128 and 256, both perspectives) and of the current tuple eval, on real board lines (49 chars + b|w).
+fn nnbench_cmd(boards: Option<String>, tup_spec: Option<String>) -> ExitCode {
+    use std::hint::black_box;
+    use titanium::nnfeat::{self, MAX_ACTIVE, NUM_FEATS};
+    let Some(path) = boards else {
+        eprintln!("nnbench: --boards FILE required");
+        return ExitCode::FAILURE;
+    };
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("nnbench: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bs: Vec<Board> = text.lines().filter_map(|l| Board::from_str(l.trim())).collect();
+    let n = bs.len() as f64;
+    println!("boards {} | features {} | max active {}", bs.len(), NUM_FEATS, MAX_ACTIVE);
+    let time = |label: &str, f: &mut dyn FnMut() -> u64| {
+        let _ = f();
+        let t = Instant::now();
+        let reps = 3;
+        let mut s = 0u64;
+        for _ in 0..reps {
+            s = s.wrapping_add(f());
+        }
+        let ns = t.elapsed().as_nanos() as f64 / (n * reps as f64);
+        println!("{label:<44} {ns:8.1} ns/eval   (chk {})", s % 1000);
+    };
+    if let Ok(Some(tup)) = load_tuple_preset(&tup_spec) {
+        time("current tuple eval (forward)", &mut || bs.iter().map(|b| black_box(tup.forward(b)) as u64).sum());
+    }
+    let mut buf = [0u32; MAX_ACTIVE];
+    let mut active = 0u64;
+    for (name, g) in [("G1 square state", nnfeat::G1), ("G2 anchor", nnfeat::G2), ("G3 stone ring", nnfeat::G3),
+        ("G5 2-ply exchange", nnfeat::G5), ("G6 global", nnfeat::G6), ("ALL groups", nnfeat::ALL_GROUPS)]
+    {
+        let label = format!("features {name} (both perspectives)");
+        time(&label, &mut || {
+            let mut s = 0u64;
+            for b in &bs {
+                for side in 0..2 {
+                    s += nnfeat::features(b, side, g, &mut buf) as u64;
+                }
+            }
+            if g == nnfeat::ALL_GROUPS {
+                active = s;
+            }
+            s
+        });
+    }
+    println!("mean active features per perspective (all groups): {:.1}", active as f64 / (2.0 * n));
+    for width in [128usize, 256] {
+        let mut seed = 0x9E37_79B9u64;
+        let w: Vec<i16> = (0..NUM_FEATS * width)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % 64) as i16 - 32
+            })
+            .collect();
+        let label = format!("features ALL + refresh width {width} (both)");
+        time(&label, &mut || {
+            let mut s = 0u64;
+            let mut acc = vec![0i16; width];
+            for b in &bs {
+                for side in 0..2 {
+                    let k = nnfeat::features(b, side, nnfeat::ALL_GROUPS, &mut buf);
+                    acc.iter_mut().for_each(|a| *a = 0);
+                    for &f in &buf[..k] {
+                        let row = &w[f as usize * width..(f as usize + 1) * width];
+                        for (a, r) in acc.iter_mut().zip(row) {
+                            *a = a.wrapping_add(*r);
+                        }
+                    }
+                    s = s.wrapping_add(acc[7] as u64);
+                }
+            }
+            black_box(s)
+        });
+    }
+    ExitCode::SUCCESS
+}
+
 fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_native: bool) -> ExitCode {
     let tup = match load_tuple_preset(&tup_spec) {
         Ok(t) => t,
@@ -862,7 +1028,26 @@ fn match_cmd(
     opp_corr: bool,
     book_spec: Option<String>,
     book_start: u32,
+    nnue_spec: Option<String>,
+    opp_nnue_spec: Option<String>,
 ) -> ExitCode {
+    let load_nn = |spec: &Option<String>| -> Result<Option<titanium::nnue::Nnue>, String> {
+        match spec {
+            None => Ok(None),
+            Some(p) => titanium::nnue::Nnue::load(p).map(Some).map_err(|e| format!("nnue {p}: {e}")),
+        }
+    };
+    let (nn, opp_nn) = match (load_nn(&nnue_spec), load_nn(&opp_nnue_spec)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("match: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if opp_nn.is_some() && opp_cmd.as_deref() != Some("self") {
+        eprintln!("match: --opp-nnue needs --opp self");
+        return ExitCode::FAILURE;
+    }
     // Eval presets, explicit per side — no env vars anywhere:
     // --net = OUR side (in-process), --opp-net = child side (appended to the
     // opp serve command). --opp self = both in-process (opp side gets opp-net).
@@ -1031,11 +1216,13 @@ fn match_cmd(
         searcher.set_tuple(tup.as_ref());
         searcher.set_tuple_native(tup_native && tup.is_some());
         searcher.set_corr(corr);
+        searcher.set_nnue(nn.as_ref());
         let mut opp_searcher = Searcher::new(); // for --opp self
         opp_searcher.set_sancta(opp_net.as_ref());
         opp_searcher.set_tuple(opp_tup.as_ref());
         opp_searcher.set_tuple_native(opp_tup_native && opp_tup.is_some());
         opp_searcher.set_corr(opp_corr);
+        opp_searcher.set_nnue(opp_nn.as_ref());
         let titanium_is_black = game % 2 == 1;
         let mut log = String::new();
         let mut result = None;
