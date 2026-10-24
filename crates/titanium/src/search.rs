@@ -63,6 +63,19 @@ const ORD_JUMP_PEN: i32 = 500;
 /// exp/ab O1: extra jump penalty per own stone neighboring the origin.
 const ORD_JUMP_CONN: i32 = 250;
 const ORD_HISTORY_MAX: i32 = 90_000;
+/// exp/search-histmb: Moonbird 1.1.0 history (searchUtils.nim) keyed [stm][from][to] (clones keyed [to][to]):
+/// +depth^2 for the move that raised alpha, -depth^2/24 for every searched move that did not, |h| capped at 107000
+/// (x24 here so the malus stays integer) with the colour's table shrunk /1.25 when the cap is hit. Ordering weight
+/// = Moonbird historyMoveOrderingFactor 2.0 stones = 2 conversions at full history.
+const HIST_SCALE: i32 = 24;
+const HIST_MAX: i32 = 107_000 * HIST_SCALE;
+const ORD_HIST_FULL: i32 = 2 * ORD_CAPTURE_UNIT;
+type History = [[[i32; 49]; 49]; 2];
+
+#[inline]
+fn hist_key(m: Move) -> (usize, usize) {
+    if m.is_clone() { (m.to as usize, m.to as usize) } else { (m.from as usize, m.to as usize) }
+}
 const _: () = assert!(ORD_HISTORY_MAX + 8 * ORD_CAPTURE_UNIT + ORD_CLONE_BONUS < ORD_KILLER);
 const _: () = assert!(ORD_KILLER < ORD_TT);
 
@@ -166,7 +179,7 @@ fn score_into(
     tt_mv: u32,
     ply: u32,
     killers: &[(u32, u32); MAX_PLY],
-    history: &[[u32; 49]; 2],
+    history: &History,
 ) {
     b.legal_moves_dedup_into(list);
     let opp = b.opp();
@@ -198,7 +211,8 @@ fn score_into(
         if packed == k1 || packed == k2 {
             score += ORD_KILLER;
         }
-        score += (hist[m.to as usize] as i32).min(ORD_HISTORY_MAX);
+        let (hf, ht) = hist_key(m);
+        score += (hist[hf][ht] as i64 * ORD_HIST_FULL as i64 / HIST_MAX as i64) as i32;
         list.set_score(i, score);
     }
     if tt_index != usize::MAX && tt_index != 0 {
@@ -442,7 +456,7 @@ pub struct Searcher<'a> {
     /// Two killer moves per ply (packed u32 moves), refreshed on cutoffs.
     killers: Box<[(u32, u32); MAX_PLY]>,
     /// History heuristic: [mover][to] cutoff counters, aged per search.
-    history: Box<[[u32; 49]; 2]>,
+    history: Box<History>,
     /// Optional sancta net (None = classical slim eval). Borrowed weights,
     /// set once via set_sancta, read-only in the tree. Zero refcount,
     /// zero unsafe — the borrow checker proves the net outlives the search.
@@ -492,7 +506,7 @@ impl<'a> Searcher<'a> {
             time_src: native_now_ms,
             tt: Tt::new(bits),
             killers: Box::new([(0, 0); MAX_PLY]),
-            history: Box::new([[0; 49]; 2]),
+            history: Box::new([[[0; 49]; 49]; 2]),
             sancta: None,
             tuple: None,
             tup_native: false,
@@ -545,7 +559,7 @@ impl<'a> Searcher<'a> {
     pub fn reset_for_new_game(&mut self) {
         self.tt.clear();
         *self.killers = [(0, 0); MAX_PLY];
-        *self.history = [[0; 49]; 2];
+        *self.history = [[[0; 49]; 49]; 2];
         if self.corr.is_some() {
             self.corr = Some(CorrHist::new());
         }
@@ -758,6 +772,9 @@ impl<'a> Searcher<'a> {
                 }
             }
             move_idx += 1;
+            if score <= alpha {
+                self.hist_add(b.turn as usize, m, -((depth * depth) as i32));
+            }
 
             if score > best {
                 best = score;
@@ -771,21 +788,37 @@ impl<'a> Searcher<'a> {
                 }
             }
         }
+        if best > alpha_orig && best_mv != 0xFFFF {
+            self.hist_add(b.turn as usize, Move::from_u32(best_mv), HIST_SCALE * (depth * depth) as i32);
+        }
         self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply, raw);
         best
     }
 
-    /// Killer/history bookkeeping on a beta cutoff.
+    /// Moonbird history update: clamp to +-HIST_MAX, shrink the colour's table /1.25 once the cap is hit.
     #[inline]
-    fn on_cutoff(&mut self, b: &Board, m: Move, depth: u32, ply: u32) {
+    fn hist_add(&mut self, stm: usize, m: Move, add: i32) {
+        let (f, t) = hist_key(m);
+        let e = &mut self.history[stm][f][t];
+        *e = (*e + add).clamp(-HIST_MAX, HIST_MAX);
+        if e.abs() >= HIST_MAX {
+            for row in self.history[stm].iter_mut() {
+                for h in row.iter_mut() {
+                    *h = *h * 4 / 5;
+                }
+            }
+        }
+    }
+
+    /// Killer bookkeeping on a beta cutoff (history: hist_add at the node's end, exp/search-histmb).
+    #[inline]
+    fn on_cutoff(&mut self, _b: &Board, m: Move, _depth: u32, ply: u32) {
         let packed = m.to_u32();
         let k = &mut self.killers[ply as usize];
         if k.0 != packed {
             k.1 = k.0;
             k.0 = packed;
         }
-        let h = &mut self.history[b.turn as usize][m.to as usize];
-        *h = h.saturating_add(1u32 << (depth * 2).min(20));
     }
 
     /// TT store at the end of a node (skipped when the clock cut it short).
@@ -833,9 +866,11 @@ impl<'a> Searcher<'a> {
 
         let mut result = SearchResult::default();
         // Age the history table so old cutoffs don't dominate forever.
-        for row in self.history.iter_mut() {
-            for h in row.iter_mut() {
-                *h /= 2;
+        for side in self.history.iter_mut() {
+            for row in side.iter_mut() {
+                for h in row.iter_mut() {
+                    *h /= 2;
+                }
             }
         }
         {
