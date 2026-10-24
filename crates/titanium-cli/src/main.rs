@@ -60,6 +60,7 @@ fn main() -> ExitCode {
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
             args.iter().any(|x| x == "--corr"),
+            flag_str(&args, "--nnue"),
         ),
         "match" => match_cmd(
             flag_int(&args, "--games").unwrap_or(20) as u32,
@@ -231,6 +232,30 @@ fn net_flag_str(spec: &Option<String>) -> String {
 
 /// Shipped champion: main runs this unless --tuple says otherwise.
 pub const DEFAULT_TUP: &str = "data/nnue/tupS57v2.tup";
+
+/// Shipped NNUE ("the optimized big net": nnue_t1ep4, sha c4829350, int16 fast path): serve / match run it when --nnue is
+/// absent; file missing = S57 fallback; `--nnue none` = explicit S57-only escape hatch. With the NNUE active and no
+/// --tuple the tuple defaults to none (the gated config `--tuple none --nnue`).
+pub const DEFAULT_NNUE: &str = "data/nnue/nnue_main.tnn";
+
+fn resolve_nnue_spec(spec: &Option<String>) -> Option<String> {
+    match spec {
+        None => std::path::Path::new(DEFAULT_NNUE).exists().then(|| DEFAULT_NNUE.to_string()),
+        Some(s) if s == "none" || s.is_empty() => None,
+        Some(s) => Some(s.clone()),
+    }
+}
+
+fn eff_tuple_spec(tup: &Option<String>, nnue: &Option<String>) -> Option<String> {
+    if tup.is_none() && nnue.is_some() { Some("none".to_string()) } else { tup.clone() }
+}
+
+fn nnue_flag_str(resolved: &Option<String>) -> String {
+    match resolved {
+        Some(p) => format!("--nnue {p}"),
+        None => "--nnue none".to_string(),
+    }
+}
 
 /// Flag absent = champion default (main is always strongest out of the box).
 /// --tuple none = pure hand eval (explicit escape hatch for A/B).
@@ -912,9 +937,20 @@ fn serve_cmd(
     tup_spec: Option<String>,
     tup_native: bool,
     corr: bool,
+    nnue_spec: Option<String>,
 ) -> ExitCode {
     let stdin = io::stdin();
     let mut searcher = Searcher::with_tt_bits(tt_bits);
+    let nnue_spec = resolve_nnue_spec(&nnue_spec);
+    let owned_nn = match nnue_spec.as_deref().map(titanium::nnue::Nnue::load) {
+        Some(Ok(n)) => Some(n),
+        Some(Err(e)) => {
+            eprintln!("serve: nnue: {e}");
+            return ExitCode::FAILURE;
+        }
+        None => None,
+    };
+    let tup_spec = eff_tuple_spec(&tup_spec, &nnue_spec);
     // Eval presets come from --net / --tuple ONLY. Owned tables outlive the
     // loop; searcher borrows them per-position (no refcount).
     let owned = match load_net_preset(&net_spec) {
@@ -935,6 +971,7 @@ fn serve_cmd(
     searcher.set_tuple(owned_tup.as_ref());
     searcher.set_tuple_native(tup_native && owned_tup.is_some());
     searcher.set_corr(corr);
+    searcher.set_nnue(owned_nn.as_ref());
     let mut current: Option<Board> = None;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -1147,6 +1184,13 @@ fn match_cmd(
             Some(p) => titanium::nnue::Nnue::load(p).map(Some).map_err(|e| format!("nnue {p}: {e}")),
         }
     };
+    // shipped-NNUE default (absent flag) on both sides; an external child gets the resolved choice as an explicit flag
+    let nnue_spec = resolve_nnue_spec(&nnue_spec);
+    let child_nnue = resolve_nnue_spec(&opp_nnue_spec);
+    let self_opp = opp_cmd.as_deref() == Some("self");
+    let opp_nnue_spec = if self_opp { child_nnue.clone() } else { None };
+    let tup_spec = eff_tuple_spec(&tup_spec, &nnue_spec);
+    let opp_tup_spec = eff_tuple_spec(&opp_tup_spec, &child_nnue);
     let (nn, opp_nn) = match (load_nn(&nnue_spec), load_nn(&opp_nnue_spec)) {
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => {
@@ -1154,10 +1198,6 @@ fn match_cmd(
             return ExitCode::FAILURE;
         }
     };
-    if opp_nn.is_some() && opp_cmd.as_deref() != Some("self") {
-        eprintln!("match: --opp-nnue needs --opp self");
-        return ExitCode::FAILURE;
-    }
     // Eval presets, explicit per side — no env vars anywhere:
     // --net = OUR side (in-process), --opp-net = child side (appended to the
     // opp serve command). --opp self = both in-process (opp side gets opp-net).
@@ -1205,6 +1245,9 @@ fn match_cmd(
                     }
                     if !with_flags.contains("--tuple") {
                         with_flags = format!("{with_flags} {}", tuple_flag_str(&opp_tup_spec));
+                    }
+                    if !with_flags.contains("--nnue") {
+                        with_flags = format!("{with_flags} {}", nnue_flag_str(&child_nnue));
                     }
                     if opp_corr && !with_flags.contains("--corr") {
                         with_flags = format!("{with_flags} {}", corr_flag_str(true));
