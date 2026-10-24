@@ -552,7 +552,9 @@ impl<'a> Searcher<'a> {
     #[inline]
     fn leaf_eval(&self, b: &Board) -> i32 {
         match self.nnue {
-            Some(nn) => nn.eval(b),
+            // v2 nets carry an S57 skip input (the tuple eval of the same board); v1 ignores it
+            Some(nn) if nn.v2 => nn.eval(b, evaluate(b, self.tuple, self.tup_native)),
+            Some(nn) => nn.eval(b, 0),
             None => evaluate(b, self.tuple, self.tup_native),
         }
     }

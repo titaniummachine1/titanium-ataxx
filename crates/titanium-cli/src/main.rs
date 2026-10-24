@@ -48,7 +48,8 @@ fn main() -> ExitCode {
         ),
         "nnbench" => nnbench_cmd(flag_str(&args, "--boards"), flag_str(&args, "--tuple")),
         "nndump" => nndump_cmd(flag_str(&args, "--in"), flag_str(&args, "--out")),
-        "nneval" => nneval_cmd(flag_str(&args, "--nnue"), flag_str(&args, "--boards")),
+        "s57dump" => s57dump_cmd(flag_str(&args, "--in"), flag_str(&args, "--out"), flag_str(&args, "--tuple")),
+        "nneval" => nneval_cmd(flag_str(&args, "--nnue"), flag_str(&args, "--boards"), flag_str(&args, "--tuple")),
         "play" => play_cmd(flag_int(&args, "--time").unwrap_or(1000) as u64),
         "show" => show_cmd(),
         "genbench" => genbench_cmd(flag_int(&args, "--iters").unwrap_or(200_000) as u64),
@@ -494,8 +495,55 @@ fn nndump_cmd(inp: Option<String>, out: Option<String>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// exp/nnue v2 skip input: the S57 eval EXACTLY as the engine computes it in games (full hand eval + tuple,
+/// `search::evaluate(b, tup, false)`), side to move, for every row of an nndump prefix (.occ0/.occ1/.stm).
+/// Writes little-endian f32 = cp / 400 (logit units), one per row, in row order. Blockers 0, like nndump.
+fn s57dump_cmd(inp: Option<String>, out: Option<String>, tup_spec: Option<String>) -> ExitCode {
+    use std::io::BufWriter;
+    let (Some(inp), Some(out)) = (inp, out) else {
+        eprintln!("s57dump: --in PREFIX --out FILE [--tuple TUP] required");
+        return ExitCode::FAILURE;
+    };
+    let tup = match load_tuple_preset(&tup_spec) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            eprintln!("s57dump: a tuple net is required");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("s57dump: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rd = |ext: &str| fs::read(format!("{inp}.{ext}")).unwrap_or_else(|e| panic!("s57dump: {inp}.{ext}: {e}"));
+    let (o0, o1, stm) = (rd("occ0"), rd("occ1"), rd("stm"));
+    let n = stm.len();
+    assert!(o0.len() == 8 * n && o1.len() == 8 * n, "s57dump: occ/stm length mismatch");
+    let tmp = format!("{out}.tmp");
+    let mut w = BufWriter::with_capacity(1 << 22, fs::File::create(&tmp).expect("out"));
+    let t0 = Instant::now();
+    for i in 0..n {
+        let b = Board::from_occ(
+            u64::from_le_bytes(o0[8 * i..8 * i + 8].try_into().unwrap()),
+            u64::from_le_bytes(o1[8 * i..8 * i + 8].try_into().unwrap()),
+            0,
+            stm[i],
+        );
+        let cp = titanium::search::evaluate(&b, Some(&tup), false);
+        w.write_all(&(cp as f32 / 400.0).to_le_bytes()).unwrap();
+        if i % 5_000_000 == 0 && i > 0 {
+            eprintln!("s57dump: {i}/{n} rows, {:.0}s", t0.elapsed().as_secs_f64());
+        }
+    }
+    w.flush().unwrap();
+    drop(w);
+    fs::rename(&tmp, &out).expect("rename");
+    println!("s57dump: {n} rows -> {out}, {:.0}s", t0.elapsed().as_secs_f64());
+    ExitCode::SUCCESS
+}
+
 /// exp/nnue parity check: lines "<49 chars> <b|w> <expected cp>" (export_nnue.py .ref.txt) -> max |diff|.
-fn nneval_cmd(nn: Option<String>, boards: Option<String>) -> ExitCode {
+fn nneval_cmd(nn: Option<String>, boards: Option<String>, tup_spec: Option<String>) -> ExitCode {
     let (Some(nn), Some(boards)) = (nn, boards) else {
         eprintln!("nneval: --nnue FILE --boards FILE required");
         return ExitCode::FAILURE;
@@ -507,13 +555,26 @@ fn nneval_cmd(nn: Option<String>, boards: Option<String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // v2 nets add the S57 tuple eval (full hand eval + tuple, as the gates run it) as a skip term
+    let tup = if net.v2 {
+        match load_tuple_preset(&tup_spec) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("nneval: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     let text = fs::read_to_string(&boards).expect("boards");
     let (mut n, mut worst, mut sum) = (0, 0i32, 0i64);
     for line in text.lines() {
         let mut parts: Vec<&str> = line.split_whitespace().collect();
         let Some(want) = parts.pop().and_then(|x| x.parse::<i32>().ok()) else { continue };
         let Some(b) = Board::from_str(&parts.join(" ")) else { continue };
-        let d = (net.eval(&b) - want).abs();
+        let s57 = if net.v2 { titanium::search::evaluate(&b, tup.as_ref(), false) } else { 0 };
+        let d = (net.eval(&b, s57) - want).abs();
         worst = worst.max(d);
         sum += d as i64;
         n += 1;
