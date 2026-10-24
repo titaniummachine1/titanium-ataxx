@@ -46,6 +46,17 @@ fn main() -> ExitCode {
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
             flag_str(&args, "--nnue"),
+            args.iter().any(|x| x == "--fresh"),
+            flag_int(&args, "--tt-bits").map(|v| v as usize),
+        ),
+        "labelbin" => labelbin_cmd(
+            flag_str(&args, "--bin"),
+            flag_int(&args, "--lo").unwrap_or(0) as usize,
+            flag_int(&args, "--hi").map(|v| v as usize),
+            flag_int(&args, "--nodes").unwrap_or(5000) as u64,
+            flag_str(&args, "--tuple"),
+            flag_str(&args, "--nnue"),
+            flag_int(&args, "--threads").unwrap_or(1).max(1) as usize,
         ),
         "nnbench" => nnbench_cmd(flag_str(&args, "--boards"), flag_str(&args, "--tuple"), flag_str(&args, "--nnue")),
         "nndump" => nndump_cmd(flag_str(&args, "--in"), flag_str(&args, "--out")),
@@ -748,7 +759,10 @@ fn nnbench_cmd(boards: Option<String>, tup_spec: Option<String>, nnue: Option<St
     ExitCode::SUCCESS
 }
 
-fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_native: bool, nnue: Option<String>) -> ExitCode {
+/// `fresh`: reset TT / killers / history / eval cache before EVERY position (label depends only on the position);
+/// `tt_bits`: TT size (5k nodes needs few entries).
+fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_native: bool, nnue: Option<String>, fresh: bool,
+             tt_bits: Option<usize>) -> ExitCode {
     let tup = match load_tuple_preset(&tup_spec) {
         Ok(t) => t,
         Err(e) => {
@@ -765,7 +779,10 @@ fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_nat
         }
         None => None,
     };
-    let mut searcher = Searcher::new();
+    let mut searcher = match tt_bits {
+        Some(b) => Searcher::with_tt_bits(b),
+        None => Searcher::new(),
+    };
     searcher.set_tuple(tup.as_ref());
     searcher.set_tuple_native(tup_native && tup.is_some());
     searcher.set_nnue(nn.as_ref());
@@ -787,6 +804,9 @@ fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_nat
             max_nodes: if time_ms.is_some() { None } else { Some(nodes) },
             max_depth: 30,
         };
+        if fresh {
+            searcher.reset_for_new_game();
+        }
         let r = searcher.search(&b, &limits);
         use std::io::Write as _;
         let _ = writeln!(out, "{} {} {}", r.score, r.depth, r.nodes);
@@ -796,6 +816,78 @@ fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_nat
         }
     }
     eprintln!("label: done {n} rows");
+    ExitCode::SUCCESS
+}
+
+/// exp/label-clean: relabel from a packed file (25-byte records: occ0 u64 | occ1 u64 | blk u64 | stm u8, little endian;
+/// training/relabel_pack.py). Rows [lo, hi) are searched for `nodes` nodes each with the state reset before EVERY row
+/// (label depends on the position only); one line `score depth nodes` per row on stdout, in row order.
+fn labelbin_cmd(bin: Option<String>, lo: usize, hi: Option<usize>, nodes: u64, tup_spec: Option<String>, nnue: Option<String>,
+                threads: usize) -> ExitCode {
+    let Some(bin) = bin else {
+        eprintln!("labelbin: --bin FILE required");
+        return ExitCode::FAILURE;
+    };
+    let tup = match load_tuple_preset(&tup_spec) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("labelbin: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let nn = match nnue.as_deref().map(titanium::nnue::Nnue::load) {
+        Some(Ok(n)) => Some(n),
+        Some(Err(e)) => {
+            eprintln!("labelbin: {e}");
+            return ExitCode::FAILURE;
+        }
+        None => None,
+    };
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    let data = fs::read(&bin).expect("bin");
+    let total = data.len() / 25;
+    let hi = hi.unwrap_or(total).min(total);
+    let n = hi.saturating_sub(lo);
+    // ONE shared read-only net for all threads (one copy in the CPU cache), one Searcher per thread, rows handed out in
+    // small chunks from an atomic counter (load balanced). Result per row packed in a u64: score(i32) | depth<<32 | nodes<<40.
+    let res: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    const CHUNK: usize = 32;
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| {
+                let mut searcher = Searcher::with_tt_bits(18);
+                searcher.set_tuple(tup.as_ref());
+                searcher.set_nnue(nn.as_ref());
+                let limits = SearchLimits { time: None, max_nodes: Some(nodes), max_depth: 30 };
+                loop {
+                    let c = next.fetch_add(CHUNK, Ordering::Relaxed);
+                    if c >= n {
+                        break;
+                    }
+                    for i in c..(c + CHUNK).min(n) {
+                        let rec = &data[(lo + i) * 25..(lo + i) * 25 + 25];
+                        let u = |k: usize| u64::from_le_bytes(rec[k..k + 8].try_into().unwrap());
+                        let b = Board::from_occ(u(0), u(8), u(16), rec[24]);
+                        searcher.reset_for_new_game();
+                        let r = searcher.search(&b, &limits);
+                        res[i].store((r.score as u32 as u64) | ((r.depth as u64 & 0xff) << 32) | ((r.nodes & 0xff_ffff) << 40), Ordering::Relaxed);
+                    }
+                    let d = done.fetch_add((c + CHUNK).min(n) - c, Ordering::Relaxed) + ((c + CHUNK).min(n) - c);
+                    if d / 2000 != (d - ((c + CHUNK).min(n) - c)) / 2000 {
+                        eprintln!("labelbin: {d}/{n}");
+                    }
+                }
+            });
+        }
+    });
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    for v in &res {
+        let v = v.load(Ordering::Relaxed);
+        use std::io::Write as _;
+        let _ = writeln!(out, "{} {} {}", v as u32 as i32, (v >> 32) & 0xff, v >> 40);
+    }
     ExitCode::SUCCESS
 }
 
