@@ -15,7 +15,7 @@ NOTHING IS RUNNING. Nothing merged. main (298b7ae, S57 net final_v2_wdl_ep8.tup 
 1) anchor = landing square of the best 2-ply move over ALL moves (clones+jumps); arms exact vs coarse symmetry bucket, 1 vs 2 anchors. 2) Stockfish-style threat edges: (side, clone|jump, landing sq, direction of adjacent enemy stone) 1,568 inputs. 3) 2-ply exchange for jumps too (vacated origin). 4) keep G1 square state. 5) skip connections from both hidden layers; width 128-256. 6) lambda schedule start->end. 7) search: order captures by 2-ply net.
 
 ### 3. Code + data state
-- Branch exp/nnue, worktree C:/gitProjects/nnue-ataxx (from main 298b7ae), UNCOMMITTED (user never answered the commit question; commit before any gate, law 8): crates/titanium/src/nnfeat.rs (v1 feature groups G1/G2/G3/G5/G6, 26,196 inputs, brute-force tests pass), nnue.rs (f32 inference, Rust==torch 0 cp), search.rs set_nnue hook (old path identical: bench d8 10915 nodes), CLI nndump/nneval/nnbench + match --nnue/--opp-nnue (use --tuple none on the nnue side).
+- Branch exp/nnue, worktree C:/gitProjects/nnue-ataxx (from main 298b7ae), COMMITTED locally as 02c3f29 (not pushed); project docs/scripts committed on exp/tonight 95c1b3b: crates/titanium/src/nnfeat.rs (v1 feature groups G1/G2/G3/G5/G6, 26,196 inputs, brute-force tests pass), nnue.rs (f32 inference, Rust==torch 0 cp), search.rs set_nnue hook (old path identical: bench d8 10915 nodes), CLI nndump/nneval/nnbench + match --nnue/--opp-nnue (use --tuple none on the nnue side).
 - Speed v1 (unoptimised): features 1.5 us + f32 refresh 256w ~3.8 us vs tuple eval 0.95 us.
 - Features on disk: data/nnue/nnfeat/{train,val,test}.{cnt,idx} (v1 groups; 13.2 GB train; REBUILD after v2 feature changes via `titanium-cli nndump`).
 - Trainer training/train_nnue.py (Ranger/EMA/warmup+cosine, stages base|teacher, --drop groups, compact() file-read loader); optuna_nnue.py (done: study nnue_base_v1 in data/nnue/nnue_hpo/optuna.db, top.json: Ranger, bs 4096, lr 3-5e-3, la_k 8; width importance 0.0); pbt_nnue.py (stopped after round 15, state data/nnue/nnue_pbt/state.pt resumable, best_base.pt val 0.01717); export_nnue.py (+ .ref.txt parity file); gate_nnue.py (export + parity + 8x200 games @5k + tripwire; never run).
@@ -30,7 +30,7 @@ NOTHING IS RUNNING. Nothing merged. main (298b7ae, S57 net final_v2_wdl_ep8.tup 
 - Research before building: dismantle the strong engines (values AND policies) and test design choices against them.
 - Invert problems with bitboards (spread targets) instead of enumerating moves.
 
-### 5. Next (needs user go): rebuild nnfeat to v2 -> brute-force tests -> re-dump features -> short ablation trains (1 group/arm) -> Optuna seed -> PBT -> commit exp/nnue -> gate_nnue.py vs S57.
+### 5. Next (needs user go): rebuild nnfeat to v2 -> brute-force tests -> re-dump features -> short ablation trains (1 group/arm) -> Optuna seed -> PBT -> commit the v2 engine change -> gate_nnue.py vs S57.
 
 ## KATA-FIRST DATASET v3 BUILT 2026-10-24 (dataset-only; NO training, NO engine labeling; details docs/KATA_FIRST_V3.md)
 - AUDIT: KataGo's own 200-visit TD value beats the v2 Ataxx raw relabel in every empties band vs the real result (MSE .008 vs .142 at <=4 empties, .143 vs .171 at 25-35). v2 had thrown TD away; own-game rows (36%) had a flat target (std .076).
