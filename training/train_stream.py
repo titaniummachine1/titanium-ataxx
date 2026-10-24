@@ -15,6 +15,35 @@ import train_full as T
 import torch
 
 
+class Lookahead:
+    def __init__(self, base, k=5, alpha=0.5):
+        self.base = base
+        self.k = max(1, int(k))
+        self.alpha = float(alpha)
+        self.n = 0
+        self.slow = [p.detach().clone() for g in base.param_groups for p in g['params']]
+
+    @property
+    def param_groups(self):
+        return self.base.param_groups
+
+    def zero_grad(self):
+        self.base.zero_grad()
+
+    def step(self):
+        self.base.step()
+        self.n += 1
+        if self.n % self.k:
+            return
+        i = 0
+        for g in self.base.param_groups:
+            for p in g['params']:
+                s = self.slow[i]
+                s.add_(self.alpha * (p.detach() - s))
+                p.data.copy_(s)
+                i += 1
+
+
 class MEMORYSTATUSEX(ctypes.Structure):
     _fields_ = [('dwLength', ctypes.c_ulong),
                 ('dwMemoryLoad', ctypes.c_ulong),
@@ -127,11 +156,14 @@ def main():
     ap.add_argument('--rows', type=int, default=0)
     ap.add_argument('--epochs', type=int, default=4)
     ap.add_argument('--chunk-rows', type=int, default=800000)
-    ap.add_argument('--opt', default='adam', choices=['sgd', 'adam', 'adamw', 'radam'])
+    ap.add_argument('--opt', default='adam', choices=['sgd', 'adam', 'adamw', 'radam', 'nadam'])
+    ap.add_argument('--lookahead', action='store_true')
+    ap.add_argument('--lookahead-k', type=int, default=5)
+    ap.add_argument('--lookahead-alpha', type=float, default=0.5)
     ap.add_argument('--opt-lr', type=float, default=0.001)
     ap.add_argument('--conv-lr', type=float, default=0.003)
     ap.add_argument('--wd', type=float, default=1e-6)
-    ap.add_argument('--freq-decay', type=float, default=2.0)
+    ap.add_argument('--freq-decay', type=float, default=0.0)
     ap.add_argument('--init', default='')
     ap.add_argument('--out', default='data/nnue/tupStream.tup')
     ap.add_argument('--ckpt', default='')
@@ -142,10 +174,30 @@ def main():
     ap.add_argument('--cyclic-lr-min', type=float, default=1e-5)
     ap.add_argument('--val-probe', default='')
     ap.add_argument('--agree-select', action='store_true')
-    ap.add_argument('--tcol', default='teacher', choices=['sc', 'teacher'])
+    ap.add_argument('--tcol', default='teacher', choices=['sc', 'teacher', 'titanium_cp'],
+                    help="target column: 'teacher' (precedence mix), 'sc' (legacy), "
+                         "'titanium_cp' (Titanium 5k search labels = Stockfish-style base stage)")
     ap.add_argument('--blend', type=float, default=1.0)
     ap.add_argument('--outcome-weight', type=float, default=0.0)
+    ap.add_argument('--wdl-loss', action='store_true')
+    ap.add_argument('--wdl-scale', type=float, default=400.0)
+    ap.add_argument('--outcome-col', default='out')
+    ap.add_argument('--teacher-prob-col', default='')
+    ap.add_argument('--weight-col', default='wsum', help='per-row sample weight column (v3: wsum3)')
+    ap.add_argument('--outcome-weight-col', default='',
+                    help='per-row outcome weight (lambda on the game result) column, e.g. ow_row; overrides --outcome-weight in the WDL target')
+    ap.add_argument('--resume', action='store_true',
+                    help='resume from a.out.resume.* files; bounds any kill loss to one chunk')
+    ap.add_argument('--mock-epoch', action='store_true',
+                    help='digest one full epoch forward-only (no backward/step/writes) and '
+                         'report rows + loss. Needs --sidecar-dir. NOT a training run.')
     ap.add_argument('--dirs', default='0,1,2,3')
+    ap.add_argument('--sidecar-dir', default='',
+                    help='pre-materialized SP/DE sidecars (training/materialize_sidecar.py); '
+                         'skips per-epoch features_for+materialize32. Must match --dirs and full rows.')
+    ap.add_argument('--debug-chunks', type=int, default=0,
+                    help='WIRING TEST ONLY: train only the first N chunks (partial epoch). '
+                         'Never use for a real run/candidate.')
     ap.add_argument('--seed', type=int, default=7)
     ap.add_argument('--threads', type=int, default=4)
     ap.add_argument('--min-free-mb', type=int, default=1200)
@@ -157,6 +209,9 @@ def main():
     np.random.seed(a.seed)
 
     z = np.load(a.cache)
+    outcol = a.outcome_col if a.outcome_col in z else 'out'
+    if a.wdl_loss and outcol not in z:
+        raise SystemExit('wdl-loss requires an outcome column (%s); no training without it' % a.outcome_col)
     occ0 = z['occ0'].astype(np.uint64)
     occ1 = z['occ1'].astype(np.uint64)
     blk = z['blk'].astype(np.uint64)
@@ -172,27 +227,36 @@ def main():
                   % (int(bad.sum()), len(raw_t), MATE_CAP), flush=True)
             occ0, occ1, blk, stm = occ0[~bad], occ1[~bad], blk[~bad], stm[~bad]
             z_teacher = raw_t[~bad]
-            z_out = (z['out'].astype(np.float64) if 'out' in z
+            z_out = (z[outcol].astype(np.float64) if outcol in z
                      else np.zeros(len(raw_t)))[~bad]
             z_sc = (z['sc'].astype(np.float64) if 'sc' in z else np.zeros(len(raw_t)))[~bad]
         else:
             z_teacher = raw_t
-            z_out = (z['out'].astype(np.float64) if 'out' in z
+            z_out = (z[outcol].astype(np.float64) if outcol in z
                      else np.zeros(len(raw_t)))
             z_sc = (z['sc'].astype(np.float64) if 'sc' in z else np.zeros(len(raw_t)))
     else:
         z_teacher = None
-        z_out = (z['out'].astype(np.float64) if 'out' in z
+        z_out = (z[outcol].astype(np.float64) if outcol in z
                  else np.zeros(len(occ0)))
         z_sc = (z['sc'].astype(np.float64) if 'sc' in z else np.zeros(len(occ0)))
     n = len(occ0)
     print('rows %d' % n, flush=True)
-    assert a.tcol in ('sc', 'teacher')
+    assert a.tcol in ('sc', 'teacher', 'titanium_cp')
     if a.tcol == 'teacher' and z_teacher is None:
         print('tcol=teacher requested but no teacher column: falling back to sc', flush=True)
         a.tcol = 'sc'
     if a.tcol == 'teacher':
         prime = np.clip(z_teacher * 1.0, -1500.0, 1500.0)
+    elif a.tcol == 'titanium_cp':
+        assert 'titanium_cp' in z, 'tcol=titanium_cp but cache has no titanium_cp column'
+        z_tcp = z['titanium_cp'].astype(np.float64)
+        if len(z_tcp) != n:
+            z_tcp = z_tcp[keep]
+        prime = np.clip(z_tcp, -1500.0, 1500.0)
+        print('base-stage target titanium_cp: mean %+.1f clipped to [-1500,1500] (%.1f%% rows at rail)'
+              % (prime.mean(), 100.0 * (np.abs(prime) >= 1500.0).mean()), flush=True)
+        del z_tcp
     else:
         prime = np.clip(z_sc * 2000.0, -1500.0, 1500.0)
         prime = prime[:n] if len(prime) != n else prime
@@ -209,13 +273,51 @@ def main():
     ow = float(a.outcome_weight)
     assert 0.0 <= ow <= 1.0
     best_cp = ((1.0 - ow) * score_cp + ow * outcome_cp).astype(np.float32) if ow > 0 else score_cp.astype(np.float32)
+    wdl_target = None
+    if a.wdl_loss:
+        if a.teacher_prob_col and a.teacher_prob_col not in z:
+            raise SystemExit('--teacher-prob-col %s not in cache (columns: %s); refusing the silent cp fallback'
+                             % (a.teacher_prob_col, ','.join(z.files)))
+        if a.teacher_prob_col:
+            tp = np.asarray(z[a.teacher_prob_col], dtype=np.float64)
+            if a.outcome_weight_col:
+                if a.outcome_weight_col not in z:
+                    raise SystemExit('--outcome-weight-col %s not in cache' % a.outcome_weight_col)
+                owr = np.asarray(z[a.outcome_weight_col], dtype=np.float64)
+                assert len(owr) == len(tp) == len(z_out) and (owr >= 0).all() and (owr <= 1).all()
+                wdl_target = ((1.0 - owr) * tp + owr * z_out).astype(np.float32)
+                print('per-row outcome weight %s: mean %.3f min %.3f max %.3f' % (
+                    a.outcome_weight_col, owr.mean(), owr.min(), owr.max()), flush=True)
+                del owr
+            else:
+                wdl_target = ((1.0 - ow) * tp + ow * z_out).astype(np.float32)
+            print('wdl-loss ON teacher-prob-col %s lambda %.2f target mean %.4f' % (
+                a.teacher_prob_col, 1.0 - ow, float(wdl_target.mean())), flush=True)
+        else:
+            wdl_target = ((1.0 - ow) * (1.0 / (1.0 + np.exp(-score_cp / a.wdl_scale)))
+                          + ow * z_out).astype(np.float32)
+        print('wdl-loss ON scale %.0f lambda %.2f target mean %.4f' % (
+            a.wdl_scale, 1.0 - ow, float(wdl_target.mean())), flush=True)
     print('outcome-weight %.2f' % ow, flush=True)
-    wsum_full = z['wsum'].astype(np.float64) if 'wsum' in z else None
+    if a.weight_col != 'wsum' and a.weight_col not in z:
+        raise SystemExit('--weight-col %s not in cache' % a.weight_col)
+    wsum_full = z[a.weight_col].astype(np.float64) if a.weight_col in z else None
     if wsum_full is not None:
         wsum_full = wsum_full[keep]
+    if 'teacher_kind' in z and wdl_target is not None and wsum_full is not None:
+        tk = z['teacher_kind'][keep]
+        for c, nm in ((1, 'kata'), (2, 'own/titanium5k'), (3, 'terminal')):
+            m = tk == c
+            if m.any():
+                print('target kind %d %-15s rows %9d  target mean %.3f std %.3f  weight share %.3f'
+                      % (c, nm, int(m.sum()), float(wdl_target[m].mean()), float(wdl_target[m].std()),
+                         float(wsum_full[m].sum() / wsum_full.sum())), flush=True)
+        del tk
     if a.rows:
         sel = np.random.choice(n, min(a.rows, n), replace=False)
         occ0, occ1, blk, stm, best_cp = occ0[sel], occ1[sel], blk[sel], stm[sel], best_cp[sel]
+        if wdl_target is not None:
+            wdl_target = wdl_target[sel]
         if wsum_full is not None:
             wsum_full = wsum_full[sel]
         sel = None
@@ -225,11 +327,29 @@ def main():
     del z, z_teacher, z_out, z_sc, score_cp, outcome_cp, prime, raw_t, keep
     gc.collect()
 
-    base = T.base_eval_stm(occ0, occ1, blk, stm)
+    base = None
+    if a.sidecar_dir:
+        import json as _jsonb
+        _manb = _jsonb.load(open(os.path.join(a.sidecar_dir, 'manifest.json')))
+        _bl = _manb.get('base', [])
+        if (_manb.get('dirs') == a.dirs and _manb.get('rows') == n and len(_bl)
+                and sum(c['hi'] - c['lo'] for c in _bl) == n
+                and all(os.path.exists(c['path']) for c in _bl)):
+            print('startup: loading precomputed base (%d chunks)...' % len(_bl), flush=True)
+            t_base = time.time()
+            base = np.concatenate([np.load(c['path'], mmap_mode='r')
+                                   for c in _bl]).astype(np.float32)
+            print('startup: precomputed base loaded (%.0fs)' % (time.time() - t_base), flush=True)
+    if base is None:
+        print('startup: base eval over %d rows...' % n, flush=True)
+        t_base = time.time()
+        base = T.base_eval_stm(occ0, occ1, blk, stm)
     assert abs(T.base_eval_stm(np.array([np.uint64(1 << 42)]), np.array([np.uint64(1 << 6)]),
                                np.array([np.uint64(0)]), np.array([0]))[0] - 150.0) < 1e-9
+    print('startup: base eval done (%.0fs)' % (time.time() - t_base), flush=True)
     resid = (best_cp - base).astype(np.float32)
     print('residual mean %+.1f std %.1f' % (resid.mean(), resid.std()), flush=True)
+    base_full = base if a.wdl_loss else None
     del base, best_cp
     gc.collect()
     if wsum_full is not None:
@@ -249,8 +369,12 @@ def main():
     cut = int(n * 0.95)
     tr, va = idx[:cut], idx[cut:]
     del idx
-    ytr_full = resid
+    ytr_full = wdl_target if a.wdl_loss else resid
     wtr_full = samp_w
+    base_tr = base_full[tr] if (base_full is not None and not a.sidecar_dir) else None
+    base_va = base_full[va] if base_full is not None else None
+    if not a.sidecar_dir:
+        del base_full
 
     active = [int(x) for x in a.dirs.split(',')]
     assert set(active) <= {0, 1, 2, 3} and active, a.dirs
@@ -258,6 +382,7 @@ def main():
     WDE = de_width(active)
     print('stream: dirs %s WSP %d WDE %d chunk %d' % (a.dirs, WSP, WDE, a.chunk_rows), flush=True)
 
+    print('startup: materializing val set (%d rows)...' % len(va), flush=True)
     t0 = time.time()
     fa = features_for(occ0[va], occ1[va], blk[va], stm[va])
     SPva, DEva = materialize32(*fa, active)
@@ -285,8 +410,8 @@ def main():
             len(AG['teach']), float(AG['teach'].mean())), flush=True)
 
     bags = torch.nn.ModuleList(
-        [torch.nn.EmbeddingBag(SP_N, 1, mode='sum', sparse=True),
-         torch.nn.EmbeddingBag(DE_N, 1, mode='sum', sparse=True)])
+        [torch.nn.EmbeddingBag(SP_N, 1, mode='sum', sparse=False),
+         torch.nn.EmbeddingBag(DE_N, 1, mode='sum', sparse=False)])
     for bg in bags:
         torch.nn.init.zeros_(bg.weight)
     bias = torch.nn.Parameter(torch.zeros(1))
@@ -296,9 +421,15 @@ def main():
     elif a.opt == 'adam':
         opt = torch.optim.Adam(groups, lr=a.opt_lr, weight_decay=0.0)
     elif a.opt == 'adamw':
-        opt = torch.optim.AdamW(groups, lr=a.opt_lr, weight_decay=a.wd)
+        opt = torch.optim.AdamW(groups, lr=a.opt_lr, weight_decay=0.0)
+    elif a.opt == 'radam':
+        opt = torch.optim.RAdam(groups, lr=a.opt_lr, weight_decay=0.0)
+    elif a.opt == 'nadam':
+        opt = torch.optim.NAdam(groups, lr=a.opt_lr, weight_decay=0.0)
     else:
-        opt = torch.optim.RAdam(groups, lr=a.opt_lr, weight_decay=a.wd)
+        raise ValueError(a.opt)
+    if a.lookahead:
+        opt = Lookahead(opt, a.lookahead_k, a.lookahead_alpha)
     fdec = float(a.freq_decay)
     freq = None
     if fdec > 0:
@@ -325,6 +456,8 @@ def main():
             de[DE_OFF['convthem']].zero_()
 
     if a.init:
+        print('startup: loading warm-start %s...' % a.init, flush=True)
+        t_init = time.time()
         b0, ws0, wps0, rest0, cc0, pa0 = T.load_tup(a.init)
         with torch.no_grad():
             W, D = bags[0].weight, bags[1].weight
@@ -348,7 +481,7 @@ def main():
             if pa0 is not None:
                 W[SP_OFF['pa']:SP_OFF['pa'] + 80 * 6561].copy_(torch.from_numpy(pa0.reshape(-1, 1)))
         zero_constrained()
-        print('warm start from %s' % a.init, flush=True)
+        print('warm start from %s (%.0fs)' % (a.init, time.time() - t_init), flush=True)
 
     def forward(Xsp, Xde):
         return bags[0](Xsp).squeeze(1) + bags[1](Xde).squeeze(1) + bias
@@ -388,14 +521,61 @@ def main():
         payload += q16(wcu) + q16(wct) + q16(wvu) + q16(wvt)
         q8 = lambda arr: bytes(bytearray([(max(-127, min(127, int(round(v)))) & 0xFF) for v in arr]))
         payload += q8(wpa)
-        with open(path, 'wb') as f:
+        tmp = path + '.tmp'
+        with open(tmp, 'wb') as f:
             f.write(b'TUP7' + payload)
+        os.replace(tmp, path)
         print('wrote %s %.1fKB dirs %s TUP7' % (path, os.path.getsize(path) / 1024, a.dirs), flush=True)
 
     bs = 4096
     ntr = len(tr)
     bounds = [(lo, min(lo + a.chunk_rows, ntr)) for lo in range(0, ntr, a.chunk_rows)]
     print('chunks %d x ~%d rows, epochs %d' % (len(bounds), a.chunk_rows, a.epochs), flush=True)
+
+    SC = None
+    if a.sidecar_dir:
+        import json as _json
+        man = _json.load(open(os.path.join(a.sidecar_dir, 'manifest.json')))
+        assert man['dirs'] == a.dirs, 'sidecar dirs %s != trainer dirs %s' % (man['dirs'], a.dirs)
+        assert man['rows'] == n, 'sidecar rows %d != cache rows %d' % (man['rows'], n)
+        assert man['WSP'] == WSP and man['WDE'] == WDE, 'sidecar width drift'
+        assert len(man['chunks']) * 0 + sum(c['hi'] - c['lo'] for c in man['chunks']) == n, \
+            'sidecar chunks do not cover all rows'
+        SC = [(c['lo'], c['hi'],
+               np.load(c['sp'], mmap_mode='r'), np.load(c['de'], mmap_mode='r'))
+              for c in man['chunks']]
+        print('sidecar: %d chunks mapped, per-epoch features_for+materialize32 OFF'
+              % len(SC), flush=True)
+
+    if SC is not None:
+        # Sequential sidecar-chunk loop: shuffled chunk order per epoch + in-chunk
+        # shuffle in train_pass. Random fancy-gather across the 56GB sidecar
+        # page-faults (~320s/800k cold); sequential slices stream at disk speed.
+        bounds = [(lo, hi) for (lo, hi, _, _) in SC]
+        srt = np.sort(tr)
+        print('sidecar loop: %d chunk-aligned bounds over sorted train rows' % len(bounds),
+              flush=True)
+
+    def sidecar_slice(lo, hi):
+        SPm = DEm = None
+        for (clo, chi, SPm_c, DEm_c) in SC:
+            if clo == lo and chi == hi:
+                SPm, DEm = SPm_c, DEm_c
+                break
+        assert SPm is not None, 'sidecar chunk %d-%d missing' % (lo, hi)
+        # Whole-chunk sequential read (disk-speed) then in-RAM mask.
+        # Fancy-indexing the mmap directly page-faults (~8s/40k rows cold).
+        SPf = np.asarray(SPm)
+        DEf = np.asarray(DEm)
+        a = int(np.searchsorted(srt, lo))
+        b = int(np.searchsorted(srt, hi))
+        local = srt[a:b] - lo
+        return SPf[local], DEf[local], srt[a:b]
+
+    if a.debug_chunks:
+        print('WARNING debug-chunks %d/%d: PARTIAL EPOCH, wiring test only'
+              % (a.debug_chunks, len(bounds)), flush=True)
+        bounds = bounds[:a.debug_chunks]
 
     cyc_on = a.cyclic_T0 > 0
     cyc_T, cyc_Ti = 0, max(a.cyclic_T0, 1)
@@ -406,8 +586,65 @@ def main():
     best_state = None
     best_agree = [float('inf')]
     rng = np.random.RandomState(a.seed)
+    # Crash-safe resume: manifest + float weights + best weights, all tmp+replace.
+    rmeta, rw, rb = a.out + '.resume_pt', a.out + '.resume_w.pt', a.out + '.resume_best.pt'
+    ep_start, resume_order, resume_done = 1, None, set()
+    resume_tot, resume_cnt = 0.0, 0
+    if a.resume and os.path.exists(rmeta):
+        try:
+            rm = torch.load(rmeta, map_location='cpu', weights_only=False)
+        except Exception as e:
+            rm = None
+            print('resume files unreadable, starting clean: %s' % e, flush=True)
+        if rm is not None and rm.get('cache') == a.cache and rm.get('seed') == a.seed and rm.get('dirs') == a.dirs and rm.get('sidecar', '') == a.sidecar_dir:
+            ep_start = int(rm['ep'])
+            resume_order = [int(x) for x in rm['order']]
+            resume_done = set(int(x) for x in rm['done'])
+            best_val, best_ep, prev_val, stale = rm['best_val'], rm['best_ep'], rm['prev_val'], rm['stale']
+            cyc_T, cyc_Ti = int(rm.get('cyc_T', cyc_T)), int(rm.get('cyc_Ti', cyc_Ti))
+            resume_tot, resume_cnt = float(rm.get('tot', 0.0)), int(rm.get('cnt', 0))
+            w = torch.load(rw, map_location='cpu')
+            with torch.no_grad():
+                for bg, ww in zip(bags, w[:-1]):
+                    bg.weight.copy_(ww)
+                bias.copy_(w[-1])
+            zero_constrained()
+            if os.path.exists(rb):
+                bw = torch.load(rb, map_location='cpu')
+                best_state = ([t.clone() for t in bw[0]], bw[1].clone())
+            print('resumed weights at ep %d (%d chunks already banked)' % (ep_start, len(resume_done)), flush=True)
+        else:
+            print('resume files present but args mismatch: starting clean', flush=True)
 
-    def train_pass(SPc, DEc, wc, yc):
+    if a.mock_epoch:
+        assert SC is not None, '--mock-epoch needs --sidecar-dir'
+        print('mock epoch: forward-only, no updates, no writes', flush=True)
+        tot, cnt, t0 = 0.0, 0, time.time()
+        with torch.no_grad():
+            for gi, (lo, hi) in enumerate(bounds):
+                SPc, DEc, rows = sidecar_slice(lo, hi)
+                wc = torch.from_numpy(wtr_full[rows])
+                yc = torch.from_numpy(ytr_full[rows])
+                bc = torch.from_numpy(base_full[rows]) if base_full is not None else None
+                for j in range(0, len(SPc), 100000):
+                    e = min(len(SPc), j + 100000)
+                    Xsp = torch.from_numpy(SPc[j:e].astype(np.int64))
+                    Xde = torch.from_numpy(DEc[j:e].astype(np.int64))
+                    pv = forward(Xsp, Xde)
+                    if a.wdl_loss:
+                        pv = torch.sigmoid((torch.from_numpy(bc[j:e]) + pv) / a.wdl_scale)
+                    tot += (((pv - yc[j:e]) ** 2) * wc[j:e]).sum().item()
+                    cnt += e - j
+                del SPc, DEc, wc, yc, bc
+                gc.collect()
+                print('  mock chunk %d/%d rows %d digested %d/%d loss %.6f (%.0fs)'
+                      % (gi + 1, len(bounds), len(rows), cnt, ntr, tot / max(cnt, 1),
+                         time.time() - t0), flush=True)
+        print('mock epoch done: digested %d/%d rows loss %.6f (%.0fs) NO UPDATES NO WRITES'
+              % (cnt, ntr, tot / max(cnt, 1), time.time() - t0), flush=True)
+        return
+
+    def train_pass(SPc, DEc, wc, yc, basec=None):
         nc = len(SPc)
         perm = torch.randperm(nc)
         tot, cnt = 0.0, 0
@@ -422,9 +659,14 @@ def main():
                     freq[1] += torch.bincount(Xde.flatten(), minlength=DE_N).float()
             opt.zero_grad()
             pred = forward(Xsp, Xde)
-            l2 = sum((bg.weight ** 2).sum() for bg in bags)
+            l2 = sum((bg.weight ** 2).sum() for bg in bags) if a.wd else 0.0
             wb = wc[b]
-            loss = ((pred - yc[b]) ** 2 * wb).mean() + a.wd * l2
+            if a.wdl_loss:
+                bc = torch.from_numpy(basec[bn])
+                p = torch.sigmoid((bc + pred) / a.wdl_scale)
+                loss = ((p - yc[b]) ** 2 * wb).mean() + a.wd * l2
+            else:
+                loss = ((pred - yc[b]) ** 2 * wb).mean() + a.wd * l2
             loss.backward()
             opt.step()
             zero_constrained()
@@ -441,14 +683,26 @@ def main():
             cnt += len(b)
         return tot, cnt
 
-    for ep in range(1, max_ep + 1):
+    print('startup: complete, entering epoch loop (ep %d-%d)' % (ep_start, max_ep), flush=True)
+    for ep in range(ep_start, max_ep + 1):
         t0 = time.time()
         for bg in bags:
             bg.train()
-        tot, cnt = 0.0, 0
-        order = rng.permutation(len(bounds))
+        if a.resume and resume_order is not None and ep == ep_start:
+            order = np.asarray(resume_order)
+            done = set(resume_done)
+            tot, cnt = resume_tot, resume_cnt
+            print('resuming ep %d, skipping %d/%d chunks' % (ep, len(done), len(order)), flush=True)
+        else:
+            tot, cnt = 0.0, 0
+            order = rng.permutation(len(bounds))
+            done = set()
         t_feat, t_mat, t_tr = 0.0, 0.0, 0.0
+        n_seen = len(done)
         for ci in order:
+            ci = int(ci)
+            if ci in done:
+                continue
             lo, hi = bounds[ci]
             if free_gb() * 1024.0 < a.min_free_mb:
                 print('RAM GUARD: free %.0fMB < %dMB before chunk %d/%d'
@@ -461,26 +715,62 @@ def main():
                     zero_constrained()
                 dump_tup(a.out)
                 return
-            rows = tr[lo:hi]
-            tf = time.time()
-            feats = features_for(occ0[rows], occ1[rows], blk[rows], stm[rows])
-            t_feat += time.time() - tf
-            tm = time.time()
-            SPc, DEc = materialize32(*feats, active)
-            del feats
-            gc.collect()
-            t_mat += time.time() - tm
+            if SC is not None:
+                ts = time.time()
+                SPc, DEc, rows = sidecar_slice(lo, hi)
+                t_feat += time.time() - ts
+            else:
+                rows = tr[lo:hi]
+                tf = time.time()
+                feats = features_for(occ0[rows], occ1[rows], blk[rows], stm[rows])
+                t_feat += time.time() - tf
+                tm = time.time()
+                SPc, DEc = materialize32(*feats, active)
+                del feats
+                gc.collect()
+                t_mat += time.time() - tm
             tt = time.time()
             wc = torch.from_numpy(wtr_full[rows])
             yc = torch.from_numpy(ytr_full[rows])
-            t_, c_ = train_pass(SPc, DEc, wc, yc)
+            if SC is not None:
+                bc = base_full[rows] if base_full is not None else None
+            else:
+                bc = base_tr[lo:hi] if base_tr is not None else None
+            # Zero-weight rows (e.g. --weight-col wsum_kataonly) carry no gradient; training on them only
+            # wastes time and lets Adam's momentum drift the weights on all-zero steps -> drop them.
+            nz = wtr_full[rows] > 0
+            if not nz.all():
+                nzt = torch.from_numpy(nz)
+                SPc, DEc, wc, yc = SPc[nz], DEc[nz], wc[nzt], yc[nzt]
+                if bc is not None:
+                    bc = bc[nz]
+            t_, c_ = train_pass(SPc, DEc, wc, yc, bc)
             tot += t_
             cnt += c_
             t_tr += time.time() - tt
             del SPc, DEc, wc, yc
             gc.collect()
-            print('  ep %d chunk %d/%d rows %d feat %.0fs mat %.0fs train %.0fs free %.1fGB'
-                  % (ep, ci + 1, len(bounds), hi - lo, t_feat, t_mat, t_tr, free_gb()), flush=True)
+            n_seen += 1
+            print('  ep %d chunk %d/%d rows %d feat %.0fs mat %.0fs train %.0fs free %.1fGB train_mse %.4f (ep_avg %.4f)'
+                  % (ep, n_seen, len(bounds), len(rows), t_feat, t_mat, t_tr, free_gb(),
+                     t_ / max(c_, 1), tot / max(cnt, 1)), flush=True)
+            if a.resume:
+                # Bank this chunk: current weights + manifest, both tmp+replace.
+                # A kill can never cost more than the in-flight chunk.
+                with torch.no_grad():
+                    torch.save([bg.weight.detach().cpu() for bg in bags] + [bias.detach().cpu()], rw + '.tmp')
+                os.replace(rw + '.tmp', rw)
+                if best_state is not None:
+                    with torch.no_grad():
+                        torch.save([[t.detach().cpu() for t in best_state[0]], best_state[1].detach().cpu()], rb + '.tmp')
+                    os.replace(rb + '.tmp', rb)
+                done.add(ci)
+                torch.save({'ep': ep, 'order': [int(x) for x in order], 'done': sorted(done),
+                            'best_val': best_val, 'best_ep': best_ep, 'prev_val': prev_val, 'stale': stale,
+                            'cyc_T': cyc_T, 'cyc_Ti': cyc_Ti, 'tot': tot, 'cnt': cnt,
+                            'cache': a.cache, 'seed': a.seed, 'dirs': a.dirs,
+                            'sidecar': a.sidecar_dir}, rmeta + '.tmp')
+                os.replace(rmeta + '.tmp', rmeta)
         for bg in bags:
             bg.eval()
         with torch.no_grad():
@@ -490,6 +780,8 @@ def main():
                 Xsp = torch.from_numpy(SPva[j:j + nv].astype(np.int64))
                 Xde = torch.from_numpy(DEva[j:j + nv].astype(np.int64))
                 pv = forward(Xsp, Xde)
+                if a.wdl_loss:
+                    pv = torch.sigmoid((torch.from_numpy(base_va[j:j + nv]) + pv) / a.wdl_scale)
                 wv = wva[j:j + nv]
                 totv += (((pv - yva[j:j + nv]) ** 2) * wv).sum().item()
                 cntv += nv
@@ -552,7 +844,7 @@ def main():
             stale += 1
         else:
             stale = 0
-        print('epoch %d train_mse %.1f val_mse %.1f%s rel_improv %+.2e bias %+.1f lr %.5f (%.0fs)%s%s'
+        print('epoch %d train_mse %.6f val_mse %.6f%s rel_improv %+.2e bias %+.1f lr %.5f (%.0fs)%s%s'
               % (ep, tot / max(cnt, 1), vmse, agree_msg, improv, bias.item(),
                  opt.param_groups[0]['lr'], time.time() - t0, tag, cyc_msg), flush=True)
         prev_val = vmse
@@ -564,6 +856,11 @@ def main():
         dump_tup(a.out)
     else:
         print('stream: best ep %d val %.1f -> %s' % (best_ep, best_val, a.out), flush=True)
+    for _f in (rmeta, rw, rb):
+        try:
+            os.remove(_f)
+        except OSError:
+            pass
 
 
 if __name__ == '__main__':

@@ -15,6 +15,8 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 
 ## 2. Where the strongest engine lives (do not guess)
 
+- **UPDATE 2026-10-24 (read with HANDOFFS top entry): strongest is still main 298b7ae + S57. A real NNUE is in progress on branch `exp/nnue` (worktree `C:\gitProjects\nnue-ataxx`, uncommitted). Its design must follow `docs/NET_ANALYSIS.md` (what Kata/Ataxx_CPP/Moonbird/autaxx/Stockfish look at, anchor test, policies). Titanium 5k labels = BASE stage data, KataGo = TEACHER.**
+- **UPDATE 2026-10-23 (supersedes the bullet below): strongest = `main-ataxx` 298b7ae (S57) + net `data/nnue/final_v2_wdl_ep8.tup` (sha 53F2B29C, main default name tupS57v2.tup). Dataset v3 plan + the Ataxx_CPP/Kata findings: `docs/AXNET_PROBE.md` (read it for any teacher/eval/dataset work).**
 - `main @ 73a859d` + default net `data/nnue/tupS55tree.tup` (726440 B,
   sha256 `F66A00FE…899D7C`) is the STRONGEST. `main` default eval IS that net.
 - THIS folder is usually on an `exp/*` branch (e.g. `exp/search-buckets`),
@@ -54,16 +56,22 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 8. **ONE variant per binary.** Experiments live on branches, not flags in hot path.
 9. **TRASH UNTIL PROVEN.** Microbenchmarks don't crown — alternating `sperft`
    pairs + real SPRT do. Single/min-of-N probes are jitter.
-10. **GATE LAW v4 / SPRT:** `training/gate_check.py --cand <tag>` recomputes
-    LLR (H0 elo≤0 vs H1 elo≥20); PASS needs LLR ≥ +2.94. Merge needs tripwire +
-    explicit user approval naming branch/net + LEDGER promotion row with DB
-    entries. `training/results.py backfill` parses `logs/*.txt` into
-    `data/nnue/results.db`. (Both scripts currently missing on some branches
-    — hand-compute LLR + seat counts and note it until restored.)
+10. **GATE LAW v5 / OBJECTIVELY BETTER (user order 2026-10-22, replaces the
+    old +20 Elo / +2.94 LLR threshold):** the gate asks only "is it better
+    than main (elo > 0)?" — NO fixed magnitude. PASS when the 95% CI lower
+    bound on score clears 0.5. `training/gate_summary.py` computes W/L/D, seat
+    balance, score, Elo, CI from match logs. Merge needs tripwire + explicit
+    user approval naming branch/net + LEDGER promotion row. (gate_check.py /
+    results.py may be absent on some branches — use gate_summary.py and note
+    it.)
 11. **NO REJECTION WHILE FOMO LIVES.** Undertrained net that loses stays
     PARKED, never rejected. **ENGINE ADAPTS TO NET** — never strip/convert a
     net blob to fit a loader. Load-time allzero skips (W4 has_q2) are NOT
     damage: path stays intact, nonzero weights take the full path.
+
+12. **(2026-10-24, BEHAVIOR 19-22)** Titanium 5k labels = BASE data, KataGo = TEACHER;
+    no spiralling (one plan, explicit go); protect the 16 GB box (RAM checks, no 13 GB memmap);
+    research before building (values AND policies of the strong engines, docs/NET_ANALYSIS.md).
 
 ## 4. Rules: two of them (do not mix)
 
@@ -104,6 +112,9 @@ python training/bundle_botzone.py; python training/verify_bundle.py
 ```
 
 ## 7. Box traps (do not relearn)
+- RAM (16 GB): never hold a whole multi-GB npz + temporaries (np.savez(**cols)) -> swap freeze/crash (2026-10-24). Never np.memmap a 13 GB file in a long run (pinned working set grew to 10.7 GB); read chunks with file reads. Check `GlobalMemoryStatusEx` available RAM before and during big jobs.
+- `npz[key]` re-reads the whole array from the zip on EVERY access: load columns once into variables.
+- Moonbird exe = tag 1.1.0 (2.58 MB eval); `data/engines/moonbird_src` is a newer unreleased checkout.
 - Edit preserves mtime → `os.utime` after EVERY edit, verify `git diff`.
 - Stale `training/__pycache__` after mtime-preserving edits → delete it.
 - `place_bench` orphans accumulate → `taskkill /F /IM titanium-cli.exe /T`;
@@ -135,3 +146,5 @@ python training/bundle_botzone.py; python training/verify_bundle.py
 - A compaction plugin (`.opencode/plugins/session-guard.ts`) forces the
   summarizer to preserve branch, dirty files, strongest-build pointer,
   HANDOFFS head, law changes, and what's owed.
+
+Decisions live in docs/DECISIONS.md: nothing counts as the user-signed unless signed there; agent rows default NEEDS-REVERIFICATION (BEHAVIOR law 18).

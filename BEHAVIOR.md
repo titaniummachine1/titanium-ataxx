@@ -58,8 +58,12 @@ real memory. Update them the moment something happens, not at the end.
     Extends law 6: time gates (100ms AND 200ms) are the crown, 5k nodes is
     the quality diagnosis.
 8. **NEVER REJECT ON A DIP — EXTEND BOTH WAYS (SPRT gate law, user order
-    2026-10-19).** Every gate is SPRT (LLR H0 elo≤0 vs H1 elo≥20, PASS at
-    ≥ +2.94). Elo/score IS the metric — it tells ahead from behind and it
+    2026-10-19; threshold amended 2026-10-22 by user order "i said better
+    objectively not some specific amount of advantage").** The gate asks ONE
+    question: is the build objectively better than main (elo > 0)? There is NO
+    fixed Elo magnitude. PASS when the 95% CI lower bound on score clears 0.5
+    (one-sided test against 0.5). LLR/Elo are reported as data, never as a
+    fixed pass threshold. Elo/score IS the metric — it tells ahead from behind and it
     is the most important number on the board — but the gate proves
     DIRECTION (better or worse than main), never magnitude (no one proves
     "how much Elo it gained"). AHEAD but proof insufficient → EXTEND (more
@@ -239,3 +243,45 @@ real memory. Update them the moment something happens, not at the end.
   code pushes, blobs stay local.
 - Update LEDGER (experiment row), HANDOFFS (state), BEHAVIOR (this file)
   in the same session as the work, not later.
+
+## Standing orders added 2026-10-22 (user orders, same weight as iron laws)
+
+14. **NO TRAINING WITHOUT A READY DATASET + EXPLICIT ORDER.** A training run
+    starts only when (a) the dataset audit script prints ok=true on the exact
+    files about to be trained, and (b) the user explicitly says "train".
+    Finishing dataset prep never authorizes training. Dataset work and
+    training are different jobs.
+15. **ONE JOB AT A TIME.** Exactly one long-running task on the box. A new
+    task starts only after the previous one is verified dead (empty process
+    list), never on assumption. No competing relabel/train/label jobs.
+16. **NO RESTARTS, ONLY RESUMES.** Every long job must be resumable
+    (chunked outputs, skip-if-exists, tmp+rename atomic writes, resume
+    manifests) BEFORE its first long run. A kill may cost at most one
+    in-flight chunk. Proof = a kill test, not a claim.
+17. **BYTES ARE THE RECEIPT.** Every claim points at a file/log line: audit
+    JSON, gate log, checkpoint with timestamp, manifest with hashes. No
+    artifact, no claim. Validation loss never crowns anything; only
+    paired-book games do.
+18. **EVERY DECISION IS SIGNED.** No decision counts as the user's unless the
+    user explicitly signed it (docs/DECISIONS.md). Agent-origin rows default to
+    NEEDS-REVERIFICATION regardless of age. Lifecycle: PROPOSED -> TESTED ->
+    EXPLAINED (user confirms understanding) -> SIGNED or SENT BACK.
+    Presenting an old agent decision as the user's is a violation. No status
+    claim without the tool call behind it in the same turn.
+
+## Standing orders added 2026-10-24 (user orders, same weight as iron laws)
+
+19. **TITANIUM LABELS ARE BASE DATA, KATAGO IS THE TEACHER.** Titanium 5k search
+    labels are the Stockfish base stage (stage 1, whole dataset); they are never
+    called or weighted as a teacher. KataGo's own 200-visit search values are the
+    teacher (stage 2, Kata rows). Use Kata data wherever it exists.
+20. **NO SPIRALLING.** One agreed plan, explicit go, one job, leave it running.
+    Never start relabels/trainings/mock runs the user did not order; never flip
+    between runs on my own reading of the latest sentence. Talk plainly.
+21. **PROTECT THE BOX (16 GB).** Check available RAM before and during big jobs;
+    stream big files; never memmap a multi-GB file in a long loop; RAM guards.
+    (2026-10-24: a dataset build crashed the PC.)
+22. **RESEARCH BEFORE BUILDING.** Before designing eval/NNUE inputs, take the
+    strong engines apart (source, exact eval reproduction, internals, VALUES AND
+    POLICIES) and test each design choice against them. State what was not
+    analysed; never call research done with gaps (docs/NET_ANALYSIS.md).

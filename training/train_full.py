@@ -864,9 +864,9 @@ def main():
         if a.opt == 'adam':
             return torch.optim.Adam(groups, lr=lr, weight_decay=0.0)
         if a.opt == 'adamw':
-            return torch.optim.AdamW(groups, lr=lr, weight_decay=a.decay)
+            return torch.optim.AdamW(groups, lr=lr, weight_decay=0.0)
         if a.opt == 'radam':
-            return torch.optim.RAdam(groups, lr=lr, weight_decay=a.decay)
+            return torch.optim.RAdam(groups, lr=lr, weight_decay=0.0)
         raise ValueError(a.opt)
 
     opt = make_opt(a, bags, bias)
