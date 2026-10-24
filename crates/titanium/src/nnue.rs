@@ -20,6 +20,8 @@ use crate::nnfeat::{self, MAX_ACTIVE};
 pub const QA: i32 = 1024;
 const MAX_W: usize = 1024;
 const MAX_H: usize = 64;
+/// prefetch distance (features ahead) for the feature-transformer rows
+const PF: usize = 8;
 
 pub struct Nnue {
     pub num_feats: usize,
@@ -45,6 +47,8 @@ pub struct Nnue {
     ftbq: Vec<i16>,
     /// l1 weights transposed per bucket: [bucket][din][l1] (one contiguous l1 column per input, for sparse L1)
     l1_wt: Vec<f32>,
+    /// psqt transposed: [bucket][feature] (one bucket's column is contiguous: ~105 KB, stays in L2)
+    psqt_t: Vec<f32>,
 }
 
 impl Nnue {
@@ -86,6 +90,7 @@ impl Nnue {
             ftq: Vec::new(),
             ftbq: Vec::new(),
             l1_wt: Vec::new(),
+            psqt_t: Vec::new(),
             num_feats,
             width,
             l1,
@@ -118,6 +123,13 @@ impl Nnue {
             }
         }
         net.l1_wt = t;
+        let mut pt = vec![0f32; net.buckets * net.num_feats];
+        for f in 0..net.num_feats {
+            for bk in 0..net.buckets {
+                pt[bk * net.num_feats + f] = net.psqt[f * net.buckets + bk];
+            }
+        }
+        net.psqt_t = pt;
         Ok(net)
     }
 
@@ -128,56 +140,115 @@ impl Nnue {
         let w = self.width;
         let empties = b.empty().count_ones() as usize;
         let bucket = (empties * self.buckets / 50).min(self.buckets - 1);
+        let pst = &self.psqt_t[bucket * self.num_feats..(bucket + 1) * self.num_feats];
         let mut acc = [[0i16; MAX_W]; 2];
         let mut ps = [0f32; 2];
         for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
             let a = &mut acc[half][..w];
             a.copy_from_slice(&self.ftbq);
-            for &f in &idx[..n] {
-                let row = &self.ftq[f as usize * w..(f as usize + 1) * w];
+            let idx = &idx[..n];
+            for k in 0..n {
+                // the 13 MB row table misses cache: request the row PF features ahead while adding this one
+                if k + PF < n {
+                    self.prefetch_row(idx[k + PF] as usize);
+                }
+                let f = idx[k] as usize;
+                let row = &self.ftq[f * w..(f + 1) * w];
                 for (x, r) in a.iter_mut().zip(row) {
                     *x = x.wrapping_add(*r);
                 }
-                ps[half] += self.psqt[f as usize * self.buckets + bucket];
+                ps[half] += pst[f];
             }
         }
         self.head(&acc, bucket, ps, s57)
     }
 
+    pub fn bench_ft(&self, b: &Board) -> i32 {
+        let (us, nu, them, nt) = nnfeat::both(b, self.groups);
+        let w = self.width;
+        let empties = b.empty().count_ones() as usize;
+        let bucket = (empties * self.buckets / 50).min(self.buckets - 1);
+        let pst = &self.psqt_t[bucket * self.num_feats..(bucket + 1) * self.num_feats];
+        let mut acc = [[0i16; MAX_W]; 2];
+        let mut ps = [0f32; 2];
+        for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
+            let a = &mut acc[half][..w];
+            a.copy_from_slice(&self.ftbq);
+            let idx = &idx[..n];
+            for k in 0..n {
+                if k + PF < n { self.prefetch_row(idx[k + PF] as usize); }
+                let f = idx[k] as usize;
+                let row = &self.ftq[f * w..(f + 1) * w];
+                for (x, r) in a.iter_mut().zip(row) { *x = x.wrapping_add(*r); }
+                ps[half] += pst[f];
+            }
+        }
+        std::hint::black_box(&acc);
+        acc[0][3] as i32 + acc[1][5] as i32 + ps[0] as i32
+    }
+    #[inline(always)]
+    fn prefetch_row(&self, f: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let base = self.ftq.as_ptr().wrapping_add(f * self.width) as *const i8;
+            let bytes = self.width * 2;
+            let mut o = 0;
+            while o < bytes {
+                // SAFETY: prefetch is a hint; it never faults, even on an out-of-range address.
+                unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(base.wrapping_add(o)) };
+                o += 64;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = f;
+    }
+
     /// Everything after the feature transformer: int16 accumulators -> activations -> sparse L1 -> L2 -> output.
+    /// Activations are computed on the fly (no zeroed scratch array); arithmetic and order are exactly as before.
     fn head(&self, acc: &[[i16; MAX_W]; 2], bucket: usize, ps: [f32; 2], s57: f32) -> f32 {
         let w = self.width;
         let inv = 1.0 / QA as f32;
         let qa = QA as i16;
-        let mut x = [0f32; 2 * MAX_W];
-        let din = if self.pairwise {
+        let l1 = self.l1;
+        let mut h1 = [0f32; MAX_H];
+        h1[..l1].copy_from_slice(&self.l1_b[bucket * l1..(bucket + 1) * l1]);
+        let din = if self.pairwise { w } else { 2 * w };
+        let base = bucket * din * l1;
+        // nonzero inputs collected branch-free (no mispredicts on the ~86% zeros), then summed in ascending input order:
+        // exactly the terms and order of the plain sparse loop, so the result is bit-identical
+        let mut nz = [0u16; 2 * MAX_W];
+        let mut cnt = 0usize;
+        if self.pairwise {
             let h = w / 2;
             for half in 0..2 {
                 let a = &acc[half];
                 for j in 0..h {
-                    x[half * h + j] = (a[j].clamp(0, qa) as f32 * inv) * (a[h + j].clamp(0, qa) as f32 * inv);
+                    nz[cnt] = (half * h + j) as u16;
+                    cnt += (a[j] > 0 && a[h + j] > 0) as usize;
                 }
             }
-            w
         } else {
             for half in 0..2 {
+                let a = &acc[half];
                 for j in 0..w {
-                    x[half * w + j] = acc[half][j].clamp(0, qa) as f32 * inv;
+                    nz[cnt] = (half * w + j) as u16;
+                    cnt += (a[j] > 0) as usize;
                 }
             }
-            2 * w
-        };
-        // sparse L1: only nonzero inputs, each adds one contiguous column of l1 weights
-        let l1 = self.l1;
-        let mut h1 = [0f32; MAX_H];
-        h1[..l1].copy_from_slice(&self.l1_b[bucket * l1..(bucket + 1) * l1]);
-        let base = bucket * din * l1;
-        for (i, &v) in x[..din].iter().enumerate() {
-            if v != 0.0 {
-                let col = &self.l1_wt[base + i * l1..base + (i + 1) * l1];
-                for (h, c) in h1[..l1].iter_mut().zip(col) {
-                    *h += v * c;
-                }
+        }
+        for &i in &nz[..cnt] {
+            let i = i as usize;
+            let v = if self.pairwise {
+                let h = w / 2;
+                let (half, j) = (i / h, i % h);
+                let a = &acc[half];
+                (a[j].clamp(0, qa) as f32 * inv) * (a[h + j].clamp(0, qa) as f32 * inv)
+            } else {
+                acc[i / w][i % w].clamp(0, qa) as f32 * inv
+            };
+            let col = &self.l1_wt[base + i * l1..base + (i + 1) * l1];
+            for (h, c) in h1[..l1].iter_mut().zip(col) {
+                *h += v * c;
             }
         }
         for h in h1[..l1].iter_mut() {

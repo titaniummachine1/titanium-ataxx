@@ -50,6 +50,7 @@ fn main() -> ExitCode {
         "nnbench" => nnbench_cmd(flag_str(&args, "--boards"), flag_str(&args, "--tuple"), flag_str(&args, "--nnue")),
         "nndump" => nndump_cmd(flag_str(&args, "--in"), flag_str(&args, "--out")),
         "s57dump" => s57dump_cmd(flag_str(&args, "--in"), flag_str(&args, "--out"), flag_str(&args, "--tuple")),
+        "nnevaldump" => nnevaldump_cmd(flag_str(&args, "--nnue"), flag_str(&args, "--boards")),
         "nneval" => nneval_cmd(flag_str(&args, "--nnue"), flag_str(&args, "--boards"), flag_str(&args, "--tuple")),
         "play" => play_cmd(flag_int(&args, "--time").unwrap_or(1000) as u64),
         "show" => show_cmd(),
@@ -569,6 +570,19 @@ fn s57dump_cmd(inp: Option<String>, out: Option<String>, tup_spec: Option<String
 }
 
 /// exp/nnue parity check: lines "<49 chars> <b|w> <expected cp>" (export_nnue.py .ref.txt) -> max |diff|.
+/// exp/nnue-speed: one fast-path eval per board line (bit-identity check across optimisations).
+fn nnevaldump_cmd(nn: Option<String>, boards: Option<String>) -> ExitCode {
+    let net = titanium::nnue::Nnue::load(&nn.expect("--nnue")).expect("nnue");
+    let text = fs::read_to_string(boards.expect("--boards")).expect("boards");
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    for line in text.lines() {
+        let Some(b) = Board::from_str(line.trim()) else { continue };
+        use std::io::Write as _;
+        let _ = writeln!(out, "{}", net.forward(&b, 0.0).to_bits());
+    }
+    ExitCode::SUCCESS
+}
+
 fn nneval_cmd(nn: Option<String>, boards: Option<String>, tup_spec: Option<String>) -> ExitCode {
     let (Some(nn), Some(boards)) = (nn, boards) else {
         eprintln!("nneval: --nnue FILE --boards FILE required");
@@ -655,6 +669,7 @@ fn nnbench_cmd(boards: Option<String>, tup_spec: Option<String>, nnue: Option<St
                 bs.iter().map(|b| black_box(titanium::search::evaluate(b, t.as_ref(), false)) as u64).sum()
             });
             time("NNUE eval f32 reference", &mut || bs.iter().map(|b| black_box(net.eval_f32(b, 0)) as u64).sum());
+            time("NNUE features+accumulate only", &mut || bs.iter().map(|b| black_box(net.bench_ft(b)) as u64).sum());
             time("NNUE eval fast (int16 FT, sparse L1)", &mut || bs.iter().map(|b| black_box(net.eval(b, 0)) as u64).sum());
             // incremental-update potential: features changed by one move, per colour perspective (parent colour c
             // perspective vs child colour c perspective), over every legal move of every board
