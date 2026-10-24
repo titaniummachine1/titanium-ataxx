@@ -23,6 +23,9 @@ const MAX_PLY: usize = 40;
 struct MoveStack {
     lists: Box<[MoveList; MAX_PLY]>,
     acc: Box<[S1Acc; MAX_PLY]>,
+    /// exp/search-moonbird: static eval the parent already computed for the child at this ply (futility
+    /// reduction), consumed at the child's entry so the eval is not paid twice. i32::MIN = none.
+    pre_eval: Box<[i32; MAX_PLY]>,
 }
 
 impl MoveStack {
@@ -30,6 +33,7 @@ impl MoveStack {
         MoveStack {
             lists: Box::new([MoveList::new(); MAX_PLY]),
             acc: Box::new([[[0; 64]; 2]; MAX_PLY]),
+            pre_eval: Box::new([i32::MIN; MAX_PLY]),
         }
     }
 }
@@ -40,6 +44,14 @@ const MATERIAL: i32 = 100;
 const TEMPO: i32 = 150;
 /// Reverse futility pruning margins, index = depth-1 (autaxx, stone = 100).
 const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774];
+/// exp/search-moonbird A: Moonbird 1.1.0 reduction scheme (searchParams.nim) in place of the universal LMR.
+/// LMR from the 7th move: new_depth = depth * HALF / (HALF + n_reduced_so_far).
+const MB_LMR_MIN_IDX: usize = 6;
+const MB_LMR_HALFLIFE: i32 = 47;
+/// Futility reduction from the 2nd move: one ply per FUT_DIV cp the child's static eval falls short of alpha
+/// (Moonbird futilityReductionDiv 35 in its units; x1.62 to Titanium cp: 568/ln10 vs 400 per logit). Reduce only.
+const MB_FUT_MIN_IDX: usize = 1;
+const MB_FUT_DIV: i32 = 57;
 
 // Ordering tiers (titanium-engine pattern: compile-asserted bands so no
 // ordering signal can structurally leak into its neighbor).
@@ -569,6 +581,8 @@ impl<'a> Searcher<'a> {
         null_allowed: bool,
     ) -> i32 {
         self.nodes += 1;
+        // consume a parent-computed static eval first, so a TT return below can never leave it stale
+        let pre = std::mem::replace(&mut self.stack.pre_eval[ply as usize], i32::MIN);
         self.check_stop();
         if self.stop {
             return 0;
@@ -617,6 +631,7 @@ impl<'a> Searcher<'a> {
         // no negation (that was the 0-50 bug: double-negated white nodes).
         let raw = match self.sancta {
             Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
+            None if pre != i32::MIN => pre,
             None => evaluate(b, self.tuple, self.tup_native),
         };
         let static_eval = self.corrected(b, raw);
@@ -688,6 +703,7 @@ impl<'a> Searcher<'a> {
         let mut best = i32::MIN;
         let mut best_mv: u32 = 0xFFFF;
         let mut move_idx = 0usize;
+        let mut lmr_cnt = 0i32;
         loop {
             let m = {
                 let list = &mut self.stack.lists[ply as usize];
@@ -697,15 +713,28 @@ impl<'a> Searcher<'a> {
                 list.pop_best()
             };
 
-            // PVS + universal LMR (autaxx): first move full window full
-            // depth; every later move scouts with a null window at a reduced
-            // depth (r = 2, or 3 from the 10th move), re-searching full
-            // window + full depth only when the scout beats alpha.
-            // Lazy sancta: child acc = parent acc + diffs BEFORE recursing.
+            // Moonbird-style selectivity (exp/search-moonbird A): late moves get a gentle LMR, every move after the
+            // first is reduced by how far its child's STATIC eval falls short of alpha, and a move reduced to depth
+            // <= 0 is not searched at all. First move: full window, full depth (always searched, so best is set).
             let child = b.make(m);
             if let Some(net) = self.sancta {
                 let (a, z) = self.stack.acc.split_at_mut(ply as usize + 1);
                 net.update_child(&a[ply as usize], &mut z[0], b, &child);
+            }
+            let mut new_depth = depth as i32;
+            if move_idx >= MB_LMR_MIN_IDX {
+                new_depth = depth as i32 * MB_LMR_HALFLIFE / (MB_LMR_HALFLIFE + lmr_cnt);
+                lmr_cnt += 1;
+            }
+            let mut child_eval = i32::MIN;
+            if move_idx >= MB_FUT_MIN_IDX && new_depth > 0 && self.sancta.is_none() {
+                // child eval is from the child's side to move = minus our static value of the move
+                child_eval = evaluate(&child, self.tuple, self.tup_native);
+                new_depth -= (alpha.saturating_add(child_eval) / MB_FUT_DIV).clamp(0, 64);
+            }
+            if new_depth <= 0 {
+                move_idx += 1;
+                continue;
             }
             let mut score;
             if move_idx == 0 {
@@ -714,30 +743,15 @@ impl<'a> Searcher<'a> {
                     return 0;
                 }
             } else {
-                let r: u32 = if move_idx < 9 { 2 } else { 3 };
-                let reduced = depth.saturating_sub(1 + r);
-                score = -self.negamax(
-                    &child,
-                    -alpha - 1,
-                    -alpha,
-                    reduced,
-                    ply + 1,
-                    true,
-                );
+                self.stack.pre_eval[ply as usize + 1] = child_eval;
+                score = -self.negamax(&child, -alpha - 1, -alpha, (new_depth - 1) as u32, ply + 1, true);
                 if self.stop {
                     return 0;
                 }
-                if score > alpha && reduced < depth - 1 {
-                    // Re-search: scout already wrote child acc in place
-                    // (same parent+child), so it is still valid. No rebuild.
-                    score = -self.negamax(
-                        &child,
-                        -beta,
-                        -alpha,
-                        depth - 1,
-                        ply + 1,
-                        true,
-                    );
+                if score > alpha {
+                    // re-search: full window, full depth
+                    self.stack.pre_eval[ply as usize + 1] = child_eval;
+                    score = -self.negamax(&child, -beta, -alpha, depth - 1, ply + 1, true);
                     if self.stop {
                         return 0;
                     }

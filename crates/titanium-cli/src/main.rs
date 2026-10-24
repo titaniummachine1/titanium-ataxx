@@ -42,6 +42,7 @@ fn main() -> ExitCode {
         ),
         "label" => label_cmd(
             flag_int(&args, "--nodes").unwrap_or(20000) as u64,
+            flag_int(&args, "--time").map(|ms| ms as u64),
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
         ),
@@ -441,7 +442,7 @@ fn default_log_path() -> PathBuf {
 // impossible (different positions = different keys); the shared table just
 // caches transpositions across rows. Killers/history carry as ordering
 // hints only (matched moves are always legal here or ignored).
-fn label_cmd(nodes: u64, tup_spec: Option<String>, tup_native: bool) -> ExitCode {
+fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_native: bool) -> ExitCode {
     let tup = match load_tuple_preset(&tup_spec) {
         Ok(t) => t,
         Err(e) => {
@@ -466,8 +467,8 @@ fn label_cmd(nodes: u64, tup_spec: Option<String>, tup_native: bool) -> ExitCode
             return ExitCode::FAILURE;
         };
         let limits = SearchLimits {
-            time: None,
-            max_nodes: Some(nodes),
+            time: time_ms.map(Duration::from_millis),
+            max_nodes: if time_ms.is_some() { None } else { Some(nodes) },
             max_depth: 30,
         };
         let r = searcher.search(&b, &limits);
