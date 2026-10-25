@@ -3,8 +3,12 @@
 //! Search order: TT probe -> eval cache (depth 0) -> move scoring
 //! (TT move > killers > captures*W + history) -> lazy selection -> alpha-beta.
 
+/// exp/nnue-speed: static-eval cache entries (2^16 x 16 B = 1 MiB per searcher).
+const ECACHE_BITS: usize = 16;
+
 use crate::board::{dist_union, jump_union, Board, Move, MoveList, RING1, SQUARES};
 use crate::tuple::TupleTable;
+use crate::nnue::Nnue;
 use crate::sancta::{S1Acc, S1Net};
 use std::time::Duration;
 
@@ -471,6 +475,10 @@ pub struct Searcher<'a> {
     ext_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Transposition table (persists across searches in the same Searcher).
     tt: Tt,
+    /// exp/nnue-speed: static-eval cache (position hash -> raw eval). The eval is a pure function of the position, so a
+    /// hit returns exactly what a recomputation would: search is bit-identical, only faster (iterative deepening
+    /// re-evaluates ~42% of positions). Cleared on new game and whenever the eval source changes.
+    ecache: Box<[(u64, i32)]>,
     /// Two killer moves per ply (packed u32 moves), refreshed on cutoffs.
     killers: Box<[(u32, u32); MAX_PLY]>,
     /// History heuristic: [mover][to] cutoff counters, aged per search.
@@ -482,6 +490,8 @@ pub struct Searcher<'a> {
     /// Optional n-tuple table (None = pure hand eval). Borrowed, read-only
     /// in the tree, same zero-cost-OFF pattern as sancta.
     tuple: Option<&'a TupleTable>,
+    /// Optional exp/nnue net (None = unchanged eval path). Takes precedence over sancta/tuple when set.
+    nnue: Option<&'a Nnue>,
     /// Tuple-native eval mode: skip E2/E4 scans, mat+PST+tempo+tuples only.
     /// False by default (full hand eval + optional additive tuples).
     tup_native: bool,
@@ -524,10 +534,12 @@ impl<'a> Searcher<'a> {
             time_src: native_now_ms,
             ext_stop: None,
             tt: Tt::new(bits),
+            ecache: vec![(0u64, i32::MIN); 1 << ECACHE_BITS].into_boxed_slice(),
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[[0; 49]; 49]; 2]),
             sancta: None,
             tuple: None,
+            nnue: None,
             tup_native: false,
             corr: None,
             stack: MoveStack::new(),
@@ -538,24 +550,60 @@ impl<'a> Searcher<'a> {
     /// duration; zero-cost OFF (None branch).
     pub fn set_sancta(&mut self, net: Option<&'a S1Net>) {
         self.sancta = net;
+        self.clear_ecache();
     }
 
     /// Attach an n-tuple table (None = pure hand eval). Borrowed for the
     /// search duration; zero-cost OFF (None branch).
+    pub fn set_nnue(&mut self, n: Option<&'a Nnue>) {
+        self.nnue = n;
+        self.clear_ecache();
+    }
+
     pub fn set_tuple(&mut self, t: Option<&'a TupleTable>) {
         self.tuple = t;
+        self.clear_ecache();
     }
 
     /// Tuple-native eval mode (skip E2/E4 scans). Predictable branch,
     /// ~free; the mode it selects is the fast one.
     pub fn set_tuple_native(&mut self, native: bool) {
         self.tup_native = native;
+        self.clear_ecache();
     }
 
     /// Correction-history tables, off by default. Enabled searchers learn
     /// per-context eval biases within a game; disabled = main behavior.
     pub fn set_corr(&mut self, on: bool) {
         self.corr = on.then(CorrHist::new);
+    }
+
+    /// Static eval of a non-sancta node: the NNUE when one is loaded (exp/nnue), else the tuple/classical eval.
+    /// Every static eval goes through here (node entry AND the futility child eval) so pruning and leaves agree.
+    fn clear_ecache(&mut self) {
+        self.ecache.fill((0, i32::MIN));
+    }
+
+    #[inline]
+    fn leaf_eval(&mut self, b: &Board) -> i32 {
+        let slot = (b.hash as usize) & ((1 << ECACHE_BITS) - 1);
+        let (k, v) = self.ecache[slot];
+        if k == b.hash && v != i32::MIN {
+            return v;
+        }
+        let v = self.leaf_eval_raw(b);
+        self.ecache[slot] = (b.hash, v);
+        v
+    }
+
+    #[inline]
+    fn leaf_eval_raw(&self, b: &Board) -> i32 {
+        match self.nnue {
+            // v2 nets carry an S57 skip input (the tuple eval of the same board); v1 ignores it
+            Some(nn) if nn.v2 => nn.eval(b, evaluate(b, self.tuple, self.tup_native)),
+            Some(nn) => nn.eval(b, 0),
+            None => evaluate(b, self.tuple, self.tup_native),
+        }
     }
 
     /// Raw static eval plus correction (if enabled). Single call site shape
@@ -584,6 +632,7 @@ impl<'a> Searcher<'a> {
     /// cross-game leakage in long matches (titanium binary_match lesson).
     pub fn reset_for_new_game(&mut self) {
         self.tt.clear();
+        self.clear_ecache();
         *self.killers = [(0, 0); MAX_PLY];
         *self.history = [[[0; 49]; 49]; 2];
         if self.corr.is_some() {
@@ -600,7 +649,7 @@ impl<'a> Searcher<'a> {
                 return;
             }
         }
-        if self.nodes & 2047 == 0 {
+        if self.nodes & 63 == 0 {
             if let Some(f) = &self.ext_stop {
                 if f.load(std::sync::atomic::Ordering::Relaxed) {
                     self.stop = true;
@@ -683,10 +732,10 @@ impl<'a> Searcher<'a> {
         // OFF = single branch to classical, zero-cost.
         // forward_ready(acc, stm) is ALREADY stm-relative (like evaluate) —
         // no negation (that was the 0-50 bug: double-negated white nodes).
-        let raw = match self.sancta {
-            Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
-            None if pre != i32::MIN => pre,
-            None => evaluate(b, self.tuple, self.tup_native),
+        let raw = match (self.nnue, self.sancta) {
+            (None, Some(net)) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
+            _ if pre != i32::MIN => pre,
+            _ => self.leaf_eval(b),
         };
         let static_eval = self.corrected(b, raw);
 
@@ -744,9 +793,9 @@ impl<'a> Searcher<'a> {
             // multiplicities, so len>0 always — but double-pass positions
             // have no children to search: score the pass-through.
             if list.is_empty() {
-                let raw = match self.sancta {
-                    Some(net) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
-                    None => evaluate(b, self.tuple, self.tup_native),
+                let raw = match (self.nnue, self.sancta) {
+                    (None, Some(net)) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
+                    _ => self.leaf_eval(b),
                 };
                 let static_eval = self.corrected(b, raw);
                 self.finish_node(b, alpha_orig, beta, static_eval, 0xFFFF, depth, ply, static_eval);
@@ -783,7 +832,7 @@ impl<'a> Searcher<'a> {
             let mut child_eval = i32::MIN;
             if move_idx >= MB_FUT_MIN_IDX && new_depth > 0 && self.sancta.is_none() {
                 // child eval is from the child's side to move = minus our static value of the move
-                child_eval = evaluate(&child, self.tuple, self.tup_native);
+                child_eval = self.leaf_eval(&child);
                 new_depth -= (alpha.saturating_add(child_eval) / MB_FUT_DIV).clamp(0, 64);
             }
             if new_depth <= 0 {
@@ -1024,13 +1073,15 @@ impl<'a> Searcher<'a> {
             if self.stop {
                 break;
             }
-            // Predict the next iteration by TIME only.
+            // exp/full-time: no "next iteration would overrun" early stop any more. A partial iteration is adopted
+            // (above), so searching on to the deadline is never wasted; the deadline check stops it.
             it_ms[1] = it_ms[0];
             it_ms[0] = self.elapsed_ms() - iter_start;
             let proj_ms = it_ms[0].max(it_ms[1]);
             // Botzone variant: no early exit. The clock is a hard limit there, so use all of it;
             // a deeper iteration cut by the deadline still contributes its completed root moves
             // (partial-iteration adoption above). Classic search keeps the prediction rule.
+            // exp/full-time: no early exit for any mode; deadline check handles it.
             if !BZ && self.elapsed_ms() + proj_ms > budget_ms {
                 self.stop_reason = StopReason::Time;
                 break;

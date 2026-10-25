@@ -935,6 +935,38 @@ impl Board {
 
     /// Parse a 49-char board string (rows top->bottom, chars `.xo#`) plus a
     /// side char `b`/`w`.
+    /// Board from raw bitboards (dataset rows): derived fields (piece counts, PST, hash) recomputed exactly like
+    /// `from_str`. Used by the exp/nnue dump tools so `evaluate()` sees a consistent board.
+    pub fn from_occ(occ0: u64, occ1: u64, blockers: u64, turn: u8) -> Board {
+        let mut b = Board {
+            occ: [occ0, occ1],
+            blockers,
+            turn,
+            passes: 0,
+            ply: 0,
+            piece_cnt: [occ0.count_ones() as u8, occ1.count_ones() as u8],
+            blocker_cnt: blockers.count_ones() as u8,
+            hash: if turn == 1 { ZOB_SIDE } else { 0 },
+            pst: 0,
+        };
+        for c in 0..2 {
+            let mut bb = b.occ[c];
+            while bb != 0 {
+                let sq = bb.trailing_zeros() as usize;
+                bb &= bb - 1;
+                b.hash ^= ZOB_PIECE[c][sq];
+                b.pst += if c == 0 { PST[sq] } else { -PST[sq] };
+            }
+        }
+        let mut blk = b.blockers;
+        while blk != 0 {
+            let sq = blk.trailing_zeros() as usize;
+            blk &= blk - 1;
+            b.hash ^= ZOB_BLOCK[sq];
+        }
+        b
+    }
+
     pub fn from_str(s: &str) -> Option<Board> {
         let mut b = Board {
             occ: [0; 2],

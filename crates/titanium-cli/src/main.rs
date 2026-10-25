@@ -45,7 +45,24 @@ fn main() -> ExitCode {
             flag_int(&args, "--time").map(|ms| ms as u64),
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
+            flag_str(&args, "--nnue"),
+            args.iter().any(|x| x == "--fresh"),
+            flag_int(&args, "--tt-bits").map(|v| v as usize),
         ),
+        "labelbin" => labelbin_cmd(
+            flag_str(&args, "--bin"),
+            flag_int(&args, "--lo").unwrap_or(0) as usize,
+            flag_int(&args, "--hi").map(|v| v as usize),
+            flag_int(&args, "--nodes").unwrap_or(5000) as u64,
+            flag_str(&args, "--tuple"),
+            flag_str(&args, "--nnue"),
+            flag_int(&args, "--threads").unwrap_or(1).max(1) as usize,
+        ),
+        "nnbench" => nnbench_cmd(flag_str(&args, "--boards"), flag_str(&args, "--tuple"), flag_str(&args, "--nnue")),
+        "nndump" => nndump_cmd(flag_str(&args, "--in"), flag_str(&args, "--out")),
+        "s57dump" => s57dump_cmd(flag_str(&args, "--in"), flag_str(&args, "--out"), flag_str(&args, "--tuple")),
+        "nnevaldump" => nnevaldump_cmd(flag_str(&args, "--nnue"), flag_str(&args, "--boards")),
+        "nneval" => nneval_cmd(flag_str(&args, "--nnue"), flag_str(&args, "--boards"), flag_str(&args, "--tuple")),
         "play" => play_cmd(flag_int(&args, "--time").unwrap_or(1000) as u64),
         "show" => show_cmd(),
         "genbench" => genbench_cmd(flag_int(&args, "--iters").unwrap_or(200_000) as u64),
@@ -55,6 +72,7 @@ fn main() -> ExitCode {
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
             args.iter().any(|x| x == "--corr"),
+            flag_str(&args, "--nnue"),
         ),
         "match" => match_cmd(
             flag_int(&args, "--games").unwrap_or(20) as u32,
@@ -76,6 +94,8 @@ fn main() -> ExitCode {
             args.iter().any(|x| x == "--opp-corr"),
             flag_str(&args, "--book"),
             flag_int(&args, "--book-start").unwrap_or(0) as u32,
+            flag_str(&args, "--nnue"),
+            flag_str(&args, "--opp-nnue"),
         ),
         "sperft" => sperft_cmd(
             flag_int(&args, "--depth").unwrap_or(8) as u32,
@@ -224,6 +244,30 @@ fn net_flag_str(spec: &Option<String>) -> String {
 
 /// Shipped champion: main runs this unless --tuple says otherwise.
 pub const DEFAULT_TUP: &str = "data/nnue/tupS57v2.tup";
+
+/// Shipped NNUE ("the optimized big net": nnue_t1ep4, sha c4829350, int16 fast path): serve / match run it when --nnue is
+/// absent; file missing = S57 fallback; `--nnue none` = explicit S57-only escape hatch. With the NNUE active and no
+/// --tuple the tuple defaults to none (the gated config `--tuple none --nnue`).
+pub const DEFAULT_NNUE: &str = "data/nnue/nnue_main.tnn";
+
+fn resolve_nnue_spec(spec: &Option<String>) -> Option<String> {
+    match spec {
+        None => std::path::Path::new(DEFAULT_NNUE).exists().then(|| DEFAULT_NNUE.to_string()),
+        Some(s) if s == "none" || s.is_empty() => None,
+        Some(s) => Some(s.clone()),
+    }
+}
+
+fn eff_tuple_spec(tup: &Option<String>, nnue: &Option<String>) -> Option<String> {
+    if tup.is_none() && nnue.is_some() { Some("none".to_string()) } else { tup.clone() }
+}
+
+fn nnue_flag_str(resolved: &Option<String>) -> String {
+    match resolved {
+        Some(p) => format!("--nnue {p}"),
+        None => "--nnue none".to_string(),
+    }
+}
 
 /// Flag absent = champion default (main is always strongest out of the box).
 /// --tuple none = pure hand eval (explicit escape hatch for A/B).
@@ -442,7 +486,283 @@ fn default_log_path() -> PathBuf {
 // impossible (different positions = different keys); the shared table just
 // caches transpositions across rows. Killers/history carry as ordering
 // hints only (matched moves are always legal here or ignored).
-fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_native: bool) -> ExitCode {
+/// exp/nnue training dump. Input `<in>.occ0` / `<in>.occ1` (u64 LE) and `<in>.stm` (u8), one entry per dataset row.
+/// Output `<out>.cnt` (u8, two per row: side to move first, then opponent) and `<out>.idx` (u16 LE feature indices,
+/// concatenated in the same order). The trainer reads exactly what the engine computes (crate::nnfeat).
+fn nndump_cmd(inp: Option<String>, out: Option<String>) -> ExitCode {
+    use std::io::BufWriter;
+    use titanium::nnfeat::{self, MAX_ACTIVE, NUM_FEATS};
+    let (Some(inp), Some(out)) = (inp, out) else {
+        eprintln!("nndump: --in PREFIX --out PREFIX required");
+        return ExitCode::FAILURE;
+    };
+    assert!(NUM_FEATS <= u16::MAX as usize);
+    let rd = |ext: &str| fs::read(format!("{inp}.{ext}")).unwrap_or_else(|e| panic!("nndump: {inp}.{ext}: {e}"));
+    let (o0, o1, stm) = (rd("occ0"), rd("occ1"), rd("stm"));
+    let n = stm.len();
+    assert!(o0.len() == 8 * n && o1.len() == 8 * n, "nndump: occ/stm length mismatch");
+    let mut cnt = BufWriter::with_capacity(1 << 20, fs::File::create(format!("{out}.cnt")).expect("cnt"));
+    let mut idx = BufWriter::with_capacity(1 << 24, fs::File::create(format!("{out}.idx")).expect("idx"));
+    let mut buf = [0u32; MAX_ACTIVE];
+    let mut total = 0u64;
+    let t0 = Instant::now();
+    for i in 0..n {
+        let mut b = Board::start();
+        b.occ = [
+            u64::from_le_bytes(o0[8 * i..8 * i + 8].try_into().unwrap()),
+            u64::from_le_bytes(o1[8 * i..8 * i + 8].try_into().unwrap()),
+        ];
+        b.blockers = 0;
+        b.turn = stm[i];
+        for side in [b.turn as usize, 1 - b.turn as usize] {
+            let k = nnfeat::features(&b, side, nnfeat::ALL_GROUPS, &mut buf);
+            cnt.write_all(&[k as u8]).unwrap();
+            for &f in &buf[..k] {
+                idx.write_all(&(f as u16).to_le_bytes()).unwrap();
+            }
+            total += k as u64;
+        }
+        if i % 5_000_000 == 0 && i > 0 {
+            eprintln!("nndump: {i}/{n} rows, {:.0}s", t0.elapsed().as_secs_f64());
+        }
+    }
+    cnt.flush().unwrap();
+    idx.flush().unwrap();
+    println!("nndump: {n} rows, {total} indices ({:.1} per perspective), {:.0}s", total as f64 / (2.0 * n as f64),
+             t0.elapsed().as_secs_f64());
+    ExitCode::SUCCESS
+}
+
+/// exp/nnue v2 skip input: the S57 eval EXACTLY as the engine computes it in games (full hand eval + tuple,
+/// `search::evaluate(b, tup, false)`), side to move, for every row of an nndump prefix (.occ0/.occ1/.stm).
+/// Writes little-endian f32 = cp / 400 (logit units), one per row, in row order. Blockers 0, like nndump.
+fn s57dump_cmd(inp: Option<String>, out: Option<String>, tup_spec: Option<String>) -> ExitCode {
+    use std::io::BufWriter;
+    let (Some(inp), Some(out)) = (inp, out) else {
+        eprintln!("s57dump: --in PREFIX --out FILE [--tuple TUP] required");
+        return ExitCode::FAILURE;
+    };
+    let tup = match load_tuple_preset(&tup_spec) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            eprintln!("s57dump: a tuple net is required");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("s57dump: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rd = |ext: &str| fs::read(format!("{inp}.{ext}")).unwrap_or_else(|e| panic!("s57dump: {inp}.{ext}: {e}"));
+    let (o0, o1, stm) = (rd("occ0"), rd("occ1"), rd("stm"));
+    let n = stm.len();
+    assert!(o0.len() == 8 * n && o1.len() == 8 * n, "s57dump: occ/stm length mismatch");
+    let tmp = format!("{out}.tmp");
+    let mut w = BufWriter::with_capacity(1 << 22, fs::File::create(&tmp).expect("out"));
+    let t0 = Instant::now();
+    for i in 0..n {
+        let b = Board::from_occ(
+            u64::from_le_bytes(o0[8 * i..8 * i + 8].try_into().unwrap()),
+            u64::from_le_bytes(o1[8 * i..8 * i + 8].try_into().unwrap()),
+            0,
+            stm[i],
+        );
+        let cp = titanium::search::evaluate(&b, Some(&tup), false);
+        w.write_all(&(cp as f32 / 400.0).to_le_bytes()).unwrap();
+        if i % 5_000_000 == 0 && i > 0 {
+            eprintln!("s57dump: {i}/{n} rows, {:.0}s", t0.elapsed().as_secs_f64());
+        }
+    }
+    w.flush().unwrap();
+    drop(w);
+    fs::rename(&tmp, &out).expect("rename");
+    println!("s57dump: {n} rows -> {out}, {:.0}s", t0.elapsed().as_secs_f64());
+    ExitCode::SUCCESS
+}
+
+/// exp/nnue parity check: lines "<49 chars> <b|w> <expected cp>" (export_nnue.py .ref.txt) -> max |diff|.
+/// exp/nnue-speed: one fast-path eval per board line (bit-identity check across optimisations).
+fn nnevaldump_cmd(nn: Option<String>, boards: Option<String>) -> ExitCode {
+    let net = titanium::nnue::Nnue::load(&nn.expect("--nnue")).expect("nnue");
+    let text = fs::read_to_string(boards.expect("--boards")).expect("boards");
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    for line in text.lines() {
+        let Some(b) = Board::from_str(line.trim()) else { continue };
+        use std::io::Write as _;
+        let _ = writeln!(out, "{}", net.forward(&b, 0.0).to_bits());
+    }
+    ExitCode::SUCCESS
+}
+
+fn nneval_cmd(nn: Option<String>, boards: Option<String>, tup_spec: Option<String>) -> ExitCode {
+    let (Some(nn), Some(boards)) = (nn, boards) else {
+        eprintln!("nneval: --nnue FILE --boards FILE required");
+        return ExitCode::FAILURE;
+    };
+    let net = match titanium::nnue::Nnue::load(&nn) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("nneval: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // v2 nets add the S57 tuple eval (full hand eval + tuple, as the gates run it) as a skip term
+    let tup = if net.v2 {
+        match load_tuple_preset(&tup_spec) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("nneval: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let text = fs::read_to_string(&boards).expect("boards");
+    let (mut n, mut worst, mut sum) = (0, 0i32, 0i64);
+    let (mut fworst, mut fsum) = (0i32, 0i64);
+    for line in text.lines() {
+        let mut parts: Vec<&str> = line.split_whitespace().collect();
+        let Some(want) = parts.pop().and_then(|x| x.parse::<i32>().ok()) else { continue };
+        let Some(b) = Board::from_str(&parts.join(" ")) else { continue };
+        let s57 = if net.v2 { titanium::search::evaluate(&b, tup.as_ref(), false) } else { 0 };
+        let d = (net.eval_f32(&b, s57) - want).abs();
+        worst = worst.max(d);
+        sum += d as i64;
+        let df = (net.eval(&b, s57) - want).abs();
+        fworst = fworst.max(df);
+        fsum += df as i64;
+        n += 1;
+    }
+    println!("nneval: {n} positions, max |rust - torch| = {worst} cp, mean {:.3} cp", sum as f64 / n.max(1) as f64);
+    println!("nneval fast path (int16 FT, QA {}): max |fast - torch| = {fworst} cp, mean {:.3} cp", titanium::nnue::QA,
+             fsum as f64 / n.max(1) as f64);
+    if worst <= 1 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// exp/nnue speed probe: per-eval cost of each feature group, of an accumulator refresh (random int16 weights,
+/// width 128 and 256, both perspectives) and of the current tuple eval, on real board lines (49 chars + b|w).
+fn nnbench_cmd(boards: Option<String>, tup_spec: Option<String>, nnue: Option<String>) -> ExitCode {
+    use std::hint::black_box;
+    use titanium::nnfeat::{self, MAX_ACTIVE, NUM_FEATS};
+    let Some(path) = boards else {
+        eprintln!("nnbench: --boards FILE required");
+        return ExitCode::FAILURE;
+    };
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("nnbench: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bs: Vec<Board> = text.lines().filter_map(|l| Board::from_str(l.trim())).collect();
+    let n = bs.len() as f64;
+    println!("boards {} | features {} | max active {}", bs.len(), NUM_FEATS, MAX_ACTIVE);
+    let time = |label: &str, f: &mut dyn FnMut() -> u64| {
+        let _ = f();
+        let t = Instant::now();
+        let reps = 3;
+        let mut s = 0u64;
+        for _ in 0..reps {
+            s = s.wrapping_add(f());
+        }
+        let ns = t.elapsed().as_nanos() as f64 / (n * reps as f64);
+        println!("{label:<44} {ns:8.1} ns/eval   (chk {})", s % 1000);
+    };
+    if let Ok(Some(tup)) = load_tuple_preset(&tup_spec) {
+        time("current tuple eval (forward)", &mut || bs.iter().map(|b| black_box(tup.forward(b)) as u64).sum());
+    }
+    if let Some(p) = &nnue {
+        if let Ok(net) = titanium::nnue::Nnue::load(p) {
+            time("full search eval S57 (hand eval + tuple)", &mut || {
+                let t = load_tuple_preset(&tup_spec).ok().flatten();
+                bs.iter().map(|b| black_box(titanium::search::evaluate(b, t.as_ref(), false)) as u64).sum()
+            });
+            time("NNUE eval f32 reference", &mut || bs.iter().map(|b| black_box(net.eval_f32(b, 0)) as u64).sum());
+            time("NNUE features+accumulate only", &mut || bs.iter().map(|b| black_box(net.bench_ft(b)) as u64).sum());
+            time("NNUE eval fast (int16 FT, sparse L1)", &mut || bs.iter().map(|b| black_box(net.eval(b, 0)) as u64).sum());
+            // incremental-update potential: features changed by one move, per colour perspective (parent colour c
+            // perspective vs child colour c perspective), over every legal move of every board
+            let (mut tot, mut chg, mut nmv) = (0u64, 0u64, 0u64);
+            for b in &bs {
+                let (pu, pnu, pt, pnt) = titanium::nnfeat::both(b, net.groups);
+                let mut list = titanium::board::MoveList::new();
+                b.legal_moves_dedup_into(&mut list);
+                for i in 0..list.len() {
+                    let c = b.make(list.move_at(i));
+                    let (cu, cnu, ct, cnt) = titanium::nnfeat::both(&c, net.groups);
+                    // colour perspectives: parent us == child them (same colour), parent them == child us
+                    for (pa, pn, ca, cn) in [(&pu, pnu, &ct, cnt), (&pt, pnt, &cu, cnu)] {
+                        let ps: std::collections::HashSet<u32> = pa[..pn].iter().copied().collect();
+                        let cs: std::collections::HashSet<u32> = ca[..cn].iter().copied().collect();
+                        chg += ps.symmetric_difference(&cs).count() as u64;
+                        tot += cn as u64;
+                    }
+                    nmv += 1;
+                }
+            }
+            println!("incremental: {nmv} moves, mean active per perspective {:.1}, mean CHANGED rows per perspective {:.1} ({:.0}% of a refresh)",
+                     tot as f64 / (2 * nmv) as f64, chg as f64 / (2 * nmv) as f64, 100.0 * chg as f64 / tot as f64);
+        }
+    }
+    let mut buf = [0u32; MAX_ACTIVE];
+    let mut active = 0u64;
+    for (name, g) in [("G1 square state", nnfeat::G1), ("G2 anchor", nnfeat::G2), ("G3 stone ring", nnfeat::G3),
+        ("G5 2-ply exchange", nnfeat::G5), ("G6 global", nnfeat::G6), ("ALL groups", nnfeat::ALL_GROUPS)]
+    {
+        let label = format!("features {name} (both perspectives)");
+        time(&label, &mut || {
+            let mut s = 0u64;
+            for b in &bs {
+                for side in 0..2 {
+                    s += nnfeat::features(b, side, g, &mut buf) as u64;
+                }
+            }
+            if g == nnfeat::ALL_GROUPS {
+                active = s;
+            }
+            s
+        });
+    }
+    println!("mean active features per perspective (all groups): {:.1}", active as f64 / (2.0 * n));
+    for width in [128usize, 256] {
+        let mut seed = 0x9E37_79B9u64;
+        let w: Vec<i16> = (0..NUM_FEATS * width)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % 64) as i16 - 32
+            })
+            .collect();
+        let label = format!("features ALL + refresh width {width} (both)");
+        time(&label, &mut || {
+            let mut s = 0u64;
+            let mut acc = vec![0i16; width];
+            for b in &bs {
+                for side in 0..2 {
+                    let k = nnfeat::features(b, side, nnfeat::ALL_GROUPS, &mut buf);
+                    acc.iter_mut().for_each(|a| *a = 0);
+                    for &f in &buf[..k] {
+                        let row = &w[f as usize * width..(f as usize + 1) * width];
+                        for (a, r) in acc.iter_mut().zip(row) {
+                            *a = a.wrapping_add(*r);
+                        }
+                    }
+                    s = s.wrapping_add(acc[7] as u64);
+                }
+            }
+            black_box(s)
+        });
+    }
+    ExitCode::SUCCESS
+}
+
+/// `fresh`: reset TT / killers / history / eval cache before EVERY position (label depends only on the position);
+/// `tt_bits`: TT size (5k nodes needs few entries).
+fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_native: bool, nnue: Option<String>, fresh: bool,
+             tt_bits: Option<usize>) -> ExitCode {
     let tup = match load_tuple_preset(&tup_spec) {
         Ok(t) => t,
         Err(e) => {
@@ -450,9 +770,22 @@ fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_nat
             return ExitCode::FAILURE;
         }
     };
-    let mut searcher = Searcher::new();
+    // exp/nnue-fast: optional NNUE (as the gates run it: every static eval through the net)
+    let nn = match nnue.as_deref().map(titanium::nnue::Nnue::load) {
+        Some(Ok(n)) => Some(n),
+        Some(Err(e)) => {
+            eprintln!("label: {e}");
+            return ExitCode::FAILURE;
+        }
+        None => None,
+    };
+    let mut searcher = match tt_bits {
+        Some(b) => Searcher::with_tt_bits(b),
+        None => Searcher::new(),
+    };
     searcher.set_tuple(tup.as_ref());
     searcher.set_tuple_native(tup_native && tup.is_some());
+    searcher.set_nnue(nn.as_ref());
     let stdin = io::stdin();
     let mut out = io::stdout().lock();
     let mut n = 0u64;
@@ -471,6 +804,9 @@ fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_nat
             max_nodes: if time_ms.is_some() { None } else { Some(nodes) },
             max_depth: 30,
         };
+        if fresh {
+            searcher.reset_for_new_game();
+        }
         let r = searcher.search(&b, &limits);
         use std::io::Write as _;
         let _ = writeln!(out, "{} {} {}", r.score, r.depth, r.nodes);
@@ -480,6 +816,78 @@ fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_nat
         }
     }
     eprintln!("label: done {n} rows");
+    ExitCode::SUCCESS
+}
+
+/// exp/label-clean: relabel from a packed file (25-byte records: occ0 u64 | occ1 u64 | blk u64 | stm u8, little endian;
+/// training/relabel_pack.py). Rows [lo, hi) are searched for `nodes` nodes each with the state reset before EVERY row
+/// (label depends on the position only); one line `score depth nodes` per row on stdout, in row order.
+fn labelbin_cmd(bin: Option<String>, lo: usize, hi: Option<usize>, nodes: u64, tup_spec: Option<String>, nnue: Option<String>,
+                threads: usize) -> ExitCode {
+    let Some(bin) = bin else {
+        eprintln!("labelbin: --bin FILE required");
+        return ExitCode::FAILURE;
+    };
+    let tup = match load_tuple_preset(&tup_spec) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("labelbin: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let nn = match nnue.as_deref().map(titanium::nnue::Nnue::load) {
+        Some(Ok(n)) => Some(n),
+        Some(Err(e)) => {
+            eprintln!("labelbin: {e}");
+            return ExitCode::FAILURE;
+        }
+        None => None,
+    };
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    let data = fs::read(&bin).expect("bin");
+    let total = data.len() / 25;
+    let hi = hi.unwrap_or(total).min(total);
+    let n = hi.saturating_sub(lo);
+    // ONE shared read-only net for all threads (one copy in the CPU cache), one Searcher per thread, rows handed out in
+    // small chunks from an atomic counter (load balanced). Result per row packed in a u64: score(i32) | depth<<32 | nodes<<40.
+    let res: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    const CHUNK: usize = 32;
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| {
+                let mut searcher = Searcher::with_tt_bits(18);
+                searcher.set_tuple(tup.as_ref());
+                searcher.set_nnue(nn.as_ref());
+                let limits = SearchLimits { time: None, max_nodes: Some(nodes), max_depth: 30 };
+                loop {
+                    let c = next.fetch_add(CHUNK, Ordering::Relaxed);
+                    if c >= n {
+                        break;
+                    }
+                    for i in c..(c + CHUNK).min(n) {
+                        let rec = &data[(lo + i) * 25..(lo + i) * 25 + 25];
+                        let u = |k: usize| u64::from_le_bytes(rec[k..k + 8].try_into().unwrap());
+                        let b = Board::from_occ(u(0), u(8), u(16), rec[24]);
+                        searcher.reset_for_new_game();
+                        let r = searcher.search(&b, &limits);
+                        res[i].store((r.score as u32 as u64) | ((r.depth as u64 & 0xff) << 32) | ((r.nodes & 0xff_ffff) << 40), Ordering::Relaxed);
+                    }
+                    let d = done.fetch_add((c + CHUNK).min(n) - c, Ordering::Relaxed) + ((c + CHUNK).min(n) - c);
+                    if d / 2000 != (d - ((c + CHUNK).min(n) - c)) / 2000 {
+                        eprintln!("labelbin: {d}/{n}");
+                    }
+                }
+            });
+        }
+    });
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    for v in &res {
+        let v = v.load(Ordering::Relaxed);
+        use std::io::Write as _;
+        let _ = writeln!(out, "{} {} {}", v as u32 as i32, (v >> 32) & 0xff, v >> 40);
+    }
     ExitCode::SUCCESS
 }
 
@@ -636,9 +1044,20 @@ fn serve_cmd(
     tup_spec: Option<String>,
     tup_native: bool,
     corr: bool,
+    nnue_spec: Option<String>,
 ) -> ExitCode {
     let stdin = io::stdin();
     let mut searcher = Searcher::with_tt_bits(tt_bits);
+    let nnue_spec = resolve_nnue_spec(&nnue_spec);
+    let owned_nn = match nnue_spec.as_deref().map(titanium::nnue::Nnue::load) {
+        Some(Ok(n)) => Some(n),
+        Some(Err(e)) => {
+            eprintln!("serve: nnue: {e}");
+            return ExitCode::FAILURE;
+        }
+        None => None,
+    };
+    let tup_spec = eff_tuple_spec(&tup_spec, &nnue_spec);
     // Eval presets come from --net / --tuple ONLY. Owned tables outlive the
     // loop; searcher borrows them per-position (no refcount).
     let owned = match load_net_preset(&net_spec) {
@@ -659,6 +1078,7 @@ fn serve_cmd(
     searcher.set_tuple(owned_tup.as_ref());
     searcher.set_tuple_native(tup_native && owned_tup.is_some());
     searcher.set_corr(corr);
+    searcher.set_nnue(owned_nn.as_ref());
     let mut current: Option<Board> = None;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -862,7 +1282,29 @@ fn match_cmd(
     opp_corr: bool,
     book_spec: Option<String>,
     book_start: u32,
+    nnue_spec: Option<String>,
+    opp_nnue_spec: Option<String>,
 ) -> ExitCode {
+    let load_nn = |spec: &Option<String>| -> Result<Option<titanium::nnue::Nnue>, String> {
+        match spec {
+            None => Ok(None),
+            Some(p) => titanium::nnue::Nnue::load(p).map(Some).map_err(|e| format!("nnue {p}: {e}")),
+        }
+    };
+    // shipped-NNUE default (absent flag) on both sides; an external child gets the resolved choice as an explicit flag
+    let nnue_spec = resolve_nnue_spec(&nnue_spec);
+    let child_nnue = resolve_nnue_spec(&opp_nnue_spec);
+    let self_opp = opp_cmd.as_deref() == Some("self");
+    let opp_nnue_spec = if self_opp { child_nnue.clone() } else { None };
+    let tup_spec = eff_tuple_spec(&tup_spec, &nnue_spec);
+    let opp_tup_spec = eff_tuple_spec(&opp_tup_spec, &child_nnue);
+    let (nn, opp_nn) = match (load_nn(&nnue_spec), load_nn(&opp_nnue_spec)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("match: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     // Eval presets, explicit per side — no env vars anywhere:
     // --net = OUR side (in-process), --opp-net = child side (appended to the
     // opp serve command). --opp self = both in-process (opp side gets opp-net).
@@ -910,6 +1352,9 @@ fn match_cmd(
                     }
                     if !with_flags.contains("--tuple") {
                         with_flags = format!("{with_flags} {}", tuple_flag_str(&opp_tup_spec));
+                    }
+                    if !with_flags.contains("--nnue") {
+                        with_flags = format!("{with_flags} {}", nnue_flag_str(&child_nnue));
                     }
                     if opp_corr && !with_flags.contains("--corr") {
                         with_flags = format!("{with_flags} {}", corr_flag_str(true));
@@ -1031,11 +1476,13 @@ fn match_cmd(
         searcher.set_tuple(tup.as_ref());
         searcher.set_tuple_native(tup_native && tup.is_some());
         searcher.set_corr(corr);
+        searcher.set_nnue(nn.as_ref());
         let mut opp_searcher = Searcher::new(); // for --opp self
         opp_searcher.set_sancta(opp_net.as_ref());
         opp_searcher.set_tuple(opp_tup.as_ref());
         opp_searcher.set_tuple_native(opp_tup_native && opp_tup.is_some());
         opp_searcher.set_corr(opp_corr);
+        opp_searcher.set_nnue(opp_nn.as_ref());
         let titanium_is_black = game % 2 == 1;
         let mut log = String::new();
         let mut result = None;
