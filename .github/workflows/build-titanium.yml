@@ -1,34 +1,29 @@
-name: Build Titanium FFI for Botzone
+name: Build Titanium Botzone upload
+# Same build as `python tools/build_botzone.py --no-pull --no-test`: zig for glibc 2.14 (Botzone = Ubuntu 16.04),
+# library checked (x86-64 ELF, ti_* exports, glibc <= 2.17), upload folder assembled with MANIFEST.txt.
+# No secrets are used; uploading to Botzone stays manual. Download the "botzone-upload" artifact.
 on:
   push:
-    branches: [exp/botzone-ffi]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          submodules: recursive
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+          targets: x86_64-unknown-linux-gnu
+      - uses: mlugg/setup-zig@v1
         with:
-          target: x86_64-unknown-linux-gnu
-      - name: Cache cargo
-        uses: actions/cache@v4
+          version: 0.13.0
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+      - name: Build + check + assemble
+        run: python3 tools/build_botzone.py --no-pull --no-test
+      - uses: actions/upload-artifact@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - name: Build titanium-ffi
-        run: cargo build --release --target x86_64-unknown-linux-gnu -p titanium-ffi
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: titanium_v2.so
-          path: target/x86_64-unknown-linux-gnu/release/libtitanium_ffi.so
-          retention-days: 7
+          name: botzone-upload
+          path: botzone/upload
+          retention-days: 14

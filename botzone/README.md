@@ -1,5 +1,13 @@
 # Titanium on Botzone (Python driver + Rust engine library)
 
+**Build the upload with one command (from main):** `python tools/build_botzone.py` -> `botzone/upload/` + `MANIFEST.txt`
+(pulls main, builds the library with zig for glibc 2.14, checks it, assembles the files, test-plays them in a Linux
+container). The GitHub workflow runs the same build on every push to main (artifact `botzone-upload`, no secrets).
+Never upload a library built with plain `cargo build` on a modern Linux: it needs glibc 2.34 and crashes the bot on
+Botzone (Ubuntu 16.04, glibc 2.23) on its first move (happened with v5, 2026-10-25).
+Eval: the big NNUE `data/nnue/nnue_main.tnn` (main's default), S57 `tupS57v2.tup` only as fallback.
+Time: 12 s on the bot's first turn of a match (wiki: first turn doubled, Python 6x), 6 s on every later turn.
+
 Simulator modes: `--mode oneshot` (default, fresh process per move) and `--mode long`.
 
 Design: **Python owns Botzone, Rust owns the game.** `titanium_botzone.py` parses the long-live Simple-IO
