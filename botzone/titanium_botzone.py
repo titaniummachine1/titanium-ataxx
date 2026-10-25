@@ -25,9 +25,10 @@ MODE = os.environ.get("TI_MODE", "oneshot")   # "oneshot" (default) or "long"
 if MODE == "long":
     FIRST_LIMIT_MS, TURN_LIMIT_MS = 12000, 4000    # long-live: first move doubled, later moves 4 s
 else:
-    # One-shot: 6 s per move. The first move is deliberately NOT given the doubled 12 s seen in older
-    # notes (unverified): a wrong guess there is a time-out loss. Set TI_FIRST_MS=12000 to use it.
-    FIRST_LIMIT_MS = int(os.environ.get("TI_FIRST_MS", "6000"))
+    # One-shot: 6 s per move, and 12 s on this bot's FIRST turn of the match (Botzone wiki, Bot page: every bot's
+    # first turn gets double time; Python = 6x the 1 s base). The first turn is told by the turn number (turn 1),
+    # never by "first loop iteration": in one-shot mode every process is on its first iteration.
+    FIRST_LIMIT_MS = int(os.environ.get("TI_FIRST_MS", "12000"))
     TURN_LIMIT_MS = 6000
 SAFETY_MS = 50              # always finish at least this much before the limit
 STARTUP_MS = 120            # interpreter start + imports happen before T_START; charged to move 1
@@ -109,7 +110,9 @@ class Stats(ctypes.Structure):
 
 def make_engine(lib):
     tt_bits = int(os.environ.get("TI_TT_BITS", "22"))
-    nets = [os.environ.get("TI_NET"), os.path.join("data", "nnue", "tupS57v2.tup"),
+    # big NNUE first (main's default eval), S57 tuple net as the fallback
+    nets = [os.environ.get("TI_NET"), os.path.join("data", "nnue", "nnue_main.tnn"),
+            os.path.join(HERE, "data", "nnue", "nnue_main.tnn"), os.path.join("data", "nnue", "tupS57v2.tup"),
             os.path.join(HERE, "data", "nnue", "tupS57v2.tup"), os.path.join("data", "nnue", "tupS56twostage.tup"),
             os.path.join("data", "nnue", "tupS55tree.tup")]
     for p in nets:
@@ -189,7 +192,7 @@ def main():
         return
     for i in range(0, len(flat), 4):
         apply_move(flat[i:i + 4])
-    first = True
+    first = turns == 1      # this bot's first turn of the match (double time), in both modes
     # The clock started before Python did: charge the real process age when the OS can tell us.
     startup_ms = PROC_AGE_MS if PROC_AGE_MS is not None else STARTUP_MS
     t_origin = T_START - startup_ms / 1000.0

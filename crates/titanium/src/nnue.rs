@@ -341,6 +341,12 @@ impl Nnue {
 
     /// Centipawn-like score from the side to move's view (same scale the training target used: 400 per logit).
     /// `s57_cp` = the S57 tuple eval of `b` in cp (side to move); ignored by v1 nets.
+    /// Free the float copy of the feature transformer (~27 MB) once the int16 fast path is built. Only the
+    /// training-parity reference `forward_f32` needs it; memory-capped hosts (Botzone, 256 MB) drop it.
+    pub fn drop_f32_reference(&mut self) {
+        self.ft = Vec::new();
+    }
+
     pub fn eval(&self, b: &Board, s57_cp: i32) -> i32 {
         (400.0 * self.forward(b, s57_cp as f32 / 400.0)).round().clamp(-30000.0, 30000.0) as i32
     }

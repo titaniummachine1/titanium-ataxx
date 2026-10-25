@@ -44,3 +44,7 @@ Thumbs.db
 !/data/nnue/tupS55tree.tup
 !/data/nnue/tupS56twostage.tup
 !/data/nnue/tupS57v2.tup
+
+# Botzone build output (tools/build_botzone.py)
+/botzone/upload/
+/botzone/dist/

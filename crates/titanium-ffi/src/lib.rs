@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use titanium::board::{Board, Move};
 use titanium::search::{SearchLimits, Searcher, StopReason};
+use titanium::nnue::Nnue;
 use titanium::tuple::TupleTable;
 
 pub const ABI_VERSION: u32 = 1;
@@ -74,14 +75,30 @@ impl TiEngine {
     }
 }
 
-/// Create an engine. `net_path` = path to a TUP tuple net; NULL = classical hand eval (weak!).
+/// Create an engine. `net_path` = path to the big NNUE (`*.tnn`, e.g. nnue_main.tnn: main's default eval) or to a TUP
+/// tuple net (S57 fallback); NULL = classical hand eval (weak!).
 /// Returns NULL if a net path is given but cannot be loaded (never silently falls back).
 /// `tt_bits` = log2 of hash entries (0 -> 22, ~100 MB); each entry is 24 bytes.
 #[no_mangle]
 pub extern "C" fn ti_new(net_path: *const c_char, tt_bits: u32) -> *mut TiEngine {
     let bits = if tt_bits == 0 { DEFAULT_TT_BITS } else { tt_bits.clamp(12, 26) } as usize;
-    let mut searcher: Searcher<'static> = Searcher::with_tt_bits(bits);
+    // the NNUE is loaded BEFORE the hash table is allocated, so the file buffer and the table never coexist (peak RAM)
+    let mut nnue: Option<&'static Nnue> = None;
     if !net_path.is_null() {
+        let p = unsafe { CStr::from_ptr(net_path) }.to_string_lossy().into_owned();
+        if p.ends_with(".tnn") {
+            match Nnue::load(&p) {
+                Ok(mut n) => {
+                    n.drop_f32_reference();
+                    nnue = Some(Box::leak(Box::new(n)));
+                }
+                Err(_) => return std::ptr::null_mut(),
+            }
+        }
+    }
+    let mut searcher: Searcher<'static> = Searcher::with_tt_bits(bits);
+    searcher.set_nnue(nnue);
+    if !net_path.is_null() && nnue.is_none() {
         let p = unsafe { CStr::from_ptr(net_path) }.to_string_lossy().into_owned();
         match TupleTable::load(&p) {
             Ok(t) => {
