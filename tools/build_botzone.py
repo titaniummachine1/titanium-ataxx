@@ -143,7 +143,7 @@ def main():
              ("turn 2", "2\\n-1 -1 -1 -1\\n6 6 5 5\\n6 0 5 1\\n")]
     script = "set -e; ldd --version | head -1; python3 --version; "
     for name, inp in turns:
-        script += "echo '-- %s'; printf '%s' | TI_TIME_SCALE=0.05 TI_DEBUG=1 python3 titanium_botzone.py; " % (name, inp)
+        script += "echo '-- %s'; printf '%s' | TI_TIME_SCALE=0.1 TI_DEBUG=1 python3 titanium_botzone.py; " % (name, inp)
     if a.full_time:
         script += "echo '-- black turn 1, real 12 s clock'; printf '1\\n-1 -1 -1 -1\\n' | TI_DEBUG=1 python3 titanium_botzone.py; "
     r = subprocess.run(["docker", "run", "--rm", "-v", "%s:/bot" % OUT, "-w", "/bot", "python:3.6-slim-buster", "bash", "-c", script],
