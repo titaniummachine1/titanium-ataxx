@@ -623,7 +623,8 @@ impl<'a> Searcher<'a> {
                 return;
             }
         }
-        if self.nodes & 2047 == 0 {
+        // exp/full-time: every 64 nodes (<1 ms with the NNUE; 2048 was ~27 ms, too coarse to run to the deadline)
+        if self.nodes & 63 == 0 {
             if let Some(dl) = self.deadline_ms {
                 if (self.time_src)() >= dl {
                     self.stop = true;
@@ -1010,14 +1011,11 @@ impl<'a> Searcher<'a> {
             if self.stop {
                 break;
             }
-            // Predict the next iteration by TIME only.
+            // exp/full-time: no "next iteration would overrun" early stop any more. A partial iteration is adopted
+            // (above), so searching on to the deadline is never wasted; the deadline check stops it.
             it_ms[1] = it_ms[0];
             it_ms[0] = self.elapsed_ms() - iter_start;
-            let proj_ms = it_ms[0].max(it_ms[1]);
-            if self.elapsed_ms() + proj_ms > budget_ms {
-                self.stop_reason = StopReason::Time;
-                break;
-            }
+            let _ = (it_ms, budget_ms);
         }
 
         if self.stop {
