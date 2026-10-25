@@ -573,6 +573,10 @@ impl MoveList {
     }
 
     #[inline]
+    pub fn score_at(&self, i: usize) -> i32 {
+        self.scores[i]
+    }
+
     pub fn set_score(&mut self, i: usize, s: i32) {
         self.scores[i] = s;
     }

@@ -60,6 +60,31 @@ const MB_FUT_DIV: i32 = 57;
 // Ordering tiers (titanium-engine pattern: compile-asserted bands so no
 // ordering signal can structurally leak into its neighbor).
 const ORD_TT: i32 = i32::MAX / 2;
+
+const fn env_usize(v: Option<&str>, default: usize) -> usize {
+    match v {
+        Some(v) => {
+            let b = v.as_bytes();
+            let mut i = 0;
+            let mut n = 0usize;
+            while i < b.len() {
+                n = n * 10 + (b[i] - b'0') as usize;
+                i += 1;
+            }
+            n
+        }
+        None => default,
+    }
+}
+/// exp/eval-order (user idea): moves are also ordered by their child's static eval (our view = minus the child's
+/// eval, cp), weight EVORD_W ordering points per cp on top of the usual score (capture 1000/stone, killer 100000,
+/// history <= 2000); TT move stays first. Default 100 with EVORD_CACHE=1 (user order 2026-10-25); 0 = off. The evals are cached, so the futility child evals reuse
+/// them. BUILD-TIME (env EVORD_W / EVORD_MIN_DEPTH at cargo build).
+const EVORD_W: i32 = env_usize(option_env!("EVORD_W"), 100) as i32;
+const EVORD_MIN_DEPTH: u32 = env_usize(option_env!("EVORD_MIN_DEPTH"), 1) as u32;
+/// 1 = only children whose eval is ALREADY in the eval cache (e.g. from the previous iterative-deepening pass) get the
+/// eval term, scored as their gain over the node's own static eval; no new eval is ever computed for ordering.
+const EVORD_CACHE: bool = env_usize(option_env!("EVORD_CACHE"), 1) == 1;
 const ORD_KILLER: i32 = 100_000;
 const ORD_CAPTURE_UNIT: i32 = 1000; // per conversion, max 8
 const ORD_CLONE_BONUS: i32 = 500;
@@ -800,6 +825,29 @@ impl<'a> Searcher<'a> {
                 let static_eval = self.corrected(b, raw);
                 self.finish_node(b, alpha_orig, beta, static_eval, 0xFFFF, depth, ply, static_eval);
                 return static_eval;
+            }
+        }
+
+        if EVORD_W > 0 && depth >= EVORD_MIN_DEPTH && self.sancta.is_none() {
+            let n = self.stack.lists[ply as usize].len();
+            if n > 1 {
+                for i in 0..n {
+                    let (m, sc) = {
+                        let l = &self.stack.lists[ply as usize];
+                        (l.move_at(i), l.score_at(i))
+                    };
+                    if sc == ORD_TT {
+                        continue;
+                    }
+                    let child = b.make(m);
+                    let add = if EVORD_CACHE {
+                        let (k, v) = self.ecache[(child.hash as usize) & ((1 << ECACHE_BITS) - 1)];
+                        if k == child.hash && v != i32::MIN { (-v).saturating_sub(static_eval) } else { 0 }
+                    } else {
+                        -self.leaf_eval(&child)
+                    };
+                    self.stack.lists[ply as usize].set_score(i, sc.saturating_add(add.saturating_mul(EVORD_W)));
+                }
             }
         }
 
