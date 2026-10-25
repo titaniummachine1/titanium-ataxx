@@ -78,13 +78,13 @@ const fn env_usize(v: Option<&str>, default: usize) -> usize {
 }
 /// exp/eval-order (user idea): moves are also ordered by their child's static eval (our view = minus the child's
 /// eval, cp), weight EVORD_W ordering points per cp on top of the usual score (capture 1000/stone, killer 100000,
-/// history <= 2000); TT move stays first. 0 = off (= main). The evals are cached, so the futility child evals reuse
+/// history <= 2000); TT move stays first. Default 100 with EVORD_CACHE=1 (user order 2026-10-25); 0 = off. The evals are cached, so the futility child evals reuse
 /// them. BUILD-TIME (env EVORD_W / EVORD_MIN_DEPTH at cargo build).
-const EVORD_W: i32 = env_usize(option_env!("EVORD_W"), 0) as i32;
+const EVORD_W: i32 = env_usize(option_env!("EVORD_W"), 100) as i32;
 const EVORD_MIN_DEPTH: u32 = env_usize(option_env!("EVORD_MIN_DEPTH"), 1) as u32;
 /// 1 = only children whose eval is ALREADY in the eval cache (e.g. from the previous iterative-deepening pass) get the
 /// eval term, scored as their gain over the node's own static eval; no new eval is ever computed for ordering.
-const EVORD_CACHE: bool = env_usize(option_env!("EVORD_CACHE"), 0) == 1;
+const EVORD_CACHE: bool = env_usize(option_env!("EVORD_CACHE"), 1) == 1;
 const ORD_KILLER: i32 = 100_000;
 const ORD_CAPTURE_UNIT: i32 = 1000; // per conversion, max 8
 const ORD_CLONE_BONUS: i32 = 500;
