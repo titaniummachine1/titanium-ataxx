@@ -1,3 +1,7 @@
+## 2026-10-26 ~13:00 (clock 12:35; earlier entry times were estimates) - CURRENT STATE (read this first): main 343ab02 PUSHED; A1 eval profile DONE (D113); bound-shift gates next
+
+**A1 result (D113):** big net = 74% of search time; 58% of ALL big-net evals are futility children the big net then prunes anyway (the small-net bound is too cautious for them); leaves ~10% skippable with a two-sided bound; RFP < 1% (demoted). Probe: branch exp/eval-probe 14e7fe7 (worktree C:/gitProjects/evalprobe-ataxx, NEVER merge), report training/eval_probe_report.py, dumps data/nnue/evalprobe/. **Next:** bound-shift candidates (+40 / +80 cp on the fut-sn lower bound) gated vs main 100 ms + 50 ms, then a tighter (better) small net. **RUNNING (started 12:45, ~40 min, PC must stay idle):** logs/gate_futup.out = exp/fut-sn-up80 03754de (exe be03bec8) then exp/fut-sn-up40 3325735 (exe b2795ac3) vs main 343ab02, 100 ms then 50 ms each, 416 g per leg, par 4. 5k-node search time vs main (200 roots): +40 x1.07, +80 x1.20. Botzone upload of c3427453 still the user's.
+
 ## 2026-10-26 ~12:45 - CURRENT STATE (read this first): main 343ab02 PUSHED (CI green); Botzone package rebuilt; NOTHING RUNNING
 
 **origin/main = 343ab02** = futility small net (D108-D112; vs 1b286f2: 100 ms +84, 50 ms +123, 5k +3; `--no-fut-sn` = exact old search).
