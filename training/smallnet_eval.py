@@ -45,8 +45,19 @@ rows = S.Rows(z, np.arange(len(nn)))
 for p in sys.argv[1:]:
     st = torch.load(p, map_location="cpu", weights_only=False)
     a = st["args"]
-    m = S.SmallNet(a["width"], a["hidden"], not a["no_hand"])
+    taus = [float(x) for x in a["quantiles"].split(",")] if a.get("quantiles") else []
+    m = S.SmallNet(a["width"], a["hidden"], not a["no_hand"], max(1, len(taus)))
     m.load_state_dict(st["model"])
-    pred = np.round(S.evaluate(m, rows) * 400).astype(np.int64)
-    report("%s (W %d H %d hand %s, val %.5f)" % (p, a["width"], a["hidden"], not a["no_hand"], st["val"]), pred,
-           (50, 100, 150, 200, 250, 300))
+    out = np.round(S.evaluate(m, rows) * 400).astype(np.int64)
+    name = "%s (W %d H %d hand %s, val %.5f)" % (p, a["width"], a["hidden"], not a["no_hand"], st["val"])
+    if not taus:
+        report(name, out, (50, 100, 150, 200, 250, 300))
+        continue
+    # bound mode: each head IS the lower bound; small extra margins show the slope around it
+    for i, t in enumerate(taus):
+        b = out[:, i]
+        print("\n%s head tau %g: big net below the bound on %.3f%% of calls" % (name, t, 100 * (nn < b).mean()))
+        for mg in (0, 25, 50):
+            cheap = nd0 - red(b - mg) <= 0
+            print("  bound - %2d: big-net evals skipped %5.1f%% | wrong prunes %.2f%% of the moves the big net keeps"
+                  % (mg, 100 * (cheap & unc).sum() / unc.sum(), 100 * (cheap & ~prune).sum() / (~prune).sum()))

@@ -31,14 +31,16 @@ def main():
     ap.add_argument("--games", type=int, default=52, help="per shard (even: every book line from both seats)")
     ap.add_argument("--book0", type=int, default=3000)
     ap.add_argument("--par", type=int, default=4)
+    ap.add_argument("--champ-exe", default=EXE, help="champion binary (default: main's exe)")
     a = ap.parse_args()
     cexe = os.path.abspath(a.cand_exe)
+    champ = os.path.abspath(a.champ_exe)
     g = "%s/logs/gate_%s" % (ROOT, a.tag)
     os.makedirs(g, exist_ok=True)
     ref = subprocess.run(["git", "-C", MAIN, "log", "-1", "--format=%h"], capture_output=True, text=True).stdout.strip()
     dirty = subprocess.run(["git", "-C", MAIN, "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True).stdout.strip()
-    head = "cand exe %s, champ exe %s (main %s%s), net %s both sides | %d ms/move | %d x %d games, book %d.., par %d" % (
-        sha(cexe), sha(EXE), ref, " DIRTY" if dirty else "", sha(NET), a.ms, a.shards, a.games, a.book0, a.par)
+    head = "cand exe %s, champ exe %s (main is %s%s), net %s both sides | %d ms/move | %d x %d games, book %d.., par %d" % (
+        sha(cexe), sha(champ), ref, " DIRTY" if dirty else "", sha(NET), a.ms, a.shards, a.games, a.book0, a.par)
     print(head, flush=True)
     open(g + "/HEADER.txt", "w").write(head + "\n")
     if dirty:
@@ -49,7 +51,7 @@ def main():
         if os.path.exists(f + ".done"):
             return f
         cmd = [cexe, "match", "--games", str(a.games), "--time", str(a.ms), "--opp-time", str(a.ms), "--tuple", "none",
-               "--nnue", NET, "--opp", EXE + " serve", "--opp-tuple", "none", "--opp-nnue", NET, "--book", BOOK,
+               "--nnue", NET, "--opp", champ + " serve", "--opp-tuple", "none", "--opp-nnue", NET, "--book", BOOK,
                "--book-start", str(a.book0 + k * a.games // 2), "--start-game", "1", "--out", f]
         r = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if r.returncode == 0:

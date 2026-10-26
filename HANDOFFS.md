@@ -1,3 +1,7 @@
+## 2026-10-26 ~11:00 - RUNNING: futility small-net gates (D110); fut-cheap PASSED both time legs (awaiting user merge call)
+
+Chain in logs/gate_futsn.out: exp/fut-sn 9888823 (tau 2%, exe A6A220D0) vs exp/fut-cheap ea3e8ec at 100 ms then 50 ms; then 5k vs main for tau 2% and tau 0.2% (exp/fut-sn-t002 8f1d228). Keep the PC idle during the time legs. Docker: nothing running (tit-sn1 deleted). Small-net tools: training/smallnet_{pack,train,eval,export}.py, data in data/nnue/smallnet/. The small net is fitted to e11827d1: retrain it (probe -> pack -> train bound mode -> export) whenever the big net changes.
+
 ## 2026-10-26 ~10:30 - RUNNING: futility small net training on Docker tit-sn1 (D109) + fut-cheap time legs
 
 Docker sandbox tit-sn1 (16 vCPU, auto-delete at 150 min from ~10:05; DELETE it when the runs saturate) trains 3 small nets in /tmp/sn (sn_w32.pt, sn_w32nh.pt, sn_w64.pt). Gates: GATE-futcheap 5k = -20 [-54,+13] inconclusive; 100 ms then 50 ms legs running (logs/gate_futcheap.out). Data: data/nnue/smallnet/. PC stays idle during the time legs.
