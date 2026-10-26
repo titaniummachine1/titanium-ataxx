@@ -245,7 +245,8 @@ fn net_flag_str(spec: &Option<String>) -> String {
 /// Shipped champion: main runs this unless --tuple says otherwise.
 pub const DEFAULT_TUP: &str = "data/nnue/tupS57v2.tup";
 
-/// Shipped NNUE ("the optimized big net": nnue_t1ep4, sha c4829350, int16 fast path): serve / match run it when --nnue is
+/// Shipped NNUE (since 2026-10-26: stage-1 retrain on the full relabel, sha e11827d1, +132 Elo @5k vs the previous
+/// c4829350; int16 fast path): serve / match run it when --nnue is
 /// absent; file missing = S57 fallback; `--nnue none` = explicit S57-only escape hatch. With the NNUE active and no
 /// --tuple the tuple defaults to none (the gated config `--tuple none --nnue`).
 pub const DEFAULT_NNUE: &str = "data/nnue/nnue_main.tnn";
