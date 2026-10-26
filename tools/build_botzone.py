@@ -149,7 +149,8 @@ def main():
              ("library fails twice", t1, "TI_FAULT=lib_fail2", "", "move+ev:lib_ok_after_2_retries"),
              ("engine creation fails once", t1, "TI_FAULT=engine_fail1", "", "move+ev:engine_ok_after_1_retries"),
              ("engine creation fails for good", t1, "TI_FAULT=engine_fail", "", "fail"),
-             ("first search fails", t2, "TI_FAULT=search_fail1", "", "move+ev:resuscitated_on_try2"),
+             # real clock (scale 1): at 1/10 the 600 ms test turn is shorter than one engine (re)load on a busy machine
+             ("first search fails", t2, "TI_FAULT=search_fail1 TI_TIME_SCALE=1", "", "move+ev:resuscitated_on_try2"),
              ("impossible process age", t1, "TI_FAULT=age_huge", "", "move+ev:age_ignored"),
              ("engine fails for good", t1, "TI_FAULT=search_fail", "", "fail"),
              ("library missing", t1, "TI_FAULT=no_lib", "", "fail")]

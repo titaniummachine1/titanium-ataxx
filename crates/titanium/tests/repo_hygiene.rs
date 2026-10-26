@@ -59,6 +59,9 @@ const EXEMPT: &[&str] = &[
     "data/nnue/tups55tree.tup", // lowercase: reason() compares against lowercased paths
     "data/nnue/tups56twostage.tup", // S56 two-stage champ
     "data/nnue/tups57v2.tup", // S57 Ataxx-relabeled WDL teacher (gated +46 @5k)
+    // main's DEFAULT eval since 923dbea (user order 2026-10-25: the big NNUE must load without flags, so the net
+    // ships with the repo like Stockfish's); 28 MB, tracked with `git add -f`
+    "data/nnue/nnue_main.tnn",
 ];
 
 fn glob_match(pattern: &str, name: &str) -> bool {
