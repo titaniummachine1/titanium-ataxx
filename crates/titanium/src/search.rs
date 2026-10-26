@@ -18,8 +18,6 @@ const MATE_BOUND: i32 = MATE - 2000;
 /// Search window infinity: finite and just above every real score (Stockfish VALUE_INFINITE style). The old
 /// i32::MIN+1 / i32::MAX window ends leaked into null-window searches as "scores" and made score_to_tt overflow.
 const INF: i32 = MATE + 1000;
-/// Botzone judge cap: it ends the game once input.size() > 800, i.e. right after half-move 401, on the stone count.
-const BZ_MAX_PLIES: u32 = 401;
 
 /// Search stack depth cap (max_depth is clamped well below this).
 const MAX_PLY: usize = 40;
@@ -722,9 +720,8 @@ impl<'a> Searcher<'a> {
         // Build-time rules selection (const generic: the dead branch is
         // compiled out, zero hot-path cost either way).
         if BZ {
-            // No passes on-platform: EITHER side stuck (the judge checks both after every move), wipeout/full,
-            // or the judge's half-move cap ends the game (bz_terminal_score scores it like the judge: bz_counts).
-            if b.bz_over() || b.ply >= BZ_MAX_PLIES {
+            // No passes on-platform: stm stuck (or wipeout/full) ends the game.
+            if b.is_over() || !b.has_moves(b.turn) {
                 return bz_terminal_score(b, ply);
             }
         } else if b.game_over() {
