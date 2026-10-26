@@ -1,3 +1,7 @@
+## 2026-10-26 ~10:30 - RUNNING: futility small net training on Docker tit-sn1 (D109) + fut-cheap time legs
+
+Docker sandbox tit-sn1 (16 vCPU, auto-delete at 150 min from ~10:05; DELETE it when the runs saturate) trains 3 small nets in /tmp/sn (sn_w32.pt, sn_w32nh.pt, sn_w64.pt). Gates: GATE-futcheap 5k = -20 [-54,+13] inconclusive; 100 ms then 50 ms legs running (logs/gate_futcheap.out). Data: data/nnue/smallnet/. PC stays idle during the time legs.
+
 ## 2026-10-26 ~10:30 - RUNNING: gates of the cheap futility pre-filter (exp/fut-cheap ea3e8ec, D108)
 
 Background chain (logs/gate_futcheap.out): 5k nodes -> 100 ms -> 50 ms vs main 1b286f2, same net e11827d1. Keep the box idle during the time legs. Done: GATE-int8-vs-main 5k = -12 [-45,+22] inconclusive (LEDGER). D107 corrected: 72 ns = hand eval, S57 = 1.76 us.
