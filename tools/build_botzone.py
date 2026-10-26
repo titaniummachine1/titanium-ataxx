@@ -11,7 +11,10 @@ Steps (each one stops the script on failure, nothing half-built is left as "read
   3. check the library: ELF x86-64, every ti_* function exported, newest glibc symbol <= 2.17.
   4. assemble botzone/upload/: the driver, data/titanium_v2.so, data/nnue/nnue_main.tnn (main's default net),
      data/nnue/tupS57v2.tup (fallback) and MANIFEST.txt (commit, sha256 of every file, where each file goes).
-  5. test (needs Docker, local only): the exact upload folder plays turn 1 as black, turn 1 as white and turn 2
+  5. test (needs Docker, local only): the exact upload folder plays turn 1 as black, turn 1 as white, turn 2, with
+     stderr closed and through every injected fault (TI_FAULT: library fails twice, engine creation fails, first search
+     fails, impossible clock -> must still move and name the recovery; engine fails for good / library missing -> must
+     fail VISIBLY with -1s + ENGINE_FAILED/FATAL),
      in a python:3.6 container with an older glibc, at a scaled clock; must load the NNUE and answer in time.
 Uploading stays manual (your Botzone login never leaves your machine): see MANIFEST.txt.
 """
@@ -139,24 +142,45 @@ def main():
     step("5/5 Linux test (Docker, python:3.6, older glibc)")
     if not shutil.which("docker"):
         fail("docker not found; rerun with --no-test to skip (not recommended)")
-    turns = [("black turn 1", "1\\n-1 -1 -1 -1\\n"), ("white turn 1", "1\\n0 0 1 1\\n"),
-             ("turn 2", "2\\n-1 -1 -1 -1\\n6 6 5 5\\n6 0 5 1\\n")]
-    script = "set -e; ldd --version | head -1; python3 --version; "
-    for name, inp in turns:
-        script += "echo '-- %s'; printf '%s' | TI_TIME_SCALE=0.1 TI_DEBUG=1 python3 titanium_botzone.py; " % (name, inp)
+    # (name, stdin, env, shell redirect, expect): "move" = legal move whose debug line names the NNUE,
+    # "move+ev:<x>" = legal move AND recovery event <x> in the debug line, "fail" = -1s + ENGINE_FAILED/FATAL (a VISIBLE failure)
+    t1, t1w, t2 = "1\\n-1 -1 -1 -1\\n", "1\\n0 0 1 1\\n", "2\\n-1 -1 -1 -1\\n6 6 5 5\\n6 0 5 1\\n"
+    cases = [("black turn 1", t1, "", "", "move"), ("white turn 1", t1w, "", "", "move"), ("turn 2", t2, "", "", "move"),
+             ("stderr closed", t1, "", "2>&-", "move"),
+             ("library fails twice", t1, "TI_FAULT=lib_fail2", "", "move+ev:lib_ok_after_2_retries"),
+             ("engine creation fails", t1, "TI_FAULT=engine_fail", "", "move+ev:net_fail"),
+             ("first search fails", t2, "TI_FAULT=search_fail1", "", "move+ev:resuscitated_on_try2"),
+             ("impossible process age", t1, "TI_FAULT=age_huge", "", "move+ev:age_ignored"),
+             ("engine fails for good", t1, "TI_FAULT=search_fail", "", "fail"),
+             ("library missing", t1, "TI_FAULT=no_lib", "", "fail")]
     if a.full_time:
-        script += "echo '-- black turn 1, real 12 s clock'; printf '1\\n-1 -1 -1 -1\\n' | TI_DEBUG=1 python3 titanium_botzone.py; "
+        cases.append(("real 12 s first move", t1, "TI_TIME_SCALE=1", "", "move"))
+    script = "ldd --version | head -1; python3 --version; "
+    for name, inp, env, redir, _ in cases:
+        script += "echo '== %s'; printf '%s' | env TI_TIME_SCALE=0.1 %s python3 titanium_botzone.py %s; echo \"== rc=$?\"; " % (name, inp, env, redir)
     r = subprocess.run(["docker", "run", "--rm", "-v", "%s:/bot" % OUT, "-w", "/bot", "python:3.6-slim-buster", "bash", "-c", script],
                        capture_output=True, text=True, env=dict(os.environ, MSYS_NO_PATHCONV="1"))
     print(r.stdout + r.stderr)
-    moves = re.findall(r"^(-?\d+) (-?\d+) (-?\d+) (-?\d+)$", r.stdout, re.M)
-    want = len(turns) + (1 if a.full_time else 0)
-    if r.returncode or len(moves) != want or any("-1" in m for m in moves):
-        fail("Linux test: expected %d legal moves, got %d (exit %d)" % (want, len(moves), r.returncode))
-    if (r.stdout + r.stderr).count("nnue_main.tnn") < want:
-        fail("Linux test: the NNUE was not loaded on every turn")
-    over = [float(x) for x in re.findall(r"over=(-?[\d.]+)", r.stdout + r.stderr)]
-    print("ok: %d turns played, NNUE loaded every turn, worst overshoot past the engine budget %.1f ms" % (want, max(over)))
+    blocks = re.split(r"^== (?!rc=)", r.stdout, flags=re.M)[1:]
+    bad = []
+    for (name, _, _, _, expect), blk in zip(cases, blocks):
+        lines = [l for l in blk.splitlines()[1:] if not l.startswith("== rc=")]
+        rc = re.search(r"== rc=(\d+)", blk)
+        mv = lines[0] if lines else ""
+        dbg = lines[1] if len(lines) > 1 else ""
+        if rc is None or rc.group(1) != "0":
+            bad.append("%s: exit code %s" % (name, rc.group(1) if rc else "?"))
+        elif expect == "fail":
+            if mv != "-1 -1 -1 -1" or not re.search(r"ENGINE_FAILED|FATAL", dbg):
+                bad.append("%s: expected a VISIBLE failure, got %r / %r" % (name, mv, dbg))
+        else:
+            if re.fullmatch(r"[0-6] [0-6] [0-6] [0-6]", mv) is None or "nnue_main.tnn" not in dbg:
+                bad.append("%s: expected a legal NNUE move, got %r / %r" % (name, mv, dbg))
+            if expect.startswith("move+ev:") and expect[8:] not in dbg:
+                bad.append("%s: recovery event %s missing in %r" % (name, expect[8:], dbg))
+    if r.returncode or bad or len(blocks) < len(cases):
+        fail("Linux test: " + ("; ".join(bad) if bad else "only %d of %d cases ran" % (len(blocks), len(cases))))
+    print("ok: %d cases passed (normal turns, stderr closed, every recovery path, visible failures)" % len(cases))
     print("\nREADY TO UPLOAD: %s  (see MANIFEST.txt)" % OUT)
 
 
