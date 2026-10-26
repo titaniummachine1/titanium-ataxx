@@ -9,11 +9,12 @@ Steps (each one stops the script on failure, nothing half-built is left as "read
   2. build the engine library for Linux with zig for glibc 2.14 (Botzone runs Ubuntu 16.04 = glibc 2.23; a
      library built on a modern system needs glibc 2.34 and crashes the bot on its first move).
   3. check the library: ELF x86-64, every ti_* function exported, newest glibc symbol <= 2.17.
-  4. assemble botzone/upload/: the driver, data/titanium_v2.so, data/nnue/nnue_main.tnn (main's default net),
-     data/nnue/tupS57v2.tup (fallback) and MANIFEST.txt (commit, sha256 of every file, where each file goes).
+  4. assemble botzone/upload/: the driver, data/titanium_v2.so, data/nnue/nnue_main.tnn (main's default net)
+     and MANIFEST.txt (no fallback net: the driver plays at full strength or fails visibly) (commit, sha256 of every file, where each file goes).
   5. test (needs Docker, local only): the exact upload folder plays turn 1 as black, turn 1 as white, turn 2, with
      stderr closed and through every injected fault (TI_FAULT: library fails twice, engine creation fails, first search
-     fails, impossible clock -> must still move and name the recovery; engine fails for good / library missing -> must
+     fails, impossible clock -> must still move AT FULL STRENGTH (NNUE, normal hash) and name the recovery; engine never
+     created / search fails for good / library missing -> must
      fail VISIBLY with -1s + ENGINE_FAILED/FATAL),
      in a python:3.6 container with an older glibc, at a scaled clock; must load the NNUE and answer in time.
 Uploading stays manual (your Botzone login never leaves your machine): see MANIFEST.txt.
@@ -38,7 +39,6 @@ ZIG_DIRS = ["C:/gitProjects/toolchains/zig-0.13.0/zig-windows-x86_64-0.13.0"]
 FILES = {  # upload-folder path -> source path in the repo
     "titanium_botzone.py": "botzone/titanium_botzone.py",
     "data/nnue/nnue_main.tnn": "data/nnue/nnue_main.tnn",
-    "data/nnue/tupS57v2.tup": "data/nnue/tupS57v2.tup",
 }
 
 
@@ -126,7 +126,6 @@ def main():
              "Upload (Botzone -> avatar menu -> manage storage), then submit the bot:",
              "  data/titanium_v2.so       -> storage /titanium_v2.so",
              "  data/nnue/nnue_main.tnn   -> storage /nnue/nnue_main.tnn   (big NNUE, main's default eval)",
-             "  data/nnue/tupS57v2.tup    -> storage /nnue/tupS57v2.tup    (fallback if the NNUE is missing)",
              "  titanium_botzone.py       -> new bot version: Python 3, simple IO, long-running OFF", "",
              "sha256:"]
     for root, _, fs in os.walk(OUT):
@@ -148,7 +147,8 @@ def main():
     cases = [("black turn 1", t1, "", "", "move"), ("white turn 1", t1w, "", "", "move"), ("turn 2", t2, "", "", "move"),
              ("stderr closed", t1, "", "2>&-", "move"),
              ("library fails twice", t1, "TI_FAULT=lib_fail2", "", "move+ev:lib_ok_after_2_retries"),
-             ("engine creation fails", t1, "TI_FAULT=engine_fail", "", "move+ev:net_fail"),
+             ("engine creation fails once", t1, "TI_FAULT=engine_fail1", "", "move+ev:engine_ok_after_1_retries"),
+             ("engine creation fails for good", t1, "TI_FAULT=engine_fail", "", "fail"),
              ("first search fails", t2, "TI_FAULT=search_fail1", "", "move+ev:resuscitated_on_try2"),
              ("impossible process age", t1, "TI_FAULT=age_huge", "", "move+ev:age_ignored"),
              ("engine fails for good", t1, "TI_FAULT=search_fail", "", "fail"),

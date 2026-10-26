@@ -5,8 +5,7 @@ this bot's first turn). TI_MODE=long = the long-live variant (>>>BOTZONE_REQUEST
 Layout on Botzone (storage files next to the bot):
     data/titanium_v2.so          engine library (Linux, glibc >= 2.14)
     data/nnue/nnue_main.tnn      big NNUE (main's default eval)
-    data/nnue/tupS57v2.tup       fallback evaluation net
-Local testing overrides (environment): TI_LIB, TI_NET, TI_TT_BITS, TI_TIME_SCALE, TI_DEBUG, TI_FAULT (tests only).
+Local testing overrides (environment): TI_LIB, TI_NET, TI_TT_BITS, TI_TIME_SCALE, TI_DEBUG, TI_FAULT (tests only: lib_fail2, engine_fail1, engine_fail, search_fail1, search_fail, no_lib, age_huge).
 
 Why (2026-10-26, match 6ade99b3...: RE after 101 ms, exit status 120, no stdout, no stderr, 144 MB): the engine had
 loaded, then the process died on a broken standard stream (CPython exits 120 when it cannot flush them; the old driver
@@ -14,9 +13,10 @@ wrote "net ..." to stderr right after loading the net). So:
   * no stream problem may cost the move: stderr writes are guarded, diagnostics go into the DEBUG line of stdout
     (line 2, shown in the Botzone match log), the answer is written with os.write (retried) and the process leaves with
     os._exit(0) so interpreter shutdown cannot fail after the move was sent;
-  * the engine is RESUSCITATED: library load and engine creation are retried, nets fall back NNUE -> S57 -> classical,
-    a failed search rebuilds the engine, replays the game and searches again with the time left; every recovery and
-    its cost in ms is listed in the debug line ("ev ...");
+  * the engine is RESUSCITATED at FULL strength only: library load and engine creation (big NNUE, normal hash table)
+    are retried, a failed search rebuilds the engine, replays the game and searches again with the time left (same
+    engine, same net, less time); every recovery and its cost in ms is listed in the debug line ("ev ...");
+    NEVER a weaker net, the classical eval or a smaller hash table (user order 2026-10-26);
   * NO backup move generator (user order 2026-10-26): if the engine cannot answer after the retries the bot answers
     "-1 -1 -1 -1" with ENGINE_FAILED and the reason in the debug line, so a failure is visible as a failure
     (INVALIDMOVE) and is never mistaken for a weak move;
@@ -45,7 +45,7 @@ WATCHDOG_GRACE_MS = 12
 RETRY_RESERVE_MS = 400      # a resuscitated search needs at least this much time left
 SCALE = float(os.environ.get("TI_TIME_SCALE", "1.0"))
 DEBUG = os.environ.get("TI_DEBUG") == "1"
-FAULT = os.environ.get("TI_FAULT", "")   # tests only: lib_fail2, engine_fail, search_fail1, search_fail, no_lib, age_huge
+FAULT = os.environ.get("TI_FAULT", "")   # tests only, see the docstring
 HERE = os.path.dirname(os.path.abspath(__file__))
 EVENTS = []                 # recoveries of this turn -> debug line
 
@@ -153,25 +153,26 @@ class Engine:
         raise RuntimeError("library_load_failed_3x")
 
     def create(self):
+        """Full strength or nothing (user order 2026-10-26): the big NNUE with the normal hash table, retried; NEVER a
+        weaker net, the classical eval or a smaller hash table just to stay alive - that would hide a failure as a
+        weak game. If it cannot be created, the turn fails visibly (ENGINE_FAILED)."""
         tt_bits = int(os.environ.get("TI_TT_BITS", "22"))
-        nets = [os.environ.get("TI_NET"), os.path.join("data", "nnue", "nnue_main.tnn"), os.path.join(HERE, "data", "nnue", "nnue_main.tnn"),
-                os.path.join("data", "nnue", "tupS57v2.tup"), os.path.join(HERE, "data", "nnue", "tupS57v2.tup")]
-        for bits in (tt_bits, tt_bits - 2):          # second round: smaller hash table (memory pressure)
-            for p in nets:
-                if not p or not os.path.exists(p):
-                    continue
-                t0 = now_ms()
-                inject = FAULT == "engine_fail" and bits == tt_bits
-                e = None if inject else self.lib.ti_new(os.path.abspath(p).encode("utf-8"), bits)
-                if e:
-                    self.e, self.net = e, "%s/%d" % (os.path.basename(p), bits)
-                    return
-                event("net_fail(%s,%d)" % (os.path.basename(p), bits), t0)
-        e = self.lib.ti_new(None, tt_bits - 2)
-        if not e:
-            raise RuntimeError("ti_new_failed_for_every_net")
-        event("classical_eval")
-        self.e, self.net = e, "classical"
+        cands = [os.environ.get("TI_NET"), os.path.join("data", "nnue", "nnue_main.tnn"), os.path.join(HERE, "data", "nnue", "nnue_main.tnn")]
+        net = next((p for p in cands if p and os.path.exists(p)), None)
+        if net is None:
+            raise RuntimeError("nnue_main.tnn_not_found")
+        for attempt in range(3):
+            t0 = now_ms()
+            inject = (FAULT == "engine_fail") or (FAULT == "engine_fail1" and attempt == 0)
+            e = None if inject else self.lib.ti_new(os.path.abspath(net).encode("utf-8"), tt_bits)
+            if e:
+                self.e, self.net = e, "%s/%d" % (os.path.basename(net), tt_bits)
+                if attempt:
+                    event("engine_ok_after_%d_retries" % attempt, t0)
+                return
+            event("engine_create_fail%d" % (attempt + 1), t0)
+            time.sleep(0.02)
+        raise RuntimeError("engine_create_failed_3x")
 
     def setup(self, history):
         self.lib.ti_new_game(self.e)
