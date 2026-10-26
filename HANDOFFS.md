@@ -2,10 +2,8 @@
 
 **Main** = origin/main 343ab02 (futility small net, `--no-fut-sn` = exact old search). Nothing was merged this block. Botzone package built from it (botzone/upload).
 
-**RUNNING: Docker sandbox tit-sn2** (16 vCPU, created ~12:56, ttl ends ~16:56 = self-delete; worst case $4.48, ~$1.2 spent at 14:00): time-cost Optuna for small net v2 (D114).
-Log /tmp/sn/optuna.out in the sandbox; first finished trial: W64 H8 skips 73.3% at 1.43% wrong prunes (cost 2.06 us/call). It is slow (~20-25 min per trial, 4 parallel):
-PLAN = stop at ~15:10 (about 16 trials) or at SATURATED, whichever first. **How to check / stop / collect / DELETE: docs/DOCKER_SANDBOXES.md section 4** (any model can do it).
-A session-local watcher may not exist in a new session; that is fine, do section 4 by hand. Modal: `python -m modal app list` was empty at 14:10 (docs/MODAL.md).
+**NOTHING RUNNING (14:40):** Docker tit-sn2 was stopped, collected into data/nnue/smallnet/v2 and DELETED (`sbx --cloud ls` empty; ledger row written, ~$1.9). Modal: `python -m modal app list` empty. PC idle.
+Optuna result (D115): saturated; chosen net = trial 2 (W64 H16, tactical + alpha inputs, focus 1, head tau 0.05 + shift): ~74.1% of big-net evals skipped at 1.43% wrong prunes vs 68.6% deployed. Port IN PROGRESS on exp/fut-sn2.
 
 **Results this block (details: DECISIONS D113-D114, LEDGER GATE-futup*):**
 - A1 profile of main (D113): the big net = 74% of search time; 58% of ALL big-net evals are futility children the big net prunes anyway; leaves ~10% skippable; RFP < 1%.
@@ -16,7 +14,7 @@ A session-local watcher may not exist in a new session; that is fine, do section
 
 **Local-only branches / worktrees (all committed, none pushed, none merged):** exp/eval-probe 14e7fe7 (C:/gitProjects/evalprobe-ataxx, probe counters, NEVER merge); exp/fut-sn-up40 3325735 and exp/fut-sn-up80 03754de (C:/gitProjects/futup-ataxx); exp/nnue-head 975bff3 (C:/gitProjects/nnhead-ataxx); exp/fut-sn2 edf58a7 (C:/gitProjects/futsn2-ataxx: smallnet::tactical() ported + tested, net format not yet swapped). Docs/tools on exp/tonight (this folder).
 
-**NEXT (in order):** (1) collect/stop/delete tit-sn2 and pick the best Optuna trial; (2) finish the v2 small-net engine port on exp/fut-sn2 (any W,H + 10 tactical + alpha inputs, exskip, AVX2 head, export format, `snparity` <= 0.5 cp), then gate 100 ms + 50 ms vs main (training/time_gate.py), user approves any merge; (3) stack lossless speed-ups on exp/nnue-head (feature computation 1.4 us/eval, FT accumulate 3 us/eval) then gate; (4) BACKLOG.md: A2 two-sided bound, A3 lazy leaf; (5) after search/speed is saturated: second relabel (the user wants max Elo first). Standing rules: AGENTS.md section 3, BEHAVIOR 25 (docs in real time), no training / long jobs without the user's order, never handle tokens/Botzone credentials (uploads are the user's).
+**NEXT (in order):** (1) DONE (collected + deleted); (2) finish the v2 small-net engine port on exp/fut-sn2 (any W,H + 10 tactical + alpha inputs, exskip, AVX2 head, export format, `snparity` <= 0.5 cp), then gate 100 ms + 50 ms vs main (training/time_gate.py), user approves any merge; (3) stack lossless speed-ups on exp/nnue-head (feature computation 1.4 us/eval, FT accumulate 3 us/eval) then gate; (4) BACKLOG.md: A2 two-sided bound, A3 lazy leaf; (5) after search/speed is saturated: second relabel (the user wants max Elo first). Standing rules: AGENTS.md section 3, BEHAVIOR 25 (docs in real time), no training / long jobs without the user's order, never handle tokens/Botzone credentials (uploads are the user's).
 
 ## 2026-10-26 ~12:45 - CURRENT STATE (read this first): main 343ab02 PUSHED (CI green); Botzone package rebuilt; NOTHING RUNNING
 
