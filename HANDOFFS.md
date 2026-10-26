@@ -1,3 +1,7 @@
+## 2026-10-26 ~09:30 - network speed ablation probe (no training; nothing running)
+
+D107: NNUE evals are ~95% of search time, 2.77 computed evals per node, 91% of futility child evals end in a prune. No free neuron pruning (all 256 used). int8 FT = exp/nnue-int8 1e0e406, +5% speed, val +0.05%, NOT gated. Next options (need the user's go): (a) time-gate int8; (b) cheaper futility child eval (search change, biggest lever); (c) retrain narrower / without G2 (Modal, ~$1-3 each), gate speed AND strength. Probe tool: training/nnue_prune_probe.py.
+
 ## 2026-10-26 ~08:30 - CURRENT STATE (read this first; everything below is history)
 
 **Main = origin/main 1b286f2 (PUSHED)** = default NNUE **e11827d1** (+132 Elo @5k vs the old c4829350, LEDGER GATE-s1chg-vs-main)
