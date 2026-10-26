@@ -66,3 +66,4 @@ filter prunes on the wrong bound. Steps (CPU only: PC or a Docker sandbox, ~1 h 
 `--no-fut-sn` on any titanium-cli command (serve included) switches the filter off = exact full-strength search (D112).
 Docker: python:3.12 image, `pip install numpy torch --index-url https://download.pytorch.org/whl/cpu`; uploading the 1.5 GB
 sn_train.npz took ~14 min, so generating the data inside a rust:1.97 sandbox may be faster next time.
+Docker usage, ledger, how to stop a sandbox: docs/DOCKER_SANDBOXES.md.

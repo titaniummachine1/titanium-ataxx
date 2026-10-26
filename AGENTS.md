@@ -15,6 +15,8 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 
 ## 2. Where the strongest engine lives (do not guess)
 
+- **DOCKER: docs/DOCKER_SANDBOXES.md = how to run, watch, STOP and pay for `sbx --cloud` sandboxes (money rules, ledger, current sandbox tit-sn2 and how to stop it). Read it before touching any sandbox.**
+
 - **UPDATE 2026-10-26 ~12:30: STRONGEST = main 343ab02 (PUSHED 12:45, CI green) = 1b286f2 + futility small net (D108-D112; vs 1b286f2: 100 ms +84, 50 ms +123, 5k +3). `--no-fut-sn` = exact full-strength search (identical to 1b286f2). Ranked next work: BACKLOG.md CURRENT BACKLOG. The small net is fitted to e11827d1: retrain it with every new big net (TRAINING_RUNBOOK). Botzone package rebuilt from it (botzone/upload, .so c3427453, 12/12 Linux cases).**
 - **READ FIRST for training/relabel/Botzone work: docs/TRAINING_RUNBOOK.md, docs/RELABEL_RUNBOOK.md, HANDOFFS top entry. No external teacher beats Titanium (D105); never fine-tune on the Kata columns (D98/D101).**
 - **UPDATE 2026-10-26 (later): STRONGEST = main 1b286f2 (PUSHED) = c7c44a3 + critical fixes (Botzone driver hardening, FFI depth cap, overflow fix; LEDGER MAIN-critical).**
