@@ -59,6 +59,13 @@ const MB_LMR_HALFLIFE: i32 = 47;
 /// (Moonbird futilityReductionDiv 35 in its units; x1.62 to Titanium cp: 568/ln10 vs 400 per logit). Reduce only.
 const MB_FUT_MIN_IDX: usize = 1;
 const MB_FUT_DIV: i32 = 57;
+/// exp/fut-cheap (D108): before the NNUE child eval of the futility step, a cheap estimate of it
+/// pred = (357 * hand(child) - 542 * parent static eval) / 1000 + 248 (least squares on 4.1M recorded futility calls of
+/// e11827d1, residual sd 191 cp; the hand eval costs ~72 ns vs ~6.5 us for the NNUE; S57 was a better fit but costs
+/// 1.8 us). If the move would be pruned even with the child eval FUT_CHEAP_M cp lower than predicted (better for us), it
+/// is pruned without the NNUE eval (offline at M 350: 49% of those NNUE evals saved, 2.8% of the moves the net keeps
+/// pruned). BUILD-TIME env FUT_CHEAP_M (0 = off).
+const FUT_CHEAP_M: i32 = env_usize(option_env!("FUT_CHEAP_M"), 350) as i32;
 
 // Ordering tiers (titanium-engine pattern: compile-asserted bands so no
 // ordering signal can structurally leak into its neighbor).
@@ -888,6 +895,18 @@ impl<'a> Searcher<'a> {
             let mut child_eval = i32::MIN;
             if move_idx >= MB_FUT_MIN_IDX && new_depth > 0 && self.sancta.is_none() {
                 // child eval is from the child's side to move = minus our static value of the move
+                if FUT_CHEAP_M > 0 && self.nnue.is_some() {
+                    let slot = (child.hash as usize) & ((1 << ECACHE_BITS) - 1);
+                    if !(self.ecache[slot].0 == child.hash && self.ecache[slot].1 != i32::MIN) {
+                        let hand = evaluate(&child, None, false);
+                        let pred = (357 * hand - 542 * static_eval) / 1000 + 248;
+                        let lo = pred - FUT_CHEAP_M;
+                        if new_depth - (alpha.saturating_add(lo) / MB_FUT_DIV).clamp(0, 64) <= 0 {
+                            move_idx += 1;
+                            continue;
+                        }
+                    }
+                }
                 child_eval = self.leaf_eval(&child);
                 new_depth -= (alpha.saturating_add(child_eval) / MB_FUT_DIV).clamp(0, 64);
             }
