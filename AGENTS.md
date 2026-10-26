@@ -15,6 +15,7 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 
 ## 2. Where the strongest engine lives (do not guess)
 
+- **UPDATE 2026-10-26 ~12:00: CANDIDATE exp/fut-sn 9888823 (futility small net, D108-D110; vs main 100 ms +84, 5k +3; 50 ms confirming) - merge APPROVED by the user if the 50 ms leg passes, with `--no-fut-sn` = exact full-strength search. Ranked next work: BACKLOG.md CURRENT BACKLOG. The small net is fitted to e11827d1: retrain it with every new big net (TRAINING_RUNBOOK).**
 - **READ FIRST for training/relabel/Botzone work: docs/TRAINING_RUNBOOK.md, docs/RELABEL_RUNBOOK.md, HANDOFFS top entry. No external teacher beats Titanium (D105); never fine-tune on the Kata columns (D98/D101).**
 - **UPDATE 2026-10-26 (later): STRONGEST = main 1b286f2 (PUSHED) = c7c44a3 + critical fixes (Botzone driver hardening, FFI depth cap, overflow fix; LEDGER MAIN-critical).**
 - **UPDATE 2026-10-26: STRONGEST = main c7c44a3 (LOCAL, not pushed) = 0f27043 + default NNUE e11827d1 (stage-1 retrain on the full 33.9M-row relabel, +132 Elo @5k vs c4829350; LEDGER MAIN-net-s1chg). The Kata fine-tune (stage 2) LOSES -137 to it (D98) - do not use.**

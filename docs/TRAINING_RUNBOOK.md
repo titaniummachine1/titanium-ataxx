@@ -41,3 +41,28 @@ ONE gate at a time. Never touch main-ataxx while a gate runs (the champion side 
 ## Promote a net to main (user approval naming the net)
 Copy the exported .tnn to data/nnue/nnue_main.tnn in a SEPARATE worktree from main (git add -f), commit, check `match` default games equal an
 explicit `--nnue` run, fast-forward main when no job reads main-ataxx, rebuild, `python tools/build_botzone.py` for the Botzone upload.
+
+## Futility small net (D109/D110) - RETRAIN IT WITH EVERY NEW BIG NET
+The engine compiles in data/nnue/fut_small.tsn (52,844 B): a tiny net trained as a LOWER BOUND of the big net's eval of
+futility children (tau 2%). It is fitted to ONE big net (e11827d1); a new nnue_main.tnn without a new small net = the
+filter prunes on the wrong bound. Steps (CPU only: PC or a Docker sandbox, ~1 h total):
+
+    # 1. record child positions + the big net's evals (probe branch exp/fut-probe, worktree C:/gitProjects/futprobe-ataxx;
+    #    rebuild it with the NEW net in data/nnue/nnue_main.tnn); roots = 49-char board lines; ~5 min per 4 x 1000 roots
+    FUT_PROBE=data/nnue/smallnet/rec_trK.bin titanium-cli label --nodes 5000 --tuple none --nnue <net> < roots_trK.txt
+    FUT_PROBE=data/nnue/smallnet/rec_ev.bin  titanium-cli label --nodes 5000 --tuple none --nnue <net> < roots_ev.txt   # disjoint roots
+    # 2. pack (dedupe train, keep every eval call)
+    python training/smallnet_pack.py
+    # 3. eval-mode net, then bound heads warm-started from it (both saturate by val-driven LR halving)
+    python training/smallnet_train.py --out data/nnue/smallnet/sn_w32.pt --width 32
+    python training/smallnet_train.py --out data/nnue/smallnet/sn_q32.pt --width 32 --quantiles 0.002,0.005,0.01,0.02,0.05 --init data/nnue/smallnet/sn_w32.pt --lr 1e-3
+    # 4. score as a filter on the held-out calls (skipped big-net evals vs wrong prunes; baseline = hand filter)
+    python training/smallnet_eval.py data/nnue/smallnet/sn_q32.pt
+    # 5. export one head + parity reference, copy into the engine, rebuild, check parity and speed
+    python training/smallnet_export.py --pt data/nnue/smallnet/sn_q32.pt --tau 0.02 --out data/nnue/fut_small.tsn
+    titanium-cli snparity --ref data/nnue/fut_small.tsn.ref.txt      # max |rust - torch| <= 0.5 cp, ~180 ns/eval
+    # 6. gate 100 ms + 50 ms vs main (training/time_gate.py); git add -f data/nnue/fut_small.tsn (repo_hygiene EXEMPT)
+
+`--no-fut-sn` on any titanium-cli command (serve included) switches the filter off = exact full-strength search (D112).
+Docker: python:3.12 image, `pip install numpy torch --index-url https://download.pytorch.org/whl/cpu`; uploading the 1.5 GB
+sn_train.npz took ~14 min, so generating the data inside a rust:1.97 sandbox may be faster next time.
