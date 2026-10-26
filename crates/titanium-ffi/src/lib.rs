@@ -190,6 +190,12 @@ pub extern "C" fn ti_stop(e: *mut TiEngine) {
     }
 }
 
+/// Iterative-deepening cap for Botzone searches. The search stack holds MAX_PLY = 40 plies and the ply < MAX_PLY check
+/// is only a debug_assert, so an uncapped depth (was u32::MAX: decided positions reached "depth 27178") could index past
+/// the stack -> panic -> abort = the bot dies. The CLI/gates cap at 24-30; real Botzone searches reach depth 10-15, so 32
+/// changes nothing but solved positions.
+const FFI_MAX_DEPTH: u32 = 32;
+
 /// Search the current position for at most `budget_ms` (wall clock, absolute) and write the move
 /// to out[0..4] = x0,y0,x1,y1. Plays the move on the internal board.
 /// Returns 1 = move written, 0 = no legal move (out = -1s), -1 = bad arguments.
@@ -209,7 +215,7 @@ pub extern "C" fn ti_search(e: *mut TiEngine, budget_ms: u64, out: *mut i32) -> 
         return 0;
     }
     e.stop.store(false, Ordering::Relaxed);
-    let limits = SearchLimits { time: Some(Duration::from_millis(budget_ms.max(1))), max_nodes: None, max_depth: u32::MAX };
+    let limits = SearchLimits { time: Some(Duration::from_millis(budget_ms.max(1))), max_nodes: None, max_depth: FFI_MAX_DEPTH };
     let r = e.searcher.search_bz(&e.board, &limits);
     let mut mv = r.best.unwrap_or_else(|| list.move_at(0));
     let mut overridden = 0u32;

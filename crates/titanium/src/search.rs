@@ -702,6 +702,11 @@ impl<'a> Searcher<'a> {
         null_allowed: bool,
     ) -> i32 {
         self.nodes += 1;
+        // Hard stack guard (release builds too): never index past the MAX_PLY-sized stacks. Unreachable while
+        // max_depth <= 32 (every recursion lowers depth by >= 1); a last line of defence instead of a panic/abort.
+        if ply as usize >= MAX_PLY - 1 {
+            return self.leaf_eval(b);
+        }
         // consume a parent-computed static eval first, so a TT return below can never leave it stale
         let pre = std::mem::replace(&mut self.stack.pre_eval[ply as usize], i32::MIN);
         self.check_stop();
