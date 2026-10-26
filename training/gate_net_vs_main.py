@@ -34,7 +34,7 @@ def main():
     ap.add_argument("--shards", type=int, default=16)
     ap.add_argument("--games", type=int, default=26, help="per shard (even: every book line from both seats)")
     ap.add_argument("--book0", type=int, default=3000)
-    ap.add_argument("--par", type=int, default=7)
+    ap.add_argument("--par", type=int, default=10, help="pure-node gate: 10 = PC sweet spot (D111)")
     ap.add_argument("--nodes", type=int, default=5000)
     ap.add_argument("--champ", default=CHAMP, help="opponent net (default: main's nnue_main.tnn)")
     ap.add_argument("--cand-exe", default=EXE, help="candidate engine binary (default: main's; the champion side always runs main's exe)")
