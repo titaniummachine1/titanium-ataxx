@@ -15,6 +15,11 @@ use std::time::Duration;
 pub const MATE: i32 = 100_000;
 /// Scores at least this close to MATE are mate scores (TT adjustment bound).
 const MATE_BOUND: i32 = MATE - 2000;
+/// Search window infinity: finite and just above every real score (Stockfish VALUE_INFINITE style). The old
+/// i32::MIN+1 / i32::MAX window ends leaked into null-window searches as "scores" and made score_to_tt overflow.
+const INF: i32 = MATE + 1000;
+/// Botzone judge cap: it ends the game once input.size() > 800, i.e. right after half-move 401, on the stone count.
+const BZ_MAX_PLIES: u32 = 401;
 
 /// Search stack depth cap (max_depth is clamped well below this).
 const MAX_PLY: usize = 40;
@@ -424,9 +429,9 @@ impl Tt {
 #[inline]
 fn score_to_tt(score: i32, ply: u32) -> i32 {
     if score >= MATE_BOUND {
-        score + ply as i32
+        score.saturating_add(ply as i32)
     } else if score <= -MATE_BOUND {
-        score - ply as i32
+        score.saturating_sub(ply as i32)
     } else {
         score
     }
@@ -435,9 +440,9 @@ fn score_to_tt(score: i32, ply: u32) -> i32 {
 #[inline]
 fn score_from_tt(score: i32, ply: u32) -> i32 {
     if score >= MATE_BOUND {
-        score - ply as i32
+        score.saturating_sub(ply as i32)
     } else if score <= -MATE_BOUND {
-        score + ply as i32
+        score.saturating_add(ply as i32)
     } else {
         score
     }
@@ -717,8 +722,9 @@ impl<'a> Searcher<'a> {
         // Build-time rules selection (const generic: the dead branch is
         // compiled out, zero hot-path cost either way).
         if BZ {
-            // No passes on-platform: stm stuck (or wipeout/full) ends the game.
-            if b.is_over() || !b.has_moves(b.turn) {
+            // No passes on-platform: EITHER side stuck (the judge checks both after every move), wipeout/full,
+            // or the judge's half-move cap ends the game (bz_terminal_score scores it like the judge: bz_counts).
+            if b.bz_over() || b.ply >= BZ_MAX_PLIES {
                 return bz_terminal_score(b, ply);
             }
         } else if b.game_over() {
@@ -1051,7 +1057,7 @@ impl<'a> Searcher<'a> {
             } else if !b.game_over() {
                 // Pass node: give the caller a meaningful score through the pass.
                 result.score =
-                    -self.negamax::<BZ>(&b.make_pass(), -i32::MAX, i32::MAX, 1, 1, true);
+                    -self.negamax::<BZ>(&b.make_pass(), -INF, INF, 1, 1, true);
             }
             result.elapsed = self.elapsed();
             result.nodes = self.nodes;
@@ -1080,7 +1086,7 @@ impl<'a> Searcher<'a> {
         let mut it_ms: [f64; 2] = [0.0, 0.0];
         for depth in 1..=limits.max_depth.max(1) {
             let iter_start = self.elapsed_ms();
-            let mut alpha = i32::MIN + 1;
+            let mut alpha = -INF;
             let mut best_this = None;
             let mut best_score = i32::MIN;
             // Clean-main ID: FULL window every iteration. No aspiration.
@@ -1094,7 +1100,7 @@ impl<'a> Searcher<'a> {
                     let (a, z) = self.stack.acc.split_at_mut(1);
                     net.update_child(&a[0], &mut z[0], b, &child);
                 }
-                let score = -self.negamax::<BZ>(&child, -i32::MAX, -alpha, depth - 1, 1, true);
+                let score = -self.negamax::<BZ>(&child, -INF, -alpha, depth - 1, 1, true);
                 if self.stop {
                     break;
                 }
@@ -1352,8 +1358,9 @@ xxx....
         let mut se = Searcher::with_tt_bits(16);
         se.set_stop_flag(Some(flag.clone()));
         // unflagged: depth-8 search runs well past 2048 nodes
-        let free = se.search(&b, &no_time(8));
-        assert!(free.nodes > 20_000, "baseline nodes {}", free.nodes);
+        let free = se.search(&b, &no_time(10));
+        // (was depth 8 > 20000: the engine got leaner since; the test only needs a search far longer than one poll)
+        assert!(free.nodes > 8_000, "baseline nodes {}", free.nodes);
         // flagged from the start: stops at the first poll (<= 2048 nodes) but still returns a move
         flag.store(true, Ordering::Relaxed);
         se.reset_for_new_game();
