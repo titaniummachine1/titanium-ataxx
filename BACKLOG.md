@@ -1,4 +1,61 @@
-# BACKLOG — living queue (newest first)
+# BACKLOG - living queue (newest first)
+
+## CURRENT BACKLOG (2026-10-26 ~12:00; replaces everything below, which is history)
+
+Method for every item (it is how fut-cheap/fut-sn were found and proven): PROFILE (count where the cost is) -> RECORD +
+SIMULATE offline (decisions changed vs cost saved, held-out data) -> BUILD on its own exp/* branch -> GATE: 5k nodes
+(per-node cost, diagnosis; 10 par on the PC or 24-32 on a 16-vCPU Docker sandbox, D111) then 100 ms + 50 ms vs main
+(speed-affected: both time legs decide, law 2; one match per physical core) -> user approves the merge.
+State at writing: main 1b286f2; exp/fut-sn (futility small net, D110) confirming vs main, merge approved by the user if it passes.
+After that merge: profile numbers below refer to main 1b286f2 and must be re-measured on the merged build.
+
+### A. Speed: big-net evals (D107: NNUE = ~95% of search time; fut-sn removed ~half of the futility child evals)
+| # | Idea | Why / evidence | How | Gate | Cost |
+|---|---|---|---|---|---|
+| A1 | **Profile the merged build** | where the remaining big-net evals are (node entry by depth, leaves, futility leftovers, RFP) | temporary counters on a probe branch (exp/fut-probe pattern), 400 positions x 5k | none (measurement) | minutes, PC |
+| A2 | **Two-sided bound small net** | today only a LOWER bound (futility); leaves/RFP need "certainly above beta" AND "certainly below alpha" | add upper-quantile + median heads (pinball), train on node-entry positions + futility children (probe recorder v3) | offline: skipped evals vs changed decisions | ~1 h PC/Docker CPU |
+| A3 | **Lazy leaf eval** (depth-0 nodes) | the leaf's static eval is backed up, so a guess costs strength (small-net error ~126 cp) - but a BOUND outside the window decides the cutoff | depth 0: lower bound >= beta -> return without the big net; upper bound <= alpha -> same (return the bound, fail-soft care) | 5k + 100 ms + 50 ms vs main | build ~1 h |
+| A4 | **RFP at node entry by bound** | RFP asks "static eval + margin < alpha?" (and the beta side) | use the upper/lower bound; big net only when undecided | same | small |
+| A5 | **Small-net move ordering** | EVORD uses cached big-net evals only (8b51d92); the median head is ~0.1 us per child | order by small-net median for uncached children | 5k first (ordering = per-node quality), then time | small |
+| A6 | **Tune tau / margin of fut-sn** | tau 2% chosen from 2 points (0.2% / 2%); 1% and 5% untested in games | build tau 1%, 5% (heads already trained in sn_q32.pt) | 100 ms + 50 ms vs the merged main | 2 builds, ~1 h gates |
+| A7 | **Big-net head, bit-identical speed-up** | head ~1.5 us of ~6.5 us per eval (f32 sparse L1, scalar L2/out) | AVX2/FMA like the small net, same summation order where needed for bit-identity | identity check (labels 400x5k == main), then 100 ms leg | small |
+| A8 | **Feature computation speed-up** | features ~1.4 us/eval, G5 2-ply exchange the largest group | profile nnfeat per group, bit-identical rewrite | identity + 100 ms | medium |
+| A9 | **int8 FT rows** (exp/nnue-int8 1e0e406) | +5% search speed, val +0.05%, 5k -12 [-45,+22] | re-test stacked on the merged build (eval share changed) | 100 ms + 50 ms | small |
+| A10 | Narrower / feature-dropped big net | no free pruning (D107): width 192 +6.4% val untrained, G2 knock-out +5.7%; needs retrain | Modal/Docker retrain, distil from e11827d1 | 5k + time legs | $1-3 per arm; lower priority now |
+| A11 | Incremental big-net accumulator | 64% of rows change per move; tried once, slower (SPEED-nnue) | only if A1 shows FT refresh dominating again | identity + time | low priority |
+
+### B. Search
+| # | Idea | Note |
+|---|---|---|
+| B1 | Policy net for move ordering / late-move pruning | ranking moves is a policy's job (Kata raw policy top-3 = search best 94%, NET_ANALYSIS); needs per-move labels; after A |
+| B2 | Botzone end rules (either side stuck, 401-ply cap) | on exp/botzone-robust; correct per the judge, slower per node; own gate |
+| B3 | Search-fix tripwire neutral (-5 [-39,+28]) | extend only on request |
+
+### C. Data / training
+| # | Idea | Note |
+|---|---|---|
+| C1 | **Self-relabel round** with e11827d1 | cheaper after fut-sn: same per-node strength (5k +3) at x1.77 speed -> ~1.7x more labels per Docker $ |
+| C2 | Deeper Titanium labels (20k+ nodes) as teacher | hindsight-free search values (D101/D105: no external teacher beats Titanium) |
+| C3 | **Retrain the small net with every new big net** | it is fitted to e11827d1: probe recorder -> smallnet_pack -> smallnet_train (bound mode, --init from the old small net) -> smallnet_export -> rebuild; gate 100 ms |
+| C4 | Small-net capacity / Optuna | saturated at 126 cp (W32 H16); H32 only -2 cp, W64 worse; low value unless A2 changes the target |
+
+### D. Harness / ops
+| # | Idea | Note |
+|---|---|---|
+| D1 | Scripted Docker 5k gate | today hand-built (scratchpad job.sh); make training/docker_gate5k.py (par 24-32, tripwire, auto-delete) |
+| D2 | Cross-OS determinism | Linux and Windows builds each replay bit-identically on their own machine; same-games across OS not checked |
+| D3 | Botzone .so with fut-sn | after the merge: rebuild (small net is compiled in, no new storage file), tools/build_botzone.py 12-case test, user uploads |
+
+### Done this session (2026-10-26, details in DECISIONS D107-D112, LEDGER)
+- D107 speed probe (no training): eval = ~95% of search time; no free neuron pruning; int8 +5%.
+- D108 exp/fut-cheap: hand-eval futility pre-filter, vs main 100 ms +69, 50 ms +59.
+- D109/D110 exp/fut-sn: futility small net as a trained lower bound (tau 2%), x1.77 at 5k, vs fut-cheap 100 ms +41,
+  50 ms +45 (832 g), vs main 5k +3; --no-fut-sn switch for exact full-strength search (D112).
+- D111 gate parallelism sweet spots (PC 10 for 5k gates, Docker 24-32; time gates one per physical core).
+
+---
+
+## HISTORY (2026-10-19/20 night, superseded)
 
 Autonomous night 2026-10-19/20. Branch `exp/tonight` (staging; user approves merges).
 Iron laws unchanged: main untouchable; proven-ahead merges only; 5k = quality, time = crown;

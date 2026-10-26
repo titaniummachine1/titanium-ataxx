@@ -1,6 +1,7 @@
 ## 2026-10-26 ~11:40 - CURRENT STATE: futility speed-up done and gated; NOTHING RUNNING (no local job, no Docker, no Modal)
 
 Main is still 1b286f2. Candidates (none merged, user decides): exp/fut-cheap ea3e8ec (hand-eval pre-filter, D108): vs main 100 ms +69 [+35,+103], 50 ms +59 [+26,+94], 5k -20 (inconclusive). exp/fut-sn 9888823 (on top of fut-cheap; futility small net as lower bound tau 2%, D110; 5k search x1.77 vs main): vs fut-cheap 100 ms +41 [+8,+75], 50 ms +45 [+22,+69] (832 g), vs main 5k +3 [-30,+37]. exp/fut-sn-t002 8f1d228 (tau 0.2%): vs main 5k -22 [-56,+12], no time legs. exp/nnue-int8 1e0e406: 5k -12 (inconclusive), +5% speed, parked. Not done: a DIRECT fut-sn vs main time confirmation (law 24 style) before merging. Gate parallelism (D111): time gates par 4 (physical cores), 5k gates par 10 on the PC, 24-32 on a 16-vCPU Docker sandbox. Docker spend this session ~$1.4 (logs/docker_spend.csv). The small net is fitted to e11827d1: retrain it with the big net (smallnet_* tools, D109/D110).
+Ranked queue of what to try and gate next: BACKLOG.md, section CURRENT BACKLOG (2026-10-26).
 
 ## 2026-10-26 ~11:00 - RUNNING: futility small-net gates (D110); fut-cheap PASSED both time legs (awaiting user merge call)
 
