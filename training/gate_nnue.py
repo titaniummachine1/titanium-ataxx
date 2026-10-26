@@ -32,7 +32,10 @@ def main():
     ap.add_argument("--drop", default="")
     ap.add_argument("--legs", type=int, default=8)
     ap.add_argument("--games", type=int, default=200)
+    ap.add_argument("--wt", default="C:/gitProjects/nnue-ataxx", help="NNUE engine worktree (exe = <wt>/target/release)")
     a = ap.parse_args()
+    global EXE
+    EXE = a.wt + "/target/release/titanium-cli.exe"
     tnn = "%s/data/nnue/nnue_%s.tnn" % (ROOT, a.tag)
     exp = [sys.executable, "training/export_nnue.py", "--pt", a.pt, "--out", tnn] + (["--drop", a.drop] if a.drop else [])
     subprocess.run(exp, cwd=ROOT, check=True)
@@ -40,9 +43,9 @@ def main():
     print(par.stdout.strip())
     if par.returncode != 0:
         sys.exit("PARITY FAILED -> not gating")
-    ref = subprocess.run(["git", "-C", "C:/gitProjects/nnue-ataxx", "log", "-1", "--format=%h"], capture_output=True,
+    ref = subprocess.run(["git", "-C", a.wt, "log", "-1", "--format=%h"], capture_output=True,
                          text=True).stdout.strip()
-    dirty = subprocess.run(["git", "-C", "C:/gitProjects/nnue-ataxx", "status", "--porcelain", "crates"],
+    dirty = subprocess.run(["git", "-C", a.wt, "status", "--porcelain", "crates"],
                            capture_output=True, text=True).stdout.strip()
     print("exe %s (exp/nnue %s%s) cand %s champ %s" % (sha(EXE), ref, " DIRTY" if dirty else "", sha(tnn),
                                                        sha(ROOT + "/" + CHAMP)))
@@ -59,6 +62,8 @@ def main():
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
     for p in procs:
         p.wait()
+    # feed the game DAG with the leg logs only (read-only on finished logs)
+    subprocess.run([sys.executable, "training/dag.py", "ingest"] + files, cwd=ROOT)
     trip = "logs/gate_%s_trip.txt" % a.tag
     subprocess.run([EXE, "match", "--games", "20", "--nodes", "5000", "--opp", "self", "--opp-nodes", "5000",
                     "--tuple", "none", "--nnue", tnn, "--opp-tuple", CHAMP, "--book", BOOK, "--book-start", "2000",

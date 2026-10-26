@@ -201,3 +201,33 @@ truth as the final selector.
   holdout.
 - No method here proves the global minimum. SAM/SWA/PBT/ASHA improve the
   probability of a better basin; the final selector remains 5k/100ms games.
+
+## 7. NNUE pipeline audit vs modern practice (2026-10-24, user: "everything algorithmically optimal")
+
+What the NNUE pipeline (train_nnue.py, export_nnue.py, gate_nnue.py) does today, and what is still missing,
+ranked by expected strength per hour of compute on this 4-core box. "Done" = in code and used by the live run.
+
+Done
+- Optimizer: Ranger = RAdam (per-parameter adaptive steps, rectified early variance) + Lookahead k8/a0.56, decoupled wd.
+- Weight averaging: EMA 0.9995; live and EMA both scored each epoch, the better is kept.
+- Loss: power-2.5 error in probability space (nnue-pytorch), stage target blended with outcome (lambda).
+- Two-stage distillation: base on Titanium 5k labels, then KataAtaxx 200-visit values as teacher (BEHAVIOR 19).
+- Base-stage hyperparameters from population based training (pbt_nnue.py); Optuna pruning hook in run().
+- LR: --auto-lr (D69) = val-driven backtracking line search over epochs + SGDR warm restarts from the best state
+  (search for a better basin); no hand-set LR after the start; stops only when no restart is left.
+- Selection: best checkpoint over all epochs (live or EMA) by val Kata-TD MSE; promotion only by paired game gates.
+- Engine parity: exported net == torch to 0 cp on 1000 positions before any gate.
+
+Missing, in the order to add them
+1. SWA across basins: average the best states of the warm-restart cycles (SWA/SWAD); keep the average only if val
+   AND a 5k gate say it beats the single best. Cheap (no extra training).
+2. Quantisation-aware training before the int16/int8 engine port: fake-quant weights/activations with a
+   straight-through estimator in the last epochs (Stockfish use_fake_*_quantization), so the speed port keeps the Elo.
+3. Teacher-stage hyperparameter search: the teacher run reuses base-stage PBT values; a short PBT/ASHA over
+   lambda, wd, Lookahead and optimizer family (RAdam vs schedule-free AdamW vs AdEMAMix) on a 2-3M-row subset, final pick by 5k games.
+4. Data: Stockfish-style skipping (positions whose label disagrees wildly with the game outcome, near-duplicate
+   openings) and the relabel loop with the current champion (HANDOFFS 3b); data quality beats optimizer tricks.
+5. Capacity: v2 (D65: 1024 + pairwise + hidden skips + S57 skip), base then teacher, once v1 is saturated and gated.
+6. Val -> games check: measure whether val Kata-TD gains predict 5k-gate Elo across checkpoints (our history says val
+   can lie); if not, add a search-agreement probe to the epoch metric.
+Not worth it here: mixed precision (Haswell CPU, no bf16), second-order optimizers (Sophia) for a 7M-param net.

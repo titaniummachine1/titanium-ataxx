@@ -10,7 +10,7 @@ tells you how to check it, collect its results and delete it. Money rules first.
 - Price: 16 vCPU / 32 GB = $1.118/h (0.07 per vCPU-h). Worst case of a sandbox = ttl x price.
 - Ledger: `logs/docker_spend.csv` (when,name,cpus,mem_gb,usd_per_h,ttl_min,charged_usd_upper,status). Add a row at creation
   (worst case = full ttl) and a row `DELETED after ~N min (actual ~$X)` when you delete. It is my estimate, the Docker billing page
-  lags up to 48 h. Total so far: sum of the latest rows, about $12 by 2026-10-26 (check the file).
+  lags up to 48 h. The running total is not summed anywhere: worst-case rows overstate, DELETED rows give the real figure; add them up before a big launch.
 - `--on-timeout delete --ttl Nm` at creation makes every sandbox self-destruct, so a forgotten one costs at most its ttl.
   Extend with `sbx --cloud ttl +Nm NAME` (hard ceiling 24 h from creation).
 

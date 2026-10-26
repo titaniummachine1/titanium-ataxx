@@ -496,3 +496,22 @@ games) but the engine never played the function the trainer optimised. The NNUE 
   patterns (.0011-.0058). S57 + NNUE together are no better than the NNUE alone (linear combination): the S57 skip in v2 is
   not expected to add much; v2's gain must come from capacity (width, pairwise, endgame buckets) and more teacher epochs.
 - Not yet: games. Closeness to Kata is not strength (Ataxx_CPP's value lost when grafted into alpha-beta).
+
+## 30. SEARCH competence gap vs Moonbird (2026-10-24, training/search_depth_probe.py)
+40 mid-game val positions (14-34 empties), fresh process / uainewgame per position, S57 for Titanium. (Measured while the
+NNUE teacher run used 4 threads: absolute nps low for both, the comparison is under the same load.)
+| | Titanium main 653d9a1 | Titanium exp/search-moonbird A | Moonbird 1.1.0 |
+|---|---|---|---|
+| depth @100 ms | 6.50 (33,855 nodes) | 7.08 (7,189 nodes) | **11.4** (6-8k counted nodes) |
+| depth @5k nodes | 4.10 | 6.92 | **9.05** |
+- Moonbird searches ~5 plies deeper at equal time. Its node count is not comparable: it statically evaluates every searched
+  child for futility and does not count those evals as nodes.
+- Search differences (both sources read): Moonbird has futility REDUCTION by the child's static eval (1 ply per 35 of its
+  units below alpha, moves reduced to <= 0 skipped), LMR depth*47/(47+n) from move 7, null move R = 4 + depth/2 (ours 3),
+  aspiration +-8 x1.9 (ours none, reverted earlier), history with malus (ours bonus only), no killers; ours has RFP margins
+  257-774 at depth <= 4, universal LMR -2/-3 from move 2, clone/jump ordering terms. Neither has quiescence.
+- Variant A (Moonbird LMR + futility reduction, rest unchanged): 3.2x fewer nodes for bench d8 (3,410 vs 10,844) and +2.8
+  plies at 5k nodes, but at equal time only +0.6 ply: our static eval costs microseconds (TUP7 fix: ~2.4x slower), Moonbird's
+  is a few table lookups, so per-child evals collapse our node rate (~72k vs ~340k nps). => SEARCH SELECTIVITY AND EVAL SPEED
+  ARE ONE LEVER for us: a fast (incremental) eval is what makes Moonbird-style pruning pay at real time controls.
+- Not yet tested: Moonbird null move R, aspiration with the fixed eval, history malus, retuning RFP margins for the fixed eval.

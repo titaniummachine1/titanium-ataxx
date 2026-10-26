@@ -10,6 +10,13 @@ BOUND mode (--quantiles, user order 2026-10-26 "bound output not eval"): Q outpu
 loss at its quantile tau, so head q is a LOWER BOUND of the big net's child eval that holds with probability 1 - tau
 (per position: tight where the position is easy, wide where it is not). The engine prunes without the big net when the
 move is pruned even at that bound. --init warm-starts from a saturated eval net (all heads start at its output).
+v2 options (D114, user order 2026-10-26 "optimise it until saturated before the next relabel"):
+  --extra: 10 cheap tactical scalars of the child (clone / jump-only targets of both sides; best capture and the number
+           of squares capturing >= 2 / >= 3 for both sides), fed into L1 and a per-bucket linear skip;
+  --alpha-in: the futility call's alpha (cp / 400) as one more scalar (search knowledge of the position's value);
+  --focus S: weight each row by 0.1 + exp(-|t - T| / S), T = (57 * new_depth - alpha) / 400 = the prune threshold of
+           that call (only errors near the cut line change a pruning decision).
+  Extras are precomputed once: python training/smallnet_train.py --make-extras --out x (writes sn_{train,eval}_ex.npy).
 Usage: python training/smallnet_train.py --out data/nnue/smallnet/sn_w32.pt [--width 32 --hidden 16 --no-hand]
        python training/smallnet_train.py --out sn_q.pt --quantiles 0.002,0.005,0.01,0.02 --init sn_w32.pt
 """
@@ -25,6 +32,81 @@ import torch.nn as nn
 D = os.environ.get("SN_DATA", "C:/gitProjects/titanium-ataxx/data/nnue/smallnet")
 NB = 8
 CLIP = 5.0
+NEX = 10
+FULL = np.uint64((1 << 49) - 1)
+
+
+def _file(f):
+    return np.uint64(sum(1 << (r * 7 + f) for r in range(7)))
+
+
+FA, FB, FF, FG = _file(0), _file(1), _file(5), _file(6)
+
+
+def _sr(x, k):
+    return x >> np.uint64(k)
+
+
+def _sl(x, k):
+    return x << np.uint64(k)
+
+
+def dil1(b):
+    """crate::board::dist_union(b, 1): the 8 neighbours"""
+    na, ng = b & ~FA, b & ~FG
+    return (_sr(b, 7) | _sl(b, 7) | _sr(na, 1) | _sl(ng, 1) | _sr(na, 8) | _sr(ng, 6) | _sl(na, 6) | _sl(ng, 8)) & FULL
+
+
+def jump(b):
+    """crate::board::jump_union: the 16 squares at Chebyshev distance 2"""
+    nab, nfg = b & ~(FA | FB), b & ~(FF | FG)
+    up, dn, lf, rt = _sr(b, 14), _sl(b, 14) & FULL, _sr(nab, 2), _sl(nfg, 2)
+    ul, ur, dl, dr = _sr(nab, 16), _sr(nfg, 12), _sl(nab, 12), _sl(nfg, 16)
+    v2, h2 = (up | dn) & FULL, lf | rt
+    n1 = _sr(v2 & ~FA, 1) | _sl(v2 & ~FG, 1)
+    n2 = _sr(h2, 7) | (_sl(h2, 7) & FULL)
+    return (up | dn | lf | rt | ul | ur | dl | dr | n1 | n2) & FULL
+
+
+ADJ = np.zeros((49, 49), np.float32)
+for _q in range(49):
+    _r, _c = divmod(_q, 7)
+    for _dr in (-1, 0, 1):
+        for _dc in (-1, 0, 1):
+            if (_dr or _dc) and 0 <= _r + _dr < 7 and 0 <= _c + _dc < 7:
+                ADJ[(_r + _dr) * 7 + _c + _dc, _q] = 1
+
+
+def pc(x):
+    return np.bitwise_count(x).astype(np.float32)
+
+
+def extras(own, opp, blk):
+    """(n,) uint64 x 3 -> (n, NEX) float32, child side to move = own. Same arithmetic as the engine port."""
+    emp = ~(own | opp | blk) & FULL
+    out = np.empty((len(own), NEX), np.float32)
+    for k, (a, b) in enumerate(((own, opp), (opp, own))):
+        c1 = dil1(a) & emp
+        j = jump(a) & emp & ~c1
+        cnt = bits(b) @ ADJ  # stones of the other side around each square
+        g = cnt * bits(c1 | j)
+        out[:, 5 * k + 0] = pc(c1) / 16
+        out[:, 5 * k + 1] = pc(j) / 16
+        out[:, 5 * k + 2] = g.max(1) / 8
+        out[:, 5 * k + 3] = (g >= 2).sum(1) / 8
+        out[:, 5 * k + 4] = (g >= 3).sum(1) / 8
+    return out
+
+
+def make_extras():
+    for name in ("train", "eval"):
+        z = np.load(D + "/sn_%s.npz" % name)
+        own, opp, blk = z["own"], z["opp"], z["blk"]
+        ex = np.empty((len(own), NEX), np.float16)
+        for i in range(0, len(own), 1 << 20):
+            ex[i:i + (1 << 20)] = extras(own[i:i + (1 << 20)], opp[i:i + (1 << 20)], blk[i:i + (1 << 20)])
+        np.save(D + "/sn_%s_ex.npy" % name, ex)
+        print("extras", name, ex.shape, flush=True)
 
 
 def bits(x):
@@ -34,11 +116,20 @@ def bits(x):
 
 
 class Rows:
-    def __init__(self, z, idx):
+    def __init__(self, z, idx, ex=None, alpha_in=False, focus=0.0):
         self.own, self.opp, self.blk = z["own"][idx], z["opp"][idx], z["blk"][idx]
         self.nn = z["nn"][idx].astype(np.float32) / 400
         self.pst = z["pst"][idx].astype(np.float32) / 400
         self.hand = z["hand"][idx].astype(np.float32) / 400
+        al = z["alpha"][idx].astype(np.float32)
+        self.thr = (57 * z["nd0"][idx].astype(np.float32) - al) / 400
+        cols = []
+        if ex is not None:
+            cols.append(np.asarray(ex[idx], np.float32))
+        if alpha_in:
+            cols.append(np.clip(al / 400, -CLIP, CLIP)[:, None])
+        self.ex = np.concatenate(cols, 1) if cols else np.zeros((len(idx), 0), np.float32)
+        self.focus = focus
         occ = self.own | self.opp | self.blk
         emp = 49 - np.bitwise_count(occ).astype(np.int64)
         self.bucket = np.minimum(emp * NB // 50, NB - 1)
@@ -51,27 +142,35 @@ class Rows:
         us = np.concatenate([o, e, k], 1)
         them = np.concatenate([e, o, k], 1)
         t = lambda a: torch.from_numpy(np.ascontiguousarray(a))
-        return (t(us), t(them), t(self.bucket[r]), t(self.pst[r]), t(self.hand[r]),
-                t(np.clip(self.nn[r], -CLIP, CLIP)))
+        tg = np.clip(self.nn[r], -CLIP, CLIP)
+        w = 0.1 + np.exp(-np.abs(self.nn[r] - self.thr[r]) / self.focus) if self.focus > 0 else np.ones_like(tg)
+        return (t(us), t(them), t(self.bucket[r]), t(self.pst[r]), t(self.hand[r]), t(self.ex[r]),
+                t(tg), t(w.astype(np.float32)))
 
 
 class SmallNet(nn.Module):
-    def __init__(self, W=32, H=16, hand=True, Q=1):
+    def __init__(self, W=32, H=16, hand=True, Q=1, K=0):
         super().__init__()
-        self.W, self.H, self.use_hand, self.Q = W, H, hand, Q
+        self.W, self.H, self.use_hand, self.Q, self.K = W, H, hand, Q, K
         self.ft = nn.Linear(147, W)
-        self.l1 = nn.Linear(2 * W, H * NB)
+        self.l1 = nn.Linear(2 * W + K, H * NB)
+        if K:
+            self.exskip = nn.Parameter(torch.zeros(NB, K))
         self.out = nn.Linear(H, NB * Q)
         self.skip = nn.Parameter(torch.zeros(2, NB))  # parent eval, hand eval (per bucket)
         with torch.no_grad():
             self.skip[0].fill_(-0.5)  # the child eval is roughly minus the parent's
 
-    def forward(self, us, them, bk, pst, hand):
+    def forward(self, us, them, bk, pst, hand, ex=None):
         a = torch.cat([self.ft(us), self.ft(them)], 1).clamp(0, 1)
+        if self.K:
+            a = torch.cat([a, ex], 1)
         n = len(bk)
         ar = torch.arange(n)
         h = self.l1(a).view(n, NB, self.H)[ar, bk].clamp(0, 1)
         y = self.out(h).view(n, NB, self.Q)[ar, bk] + (self.skip[0, bk] * pst)[:, None]
+        if self.K:
+            y = y + (self.exskip[bk] * ex).sum(1)[:, None]
         if self.use_hand:
             y = y + (self.skip[1, bk] * hand)[:, None]
         return y if self.Q > 1 else y[:, 0]
@@ -83,7 +182,7 @@ def evaluate(m, rows, bs=65536):
     with torch.no_grad():
         for i in range(0, len(rows), bs):
             b = rows.batch(np.arange(i, min(i + bs, len(rows))))
-            out.append(m(*b[:5]).numpy())
+            out.append(m(*b[:6]).numpy())
     m.train()
     return np.concatenate(out)
 
@@ -105,18 +204,28 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--quantiles", default="", help="comma list of tau: bound mode (pinball loss per head)")
     ap.add_argument("--init", default="", help="warm start from an eval-mode checkpoint (same W/H/hand)")
+    ap.add_argument("--extra", action="store_true", help="10 tactical scalars (precomputed by --make-extras)")
+    ap.add_argument("--alpha-in", action="store_true", help="the call's alpha as an input")
+    ap.add_argument("--focus", type=float, default=0.0, help="weight rows near the prune threshold (cp/400 scale)")
+    ap.add_argument("--make-extras", action="store_true")
     a = ap.parse_args()
+    if a.make_extras:
+        make_extras()
+        return
     taus = [float(x) for x in a.quantiles.split(",")] if a.quantiles else []
     torch.set_num_threads(a.threads)
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
     z = dict(np.load(D + "/sn_train.npz"))
+    ex = np.load(D + "/sn_train_ex.npy", mmap_mode="r") if a.extra else None
     n = len(z["nn"])
     perm = rng.permutation(n)
     nval = min(500_000, n // 50)
-    tr, va = Rows(z, np.sort(perm[nval:])), Rows(z, np.sort(perm[:nval]))
-    del z
-    m = SmallNet(a.width, a.hidden, not a.no_hand, max(1, len(taus)))
+    kw = dict(ex=ex, alpha_in=a.alpha_in, focus=a.focus)
+    tr, va = Rows(z, np.sort(perm[nval:]), **kw), Rows(z, np.sort(perm[:nval]), **kw)
+    del z, ex
+    K = tr.ex.shape[1]
+    m = SmallNet(a.width, a.hidden, not a.no_hand, max(1, len(taus)), K)
     if a.init:
         src = torch.load(a.init, map_location="cpu", weights_only=False)["model"]
         st = m.state_dict()
@@ -124,16 +233,20 @@ def main():
             if k_.startswith("out."):
                 # [NB, H] -> [NB * Q, H]: every head starts at the eval net's output
                 st[k_] = v_.view(NB, 1, -1).expand(NB, m.Q, v_.shape[-1] if v_.dim() > 1 else 1).reshape(st[k_].shape)                     if v_.dim() > 1 else v_.view(NB, 1).expand(NB, m.Q).reshape(-1)
+            elif k_ == "l1.weight" and v_.shape != st[k_].shape:
+                # warm start without the extra inputs: copy the 2W activation columns, the extras start at zero
+                st[k_] = torch.zeros_like(st[k_])
+                st[k_][:, :v_.shape[1]] = v_
             else:
                 st[k_] = v_
         m.load_state_dict(st)
     tq = torch.tensor(taus) if taus else None
 
-    def lossf(y, t):
+    def lossf(y, t, w):
         if tq is None:
-            return ((y - t) ** 2).mean()
+            return (w * (y - t) ** 2).sum() / w.sum()
         d = t[:, None] - y
-        return torch.maximum(tq * d, (tq - 1) * d).mean()
+        return (w[:, None] * torch.maximum(tq * d, (tq - 1) * d)).sum() / (w.sum() * len(taus))
 
     opt = torch.optim.AdamW(m.parameters(), lr=a.lr, weight_decay=a.wd)
     lr, best, bad, ep = a.lr, float("inf"), 0, 0
@@ -152,9 +265,9 @@ def main():
         idx = rng.choice(len(tr), size=a.epoch_rows, replace=False)
         tl, k = 0.0, 0
         for i in range(0, len(idx), a.bs):
-            us, them, bk, pst, hand, t = tr.batch(np.sort(idx[i:i + a.bs]))
-            y = m(us, them, bk, pst, hand)
-            loss = lossf(y, t)
+            us, them, bk, pst, hand, ex_, t, w = tr.batch(np.sort(idx[i:i + a.bs]))
+            y = m(us, them, bk, pst, hand, ex_)
+            loss = lossf(y, t, w)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -162,14 +275,15 @@ def main():
             k += 1
         p = evaluate(m, va)
         tv = np.clip(va.nn, -CLIP, CLIP)
+        wv = 0.1 + np.exp(-np.abs(va.nn - va.thr) / a.focus) if a.focus > 0 else np.ones_like(tv)
         if tq is None:
-            v = float(((np.clip(p, -CLIP, CLIP) - tv) ** 2).mean())
+            v = float((wv * (np.clip(p, -CLIP, CLIP) - tv) ** 2).sum() / wv.sum())
             sd = float(np.std((p - va.nn)[np.abs(va.nn) < CLIP]) * 400)
             stat = "resid sd %.1f cp" % sd
         else:
             d = tv[:, None] - p
             ta = np.array(taus)
-            v = float(np.maximum(ta * d, (ta - 1) * d).mean())
+            v = float((wv[:, None] * np.maximum(ta * d, (ta - 1) * d)).sum() / (wv.sum() * len(taus)))
             stat = "below-bound rate " + " ".join("%.4f/%g" % (float((d[:, i] < 0).mean()), t_) for i, t_ in enumerate(taus))
         if v < best * (1 - a.min_rel):
             best, bad = v, 0
