@@ -33,6 +33,8 @@ _M.ENGINE = os.environ.get("CPP_EXE") or os.path.join(_M.ROOT, "data", "engines"
 ROOT = r"C:\gitProjects\titanium-ataxx"
 TI_EXE = r"C:\gitProjects\main-ataxx\target\release\titanium-cli.exe"
 TI_TUP = os.path.join("data", "nnue", "final_v2_wdl_ep8.tup")
+# 2026-10-26: Titanium = main's default big NNUE (e11827d1), tuple off (the gated config)
+TI_NNUE = os.environ.get("TI_NNUE", "C:/gitProjects/main-ataxx/data/nnue/nnue_main.tnn")
 FULL = (1 << 49) - 1
 
 REACH2 = []
@@ -69,7 +71,7 @@ def flip_rows(b):
     return out
 
 
-KATA_CFG = "C:/Users/TERMIN~1/AppData/Local/Temp/claude/C--gitProjects-titanium-ataxx/7e3ffd33-1f98-40e2-9e9e-158a76f7fbbb/scratchpad/cpu_nopond.cfg"
+KATA_CFG = os.path.join(ROOT, "data", "engines", "kataataxx", "ext", "KataAtaxx_20260501_other_or_cpu", "engine_cpu_arena.cfg")  # 1 thread, no ponder
 
 
 class Ti:
@@ -77,7 +79,7 @@ class Ti:
 
     def __init__(self, go, cmd=None, env=None):
         self.go = go
-        self.p = subprocess.Popen(cmd or [TI_EXE, "serve", "--tuple", TI_TUP], cwd=ROOT, stdin=subprocess.PIPE,
+        self.p = subprocess.Popen(cmd or [TI_EXE, "serve", "--tuple", "none", "--nnue", TI_NNUE], cwd=ROOT, stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env,
                                   encoding="utf-8", errors="replace")
         self.r = Reader(self.p)
@@ -143,7 +145,11 @@ def play_game(book_line, ti_is_black, a):
     kata = cpp = None
     if a.opp == "kata":
         env = dict(os.environ, KATA_CFG=KATA_CFG, KATA_LOG=os.path.join(ROOT, "logs", "kata_arena_%d.log" % os.getpid()))
-        kata = Ti("go nodes %d" % a.kata_visits, cmd=[sys.executable, os.path.join(ROOT, "training", "kata_bridge.py")], env=env)
+        kgo = ("go movetime %d" % a.kata_ms) if a.kata_ms else ("go nodes %d" % a.kata_visits)
+        kata = Ti(kgo, cmd=[sys.executable, os.path.join(ROOT, "training", "kata_bridge.py")], env=env)
+        kata.send("uainewgame")
+    elif a.opp == "uai":
+        kata = Ti(a.opp_go, cmd=a.opp_cmd.split("|"))      # generic UAI opponent (Moonbird); args split on |
         kata.send("uainewgame")
     else:
         cpp = CppSide()
@@ -201,7 +207,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--games", type=int, default=40)
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--opp", default="cpp", choices=["cpp", "kata"])
+    ap.add_argument("--opp", default="cpp", choices=["cpp", "kata", "uai"])
+    ap.add_argument("--kata-ms", type=int, default=None, help="KataAtaxx time per move (maxTime) instead of visits")
+    ap.add_argument("--opp-cmd", default="", help="uai opponent command, arguments separated by |")
+    ap.add_argument("--opp-go", default="go movetime 100", help="uai opponent go command")
     ap.add_argument("--kata-visits", type=int, default=16)
     ap.add_argument("--a", default="ab", help="side A: ab (Titanium alpha-beta) or cmd:<path to a UAI engine>")
     ap.add_argument("--ti-ms", type=int, default=100)
@@ -217,11 +226,18 @@ def main():
     book = [l.strip() for l in open(a.book) if l.strip()]
     lines = a.games // 2
     tasks = [(a.book_start + i, black) for i in range(lines) for black in (True, False)]
-    desc = "%s %s vs %s" % (
-        "Titanium-AB" if a.a == "ab" else "EXT[%s]" % os.path.basename(a.a[4:]),
-        ("%dms" % a.ti_ms) if a.ti_nodes is None else ("%d nodes" % a.ti_nodes),
-        ("KataAtaxx-2026 transformer, CPU, %d visits" % a.kata_visits) if a.opp == "kata" else
-        ("Ataxx_CPP VALUE-only 1-ply" if a.cpp_valuegreedy else "Ataxx_CPP policy-only (1 forward pass)" if a.cpp_policy else "Ataxx_CPP %s" % (("%dms" % a.cpp_ms) if a.cpp_evals is None else ("%d evals (fresh tree)" % a.cpp_evals))))
+    if a.opp == "kata":
+        opp_desc = "KataAtaxx-2026 transformer, CPU 1 thread, %s" % (("%dms" % a.kata_ms) if a.kata_ms else ("%d visits" % a.kata_visits))
+    elif a.opp == "uai":
+        opp_desc = "UAI %s [%s]" % (os.path.basename(a.opp_cmd.split("|")[0]), a.opp_go)
+    elif a.cpp_valuegreedy:
+        opp_desc = "Ataxx_CPP VALUE-only 1-ply"
+    elif a.cpp_policy:
+        opp_desc = "Ataxx_CPP policy-only (1 forward pass)"
+    else:
+        opp_desc = "Ataxx_CPP %s" % (("%dms" % a.cpp_ms) if a.cpp_evals is None else ("%d evals (fresh tree)" % a.cpp_evals))
+    desc = "%s %s vs %s" % ("Titanium-AB" if a.a == "ab" else "EXT[%s]" % os.path.basename(a.a[4:]),
+                            ("%dms" % a.ti_ms) if a.ti_nodes is None else ("%d nodes" % a.ti_nodes), opp_desc)
     exe_sha = subprocess.run(["certutil", "-hashfile", TI_EXE, "SHA256"], capture_output=True, text=True).stdout.split("\n")[1][:8]
     out = open(a.out, "w", encoding="utf-8")
     lock = threading.Lock()
@@ -231,8 +247,8 @@ def main():
             out.write(s + "\n")
             out.flush()
 
-    emit("ARENA %s | games %d | book %d..%d | ti exe %s tup %s | cpp engine.exe champion+4 phases | Botzone end rules" % (
-        desc, len(tasks), a.book_start, a.book_start + lines - 1, exe_sha, TI_TUP))
+    emit("ARENA %s | games %d | book %d..%d | ti exe %s nnue %s | cpp %s champion+4 phases | Botzone end rules" % (
+        desc, len(tasks), a.book_start, a.book_start + lines - 1, exe_sha, os.path.basename(TI_NNUE), os.path.basename(_M.ENGINE)))
     scores = {}
 
     def run(t):

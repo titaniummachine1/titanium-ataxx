@@ -46,11 +46,13 @@ def main():
         if a.time:
             cmd += ["--time", str(a.time), "--opp-time", str(a.time)]
         else:
-            cmd += ["--nodes", str(a.nodes)] + (["--opp-nodes", str(a.opp_nodes)] if a.opp_nodes else ["--opp-time", str(a.opp_time)])
+            cmd += ["--nodes", str(a.nodes), "--time", "0"] + (["--opp-nodes", str(a.opp_nodes)] if a.opp_nodes else ["--opp-time", str(a.opp_time)])
         procs.append(subprocess.Popen(cmd, cwd=ROOT, stdout=open("logs/gate_%s_s%d.stdout" % (a.tag, i), "w"),
                                       stderr=subprocess.STDOUT))
     for p in procs:
         p.wait()
+    # feed the game DAG (read-only on the finished logs; never touches a running gate)
+    subprocess.run([sys.executable, "training/dag.py", "ingest", "logs/gate_%s_s*.txt" % a.tag], cwd=ROOT)
     W = L = D = 0
     seat = {"x": [0, 0], "o": [0, 0]}
     pairs = []

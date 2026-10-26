@@ -1,16 +1,207 @@
+## 2026-10-26 ~08:30 - CURRENT STATE (read this first; everything below is history)
+
+**Main = origin/main 1b286f2 (PUSHED)** = default NNUE **e11827d1** (+132 Elo @5k vs the old c4829350, LEDGER GATE-s1chg-vs-main)
++ critical fixes (LEDGER MAIN-critical): Botzone driver hardening, FFI depth cap 32 + release stack guard, finite-INF window /
+saturating TT mate conversion (strength-neutral, -5 [-39,+28]), stale tests fixed. Workspace tests pass except the known-broken
+titanium-wasm crate. Local main exe f3552dc7. NOTHING IS RUNNING (no local job, no Modal app, no Docker sandbox).
+
+**Owed / waiting on the user**
+- Botzone upload (user's login): C:/gitProjects/main-ataxx/botzone/upload = titanium_botzone.py 320c2c0f (14,288 B, new bot version,
+  Python 3, simple IO, long-running OFF), data/titanium_v2.so 942faa88 (438,752 B -> storage /titanium_v2.so), data/nnue/nnue_main.tnn
+  e11827d1 (27,945,148 B -> storage /nnue/nnue_main.tnn). Then a test match: read its log with
+  `curl -H "X-Requested-With: XMLHttpRequest" "https://www.botzone.org.cn/match/<id>?lite=true"` (debug line = depth/nodes/time/net + "ev ..." recoveries).
+- Next round choice (user): (a) self-relabel the 33.9M rows with e11827d1 + retrain stage 1, (b) deeper Titanium labels (20k+ nodes) as
+  the teacher, (c) speed ablation of the net (narrower FT/head) aimed at Moonbird's speed edge. NO external teacher (see arena).
+- Optional: Botzone end rules in search (either side stuck = bz_over, 401-ply judge cap) live only on exp/botzone-robust (bzrob-ataxx);
+  correct per the judge, not crash fixes, slower per node, untested in Botzone Elo -> needs its own gate before main.
+
+**What was learned (2026-10-25/26), all in docs/DECISIONS.md D73-D106, LEDGER, MISTAKES 25-30**
+- Relabel: all 33,891,139 rows labelled by big NNUE c4829350 @5000 nodes (docs/RELABEL_RUNBOOK.md); joined as data/nnue/final/final_*_v4.npz
+  (titanium_cp replaced, titanium_cp_old + relabel_depth kept; training/relabel_join.py, verified on all rows). train_nnue.py reads v4 by
+  default (TI_DATA_TAG=v3 = old).
+- Trainer fixes (training/train_nnue.py): --block 1024 mixed chunks (the npz files are in source+game order; old loader trained 245 steps at a
+  time on one contiguous chunk = non-iid, D75); warm-start seed is the score to beat (D76); hypergrad fixed to Baydin-for-Adam (D78) and reset
+  at every warm restart (D82); TI_DEVICE=cuda / TI_ROOT for Modal (D80).
+- GPU training on Modal: training/modal_train.py (L4, volume ti-train: /up = slim npz + seeds, /ckpt/<tag> = runs; features rebuilt in the
+  container by the engine's nndump and sha256-checked vs local), ~2.7 min/epoch vs 64 min on the CPU, ~$1.2/h. Spent ~$8 on Modal today.
+- THE RECIPE that made e11827d1: stage 1 (base, v4 labels) seeded with c4829350, auto-lr + hypergrad, lr 4e-3, saturated 0.022533 (+50 vs main)
+  -> short Optuna continuation search (training/optuna_ft.py, D83/D90: lr ~1.1-1.7e-3, Lookahead k 9-10 alpha ~0.33, bs 4096; weight decay
+  irrelevant) -> continuation from trial 14 to saturation WITH hypergrad (s1c_hg): val 0.021626 = e11827d1 (+132). Without hypergrad: equal
+  in Elo (+3 [-31,+36], D95), hypergrad costs +50% GPU time.
+- STAGE 2 (Kata fine-tune) IS HARMFUL: -137 vs its stage-1 net (D98); scaling its output to stage 1's spread is worse (-183, D104) -> not scale;
+  Kata's targets are TD values that blend each game's own result (hindsight, D101). Titanium's labels predict results better than
+  Ataxx_CPP's raw net (Brier 0.162 vs 0.169; right 70% of confident disagreements).
+- External arena (training/ax_vs_ti.py, Botzone end rules, 100 g/leg, D103/D105): Ataxx_CPP 5k 100-0 / 100 ms +220 / 1 s +210 (Titanium
+  wins); KataAtaxx (1 thread; ignores visit limits, so no 5k leg) 100 ms -108 with ~9x Titanium's time, 1 s +191 with ~1.8x; Moonbird 1.1.0
+  5k -7 (equal) / 100 ms -241 / 1 s -21 -> Moonbird's edge is SEARCH SPEED.
+- Gate tools: training/gate_net_vs_main.py (any .pt/.tnn vs main or --champ net, --cand-exe, pure node limit --time 0, tripwire = shard 0
+  replayed); training/run_ext_arena.sh; KataAtaxx arena config engine_cpu_arena.cfg (1 thread, no ponder). training/cpp_bridge.py is an
+  UNVERIFIED UAI bridge (engine.exe lacks `set`; the arena uses engine-ctl.exe directly) - do not use without fixing.
+- Harness trap (D102, MISTAKES 30): `match --nodes N` without `--time 0` caps the in-process candidate at 1 s; under CPU overload that voids
+  gates. Run ONE gate at a time; never edit/build in a worktree a running job reads (MISTAKES 29).
+- New law: BEHAVIOR 25 DOCS IN REAL TIME ("what you remember you shall forget, what you wrote down you will remember").
+
+**Worktrees made today (can be removed when no longer needed):** bzrob-ataxx (exp/botzone-robust, keeps the BZ-rule commits), crit-ataxx
+(exp/critical-fixes = main), netpromo-ataxx (exp/net-s1chg, merged). Nets: data/nnue/champions/MAIN_NNUE_s1chg_e11827d1.tnn,
+data/nnue/modal_ckpt/{base_v4s,s1c_hg,s1c_nohg,s2_hg,hpo_ft}/.
+
+## 2026-10-25 19:30 - FULL RELABEL DONE (all 33,891,139 rows labelled by main 0f27043 + plain big NNUE c4829350, 5000 nodes, fresh state per position)
+
+data/nnue/relabel/labels.npz (644 MB): rows (global dataset row = train rows, then val, then test), have (all True), score, depth, nodes. 0 sandboxes left (tit-rl1..rl8 deleted).
+Facts: mean depth 8.21, mean nodes 4939; 832,568 rows (2.46%) are proven wins/losses (|score| > 5000: values +-99999 minus ply, mate distance) -> clip/convert when training; 15,850 rows have depth 0 (terminal or no-move positions, score 0 or -99998/-2xxx sample values: inspect before use); non-decided scores: mean 66, p1 -1114, p99 +1190.
+Cost: docker_spend.csv sums to $58.5 WORST CASE (every sandbox at full ttl); by actual runtime ~ $48 (rl1 ~9, rl2 ~10, rl3 ~5, rl4 ~6, rl5 ~9, rl6 ~4.4, rl7 ~4.3, rl8 ~0.3). Not the bill.
+DONE 2026-10-26 ~08:00 (D105): external arena - Ataxx_CPP and KataAtaxx are weaker than Titanium on equal terms, Moonbird equal except at 100 ms (speed); no external teacher. Earlier: RUNNING (2026-10-26 ~04:00): (1) local gates srchfix_vs_main2 then s2scaled_vs_s1chg2 (pure node, --time 0; logs/gate_*2); (2) external arena training/run_ext_arena.sh (D103, runner log logs/arena_ext_runner.txt, results logs/arena_*.txt; ~7-8 h; timed legs wait for (1)). MAIN = 1b286f2 PUSHED (D106): default net e11827d1 + critical fixes; Botzone upload folder C:/gitProjects/crit-ataxx/botzone/upload (user uploads .py + .so + net). Main exe rebuild after gate s2scaled_vs_s1chg ends; Botzone needs the new net uploaded. The srchfix_vs_main gate is VOID (tripwire mismatch on 2 of 26 games, most likely the 82-s net swap; candidate replays deterministically) -> re-run it in full. KATA FINE-TUNE HURTS (D98): stage-2 net -137 Elo vs its stage-1 net (CI [-175,-102]), = main; best net stays the stage-1 hg net data/nnue/modal_ckpt/s1c_hg/net.pt (TNN E11827D1, +132 vs main); stage 2 parked, user to confirm. BOTZONE (D97): hardened driver on exp/botzone-robust d389bd6, upload folder C:/gitProjects/bzrob-ataxx/botzone/upload - user uploads the new titanium_botzone.py as a new bot version (storage files unchanged); merge into main needs the user's OK. GATE s1chg vs main PASSED (D94): +132 Elo at 5k, CI [+97,+170], net data/nnue/modal_ckpt/s1c_hg/net.pt (TNN E11827D1) = strongest so far, NOT staged/merged. RUNNING (D93, since ~01:50): STAGE 2 s2_hg on Modal app ap-qxEOaY2aJ5uXqKLd4WId7A from the stage-1 hg net (val 0.021626; local stream logs/modal_s2_hg.txt; stop: python -m modal app stop -y ap-qxEOaY2aJ5uXqKLd4WId7A) + local gates s1chg_vs_main then s1chg_vs_nohg (logs/gate_s1chg_*). DONE before: RUNNING (D91, since ~00:50): stage-1 continuation A/B on Modal: s1c_nohg app ap-674nks78Y9cQVVQqZ3IZgW, s1c_hg app ap-7RBJvvqQSYOaP8wweVvDoK (volume /ckpt/<tag>, local streams logs/modal_s1c_*.txt; stop: python -m modal app stop -y <app>); the better one -> gate vs main -> stage 2. D83 SEARCH DONE (D90): best t14 val 0.022166 (-1.6%), data/nnue/modal_ckpt/hpo_ft/t014.pt; next = continue stage 1 from it with its settings (auto-lr) -> gate vs main -> stage 2. STAGE 2 STOPPED (D89: the D83 search found a 0.72% better stage-1 continuation; stage 2 restarts from that net) - was app ap-GOfH0q7aRoG3PXd1hmAw0J (volume /ckpt/teacher_v4s, local stream logs/modal_teacher_v4s.txt, stop: python -m modal app stop -y ap-GOfH0q7aRoG3PXd1hmAw0J). GATE s1v4 PASSED 23:35 (D87): stage-1 net beats main at 5k, 230-170-16, +50 Elo, CI [+17,+85], both seats; NOT staged/merged (user call). STAGE 1 SATURATED 23:16 (D86): data/nnue/modal_ckpt/base_v4s/net.pt, val 0.022533 (seed 0.025629). NOW RUNNING (23:22): D84 gate s1v4 on the local CPU (logs/gate_s1v4/, logs/gate_s1v4.out) + D83 search on Modal app ap-A34IiY50Lf9bPgJbViDcVu (volume /ckpt/hpo_ft, stop: python -m modal app stop -y ap-A34IiY50Lf9bPgJbViDcVu). Plan:  D83 continue-from-saturated Optuna (optuna_ft.py, ~1 h, ~$1.5) -> D84 GATE the best stage-1 net vs the champion (training/gate_net_vs_main.py, 416 g at 5k, local CPU ~10 min) -> stage 2 (Kata fine-tune, user OK given as part of D85) -> GATE stage-2 net vs main AND vs stage-1 net = does the Kata fine-tune help? (D85: Kata is NOT assumed right; games decide). STAGE 1 NOW ON MODAL GPU (D81, since ~21:47): app https://modal.com/apps/terminatort8004/main/ap-BLbA4IHnUttQKngTjOSJGs (relaunched 21:58 from the seed with the D82 hypergrad-restart fix; stop: `python -m modal app stop -y ap-BLbA4IHnUttQKngTjOSJGs`; first try ap-qigqdHSAm6pt9VEIM3FKxf stopped after 2.4 epochs, log logs/modal_base_v4s_run1_stopped.txt), local stream logs/modal_base_v4s_launch.txt; volume ti-train /ckpt/base_v4s (log.txt, net.pt); check: `MSYS_NO_PATHCONV=1 python -m modal volume get ti-train /ckpt/base_v4s/log.txt logs/` ; relaunch = same modal run command (resumes). CPU run STOPPED 21:45. Earlier: GPU MOVE IN PREP (D80, 21:30): training/modal_train.py + slim data upload to Modal volume ti-train; switch only after a <$1 smoke shows >=5x. STAGE 1 RUNNING since 20:37 (D79) [EPOCH 1 DONE 21:41: val mse_target EMA 0.023099 (live 0.024298) vs seed 0.025629 = -9.9%, accepted; Kata-TD drifted 0.05585 -> 0.06086 (expected for the base stage, stage 2 re-fits Kata); the rising train loss did not hurt val] [21:22 WATCH: epoch-1 per-chunk TRAIN loss rose 0.0105 -> 0.0117 while hypergrad cut the LR 1.21x -> 0.80x (264 up / 4443 down) = LR too high for the warm start; epoch-1 val decides: worse than seed 0.025629 -> auto-lr rolls back + halves LR] - user 2026-10-25: "try to saturate the first stage before progressing" (stage 2 only after auto-lr SATURATED + user approval): `bash training/run_base_v4s.sh`, log logs/train_nnue_base_v4s.txt, runner log logs/run_base_v4s.txt; to resume after a reboot just run the same script (it resumes); stage 2 needs the user's approval. Earlier: STAGE 1 PREP (~20:15): trainer fixed (--block mixing D75, warm-start seed D76); hypergrad smoke showed a runaway LR (D77) -> fixing to Baydin-for-Adam and re-smoking; full stage-1 run NOT started yet (runner training/run_base_v4s.sh). JOIN DONE + VERIFIED (2026-10-25 evening, user order 'replace old labels'): `python training/relabel_join.py` wrote data/nnue/final/final_{train,val,test}_v4.npz = v3 + `titanium_cp` replaced by the relabel score, `titanium_cp_old` (previous values), `relabel_depth`; v3 files untouched. Verified on ALL rows: every other column identical, titanium_cp == mapped score, packed position == dataset position (train/val/test 32,534,256 / 677,670 / 679,213). training/train_nnue.py now loads `final_<split>_${TI_DATA_TAG:-v4}.npz` (DATA_TAG; set TI_DATA_TAG=v3 for the old labels). Old vs new on val (undecided rows): corr 0.67, new labels correlate better with the game result (0.343 vs 0.236), new sd 385 cp vs 246. Kata columns (teacher_p3, kata_td_*, teacher_kind) unchanged, so the teacher stage is unaffected. Nothing trained.
+STILL TO DO (user go): join step is done; join labels into the training files by row (final_{train,val,test}_v3.npz column `titanium_cp` <- labels.score, keep Kata columns), then stage 1 base training on the new titanium_cp, stage 2 Kata fine-tune (same recipe as nnue_t1ep4: HANDOFFS lines on `train_nnue.py --stage teacher`, DECISIONS D36 warm-start question still open), export TNN2 + parity, gate vs main. Then the speed ablation (user plan below).
+
+## 2026-10-25 afternoon - FULL RELABEL (user: relabel the whole dataset, wait for it to finish)
+
+RUNBOOK with all recipes, lessons and the Botzone glibc diagnosis: docs/RELABEL_RUNBOOK.md (read it first for anything relabel / sbx / Botzone log related).
+
+USER PLAN (2026-10-25 14:30, not started, needs an explicit go): after the relabel finishes and the last training run(s) are done, ABLATE the network to see how much faster it can be made (narrower first layer / head: train-from-scratch and distillation vs lottery-ticket-style neuron pruning with reset to initial weights). Gate each by speed AND strength (5k nodes, 100 ms, 50 ms). Unstructured weight pruning is useless for our dense AVX2 eval - prune whole neurons.
+
+(13:45: watcher v4 REUSES finished sandboxes instead of delete+create: `sbx --cloud ttl +Nm` extends the ttl, `relabel_run.py reuse` uploads the next slice.bin+job.sh and restarts the job; slices are fair-shared by vCPU so all sandboxes end together; fallback = delete + new sandbox from the prebuilt engine.) At 13:20 the watcher became v3 (data/nnue/relabel/watch_all.sh): work queue queue.txt (rows 25,127,785-33,000,000 first), sandboxes.txt = 'name vcpu lo hi'.
+tit-rl4/5/6 (16/16/8 vCPU) finish their slices ~14:50 (job deadline 15:00); each time one is DONE it is pulled+deleted, its unlabelled tail goes to the queue front, and a
+same-size successor starts on the next range, sized to finish by ~20:00 (12.5 rows/s/vCPU), using the PREBUILT Linux engine (no cargo build): training/relabel_run.py cloud --prebuilt
+data/nnue/relabel/prebuilt/titanium-cli = zig build (glibc 2.31) of main 0f27043, labels verified bit-identical to the cargo-built sandbox on 400 rows.
+PC: pc_crawl.sh crawls from row 33.9M downward, no deadline (stop by hand). ETA all rows ~19:30-20:00. Extra cost ~$12-14 (total ~$57; Docker free allowance $200).
+When the watcher log says 'watcher finished': check `python training/relabel_run.py merge` (full) - if rows are missing the PC crawl fills them, or relaunch a sandbox on the gap.
+No training without the user's order.
+
+## 2026-10-25 night - OVERNIGHT RELABEL RUNNING (big NNUE c4829350, 5000 nodes/position, fresh state per position)
+
+(The entry below saying "push blocked" is outdated: main 0f27043 is pushed, Actions build artifact `botzone-upload` exists.)
+Dataset packed shuffled: data/nnue/relabel/positions.bin (33,891,139 records) + rows.npy, so ANY finished set of rows is a random sample.
+Workers (chunks of 5000 rows -> data/nnue/relabel/out/c_<firstrow>.txt, resumable):
+- PC (terminal tab c9): rows 0-1.6M, ~41 pos/s, deadline 15:00, expected done ~12:45.
+- tit-rl1 (Docker cloud, 16 vCPU): rows 1.6M-5.6M, ~227 pos/s, expected done ~07:00.
+- tit-rl2 (16 vCPU): rows 5.6M-12,672,785, expected done ~10:45.
+- tit-rl3 (8 vCPU): rows 12,672,785-16,672,785, ~113 pos/s, expected done ~12:05.
+Docker cloud vCPU quota is 40, so the planned rl3-rl5 (16 vCPU each) could not be created (cost nothing). Rows 16.67M-33.9M (~17M, half the data) are NOT labelled
+unless more is launched; ~16.7M rows (49%) will be.
+Watcher data/nnue/relabel/watch_all.sh (log watch_all.log): every 30 min pulls chunks from each sandbox, restarts dead jobs, deletes a sandbox when DONE, hard stop 13:10.
+Spend ~ $11.2 + $11.7 + $5.9 = ~$29 worst case (logs/docker_spend.csv; the sandboxes auto-delete after ttl 10.5 h anyway).
+Merge: `python training/relabel_run.py merge --partial` -> data/nnue/relabel/labels.npz (rows, have, score, depth, nodes; scores include +-99998/99999 decided - clip when training).
+UPDATE (user: let PC cook until stopped, +2 h for Docker): watcher v2 checks every 10 min; when a sandbox is DONE it is pulled+deleted and a same-size
+successor (tit-rl4, 5, 6...) starts on the next unlabelled rows (from 16,672,785 upwards, cap 33,000,000), deadline 15:00, final pull+delete 15:10 (state: sandboxes.txt,
+next_row.txt). After its slice (~12:45) the PC crawls the unlabelled rows downward from 33.9M (data/nnue/relabel/pc_crawl.sh) with NO deadline - stop it by hand (kill python/titanium-cli) when training starts.
+Expected extra cloud spend ~ $15 (total ~ $44). Old tit-rl1 ttl ends ~11:45, rl2 ~12:30, rl3 ~12:40 (auto-delete) - all expected done before that.
+No training without the user's order. After rl1 finishes (~07:00) 16 vCPU of quota is free: a new sandbox on rows 16.67M+ could add ~4M rows (~$6).
+
+## 2026-10-25 night - Botzone crash fixed locally; main 0f27043 NOT pushed (needs GitHub workflow scope)
+
+Botzone v5 (cf94732, deployed by another agent) crashed on the bot's first move: titanium_v2.so needed glibc 2.34
+(Botzone = Ubuntu 16.04 / glibc 2.23) - built on a modern runner. It also ran S57 only (the NNUE default was CLI-only).
+Fix on exp/botzone-nnue, fast-forwarded into LOCAL main 0f27043 (staging too): zig glibc 2.14 build, FFI loads
+nnue_main.tnn (peak 125 MB), driver 12 s on turn 1 / 6 s later, tools/build_botzone.py (one command, Docker test),
+workflow rewritten. Normal search identical to 8b51d92. Upload folder ready: C:/gitProjects/main-ataxx/botzone/upload.
+PUSH BLOCKED: GitHub refuses workflow-file changes from a token without 'workflow' scope (user must run
+`gh auth refresh -h github.com -s workflow` + `gh auth setup-git`, then push main). Old branch exp/botzone-ffi is superseded.
+
+## 2026-10-25 evening - main 8b51d92 pushed; relabel ready to plan
+
+**Main (pushed):** 923dbea (NNUE c4829350 default) -> d1e0055 (eval cache + prefetch/head speedups, bit-identical, ~2x; +135 @100ms vs 923dbea, 360 g) -> dc937b3 (search to the deadline, time check every 64 nodes; user: no gate) -> 8b51d92 (cache-only eval move ordering EVORD_W 100; 5k gate stopped at +57 in 83 g, inconclusive; user merged). Staging = main.
+**Speed facts:** 5k-node search ~70-75 ms (was 131); PC relabel 48 pos/s (labelbin, 8 threads). Dropped: int8 FT, register tiling, incremental accumulator, evaluate-every-child ordering (6x slower).
+**Relabel (NOT started, user said wait for my 'ready'):** training/relabel_pack.py (8M subset packed -> data/nnue/relabel/positions.bin 9.36M rows), training/relabel_run.py (plan/pc/cloud/collect/merge; EXE + cloud source now = C:/gitProjects/main-ataxx (main 8b51d92, the engine on main)). Open: user wants WHOLE dataset (33.9M) shuffled; duplicate count not checked; cloud per-vCPU speed never measured (first test failed: uncommitted code). Labeller = main 8b51d92 (record the exe sha in the run).
+**Botzone:** python driver fine (6 s one-shot, margins, watchdog); engine .so on exp/botzone-ffi is old (S57, b0c4329-level) - another agent owns the update.
+**Running:** nothing. Docker ledger ~$11.6 of $200.
+
+## 2026-10-25 ~00:20 STATE (usage limit hit mid-run)
+- STAGING = d61d0c4 (fast int16 NNUE) by USER ORDER; engine config --tuple none --nnue data/nnue/champions/STAGING_NNUE_t1ep4_c4829350.tnn.
+  Gate vs main: 5k +207 PASS, 100 ms +29 / 50 ms +13 (ahead, not conclusive). MAIN untouched (b0c4329 + S57 53F2B29C). Nets backed up read-only in data/nnue/champions/.
+- RUNNING: hybrid grids vs main (exp/nnue-hybrid caa8f0b): cloud sandbox tit-hyb (move-share HYB_PCT 10/20/35/50/100, ttl 2h auto-delete)
+  + local Docker container tit-local-hyb (material switch HYB_MAT 6/8/10/12). Results: logs/sbx_hyb/res/logs, logs/local_hyb. If no session is
+  watching: `sbx --cloud ls` / `sbx --cloud rm --force <id>`, `docker rm -f tit-local-hyb`, pool with training/pool_glob.py.
+- Docker ledger logs/docker_spend.csv (worst case ~$10 of $200 stop). Training STOPPED (relaunch needs --force-restart --hypergrad).
+- NEXT: pick best hybrid -> gate vs staging/main; then default-NNUE switch + ask user for main merge; relabel with strongest engine only after user go.
+
+## 2026-10-24 23:25 NNUE teacher run STOPPED by user order ("just stop training, not worth it for now")
+- Best net = epoch-4 EMA (0.055853 Kata-TD MSE), exported data/nnue/nnue_t1ep4.tnn (c4829350). Cycle 0 bottomed out (ep5-8 all worse).
+- The resume file holds the PRE-restart state (cycle 0): if training resumes later, relaunch WITH --force-restart --hypergrad.
+- The box is now free for gates (local Docker Linux workers next to the cloud sandboxes).
+
+## 2026-10-24 ~22:50 NNUE teacher run: FORCED warm restart (user: "make it look for better basins, it hit rock bottom")
+- Cycle 0 bottomed out: epochs 5-8 all within 0.1% of best 0.055853 (ep4 EMA) at lr 5e-4 .. 3.1e-5.
+- train_nnue.py: --force-restart (applied ONCE at startup: basin0 saved, warm restart from the global best), first restart
+  jump = lr/2 (3.75e-4), smaller after each failed cycle in a row; relaunched with --auto-restarts 3.
+- If the trainer has to be relaunched again (RAM guard, reboot): use the same command WITHOUT --force-restart.
+- Also: the run now uses --hypergrad (D72, per-step LR scale, persisted in the resume file) - keep the flag on relaunch.
+
+## PAUSED 2026-10-24 ~20:50 for a PC restart (user enables Windows Hypervisor Platform for Docker Sandboxes)
+- NNUE teacher run (D69 --auto-lr) paused at ep6 chunk 16 checkpoint (resume file saved). RESUME with the exact D69 command:
+  python -I -u training/train_nnue.py --stage teacher --init data/nnue/nnue_pbt/best_base.pt --out data/nnue/nnue_teacher_v1 --epochs 60
+  --auto-lr --cos-epochs 12 --auto-restarts 2 --min-rel 0.002 --metric mse_kata_td --lr 7.5e-4 --lr-min 2e-5 --bs 4096 --width 256
+  --opt ranger --wd 3e-7 --la-k 8 --la-alpha 0.56 --ema 0.9995 --threads 4 --min-free-gb 1.5 >> logs/train_nnue_teacher_v1.txt
+- Modal gates of exp/search-nmpmb-b0 1df8ddb vs staging: 5k PASS +41; 100 ms +12 inconclusive (extension book 200-399 was running);
+  50 ms rerun was running. Both are killed by the restart -> rerun training/modal_gate.py (OPP_SRC staging, CAND_SRC nmpmbb0-ataxx).
+- After restart: user runs `sbx login`; then test one tiny Docker Sandboxes batch job (cloud? scripted? my own spend ledger < $200).
+
+## STAGING LIVE 2026-10-24 (BEHAVIOR 24, D70): branch staging @ b0c4329 (= main), worktree C:/gitProjects/staging-ataxx
+- Candidates now gate vs the STAGING TIP; a full pass -> agent merges into staging + LEDGER STAGE-<tag>; staging -> main needs user approval
+  after a staging-vs-main confirmation gate (5k + 100 ms + 50 ms). Not pushed.
+- NNUE trainer: --auto-lr (D69: cycles of backtracking + SGDR warm restarts from the global best, stop after 2 failed cycles in a row, then
+  SWA over basins + a 2D plane map through the best and two best basins). Smoke test then the real teacher run (resumes ep5 chunk 16).
+
+## PROMOTED 2026-10-24 night: main = b0c4329 (Moonbird history), PUSHED. STRONGEST = main b0c4329 + S57 (tupS57v2.tup 53F2B29C)
+- Gates vs a3c9b74, same S57: 5k +200, 100 ms +159, 50 ms +169 (400g each, all PASS). LEDGER Whistmb5k/100/50, PROMOTE-histmb.
+- PARKED (behind, inconclusive vs a3c9b74, not rejected): exp/search-rootpvs 40dd73c (-27 @5k), exp/search-nmpmb 027e07a (-11 @5k).
+  Re-test both rebased on b0c4329.
+- NEXT (user design 2026-10-24): search-tuning teacher. Teacher = WIDE search (no lossy pruning: no LMR/futility/RFP/NMP/IIR,
+  or ~2x the student breadth; TT/ordering/PVS kept) to the SAME depth D as the student; student = tuned pruned search.
+  Fitness = regret vs teacher at depth D + node cost (honest node counting incl. pruned-move static evals); keep the
+  agreement-vs-nodes Pareto front, then game gates decide. Endgame <= ~10 empties: exact solve as teacher. Measure first what
+  full-width depth 6-9 costs on ~20 positions. Branch exp/teacher-search (own binary, no hot-path flag).
+- NNUE teacher run training (resumed 18:47 at ep4 chunk 8). Its gate must be vs main b0c4329 (rebase exp/nnue).
+
+## PROMOTED 2026-10-24 evening: main = a3c9b74 (Moonbird-style search), PUSHED. STRONGEST = main a3c9b74 + S57 (tupS57v2.tup 53F2B29C)
+- Gates vs main 653d9a1, same S57: 5k +263 (flattered: the child static evals of pruned moves are not counted as nodes), 100 ms +48
+  [0.5225,0.6138], 50 ms +96 [0.5900,0.6787], 400g each, all PASS. LEDGER WsearchmbA5k/100/50, PROMOTE-searchmbA.
+- Change: LMR from move 7 depth*47/(47+n); futility REDUCTION 1 ply per 57 cp the child static eval is below alpha (from move 2);
+  moves reduced to <= 0 skipped; child eval reused via pre_eval. Depth @100 ms 7.08 vs 6.50 (Moonbird 11.4).
+- main exe rebuilt e6a9090b, bench d8 a1b2 13 / 3410 nodes (identical to gated candidate). titanium-wasm does not compile
+  (Searcher lifetime, predates a3c9b74): fix before any web/wasm build.
+- NNUE teacher run RESUMED 17:49 at epoch 4 (saturation run, patience 2). Its later NNUE gate must be vs main a3c9b74 and the
+  NNUE side must be built on a3c9b74 search (rebase exp/nnue).
+- Next search levers (own branch + gate each): NMP R=4+depth/2, aspiration, history malus, RFP retune; cheaper eval makes A pay more.
+
 ## PROMOTED 2026-10-24 late: main = 653d9a1 (TUP7 eval fix), PUSHED. STRONGEST = main 653d9a1 + S57 (tupS57v2.tup 53F2B29C)
 - Gates vs old main 298b7ae, same S57: 5k +77 (400g), 100 ms +45 (400g), 50 ms +26 (800g), all PASS; Moonbird odds +53. LEDGER PROMOTE-tup7fix.
 - main exe rebuilt (45537061), bench d8 a1a2 13 / 10844 nodes. Speed not optimised yet (~2.4x slower per node than 298b7ae).
 - The NNUE teacher run (D64) is RUNNING again (resumed at chunk 16, epoch 1). Epoch 1 done: val Kata-TD MSE .0587 (EMA)
   vs S57 .0663 vs base start .0686; level with Ataxx_CPP's raw value from 25 empties up, behind at <= 24 (NET_ANALYSIS 29).
+- DAG LIVE (D67): data/dag/games_dag.db, 16,940 games / 1.44M nodes from all gate logs; gates feed it automatically
+  (gate_nnue.py, ext_gate.py; bat-launched gates: run `python training/dag.py ingest "logs/gate_<tag>_*.txt"` after).
+- Teacher run now TRAINS TO SATURATION (training/restart_teacher_saturate.ps1 switched it at ep2 chunk 16): up to 12
+  epochs, plateau stop patience 2 / 0.2% on val Kata-TD; best checkpoint over all epochs -> data/nnue/nnue_teacher_v1.pt.
 - LEVER QUEUE (main = champion, branches try to beat it; side branches for exploration):
   1. finish v1 teacher (3 epochs) -> export -> gate the NNUE vs main @5k (exp/nnue has the tuple fix; NNUE side --tuple S57 not
      needed for v1, use --tuple none on the nnue side as before) -> 100/50 ms legs if ahead.
   2. v2 big (D65: W 1024 + pairwise + hidden skips + engine-exact S57 skip, data/nnue/s57/*.f32 built with the fixed engine),
      base then teacher; capacity aimed at <= 24 empties.
   3. relabel the base data with current main 653d9a1 + S57 (~20% closer to Kata, NET_ANALYSIS 28; ~14 h on 8 workers).
+  3b. (user 2026-10-24) the relabel is a LOOP: relabel every row's titanium_cp with the current champion (keep Kata labels
+     where they exist) -> base stage again (warm start) -> Kata teacher fine-tune -> gate -> the new champion relabels again.
+  3c. (user 2026-10-24) NOT before: (1) saturate the current setup, (2) relabel with the current Titanium + saturate again.
+     Moonbird must first be PROVEN a better teacher at 5k nodes per position than KataAtaxx before any Moonbird relabel.
+     Then: Moonbird 1.1.0 as SECONDARY teacher = its 5k-node SEARCH values on
+     all positions (not its static eval: S57 static is already >= Moonbird static vs Kata, NET_ANALYSIS 23; Moonbird's edge is
+     search, it beats Titanium ~8-192 at equal 5k nodes). Existing pipeline: training/relabel_moonbird.py (stopped at 1/238
+     chunks by D57, resumable); calibration rows already carry Moonbird@1k labels. Then ablate with identical budgets and
+     paired games: Titanium-only / Kata-only / Moonbird-only / mixed targets; also test using Moonbird only where it disagrees
+     sharply with Titanium. Keep every stage's best checkpoint; judge by paired-match Elo vs main AND vs Moonbird.
+     Watch: a loss plateau can be capacity, label noise floor, optimiser or distribution mismatch, not only "saturated".
   4. speed recovery for the tuple fix (after strength levers; profile capconv + env loop).
+  4b. (user 2026-10-24) NNUE PRUNING after strength is proven: skip zero activations in L1 (Stockfish find-nnz), delete
+     never-active FT neurons, L1-regularised fine-tune + magnitude-prune sweep |w| < eps gated per eps (fixed-node gate =
+     strength loss, time gate = speed gain; raise eps until the speed gain stops paying), structured pruning (neurons,
+     input groups) before quantisation.
   5. root-move ordering by Ataxx_CPP policy (NET_ANALYSIS 22).
+  6. (user idea 2026-10-24, AFTER gating what we have) OPENING/GAME DAG like Quoridor_best_AI: one node per position (Zobrist
+     key) with W/D/L + visits + children; self-play walks the known DAG with temperature (explore variants) and plays the
+     engine's best once off-DAG (full-budget search, every position labelled once); later MCTS-style frontier expansion
+     (eval all children at a known node, pick the best unseen). Gives opening WDL statistics (book + training targets) and
+     millions of diverse self-play rows. Seed from data/nnue/outcomes.db (33.9M positions with W/D/L, mostly Kata self-play)
+     + gate logs. Guard against the S21-era echo chamber (self-distillation fossilised): keep temperature + outside games
+     (Kata, Moonbird). Cost guide: ~1 s/game/core at 5k nodes -> 1M games ~ 35 h on 8 cores.
 
 ## ENGINE BUG FOUND 2026-10-24 late: main plays TUP7 tuple nets != how they were trained (docs/NET_ANALYSIS.md section 27)
 - Engine TUP7 loader skipped capn/conv and read `pa` 1060 bytes early (S53..S57); trainer zero-constraint only block 0 while

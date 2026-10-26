@@ -15,7 +15,15 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 
 ## 2. Where the strongest engine lives (do not guess)
 
-- **UPDATE 2026-10-24 late: STRONGEST = main 653d9a1 (pushed) + S57 tupS57v2.tup (53F2B29C).** 653d9a1 = the engine now evaluates TUP7 nets exactly as trained (NET_ANALYSIS section 27; +77 @5k, +45 @100ms, +26 @50ms vs 298b7ae). Any tuple-net work must keep training/tuple_parity.py at 0 cp.
+- **READ FIRST for training/relabel/Botzone work: docs/TRAINING_RUNBOOK.md, docs/RELABEL_RUNBOOK.md, HANDOFFS top entry. No external teacher beats Titanium (D105); never fine-tune on the Kata columns (D98/D101).**
+- **UPDATE 2026-10-26 (later): STRONGEST = main 1b286f2 (PUSHED) = c7c44a3 + critical fixes (Botzone driver hardening, FFI depth cap, overflow fix; LEDGER MAIN-critical).**
+- **UPDATE 2026-10-26: STRONGEST = main c7c44a3 (LOCAL, not pushed) = 0f27043 + default NNUE e11827d1 (stage-1 retrain on the full 33.9M-row relabel, +132 Elo @5k vs c4829350; LEDGER MAIN-net-s1chg). The Kata fine-tune (stage 2) LOSES -137 to it (D98) - do not use.**
+- **UPDATE 2026-10-25 evening: STRONGEST = main 8b51d92 (pushed) = big NNUE c4829350 by default + eval cache/2x speed (d1e0055) + full-time search to the deadline (dc937b3) + cache-only eval move ordering (8b51d92, gate stopped early by user). Botzone .so is still the OLD engine (branch exp/botzone-ffi, S57 only) - another agent is updating it.**
+- **UPDATE 2026-10-25 later: STRONGEST = main d1e0055 (pushed) = 923dbea + exp/nnue-speed (eval cache, prefetch, faster head; same moves at equal nodes, ~2x faster, +135 @100ms vs 923dbea). Relabel tools: labelbin + training/relabel_run.py on this build.**
+- **UPDATE 2026-10-25: STRONGEST = main 923dbea (pushed): fast int16 NNUE nnue_t1ep4 c4829350 loaded BY DEFAULT (data/nnue/nnue_main.tnn; --nnue none = old S57 b0c4329 engine). Hybrid P=20 (exp/nnue-hybrid 2a2056b) is the next candidate.**
+- **UPDATE 2026-10-24 night: STRONGEST = main b0c4329 (pushed) + S57 tupS57v2.tup (53F2B29C).** b0c4329 = a3c9b74 + Moonbird history (from-to key, +d^2 / -d^2/24 malus, ordering weight 2 conversions): +200 @5k, +159 @100ms, +169 @50ms vs a3c9b74.
+- **UPDATE 2026-10-24 evening: main a3c9b74 (pushed) + S57 tupS57v2.tup (53F2B29C).** a3c9b74 = Moonbird-style search (LMR from move 7 depth*47/(47+n) + futility reduction by the child's static eval, NET_ANALYSIS section 30): +263 @5k (flattered: child evals uncounted), +48 @100ms, +96 @50ms vs 653d9a1. titanium-wasm fails to compile (Searcher lifetime, predates a3c9b74).
+- **UPDATE 2026-10-24 late: main 653d9a1 (pushed) + S57 tupS57v2.tup (53F2B29C).** 653d9a1 = the engine now evaluates TUP7 nets exactly as trained (NET_ANALYSIS section 27; +77 @5k, +45 @100ms, +26 @50ms vs 298b7ae). Any tuple-net work must keep training/tuple_parity.py at 0 cp.
 - **UPDATE 2026-10-24 (read with HANDOFFS top entry): strongest is still main 298b7ae + S57. A real NNUE is in progress on branch `exp/nnue` (worktree `C:\gitProjects\nnue-ataxx`, committed locally 02c3f29). Its design must follow `docs/NET_ANALYSIS.md` (what Kata/Ataxx_CPP/Moonbird/autaxx/Stockfish look at, anchor test, policies). Titanium 5k labels = BASE stage data, KataGo = TEACHER.**
 - **UPDATE 2026-10-23 (supersedes the bullet below): strongest = `main-ataxx` 298b7ae (S57) + net `data/nnue/final_v2_wdl_ep8.tup` (sha 53F2B29C, main default name tupS57v2.tup). Dataset v3 plan + the Ataxx_CPP/Kata findings: `docs/AXNET_PROBE.md` (read it for any teacher/eval/dataset work).**
 - `main @ 73a859d` + default net `data/nnue/tupS55tree.tup` (726440 B,
@@ -77,6 +85,12 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
     build / train / ablate without a per-step go (log a DECISIONS row); one job at a time, RAM + audit rules stay;
     merging into main still needs explicit user approval naming branch + net after a passed gate.
     Ranked "what matters" summary for any eval/NNUE work: docs/WHAT_MATTERS.md.
+14. **(2026-10-24, BEHAVIOR 24) STAGING:** branch `staging` (worktree C:\gitProjects\staging-ataxx) = main + proven gains.
+    The agent merges a candidate into staging itself once it passed the full gate vs the STAGING TIP (laws 3-6/8/10; speed-affected
+    = 100 ms + 50 ms legs); LEDGER row STAGE-<tag>. New candidates gate vs the staging tip. staging -> main = user approval naming
+    commit + net, after a staging-vs-main confirmation gate. Staging is not pushed unless the user says so.
+
+15. **(2026-10-25, BEHAVIOR 25) DOCS IN REAL TIME:** every important change (LR algorithm, data, labels, recipe, what a net was really trained with, run start/stop) goes into DECISIONS + HANDOFFS the moment it happens, with a TRUE status; read DECISIONS + run logs + the nnue-pytorch recipe before choosing any training setting.
 
 ## 4. Rules: two of them (do not mix)
 

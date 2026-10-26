@@ -25,7 +25,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--drop", default="")
     a = ap.parse_args()
-    ck = torch.load(a.pt, weights_only=False)
+    ck = torch.load(a.pt, weights_only=False, map_location="cpu")  # GPU-trained checkpoints (D80) too
     sd = ck["model"]
     W = sd["ft.weight"].shape[1]
     L1 = sd["l2.weight"].shape[1]
