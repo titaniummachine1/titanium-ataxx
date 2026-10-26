@@ -64,6 +64,8 @@ Never leave it running because "the study is not finished": the ttl is a hard st
   `docs/TRAINING_RUNBOOK.md` section "Futility small net" and D109/D110/D114.
 - The small net is fitted to ONE big net (e11827d1): retrain it after every new big net.
 
+Modal (GPU, cloud gates, the $30/month cap): docs/MODAL.md.
+
 ## 6. Other places that mention sandboxes
 `docs/RELABEL_RUNBOOK.md` (relabel runs, watcher, reuse of finished sandboxes), `docs/DECISIONS.md` D111 (gate parallelism),
 `logs/docker_spend.csv`, `training/par_probe.py`, `training/gate_net_vs_main.py` (5k gates, `--par`).
