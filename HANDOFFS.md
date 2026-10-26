@@ -1,3 +1,9 @@
+## 2026-10-26 ~12:45 - CURRENT STATE (read this first): main 343ab02 PUSHED (CI green); Botzone package rebuilt; NOTHING RUNNING
+
+**origin/main = 343ab02** = futility small net (D108-D112; vs 1b286f2: 100 ms +84, 50 ms +123, 5k +3; `--no-fut-sn` = exact old search).
+**Botzone upload ready (user's login):** C:/gitProjects/main-ataxx/botzone/upload (MANIFEST.txt), built from 343ab02, 12/12 Linux cases pass (real 12 s first move: depth 14, 797k nodes, 11.96 s). Only the library changed: data/titanium_v2.so c3427453 (530,416 B) -> storage /titanium_v2.so. Unchanged: titanium_botzone.py 320c2c0f (14,288 B), data/nnue/nnue_main.tnn e11827d1 (27,945,148 B -> /nnue/nnue_main.tnn); if the 1b286f2 upload was never done, upload all three. The small net is inside the .so (no new storage file).
+**Next:** BACKLOG.md CURRENT BACKLOG (A1: profile the merged build).
+
 ## 2026-10-26 ~12:30 - CURRENT STATE (read this first): main 343ab02 LOCAL (not pushed) = futility small net merged; NOTHING RUNNING
 
 **Main = 343ab02 (local; origin/main still 1b286f2)**: 1b286f2 + exp/fut-cheap ea3e8ec + exp/fut-sn 9888823 (futility small net, lower bound tau 2%) + 343ab02 `--no-fut-sn` switch (exact full-strength search = 1b286f2). Gates vs 1b286f2: 100 ms +84 [+51,+120], 50 ms +123 [+88,+160], 5k +3 [-30,+37] (LEDGER MAIN-futsn, D108-D112). Exe 13210C04, net e11827d1, small net 0068e7d0 (compiled in, data/nnue/fut_small.tsn).
