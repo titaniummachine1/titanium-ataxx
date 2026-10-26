@@ -23,6 +23,10 @@ use titanium::{best_move, Board, Move, SearchLimits, Searcher, RING1};
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("help");
+    // exact full-strength search without the lossy futility small net (D112); any command, `serve` included
+    if args.iter().any(|x| x == "--no-fut-sn") {
+        titanium::search::set_fut_sn(false);
+    }
     match cmd {
         "perft" => perft_cmd(first_int(&args).unwrap_or(4) as u32),
         "bench" => bench_cmd(

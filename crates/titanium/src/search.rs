@@ -71,6 +71,15 @@ const FUT_CHEAP_M: i32 = env_usize(option_env!("FUT_CHEAP_M"), 350) as i32;
 /// FUT_CHEAP_M only switches the pre-filter on (> 0) or off (0) here.
 const FUT_SN_M: i32 = env_usize(option_env!("FUT_SN_M"), 0) as i32;
 
+/// Process-wide switch for the futility small net (D112): ON by default (as strong per node as main, 5k +3 [-30,+37],
+/// x1.77 faster). `titanium-cli ... --no-fut-sn` turns it off for exact full-strength search (slower). Read once per
+/// search into the searcher, never per node.
+static FUT_SN_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_fut_sn(on: bool) {
+    FUT_SN_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn small_net() -> &'static crate::smallnet::SmallNet {
     static SN: std::sync::OnceLock<crate::smallnet::SmallNet> = std::sync::OnceLock::new();
     SN.get_or_init(crate::smallnet::SmallNet::builtin)
@@ -511,6 +520,8 @@ pub struct Searcher<'a> {
     stop: bool,
     stop_reason: StopReason,
     node_limit: Option<u64>,
+    /// futility small-net pre-filter on (FUT_SN_ON at search start)
+    fut_sn: bool,
     /// Monotonic milliseconds. Native builds use `Instant`; wasm builds
     /// inject `performance.now()` (std time does not exist on wasm32).
     time_src: fn() -> f64,
@@ -575,6 +586,7 @@ impl<'a> Searcher<'a> {
             stop: false,
             stop_reason: StopReason::Completed,
             node_limit: None,
+            fut_sn: true,
             time_src: native_now_ms,
             ext_stop: None,
             tt: Tt::new(bits),
@@ -906,7 +918,7 @@ impl<'a> Searcher<'a> {
             let mut child_eval = i32::MIN;
             if move_idx >= MB_FUT_MIN_IDX && new_depth > 0 && self.sancta.is_none() {
                 // child eval is from the child's side to move = minus our static value of the move
-                if FUT_CHEAP_M > 0 && self.nnue.is_some() {
+                if FUT_CHEAP_M > 0 && self.fut_sn && self.nnue.is_some() {
                     let slot = (child.hash as usize) & ((1 << ECACHE_BITS) - 1);
                     if !(self.ecache[slot].0 == child.hash && self.ecache[slot].1 != i32::MIN) {
                         let hand = evaluate(&child, None, false);
@@ -1048,6 +1060,7 @@ impl<'a> Searcher<'a> {
         self.stop = false;
         self.stop_reason = StopReason::Completed;
         self.node_limit = limits.max_nodes;
+        self.fut_sn = FUT_SN_ON.load(std::sync::atomic::Ordering::Relaxed);
         self.deadline_ms = limits
             .time
             .map(|t| self.start_ms + t.as_secs_f64() * 1000.0);
