@@ -66,6 +66,15 @@ const MB_FUT_DIV: i32 = 57;
 /// is pruned without the NNUE eval (offline at M 350: 49% of those NNUE evals saved, 2.8% of the moves the net keeps
 /// pruned). BUILD-TIME env FUT_CHEAP_M (0 = off).
 const FUT_CHEAP_M: i32 = env_usize(option_env!("FUT_CHEAP_M"), 350) as i32;
+/// exp/fut-sn (D110): the cheap estimate above is replaced by the futility small net's LOWER BOUND of the big net's child
+/// eval (crate::smallnet, compiled in); FUT_SN_M = extra cp subtracted from that bound (BUILD-TIME env, default 0).
+/// FUT_CHEAP_M only switches the pre-filter on (> 0) or off (0) here.
+const FUT_SN_M: i32 = env_usize(option_env!("FUT_SN_M"), 0) as i32;
+
+fn small_net() -> &'static crate::smallnet::SmallNet {
+    static SN: std::sync::OnceLock<crate::smallnet::SmallNet> = std::sync::OnceLock::new();
+    SN.get_or_init(crate::smallnet::SmallNet::builtin)
+}
 
 // Ordering tiers (titanium-engine pattern: compile-asserted bands so no
 // ordering signal can structurally leak into its neighbor).
@@ -869,6 +878,8 @@ impl<'a> Searcher<'a> {
         let mut best = i32::MIN;
         let mut best_mv: u32 = 0xFFFF;
         let mut move_idx = 0usize;
+        // futility small net: the parent's accumulator, built at the first child that needs it (D110)
+        let mut sn_parent: Option<[f32; 64]> = None;
         let mut lmr_cnt = 0i32;
         loop {
             let m = {
@@ -899,8 +910,11 @@ impl<'a> Searcher<'a> {
                     let slot = (child.hash as usize) & ((1 << ECACHE_BITS) - 1);
                     if !(self.ecache[slot].0 == child.hash && self.ecache[slot].1 != i32::MIN) {
                         let hand = evaluate(&child, None, false);
-                        let pred = (357 * hand - 542 * static_eval) / 1000 + 248;
-                        let lo = pred - FUT_CHEAP_M;
+                        let (bt, ct) = (b.turn as usize, child.turn as usize);
+                        let sn = small_net();
+                        let pa = *sn_parent.get_or_insert_with(|| sn.acc(b.occ[bt], b.occ[1 - bt], b.blockers));
+                        let ca = sn.child_acc(&pa, b.occ[bt], b.occ[1 - bt], child.occ[ct], child.occ[1 - ct]);
+                        let lo = sn.bound_acc(&ca, child.empty().count_ones(), static_eval, hand) - FUT_SN_M;
                         if new_depth - (alpha.saturating_add(lo) / MB_FUT_DIV).clamp(0, 64) <= 0 {
                             move_idx += 1;
                             continue;

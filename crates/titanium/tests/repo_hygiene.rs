@@ -56,6 +56,7 @@ const EXEMPT: &[&str] = &[
     // The shipped champion eval. Small (28KB), our own SGD weights, and main
     // runs it by default — like Stockfish shipping its net with the repo.
     // Every other blob stays untracked (the *.tup rule above still bites).
+    "data/nnue/fut_small.tsn", // exp/fut-sn: futility small net compiled into the binary (~56 KB, D110)
     "data/nnue/tups55tree.tup", // lowercase: reason() compares against lowercased paths
     "data/nnue/tups56twostage.tup", // S56 two-stage champ
     "data/nnue/tups57v2.tup", // S57 Ataxx-relabeled WDL teacher (gated +46 @5k)

@@ -58,6 +58,7 @@ fn main() -> ExitCode {
             flag_str(&args, "--nnue"),
             flag_int(&args, "--threads").unwrap_or(1).max(1) as usize,
         ),
+        "snparity" => snparity_cmd(flag_str(&args, "--ref")),
         "nnbench" => nnbench_cmd(flag_str(&args, "--boards"), flag_str(&args, "--tuple"), flag_str(&args, "--nnue")),
         "nndump" => nndump_cmd(flag_str(&args, "--in"), flag_str(&args, "--out")),
         "s57dump" => s57dump_cmd(flag_str(&args, "--in"), flag_str(&args, "--out"), flag_str(&args, "--tuple")),
@@ -1788,4 +1789,56 @@ fn genbench_cmd(iters: u64) -> ExitCode {
     );
 
     ExitCode::SUCCESS
+}
+
+/// exp/fut-sn: compiled-in futility small net vs the torch reference (training/smallnet_export.py <out>.ref.txt), and
+/// its speed on those inputs.
+fn snparity_cmd(refp: Option<String>) -> ExitCode {
+    let Some(p) = refp else {
+        eprintln!("snparity: --ref FILE required");
+        return ExitCode::FAILURE;
+    };
+    let text = fs::read_to_string(&p).unwrap_or_default();
+    let net = titanium::smallnet::SmallNet::builtin();
+    let rows: Vec<(u64, u64, u64, i32, i32, f64)> = text
+        .lines()
+        .filter_map(|l| {
+            let t: Vec<&str> = l.split_whitespace().collect();
+            (t.len() == 6).then(|| {
+                (u64::from_str_radix(t[0], 16).unwrap(), u64::from_str_radix(t[1], 16).unwrap(),
+                 u64::from_str_radix(t[2], 16).unwrap(), t[3].parse().unwrap(), t[4].parse().unwrap(), t[5].parse().unwrap())
+            })
+        })
+        .collect();
+    let mut worst = 0f64;
+    for r in &rows {
+        worst = worst.max((net.bound(r.0, r.1, r.2, r.3, r.4) as f64 - r.5).abs());
+    }
+    let t = Instant::now();
+    let mut s = 0i64;
+    for _ in 0..200 {
+        for r in &rows {
+            s += std::hint::black_box(net.bound(r.0, r.1, r.2, r.3, r.4)) as i64;
+        }
+    }
+    let ns = t.elapsed().as_nanos() as f64 / (200.0 * rows.len().max(1) as f64);
+    let t2 = Instant::now();
+    let mut s2 = 0f32;
+    for _ in 0..200 {
+        for r in &rows {
+            s2 += std::hint::black_box(net.acc(r.0, r.1, r.2))[7];
+        }
+    }
+    let ns_acc = t2.elapsed().as_nanos() as f64 / (200.0 * rows.len().max(1) as f64);
+    let accs: Vec<[f32; 64]> = rows.iter().map(|r| net.acc(r.0, r.1, r.2)).collect();
+    let t3 = Instant::now();
+    for _ in 0..200 {
+        for (r, a) in rows.iter().zip(&accs) {
+            s += std::hint::black_box(net.bound_acc(std::hint::black_box(a), 20, r.3, r.4)) as i64;
+        }
+    }
+    let ns_head = t3.elapsed().as_nanos() as f64 / (200.0 * rows.len().max(1) as f64);
+    println!("snparity parts: full refresh {ns_acc:.0} ns, head {ns_head:.0} ns (chk {})", s2 as i64 % 7);
+    println!("snparity: {} rows, max |rust - torch| = {:.2} cp (rounding <= 0.5), {:.0} ns/eval (chk {})", rows.len(), worst, ns, s % 7);
+    if worst <= 1.0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }

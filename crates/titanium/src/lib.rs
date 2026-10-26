@@ -13,6 +13,7 @@ pub mod nnfeat;
 pub mod nnue;
 pub mod sancta;
 pub mod search;
+pub mod smallnet;
 pub mod tuple;
 
 pub use board::{
