@@ -4,7 +4,7 @@ Default mode: ONE-SHOT (a fresh process per move, the whole game history is sent
 this bot's first turn). TI_MODE=long = the long-live variant (>>>BOTZONE_REQUEST_KEEP_RUNNING<<<).
 Layout on Botzone (storage files next to the bot):
     data/titanium_v2.so          engine library (Linux, glibc >= 2.14)
-    data/nnue/nnue_main.tnn      big NNUE (main's default eval)
+    The main big NNUE is embedded in titanium_v2.so; TI_NET may override it.
 Local testing overrides (environment): TI_LIB, TI_NET, TI_TT_BITS, TI_TIME_SCALE, TI_DEBUG, TI_FAULT (tests only: lib_fail2, engine_fail1, engine_fail, search_fail1, search_fail, no_lib, age_huge).
 
 Why (2026-10-26, match 6ade99b3...: RE after 101 ms, exit status 120, no stdout, no stderr, 144 MB): the engine had
@@ -45,6 +45,7 @@ WATCHDOG_GRACE_MS = 12
 RETRY_RESERVE_MS = 400      # a resuscitated search needs at least this much time left
 SCALE = float(os.environ.get("TI_TIME_SCALE", "1.0"))
 DEBUG = os.environ.get("TI_DEBUG") == "1"
+BOTZONE_MAX_DEPTH = 30
 FAULT = os.environ.get("TI_FAULT", "")   # tests only, see the docstring
 HERE = os.path.dirname(os.path.abspath(__file__))
 EVENTS = []                 # recoveries of this turn -> debug line
@@ -140,8 +141,11 @@ class Engine:
                 lib.ti_stop.argtypes = [ctypes.c_void_p]
                 lib.ti_search.restype = ctypes.c_int
                 lib.ti_search.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_int)]
+                lib.ti_search_with_limits.restype = ctypes.c_int
+                lib.ti_search_with_limits.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+                                                      ctypes.c_uint8, ctypes.POINTER(ctypes.c_int)]
                 lib.ti_stats.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-                if lib.ti_abi_version() != 1:
+                if lib.ti_abi_version() != 2:
                     raise RuntimeError("abi_%d" % lib.ti_abi_version())
                 self.lib = lib
                 if attempt:
@@ -157,16 +161,17 @@ class Engine:
         weaker net, the classical eval or a smaller hash table just to stay alive - that would hide a failure as a
         weak game. If it cannot be created, the turn fails visibly (ENGINE_FAILED)."""
         tt_bits = int(os.environ.get("TI_TT_BITS", "22"))
-        cands = [os.environ.get("TI_NET"), os.path.join("data", "nnue", "nnue_main.tnn"), os.path.join(HERE, "data", "nnue", "nnue_main.tnn")]
-        net = next((p for p in cands if p and os.path.exists(p)), None)
-        if net is None:
-            raise RuntimeError("nnue_main.tnn_not_found")
+        net = os.environ.get("TI_NET")
+        if net and not os.path.isfile(net):
+            raise RuntimeError("custom_network_not_found")
         for attempt in range(3):
             t0 = now_ms()
             inject = (FAULT == "engine_fail") or (FAULT == "engine_fail1" and attempt == 0)
-            e = None if inject else self.lib.ti_new(os.path.abspath(net).encode("utf-8"), tt_bits)
+            net_arg = os.path.abspath(net).encode("utf-8") if net else None
+            e = None if inject else self.lib.ti_new(net_arg, tt_bits)
             if e:
-                self.e, self.net = e, "%s/%d" % (os.path.basename(net), tt_bits)
+                label = "custom:%s" % os.path.basename(net) if net else "bundled-main"
+                self.e, self.net = e, "%s/%d" % (label, tt_bits)
                 if attempt:
                     event("engine_ok_after_%d_retries" % attempt, t0)
                 return
@@ -196,7 +201,7 @@ class Engine:
             if FAULT == "search_fail" or (FAULT == "search_fail1" and self.injected == 0):
                 self.injected += 1
                 raise RuntimeError("injected")
-            res = self.lib.ti_search(self.e, budget, out)
+            res = self.lib.ti_search_with_limits(self.e, budget, 0, BOTZONE_MAX_DEPTH, out)
         finally:
             timer.cancel()
         st = Stats()

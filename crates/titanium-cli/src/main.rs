@@ -18,38 +18,47 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use titanium::{best_move, Board, Move, SearchLimits, Searcher, RING1};
+use titanium::{Board, Move, SearchLimits, Searcher, RING1};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     // exact full-strength search without the lossy futility small net (D112); any command, `serve` included
-    if args.iter().any(|x| x == "--no-fut-sn") {
+    if args
+        .iter()
+        .any(|x| x == "--no-fut-sn" || x == "--exact-search")
+    {
         titanium::search::set_fut_sn(false);
     }
     match cmd {
         "perft" => perft_cmd(first_int(&args).unwrap_or(4) as u32),
         "bench" => bench_cmd(
-            flag_int(&args, "--depth").unwrap_or(8) as u32,
+            depth_flag(&args, 8),
             flag_str(&args, "--net"),
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
+            network_flag(&args),
         ),
         "selfplay" => selfplay_cmd(
             flag_int(&args, "--games").unwrap_or(2) as u32,
-            flag_int(&args, "--time").unwrap_or(300) as u64,
+            flag_int_alias(&args, "--time-limit-ms", "--time").unwrap_or(300) as u64,
             flag_str(&args, "--out"),
+            network_flag(&args),
+            max_depth_flag(&args),
         ),
         "bestmove" => bestmove_cmd(
             positional_str(&args).or_else(|| Some(Board::start().to_string())),
-            flag_int(&args, "--time").map(|ms| ms as u64),
+            Some(flag_int_alias(&args, "--time-limit-ms", "--time").unwrap_or(1000) as u64),
+            max_depth_flag(&args),
+            network_flag(&args),
         ),
         "label" => label_cmd(
-            flag_int(&args, "--nodes").unwrap_or(20000) as u64,
-            flag_int(&args, "--time").map(|ms| ms as u64),
+            flag_int_alias(&args, "--node-limit", "--nodes").map(|n| n as u64),
+            flag_int_alias(&args, "--time-limit-ms", "--time").map(|ms| ms as u64),
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
-            flag_str(&args, "--nnue"),
+            network_flag(&args),
+            max_depth_flag(&args),
             args.iter().any(|x| x == "--fresh"),
             flag_int(&args, "--tt-bits").map(|v| v as usize),
         ),
@@ -57,18 +66,36 @@ fn main() -> ExitCode {
             flag_str(&args, "--bin"),
             flag_int(&args, "--lo").unwrap_or(0) as usize,
             flag_int(&args, "--hi").map(|v| v as usize),
-            flag_int(&args, "--nodes").unwrap_or(5000) as u64,
+            flag_int_alias(&args, "--node-limit", "--nodes").map(|n| n as u64),
             flag_str(&args, "--tuple"),
-            flag_str(&args, "--nnue"),
+            network_flag(&args),
             flag_int(&args, "--threads").unwrap_or(1).max(1) as usize,
+            max_depth_flag(&args),
+            flag_int_alias(&args, "--time-limit-ms", "--time").map(|ms| ms as u64),
         ),
         "snparity" => snparity_cmd(flag_str(&args, "--ref")),
-        "nnbench" => nnbench_cmd(flag_str(&args, "--boards"), flag_str(&args, "--tuple"), flag_str(&args, "--nnue")),
+        "nnbench" => nnbench_cmd(
+            flag_str(&args, "--boards"),
+            flag_str(&args, "--tuple"),
+            network_flag(&args),
+        ),
         "nndump" => nndump_cmd(flag_str(&args, "--in"), flag_str(&args, "--out")),
-        "s57dump" => s57dump_cmd(flag_str(&args, "--in"), flag_str(&args, "--out"), flag_str(&args, "--tuple")),
-        "nnevaldump" => nnevaldump_cmd(flag_str(&args, "--nnue"), flag_str(&args, "--boards")),
-        "nneval" => nneval_cmd(flag_str(&args, "--nnue"), flag_str(&args, "--boards"), flag_str(&args, "--tuple")),
-        "play" => play_cmd(flag_int(&args, "--time").unwrap_or(1000) as u64),
+        "s57dump" => s57dump_cmd(
+            flag_str(&args, "--in"),
+            flag_str(&args, "--out"),
+            flag_str(&args, "--tuple"),
+        ),
+        "nnevaldump" => nnevaldump_cmd(network_flag(&args), flag_str(&args, "--boards")),
+        "nneval" => nneval_cmd(
+            network_flag(&args),
+            flag_str(&args, "--boards"),
+            flag_str(&args, "--tuple"),
+        ),
+        "play" => play_cmd(
+            flag_int_alias(&args, "--time-limit-ms", "--time").unwrap_or(1000) as u64,
+            max_depth_flag(&args),
+            network_flag(&args),
+        ),
         "show" => show_cmd(),
         "genbench" => genbench_cmd(flag_int(&args, "--iters").unwrap_or(200_000) as u64),
         "serve" => serve_cmd(
@@ -77,11 +104,12 @@ fn main() -> ExitCode {
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
             args.iter().any(|x| x == "--corr"),
-            flag_str(&args, "--nnue"),
+            network_flag(&args),
+            max_depth_flag(&args),
         ),
         "match" => match_cmd(
             flag_int(&args, "--games").unwrap_or(20) as u32,
-            flag_int(&args, "--time").unwrap_or(1000) as u64,
+            flag_int_alias(&args, "--time-limit-ms", "--time").unwrap_or(1000) as u64,
             flag_str(&args, "--opp"),
             flag_str(&args, "--net"),
             flag_str(&args, "--opp-net"),
@@ -89,24 +117,27 @@ fn main() -> ExitCode {
             flag_str(&args, "--opp-tuple"),
             args.iter().any(|x| x == "--tuple-native"),
             args.iter().any(|x| x == "--opp-tuple-native"),
-            flag_int(&args, "--opp-time").unwrap_or(1000) as u64,
-            flag_int(&args, "--opp-depth").map(|d| d as u32),
-            flag_int(&args, "--opp-nodes").map(|n| n as u64),
-            flag_int(&args, "--nodes").map(|n| n as u64),
+            flag_int_alias(&args, "--opponent-time-limit-ms", "--opp-time").unwrap_or(0) as u64,
+            flag_int_alias(&args, "--opponent-max-depth", "--opp-depth")
+                .map(|d| d.clamp(1, 255) as u32),
+            flag_int_alias(&args, "--opponent-node-limit", "--opp-nodes").map(|n| n as u64),
+            flag_int_alias(&args, "--node-limit", "--nodes").map(|n| n as u64),
             flag_int(&args, "--start-game").unwrap_or(1) as u32,
             flag_str(&args, "--out"),
             args.iter().any(|x| x == "--corr"),
             args.iter().any(|x| x == "--opp-corr"),
             flag_str(&args, "--book"),
             flag_int(&args, "--book-start").unwrap_or(0) as u32,
-            flag_str(&args, "--nnue"),
-            flag_str(&args, "--opp-nnue"),
+            network_flag(&args),
+            flag_str_alias(&args, "--opponent-network", "--opp-nnue"),
+            max_depth_flag(&args),
         ),
         "sperft" => sperft_cmd(
-            flag_int(&args, "--depth").unwrap_or(8) as u32,
+            depth_flag(&args, 8),
             flag_int(&args, "--games").unwrap_or(8) as usize,
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
+            network_flag(&args),
         ),
         _ => {
             print_help();
@@ -119,14 +150,16 @@ fn print_help() {
     println!(
         "titanium-cli - Ataxx engine test harness\n\
          \n\
-         USAGE (eval preset = --net <file.s1|none>; NO env vars):\n\
-         \x20 titanium-cli bench [--depth N] [--net F]    search speed benchmark\n\
-         \x20 titanium-cli serve [--net F]                UAI engine (match child)\n\
+         USAGE: --network <bundled|FILE|none> selects the big NNUE (default: bundled main network).\n\
+         \x20 --max-depth 1..255 limits iterative deepening; --nnue and --depth remain aliases.\n\
+         \x20 --exact-search disables the fast futility filter; --no-fut-sn remains an alias.\n\
+         \x20 titanium-cli bench [--max-depth N] [--network FILE]  search speed benchmark\n\
+         \x20 titanium-cli serve [--max-depth 30]                 UAI engine (30 is the Botzone cap)\n\
          \x20 titanium-cli match --games N --opp \"CMD\" [--net F] [--opp-net F]\n\
-         \x20             [--time MS --opp-time MS | --nodes N --opp-nodes N]\n\
+         \x20             [--time-limit-ms MS --node-limit N --opponent-max-depth N]\n\
          \x20             [--out F]                       colors alternate\n\
          \x20 titanium-cli selfplay [--games N] [--time MS] engine vs engine into logs/\n\
-         \x20 titanium-cli sperft [--depth N] [--games N]   search throughput suite\n\
+         \x20 titanium-cli sperft [--max-depth N] [--games N] search throughput suite\n\
          \n\
          Scripts: scripts/gate.ps1 <games> <net.s1|none>  (5k + 100ms vs classical)\n\
          \n\
@@ -155,10 +188,32 @@ fn flag_str(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+fn flag_int_alias(args: &[String], primary: &str, legacy: &str) -> Option<i64> {
+    flag_int(args, primary).or_else(|| flag_int(args, legacy))
+}
+
+fn flag_str_alias(args: &[String], primary: &str, legacy: &str) -> Option<String> {
+    flag_str(args, primary).or_else(|| flag_str(args, legacy))
+}
+
+fn network_flag(args: &[String]) -> Option<String> {
+    flag_str_alias(args, "--network", "--nnue")
+}
+
+fn max_depth_flag(args: &[String]) -> u8 {
+    flag_int_alias(args, "--max-depth", "--depth")
+        .map(|d| d.clamp(1, i64::from(u8::MAX)) as u8)
+        .unwrap_or(u8::MAX)
+}
+
+fn depth_flag(args: &[String], default: u8) -> u8 {
+    flag_int_alias(args, "--max-depth", "--depth")
+        .map(|d| d.clamp(1, i64::from(u8::MAX)) as u8)
+        .unwrap_or(default)
+}
+
 fn positional_str(args: &[String]) -> Option<String> {
-    args.get(1)
-        .filter(|a| !a.starts_with("--"))
-        .cloned()
+    args.get(1).filter(|a| !a.starts_with("--")).cloned()
 }
 
 // ---------- perft ----------
@@ -228,7 +283,11 @@ fn load_net_preset(spec: &Option<String>) -> Result<Option<titanium::S1Net>, Str
         None => Ok(None),
         Some(s) if s == "none" || s.is_empty() => Ok(None),
         Some(s) => {
-            let path = if s == "default" { "data/nnue/sancta_w.s1".into() } else { s.clone() };
+            let path = if s == "default" {
+                "data/nnue/sancta_w.s1".into()
+            } else {
+                s.clone()
+            };
             match titanium::S1Net::load(&path) {
                 Some(n) => Ok(Some(n)),
                 None => Err(format!("net file missing: {path}")),
@@ -254,22 +313,45 @@ pub const DEFAULT_TUP: &str = "data/nnue/tupS57v2.tup";
 /// c4829350; int16 fast path): serve / match run it when --nnue is
 /// absent; file missing = S57 fallback; `--nnue none` = explicit S57-only escape hatch. With the NNUE active and no
 /// --tuple the tuple defaults to none (the gated config `--tuple none --nnue`).
-pub const DEFAULT_NNUE: &str = "data/nnue/nnue_main.tnn";
+pub const DEFAULT_NNUE: &str = "bundled";
 
 fn resolve_nnue_spec(spec: &Option<String>) -> Option<String> {
     match spec {
-        None => std::path::Path::new(DEFAULT_NNUE).exists().then(|| DEFAULT_NNUE.to_string()),
-        Some(s) if s == "none" || s.is_empty() => None,
+        None => Some(DEFAULT_NNUE.to_string()),
+        Some(s) if s.is_empty() => Some(DEFAULT_NNUE.to_string()),
         Some(s) => Some(s.clone()),
     }
 }
 
+fn load_nnue_spec(spec: &Option<String>) -> Result<Option<titanium::nnue::Nnue>, String> {
+    match spec.as_deref() {
+        None | Some("none") => Ok(None),
+        Some("bundled") => Ok(Some(titanium::nnue::Nnue::bundled())),
+        Some(path) => titanium::nnue::Nnue::load(path)
+            .map(Some)
+            .map_err(|e| format!("network {path}: {e}")),
+    }
+}
+
+fn network_description(spec: &Option<String>) -> &str {
+    match spec.as_deref() {
+        None | Some("none") => "disabled (legacy eval)",
+        Some("bundled") => "bundled main NNUE",
+        Some(path) => path,
+    }
+}
+
 fn eff_tuple_spec(tup: &Option<String>, nnue: &Option<String>) -> Option<String> {
-    if tup.is_none() && nnue.is_some() { Some("none".to_string()) } else { tup.clone() }
+    if tup.is_none() && nnue.as_deref().is_some_and(|n| n != "none") {
+        Some("none".to_string())
+    } else {
+        tup.clone()
+    }
 }
 
 fn nnue_flag_str(resolved: &Option<String>) -> String {
     match resolved {
+        Some(p) if p == "bundled" => "--nnue data/nnue/nnue_main.tnn".to_string(),
         Some(p) => format!("--nnue {p}"),
         None => "--nnue none".to_string(),
     }
@@ -314,7 +396,27 @@ fn corr_flag_str(on: bool) -> String {
     }
 }
 
-fn bench_cmd(depth: u32, net_spec: Option<String>, tup_spec: Option<String>, tup_native: bool) -> ExitCode {
+fn bench_cmd(
+    depth: u8,
+    net_spec: Option<String>,
+    tup_spec: Option<String>,
+    tup_native: bool,
+    nnue_spec: Option<String>,
+) -> ExitCode {
+    let nnue_spec = resolve_nnue_spec(&nnue_spec);
+    let nn = match load_nnue_spec(&nnue_spec) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Bench: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "bench: network={}, max-depth={}",
+        network_description(&nnue_spec),
+        depth
+    );
+    let tup_spec = eff_tuple_spec(&tup_spec, &nnue_spec);
     let net = match load_net_preset(&net_spec) {
         Ok(n) => {
             match &net_spec {
@@ -348,10 +450,11 @@ fn bench_cmd(depth: u32, net_spec: Option<String>, tup_spec: Option<String>, tup
         max_nodes: None,
         max_depth: depth,
     };
-    let mut searcher = Searcher::new();
+    let mut searcher = Searcher::new_unconfigured();
     searcher.set_sancta(net.as_ref());
     searcher.set_tuple(tup.as_ref());
     searcher.set_tuple_native(tup_native && tup.is_some());
+    searcher.set_nnue(nn.as_ref());
     if tup_native {
         println!("Bench: tuple-NATIVE eval (no E2/E4 scans)");
     }
@@ -377,7 +480,26 @@ fn move_str(m: Option<Move>) -> String {
     }
 }
 
-fn selfplay_cmd(games: u32, time_ms: u64, out: Option<String>) -> ExitCode {
+fn selfplay_cmd(
+    games: u32,
+    time_ms: u64,
+    out: Option<String>,
+    network: Option<String>,
+    max_depth: u8,
+) -> ExitCode {
+    let network = resolve_nnue_spec(&network);
+    let nn = match load_nnue_spec(&network) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("selfplay: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "selfplay: network={}, max-depth={}",
+        network_description(&network),
+        max_depth
+    );
     let mut report = String::new();
     report.push_str(&format!(
         "Titanium selfplay: {games} games, {time_ms} ms per move\n===\n"
@@ -387,7 +509,8 @@ fn selfplay_cmd(games: u32, time_ms: u64, out: Option<String>) -> ExitCode {
 
     for game in 1..=games {
         let mut b = Board::start();
-        let mut searcher = Searcher::new();
+        let mut searcher = Searcher::new_unconfigured();
+        searcher.set_nnue(nn.as_ref());
         let mut log = String::new();
         let mut ply = 0u32;
         let started = Instant::now();
@@ -396,7 +519,7 @@ fn selfplay_cmd(games: u32, time_ms: u64, out: Option<String>) -> ExitCode {
             let limits = SearchLimits {
                 time: Some(Duration::from_millis(time_ms)),
                 max_nodes: None,
-                max_depth: 24,
+                max_depth,
             };
             let r = if b.has_moves(b.turn) {
                 searcher.search(&b, &limits)
@@ -503,12 +626,23 @@ fn nndump_cmd(inp: Option<String>, out: Option<String>) -> ExitCode {
         return ExitCode::FAILURE;
     };
     assert!(NUM_FEATS <= u16::MAX as usize);
-    let rd = |ext: &str| fs::read(format!("{inp}.{ext}")).unwrap_or_else(|e| panic!("nndump: {inp}.{ext}: {e}"));
+    let rd = |ext: &str| {
+        fs::read(format!("{inp}.{ext}")).unwrap_or_else(|e| panic!("nndump: {inp}.{ext}: {e}"))
+    };
     let (o0, o1, stm) = (rd("occ0"), rd("occ1"), rd("stm"));
     let n = stm.len();
-    assert!(o0.len() == 8 * n && o1.len() == 8 * n, "nndump: occ/stm length mismatch");
-    let mut cnt = BufWriter::with_capacity(1 << 20, fs::File::create(format!("{out}.cnt")).expect("cnt"));
-    let mut idx = BufWriter::with_capacity(1 << 24, fs::File::create(format!("{out}.idx")).expect("idx"));
+    assert!(
+        o0.len() == 8 * n && o1.len() == 8 * n,
+        "nndump: occ/stm length mismatch"
+    );
+    let mut cnt = BufWriter::with_capacity(
+        1 << 20,
+        fs::File::create(format!("{out}.cnt")).expect("cnt"),
+    );
+    let mut idx = BufWriter::with_capacity(
+        1 << 24,
+        fs::File::create(format!("{out}.idx")).expect("idx"),
+    );
     let mut buf = [0u32; MAX_ACTIVE];
     let mut total = 0u64;
     let t0 = Instant::now();
@@ -534,8 +668,11 @@ fn nndump_cmd(inp: Option<String>, out: Option<String>) -> ExitCode {
     }
     cnt.flush().unwrap();
     idx.flush().unwrap();
-    println!("nndump: {n} rows, {total} indices ({:.1} per perspective), {:.0}s", total as f64 / (2.0 * n as f64),
-             t0.elapsed().as_secs_f64());
+    println!(
+        "nndump: {n} rows, {total} indices ({:.1} per perspective), {:.0}s",
+        total as f64 / (2.0 * n as f64),
+        t0.elapsed().as_secs_f64()
+    );
     ExitCode::SUCCESS
 }
 
@@ -559,10 +696,15 @@ fn s57dump_cmd(inp: Option<String>, out: Option<String>, tup_spec: Option<String
             return ExitCode::FAILURE;
         }
     };
-    let rd = |ext: &str| fs::read(format!("{inp}.{ext}")).unwrap_or_else(|e| panic!("s57dump: {inp}.{ext}: {e}"));
+    let rd = |ext: &str| {
+        fs::read(format!("{inp}.{ext}")).unwrap_or_else(|e| panic!("s57dump: {inp}.{ext}: {e}"))
+    };
     let (o0, o1, stm) = (rd("occ0"), rd("occ1"), rd("stm"));
     let n = stm.len();
-    assert!(o0.len() == 8 * n && o1.len() == 8 * n, "s57dump: occ/stm length mismatch");
+    assert!(
+        o0.len() == 8 * n && o1.len() == 8 * n,
+        "s57dump: occ/stm length mismatch"
+    );
     let tmp = format!("{out}.tmp");
     let mut w = BufWriter::with_capacity(1 << 22, fs::File::create(&tmp).expect("out"));
     let t0 = Instant::now();
@@ -582,7 +724,10 @@ fn s57dump_cmd(inp: Option<String>, out: Option<String>, tup_spec: Option<String
     w.flush().unwrap();
     drop(w);
     fs::rename(&tmp, &out).expect("rename");
-    println!("s57dump: {n} rows -> {out}, {:.0}s", t0.elapsed().as_secs_f64());
+    println!(
+        "s57dump: {n} rows -> {out}, {:.0}s",
+        t0.elapsed().as_secs_f64()
+    );
     ExitCode::SUCCESS
 }
 
@@ -593,7 +738,9 @@ fn nnevaldump_cmd(nn: Option<String>, boards: Option<String>) -> ExitCode {
     let text = fs::read_to_string(boards.expect("--boards")).expect("boards");
     let mut out = io::BufWriter::new(io::stdout().lock());
     for line in text.lines() {
-        let Some(b) = Board::from_str(line.trim()) else { continue };
+        let Some(b) = Board::from_str(line.trim()) else {
+            continue;
+        };
         use std::io::Write as _;
         let _ = writeln!(out, "{}", net.forward(&b, 0.0).to_bits());
     }
@@ -629,9 +776,17 @@ fn nneval_cmd(nn: Option<String>, boards: Option<String>, tup_spec: Option<Strin
     let (mut fworst, mut fsum) = (0i32, 0i64);
     for line in text.lines() {
         let mut parts: Vec<&str> = line.split_whitespace().collect();
-        let Some(want) = parts.pop().and_then(|x| x.parse::<i32>().ok()) else { continue };
-        let Some(b) = Board::from_str(&parts.join(" ")) else { continue };
-        let s57 = if net.v2 { titanium::search::evaluate(&b, tup.as_ref(), false) } else { 0 };
+        let Some(want) = parts.pop().and_then(|x| x.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Some(b) = Board::from_str(&parts.join(" ")) else {
+            continue;
+        };
+        let s57 = if net.v2 {
+            titanium::search::evaluate(&b, tup.as_ref(), false)
+        } else {
+            0
+        };
         let d = (net.eval_f32(&b, s57) - want).abs();
         worst = worst.max(d);
         sum += d as i64;
@@ -640,10 +795,20 @@ fn nneval_cmd(nn: Option<String>, boards: Option<String>, tup_spec: Option<Strin
         fsum += df as i64;
         n += 1;
     }
-    println!("nneval: {n} positions, max |rust - torch| = {worst} cp, mean {:.3} cp", sum as f64 / n.max(1) as f64);
-    println!("nneval fast path (int16 FT, QA {}): max |fast - torch| = {fworst} cp, mean {:.3} cp", titanium::nnue::QA,
-             fsum as f64 / n.max(1) as f64);
-    if worst <= 1 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    println!(
+        "nneval: {n} positions, max |rust - torch| = {worst} cp, mean {:.3} cp",
+        sum as f64 / n.max(1) as f64
+    );
+    println!(
+        "nneval fast path (int16 FT, QA {}): max |fast - torch| = {fworst} cp, mean {:.3} cp",
+        titanium::nnue::QA,
+        fsum as f64 / n.max(1) as f64
+    );
+    if worst <= 1 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 /// exp/nnue speed probe: per-eval cost of each feature group, of an accumulator refresh (random int16 weights,
@@ -662,9 +827,17 @@ fn nnbench_cmd(boards: Option<String>, tup_spec: Option<String>, nnue: Option<St
             return ExitCode::FAILURE;
         }
     };
-    let bs: Vec<Board> = text.lines().filter_map(|l| Board::from_str(l.trim())).collect();
+    let bs: Vec<Board> = text
+        .lines()
+        .filter_map(|l| Board::from_str(l.trim()))
+        .collect();
     let n = bs.len() as f64;
-    println!("boards {} | features {} | max active {}", bs.len(), NUM_FEATS, MAX_ACTIVE);
+    println!(
+        "boards {} | features {} | max active {}",
+        bs.len(),
+        NUM_FEATS,
+        MAX_ACTIVE
+    );
     let time = |label: &str, f: &mut dyn FnMut() -> u64| {
         let _ = f();
         let t = Instant::now();
@@ -677,17 +850,29 @@ fn nnbench_cmd(boards: Option<String>, tup_spec: Option<String>, nnue: Option<St
         println!("{label:<44} {ns:8.1} ns/eval   (chk {})", s % 1000);
     };
     if let Ok(Some(tup)) = load_tuple_preset(&tup_spec) {
-        time("current tuple eval (forward)", &mut || bs.iter().map(|b| black_box(tup.forward(b)) as u64).sum());
+        time("current tuple eval (forward)", &mut || {
+            bs.iter().map(|b| black_box(tup.forward(b)) as u64).sum()
+        });
     }
     if let Some(p) = &nnue {
         if let Ok(net) = titanium::nnue::Nnue::load(p) {
             time("full search eval S57 (hand eval + tuple)", &mut || {
                 let t = load_tuple_preset(&tup_spec).ok().flatten();
-                bs.iter().map(|b| black_box(titanium::search::evaluate(b, t.as_ref(), false)) as u64).sum()
+                bs.iter()
+                    .map(|b| black_box(titanium::search::evaluate(b, t.as_ref(), false)) as u64)
+                    .sum()
             });
-            time("NNUE eval f32 reference", &mut || bs.iter().map(|b| black_box(net.eval_f32(b, 0)) as u64).sum());
-            time("NNUE features+accumulate only", &mut || bs.iter().map(|b| black_box(net.bench_ft(b)) as u64).sum());
-            time("NNUE eval fast (int16 FT, sparse L1)", &mut || bs.iter().map(|b| black_box(net.eval(b, 0)) as u64).sum());
+            time("NNUE eval f32 reference", &mut || {
+                bs.iter()
+                    .map(|b| black_box(net.eval_f32(b, 0)) as u64)
+                    .sum()
+            });
+            time("NNUE features+accumulate only", &mut || {
+                bs.iter().map(|b| black_box(net.bench_ft(b)) as u64).sum()
+            });
+            time("NNUE eval fast (int16 FT, sparse L1)", &mut || {
+                bs.iter().map(|b| black_box(net.eval(b, 0)) as u64).sum()
+            });
             // incremental-update potential: features changed by one move, per colour perspective (parent colour c
             // perspective vs child colour c perspective), over every legal move of every board
             let (mut tot, mut chg, mut nmv) = (0u64, 0u64, 0u64);
@@ -714,9 +899,14 @@ fn nnbench_cmd(boards: Option<String>, tup_spec: Option<String>, nnue: Option<St
     }
     let mut buf = [0u32; MAX_ACTIVE];
     let mut active = 0u64;
-    for (name, g) in [("G1 square state", nnfeat::G1), ("G2 anchor", nnfeat::G2), ("G3 stone ring", nnfeat::G3),
-        ("G5 2-ply exchange", nnfeat::G5), ("G6 global", nnfeat::G6), ("ALL groups", nnfeat::ALL_GROUPS)]
-    {
+    for (name, g) in [
+        ("G1 square state", nnfeat::G1),
+        ("G2 anchor", nnfeat::G2),
+        ("G3 stone ring", nnfeat::G3),
+        ("G5 2-ply exchange", nnfeat::G5),
+        ("G6 global", nnfeat::G6),
+        ("ALL groups", nnfeat::ALL_GROUPS),
+    ] {
         let label = format!("features {name} (both perspectives)");
         time(&label, &mut || {
             let mut s = 0u64;
@@ -731,7 +921,10 @@ fn nnbench_cmd(boards: Option<String>, tup_spec: Option<String>, nnue: Option<St
             s
         });
     }
-    println!("mean active features per perspective (all groups): {:.1}", active as f64 / (2.0 * n));
+    println!(
+        "mean active features per perspective (all groups): {:.1}",
+        active as f64 / (2.0 * n)
+    );
     for width in [128usize, 256] {
         let mut seed = 0x9E37_79B9u64;
         let w: Vec<i16> = (0..NUM_FEATS * width)
@@ -767,8 +960,18 @@ fn nnbench_cmd(boards: Option<String>, tup_spec: Option<String>, nnue: Option<St
 
 /// `fresh`: reset TT / killers / history / eval cache before EVERY position (label depends only on the position);
 /// `tt_bits`: TT size (5k nodes needs few entries).
-fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_native: bool, nnue: Option<String>, fresh: bool,
-             tt_bits: Option<usize>) -> ExitCode {
+fn label_cmd(
+    node_limit: Option<u64>,
+    time_ms: Option<u64>,
+    tup_spec: Option<String>,
+    tup_native: bool,
+    nnue: Option<String>,
+    max_depth: u8,
+    fresh: bool,
+    tt_bits: Option<usize>,
+) -> ExitCode {
+    let nnue = resolve_nnue_spec(&nnue);
+    let tup_spec = eff_tuple_spec(&tup_spec, &nnue);
     let tup = match load_tuple_preset(&tup_spec) {
         Ok(t) => t,
         Err(e) => {
@@ -777,17 +980,21 @@ fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_nat
         }
     };
     // exp/nnue-fast: optional NNUE (as the gates run it: every static eval through the net)
-    let nn = match nnue.as_deref().map(titanium::nnue::Nnue::load) {
-        Some(Ok(n)) => Some(n),
-        Some(Err(e)) => {
+    let nn = match load_nnue_spec(&nnue) {
+        Ok(n) => n,
+        Err(e) => {
             eprintln!("label: {e}");
             return ExitCode::FAILURE;
         }
-        None => None,
     };
+    let max_nodes = node_limit.or_else(|| time_ms.is_none().then_some(20_000));
+    eprintln!(
+        "label: network={}, max-depth={}, node-limit={:?}, time-limit-ms={:?}",
+        network_description(&nnue), max_depth, max_nodes, time_ms
+    );
     let mut searcher = match tt_bits {
-        Some(b) => Searcher::with_tt_bits(b),
-        None => Searcher::new(),
+        Some(b) => Searcher::with_tt_bits_unconfigured(b),
+        None => Searcher::new_unconfigured(),
     };
     searcher.set_tuple(tup.as_ref());
     searcher.set_tuple_native(tup_native && tup.is_some());
@@ -807,8 +1014,8 @@ fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_nat
         };
         let limits = SearchLimits {
             time: time_ms.map(Duration::from_millis),
-            max_nodes: if time_ms.is_some() { None } else { Some(nodes) },
-            max_depth: 30,
+            max_nodes,
+            max_depth,
         };
         if fresh {
             searcher.reset_for_new_game();
@@ -828,12 +1035,23 @@ fn label_cmd(nodes: u64, time_ms: Option<u64>, tup_spec: Option<String>, tup_nat
 /// exp/label-clean: relabel from a packed file (25-byte records: occ0 u64 | occ1 u64 | blk u64 | stm u8, little endian;
 /// training/relabel_pack.py). Rows [lo, hi) are searched for `nodes` nodes each with the state reset before EVERY row
 /// (label depends on the position only); one line `score depth nodes` per row on stdout, in row order.
-fn labelbin_cmd(bin: Option<String>, lo: usize, hi: Option<usize>, nodes: u64, tup_spec: Option<String>, nnue: Option<String>,
-                threads: usize) -> ExitCode {
+fn labelbin_cmd(
+    bin: Option<String>,
+    lo: usize,
+    hi: Option<usize>,
+    node_limit: Option<u64>,
+    tup_spec: Option<String>,
+    nnue: Option<String>,
+    threads: usize,
+    max_depth: u8,
+    time_ms: Option<u64>,
+) -> ExitCode {
     let Some(bin) = bin else {
         eprintln!("labelbin: --bin FILE required");
         return ExitCode::FAILURE;
     };
+    let nnue = resolve_nnue_spec(&nnue);
+    let tup_spec = eff_tuple_spec(&tup_spec, &nnue);
     let tup = match load_tuple_preset(&tup_spec) {
         Ok(t) => t,
         Err(e) => {
@@ -841,14 +1059,18 @@ fn labelbin_cmd(bin: Option<String>, lo: usize, hi: Option<usize>, nodes: u64, t
             return ExitCode::FAILURE;
         }
     };
-    let nn = match nnue.as_deref().map(titanium::nnue::Nnue::load) {
-        Some(Ok(n)) => Some(n),
-        Some(Err(e)) => {
+    let nn = match load_nnue_spec(&nnue) {
+        Ok(n) => n,
+        Err(e) => {
             eprintln!("labelbin: {e}");
             return ExitCode::FAILURE;
         }
-        None => None,
     };
+    let max_nodes = node_limit.or_else(|| time_ms.is_none().then_some(5000));
+    eprintln!(
+        "labelbin: network={}, max-depth={}, node-limit={:?}, time-limit-ms={:?}",
+        network_description(&nnue), max_depth, max_nodes, time_ms
+    );
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     let data = fs::read(&bin).expect("bin");
     let total = data.len() / 25;
@@ -863,10 +1085,14 @@ fn labelbin_cmd(bin: Option<String>, lo: usize, hi: Option<usize>, nodes: u64, t
     std::thread::scope(|sc| {
         for _ in 0..threads {
             sc.spawn(|| {
-                let mut searcher = Searcher::with_tt_bits(18);
+                let mut searcher = Searcher::with_tt_bits_unconfigured(18);
                 searcher.set_tuple(tup.as_ref());
                 searcher.set_nnue(nn.as_ref());
-                let limits = SearchLimits { time: None, max_nodes: Some(nodes), max_depth: 30 };
+                let limits = SearchLimits {
+                    time: time_ms.map(Duration::from_millis),
+                    max_nodes,
+                    max_depth,
+                };
                 loop {
                     let c = next.fetch_add(CHUNK, Ordering::Relaxed);
                     if c >= n {
@@ -878,9 +1104,15 @@ fn labelbin_cmd(bin: Option<String>, lo: usize, hi: Option<usize>, nodes: u64, t
                         let b = Board::from_occ(u(0), u(8), u(16), rec[24]);
                         searcher.reset_for_new_game();
                         let r = searcher.search(&b, &limits);
-                        res[i].store((r.score as u32 as u64) | ((r.depth as u64 & 0xff) << 32) | ((r.nodes & 0xff_ffff) << 40), Ordering::Relaxed);
+                        res[i].store(
+                            (r.score as u32 as u64)
+                                | ((r.depth as u64 & 0xff) << 32)
+                                | ((r.nodes & 0xff_ffff) << 40),
+                            Ordering::Relaxed,
+                        );
                     }
-                    let d = done.fetch_add((c + CHUNK).min(n) - c, Ordering::Relaxed) + ((c + CHUNK).min(n) - c);
+                    let d = done.fetch_add((c + CHUNK).min(n) - c, Ordering::Relaxed)
+                        + ((c + CHUNK).min(n) - c);
                     if d / 2000 != (d - ((c + CHUNK).min(n) - c)) / 2000 {
                         eprintln!("labelbin: {d}/{n}");
                     }
@@ -899,7 +1131,12 @@ fn labelbin_cmd(bin: Option<String>, lo: usize, hi: Option<usize>, nodes: u64, t
 
 // ---------- bestmove ----------
 
-fn bestmove_cmd(board: Option<String>, time_ms: Option<u64>) -> ExitCode {
+fn bestmove_cmd(
+    board: Option<String>,
+    time_ms: Option<u64>,
+    max_depth: u8,
+    nnue_spec: Option<String>,
+) -> ExitCode {
     let Some(text) = board else {
         eprintln!("bestmove: missing board string");
         return ExitCode::FAILURE;
@@ -909,12 +1146,27 @@ fn bestmove_cmd(board: Option<String>, time_ms: Option<u64>) -> ExitCode {
         return ExitCode::FAILURE;
     };
     println!("{}", b.pretty());
+    let nnue_spec = resolve_nnue_spec(&nnue_spec);
+    let nn = match load_nnue_spec(&nnue_spec) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("bestmove: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "bestmove: network={}, max-depth={}",
+        network_description(&nnue_spec),
+        max_depth
+    );
+    let mut searcher = Searcher::new_unconfigured();
+    searcher.set_nnue(nn.as_ref());
     let limits = SearchLimits {
         time: time_ms.map(Duration::from_millis),
         max_nodes: None,
-        max_depth: 24,
+        max_depth,
     };
-    let r = best_move(&b, &limits);
+    let r = searcher.search(&b, &limits);
     if b.game_over() {
         println!("game over: {}", outcome(&b));
         return ExitCode::SUCCESS;
@@ -955,12 +1207,26 @@ fn parse_move(text: &str) -> Option<Move> {
     Some(Move { from, to })
 }
 
-fn play_cmd(time_ms: u64) -> ExitCode {
+fn play_cmd(time_ms: u64, max_depth: u8, nnue_spec: Option<String>) -> ExitCode {
     println!("Titanium console game. You are black (x). Moves like e2e3, or: moves, quit");
     let mut b = Board::start();
     let human = 0u8;
     let stdin = io::stdin();
-    let mut searcher = Searcher::new();
+    let nnue_spec = resolve_nnue_spec(&nnue_spec);
+    let nn = match load_nnue_spec(&nnue_spec) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("play: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    eprintln!(
+        "play: network={}, max-depth={}",
+        network_description(&nnue_spec),
+        max_depth
+    );
+    let mut searcher = Searcher::new_unconfigured();
+    searcher.set_nnue(nn.as_ref());
 
     loop {
         println!("{}", b.pretty());
@@ -985,7 +1251,8 @@ fn play_cmd(time_ms: u64) -> ExitCode {
             match line {
                 "quit" | "q" => return ExitCode::SUCCESS,
                 "moves" => {
-                    let mv: Vec<String> = b.legal_moves().iter().map(|m| move_str(Some(m))).collect();
+                    let mv: Vec<String> =
+                        b.legal_moves().iter().map(|m| move_str(Some(m))).collect();
                     println!("{}", mv.join(" "));
                     continue;
                 }
@@ -1007,7 +1274,7 @@ fn play_cmd(time_ms: u64) -> ExitCode {
             let limits = SearchLimits {
                 time: Some(Duration::from_millis(time_ms)),
                 max_nodes: None,
-                max_depth: 24,
+                max_depth,
             };
             let r = searcher.search(&b, &limits);
             match r.best {
@@ -1032,7 +1299,6 @@ fn play_cmd(time_ms: u64) -> ExitCode {
 
 // ---------- serve ----------
 
-
 // ---------- serve (UAI) ----------
 
 /// Minimal UAI engine loop so any titanium build (main/candidate snapshots)
@@ -1051,18 +1317,23 @@ fn serve_cmd(
     tup_native: bool,
     corr: bool,
     nnue_spec: Option<String>,
+    max_depth: u8,
 ) -> ExitCode {
     let stdin = io::stdin();
-    let mut searcher = Searcher::with_tt_bits(tt_bits);
+    let mut searcher = Searcher::with_tt_bits_unconfigured(tt_bits);
     let nnue_spec = resolve_nnue_spec(&nnue_spec);
-    let owned_nn = match nnue_spec.as_deref().map(titanium::nnue::Nnue::load) {
-        Some(Ok(n)) => Some(n),
-        Some(Err(e)) => {
+    let owned_nn = match load_nnue_spec(&nnue_spec) {
+        Ok(n) => n,
+        Err(e) => {
             eprintln!("serve: nnue: {e}");
             return ExitCode::FAILURE;
         }
-        None => None,
     };
+    eprintln!(
+        "serve: network={}, max-depth={}",
+        network_description(&nnue_spec),
+        max_depth
+    );
     let tup_spec = eff_tuple_spec(&tup_spec, &nnue_spec);
     // Eval presets come from --net / --tuple ONLY. Owned tables outlive the
     // loop; searcher borrows them per-position (no refcount).
@@ -1096,7 +1367,10 @@ fn serve_cmd(
             break;
         }
         if t == "uai" {
-            out_line("id name Titanium Ataxx");
+            out_line(&format!(
+                "id name Titanium Ataxx ({})",
+                network_description(&nnue_spec)
+            ));
             out_line("id author titaniummachine1");
             out_line("uaiok");
         } else if t == "isready" {
@@ -1126,10 +1400,21 @@ fn serve_cmd(
                     if b.game_over() || !b.has_moves(b.turn) {
                         return "0000".to_string();
                     }
+                    let explicit_depth = depth.is_some();
+                    let depth = depth
+                        .unwrap_or(u32::from(max_depth))
+                        .clamp(1, u32::from(max_depth));
+                    let time = movetime
+                        .filter(|ms| *ms > 0)
+                        .map(Duration::from_millis)
+                        .or_else(|| {
+                            (nodes.is_none() && !explicit_depth)
+                                .then(|| Duration::from_millis(1000))
+                        });
                     let limits = SearchLimits {
-                        time: movetime.filter(|ms| *ms > 0).map(Duration::from_millis),
+                        time,
                         max_nodes: nodes,
-                        max_depth: depth.unwrap_or(24),
+                        max_depth: depth as u8,
                     };
                     match searcher.search(b, &limits).best {
                         Some(m) => {
@@ -1168,7 +1453,10 @@ impl UaiOpp {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty command"))?;
         let mut command = Command::new(program);
         command.args(parts);
-        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         let mut child: Child = command.spawn()?;
         let stdin: ChildStdin = child.stdin.take().expect("stdin");
         let out: BufReader<ChildStdout> = BufReader::new(child.stdout.take().expect("stdout"));
@@ -1290,13 +1578,8 @@ fn match_cmd(
     book_start: u32,
     nnue_spec: Option<String>,
     opp_nnue_spec: Option<String>,
+    max_depth: u8,
 ) -> ExitCode {
-    let load_nn = |spec: &Option<String>| -> Result<Option<titanium::nnue::Nnue>, String> {
-        match spec {
-            None => Ok(None),
-            Some(p) => titanium::nnue::Nnue::load(p).map(Some).map_err(|e| format!("nnue {p}: {e}")),
-        }
-    };
     // shipped-NNUE default (absent flag) on both sides; an external child gets the resolved choice as an explicit flag
     let nnue_spec = resolve_nnue_spec(&nnue_spec);
     let child_nnue = resolve_nnue_spec(&opp_nnue_spec);
@@ -1304,13 +1587,19 @@ fn match_cmd(
     let opp_nnue_spec = if self_opp { child_nnue.clone() } else { None };
     let tup_spec = eff_tuple_spec(&tup_spec, &nnue_spec);
     let opp_tup_spec = eff_tuple_spec(&opp_tup_spec, &child_nnue);
-    let (nn, opp_nn) = match (load_nn(&nnue_spec), load_nn(&opp_nnue_spec)) {
+    let (nn, opp_nn) = match (load_nnue_spec(&nnue_spec), load_nnue_spec(&opp_nnue_spec)) {
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => {
             eprintln!("match: {e}");
             return ExitCode::FAILURE;
         }
     };
+    eprintln!(
+        "match: network={}, opponent-network={}, max-depth={}",
+        network_description(&nnue_spec),
+        network_description(&opp_nnue_spec),
+        max_depth
+    );
     // Eval presets, explicit per side — no env vars anywhere:
     // --net = OUR side (in-process), --opp-net = child side (appended to the
     // opp serve command). --opp self = both in-process (opp side gets opp-net).
@@ -1359,7 +1648,7 @@ fn match_cmd(
                     if !with_flags.contains("--tuple") {
                         with_flags = format!("{with_flags} {}", tuple_flag_str(&opp_tup_spec));
                     }
-                    if !with_flags.contains("--nnue") {
+                    if !with_flags.contains("--network") && !with_flags.contains("--nnue") {
                         with_flags = format!("{with_flags} {}", nnue_flag_str(&child_nnue));
                     }
                     if opp_corr && !with_flags.contains("--corr") {
@@ -1406,7 +1695,7 @@ fn match_cmd(
         start_game + games - 1,
         opp_depth
             .map(|d| format!("depth {d}"))
-            .unwrap_or_else(|| format!("movetime {opp_time} ms"))
+            .unwrap_or_else(|| format!("movetime {} ms", if opp_time == 0 { 1000 } else { opp_time }))
     ));
 
     // Incremental log: header first, then append per game — played games
@@ -1424,8 +1713,11 @@ fn match_cmd(
         None => None,
         Some(p) => match fs::read_to_string(&p) {
             Ok(text) => {
-                let lines: Vec<String> =
-                    text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                let lines: Vec<String> = text
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
                 if lines.is_empty() {
                     eprintln!("match: book {p} is empty");
                     return ExitCode::FAILURE;
@@ -1460,7 +1752,11 @@ fn match_cmd(
                 match Board::from_str(&lines[idx]) {
                     Some(pos) => pos,
                     None => {
-                        eprintln!("match: book line {} does not parse: {:?}", idx + 1, lines[idx]);
+                        eprintln!(
+                            "match: book line {} does not parse: {:?}",
+                            idx + 1,
+                            lines[idx]
+                        );
                         return ExitCode::FAILURE;
                     }
                 }
@@ -1477,13 +1773,13 @@ fn match_cmd(
         if let Some(o) = &mut opp {
             o.send("uainewgame");
         }
-        let mut searcher = Searcher::new(); // fresh TT per game
+        let mut searcher = Searcher::new_unconfigured(); // fresh TT per game
         searcher.set_sancta(net.as_ref());
         searcher.set_tuple(tup.as_ref());
         searcher.set_tuple_native(tup_native && tup.is_some());
         searcher.set_corr(corr);
         searcher.set_nnue(nn.as_ref());
-        let mut opp_searcher = Searcher::new(); // for --opp self
+        let mut opp_searcher = Searcher::new_unconfigured(); // for --opp self
         opp_searcher.set_sancta(opp_net.as_ref());
         opp_searcher.set_tuple(opp_tup.as_ref());
         opp_searcher.set_tuple_native(opp_tup_native && opp_tup.is_some());
@@ -1494,9 +1790,13 @@ fn match_cmd(
         let mut result = None;
 
         let node_limits = |nodes: Option<u64>| SearchLimits {
-            time: if time_ms == 0 { None } else { Some(Duration::from_millis(time_ms)) },
+            time: if time_ms == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(time_ms))
+            },
             max_nodes: nodes,
-            max_depth: 24,
+            max_depth,
         };
         let titanium_limits = node_limits(max_nodes);
         let self_opp_limits = node_limits(max_nodes);
@@ -1514,13 +1814,15 @@ fn match_cmd(
             } else {
                 match &mut opp {
                     Some(o) => {
-                        let go = if let Some(n) = opp_nodes {
-                            format!("go nodes {n}")
-                        } else if let Some(d) = opp_depth {
-                            format!("go depth {d}")
-                        } else {
-                            format!("go movetime {opp_time}")
-                        };
+                        let mut limits = vec!["go".to_string()];
+                        if let Some(n) = opp_nodes { limits.push(format!("nodes {n}")); }
+                        if let Some(d) = opp_depth { limits.push(format!("depth {d}")); }
+                        if opp_time > 0 {
+                            limits.push(format!("movetime {opp_time}"));
+                        } else if opp_nodes.is_none() && opp_depth.is_none() {
+                            limits.push("movetime 1000".to_string());
+                        }
+                        let go = limits.join(" ");
                         let reply = o.best_move(&b.to_ataxx_fen(), &go);
                         reply.as_deref().and_then(|t| parse_opp_move(&b, t))
                     }
@@ -1553,7 +1855,11 @@ fn match_cmd(
             }
         });
         let (bl, wh) = b.counts();
-        let (titanium_color, opp_color) = if titanium_is_black { ("x", "o") } else { ("o", "x") };
+        let (titanium_color, opp_color) = if titanium_is_black {
+            ("x", "o")
+        } else {
+            ("o", "x")
+        };
         let titanium_won =
             (outcome == 0 && titanium_is_black) || (outcome == 1 && !titanium_is_black);
         let line = if outcome == 2 {
@@ -1626,7 +1932,21 @@ fn sperft_positions(n: usize) -> Vec<Board> {
 /// Search-throughput benchmark ("perft for the search"): fixed depth, no
 /// time limit, deterministic position suite. Node counts are reproducible,
 /// nps tracks search optimizations (TT, ordering, eval).
-fn sperft_cmd(depth: u32, positions: usize, tup_spec: Option<String>, tup_native: bool) -> ExitCode {
+fn sperft_cmd(
+    depth: u8,
+    positions: usize,
+    tup_spec: Option<String>,
+    tup_native: bool,
+    network: Option<String>,
+) -> ExitCode {
+    let network = resolve_nnue_spec(&network);
+    let nn = match load_nnue_spec(&network) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("sperft: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let suite = sperft_positions(positions);
     let tup = match load_tuple_preset(&tup_spec) {
         Ok(t) => t,
@@ -1644,9 +1964,10 @@ fn sperft_cmd(depth: u32, positions: usize, tup_spec: Option<String>, tup_native
         let mut total_nodes = 0u64;
         let mut total_time = 0.0f64;
         for (i, b) in suite.iter().enumerate() {
-            let mut searcher = Searcher::with_tt_bits(20);
+            let mut searcher = Searcher::with_tt_bits_unconfigured(20);
             searcher.set_tuple(tup.as_ref());
             searcher.set_tuple_native(tup_native && tup.is_some());
+            searcher.set_nnue(nn.as_ref());
             let limits = SearchLimits {
                 time: None,
                 max_nodes: None,
@@ -1745,7 +2066,10 @@ fn genbench_cmd(iters: u64) -> ExitCode {
         sink ^= next.occ[0] ^ next.occ[1];
     }
     let dt = t.elapsed().as_secs_f64();
-    println!("  make (AND)          {:>10.0} /s   (sink {sink:x})", n as f64 / dt);
+    println!(
+        "  make (AND)          {:>10.0} /s   (sink {sink:x})",
+        n as f64 / dt
+    );
 
     let t = Instant::now();
     let mut sink2 = 0u64;
@@ -1755,7 +2079,10 @@ fn genbench_cmd(iters: u64) -> ExitCode {
         sink2 ^= next.occ[0] ^ next.occ[1];
     }
     let dt = t.elapsed().as_secs_f64();
-    println!("  make_via_lut        {:>10.0} /s   (sink {sink2:x})", n as f64 / dt);
+    println!(
+        "  make_via_lut        {:>10.0} /s   (sink {sink2:x})",
+        n as f64 / dt
+    );
 
     // 4) extraction: portable loop vs BMI2 PEXT
     let opp = b.opp();
@@ -1765,7 +2092,10 @@ fn genbench_cmd(iters: u64) -> ExitCode {
         k += titanium::extract8(opp, (i % 49) as u8) as u64;
     }
     let dt = t.elapsed().as_secs_f64();
-    println!("  extract8 (loop)     {:>10.0} /s   (k {k})", 2_000_000.0 / dt);
+    println!(
+        "  extract8 (loop)     {:>10.0} /s   (k {k})",
+        2_000_000.0 / dt
+    );
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -1776,7 +2106,10 @@ fn genbench_cmd(iters: u64) -> ExitCode {
                 k += unsafe { titanium::extract8_pext(opp, (i % 49) as u8) } as u64;
             }
             let dt = t.elapsed().as_secs_f64();
-            println!("  extract8 (PEXT)     {:>10.0} /s   (k {k})", 2_000_000.0 / dt);
+            println!(
+                "  extract8 (PEXT)     {:>10.0} /s   (k {k})",
+                2_000_000.0 / dt
+            );
         } else {
             println!("  extract8 (PEXT)     not supported on this CPU");
         }
@@ -1809,8 +2142,14 @@ fn snparity_cmd(refp: Option<String>) -> ExitCode {
         .filter_map(|l| {
             let t: Vec<&str> = l.split_whitespace().collect();
             (t.len() == 6).then(|| {
-                (u64::from_str_radix(t[0], 16).unwrap(), u64::from_str_radix(t[1], 16).unwrap(),
-                 u64::from_str_radix(t[2], 16).unwrap(), t[3].parse().unwrap(), t[4].parse().unwrap(), t[5].parse().unwrap())
+                (
+                    u64::from_str_radix(t[0], 16).unwrap(),
+                    u64::from_str_radix(t[1], 16).unwrap(),
+                    u64::from_str_radix(t[2], 16).unwrap(),
+                    t[3].parse().unwrap(),
+                    t[4].parse().unwrap(),
+                    t[5].parse().unwrap(),
+                )
             })
         })
         .collect();
@@ -1842,7 +2181,14 @@ fn snparity_cmd(refp: Option<String>) -> ExitCode {
         }
     }
     let ns_head = t3.elapsed().as_nanos() as f64 / (200.0 * rows.len().max(1) as f64);
-    println!("snparity parts: full refresh {ns_acc:.0} ns, head {ns_head:.0} ns (chk {})", s2 as i64 % 7);
+    println!(
+        "snparity parts: full refresh {ns_acc:.0} ns, head {ns_head:.0} ns (chk {})",
+        s2 as i64 % 7
+    );
     println!("snparity: {} rows, max |rust - torch| = {:.2} cp (rounding <= 0.5), {:.0} ns/eval (chk {})", rows.len(), worst, ns, s % 7);
-    if worst <= 1.0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    if worst <= 1.0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }

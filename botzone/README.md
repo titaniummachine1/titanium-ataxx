@@ -5,14 +5,15 @@
 container). The GitHub workflow runs the same build on every push to main (artifact `botzone-upload`, no secrets).
 Never upload a library built with plain `cargo build` on a modern Linux: it needs glibc 2.34 and crashes the bot on
 Botzone (Ubuntu 16.04, glibc 2.23) on its first move (happened with v5, 2026-10-25).
-Eval: the big NNUE `data/nnue/nnue_main.tnn` (main's default), S57 `tupS57v2.tup` only as fallback.
+Eval: main's strongest big NNUE is embedded in `data/titanium_v2.so`; the upload no longer needs a separate network file. Local `TI_NET` still allows an explicit replacement network.
+Search: the Botzone driver passes a depth cap of 30 along with its time budget; whichever limit is reached first ends the search.
 Time: 12 s on the bot's first turn of a match (wiki: first turn doubled, Python 6x), 6 s on every later turn.
 
 Simulator modes: `--mode oneshot` (default, fresh process per move) and `--mode long`.
 
 Design: **Python owns Botzone, Rust owns the game.** `titanium_botzone.py` parses the long-live Simple-IO
 requests, replays the game after a restart, keeps the clock and the watchdog, and talks to the engine only
-through a tiny C ABI (`crates/titanium-ffi`): `ti_new / ti_new_game / ti_apply / ti_search(budget_ms) / ti_stop / ti_stats`.
+through a tiny C ABI (`crates/titanium-ffi`): `ti_new / ti_new_game / ti_apply / ti_search_with_limits(time, nodes, depth) / ti_stop / ti_stats`.
 The engine knows nothing about the Botzone protocol.
 
 ## Time policy (default: ONE-SHOT, 6 s per move)

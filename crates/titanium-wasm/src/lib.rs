@@ -20,7 +20,7 @@ pub struct Game {
     last_nodes: u32,
     last_ms: u32,
     /// Persistent searcher: TT carries over between moves of the game.
-    searcher: Searcher,
+    searcher: Searcher<'static>,
 }
 
 #[wasm_bindgen]
@@ -33,7 +33,7 @@ impl Game {
             hist: vec![Board::start()],
             moves: vec![Move::PASS],
             time_ms: [600, 600],
-            max_depth: 12,
+            max_depth: 255,
             last_depth: 0,
             last_nodes: 0,
             last_ms: 0,
@@ -47,7 +47,7 @@ impl Game {
     }
 
     pub fn set_max_depth(&mut self, max_depth: u32) {
-        self.max_depth = max_depth.clamp(1, 30);
+        self.max_depth = max_depth.clamp(1, 255);
     }
 
     /// Side to move: 0 black, 1 white.
@@ -72,7 +72,11 @@ impl Game {
 
     /// Legal moves for the side to move, packed as `(from << 8) | to`.
     pub fn legal_moves(&self) -> Vec<u32> {
-        self.cur().legal_moves().iter().map(|m| m.to_u32()).collect()
+        self.cur()
+            .legal_moves()
+            .iter()
+            .map(|m| m.to_u32())
+            .collect()
     }
 
     pub fn has_moves(&self) -> bool {
@@ -113,9 +117,11 @@ impl Game {
             return None;
         }
         let limits = SearchLimits {
-            time: Some(Duration::from_millis(self.time_ms[self.cur().turn as usize] as u64)),
+            time: Some(Duration::from_millis(
+                self.time_ms[self.cur().turn as usize] as u64,
+            )),
             max_nodes: None,
-            max_depth: self.max_depth,
+            max_depth: self.max_depth as u8,
         };
         let started = perf::now();
         let r = self.searcher.search(&b, &limits);

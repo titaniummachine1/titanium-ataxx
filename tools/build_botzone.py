@@ -9,7 +9,7 @@ Steps (each one stops the script on failure, nothing half-built is left as "read
   2. build the engine library for Linux with zig for glibc 2.14 (Botzone runs Ubuntu 16.04 = glibc 2.23; a
      library built on a modern system needs glibc 2.34 and crashes the bot on its first move).
   3. check the library: ELF x86-64, every ti_* function exported, newest glibc symbol <= 2.17.
-  4. assemble botzone/upload/: the driver, data/titanium_v2.so, data/nnue/nnue_main.tnn (main's default net)
+  4. assemble botzone/upload/: the driver and data/titanium_v2.so (main's big NNUE is embedded in the library)
      and MANIFEST.txt (no fallback net: the driver plays at full strength or fails visibly) (commit, sha256 of every file, where each file goes).
   5. test (needs Docker, local only): the exact upload folder plays turn 1 as black, turn 1 as white, turn 2, with
      stderr closed and through every injected fault (TI_FAULT: library fails twice, engine creation fails, first search
@@ -34,11 +34,10 @@ GLIBC_BUILD = "2.14"
 GLIBC_MAX = (2, 17)
 SO = os.path.join(ROOT, "target", TARGET, "release", "libtitanium_ffi.so")
 EXPORTS = [b"ti_abi_version", b"ti_new", b"ti_free", b"ti_new_game", b"ti_apply", b"ti_legal_count", b"ti_search",
-           b"ti_stop", b"ti_stats"]
+           b"ti_search_with_limits", b"ti_stop", b"ti_stats"]
 ZIG_DIRS = ["C:/gitProjects/toolchains/zig-0.13.0/zig-windows-x86_64-0.13.0"]
 FILES = {  # upload-folder path -> source path in the repo
     "titanium_botzone.py": "botzone/titanium_botzone.py",
-    "data/nnue/nnue_main.tnn": "data/nnue/nnue_main.tnn",
 }
 
 
@@ -115,17 +114,20 @@ def main():
     step("4/5 assemble %s" % OUT)
     if os.path.exists(OUT):
         shutil.rmtree(OUT)
-    os.makedirs(os.path.join(OUT, "data", "nnue"))
+    os.makedirs(os.path.join(OUT, "data"))
     shutil.copy2(SO, os.path.join(OUT, "data", "titanium_v2.so"))
     for dst, src in FILES.items():
         s = os.path.join(ROOT, src)
         if not os.path.exists(s):
             fail("missing %s" % src)
         shutil.copy2(s, os.path.join(OUT, dst))
+    if os.path.exists(os.path.join(OUT, "data", "nnue", "nnue_main.tnn")):
+        fail("the bundled-NNUE package must not depend on an external network file")
     lines = ["Titanium Ataxx Botzone upload, built from %s @ %s" % (branch, commit), "",
              "Upload (Botzone -> avatar menu -> manage storage), then submit the bot:",
              "  data/titanium_v2.so       -> storage /titanium_v2.so",
-             "  data/nnue/nnue_main.tnn   -> storage /nnue/nnue_main.tnn   (big NNUE, main's default eval)",
+             "Embedded main NNUE: data/nnue/nnue_main.tnn (sha256 %s)" % sha256(os.path.join(ROOT, "data", "nnue", "nnue_main.tnn")),
+             "Botzone search limits: time budget plus depth cap 30; first limit reached stops the search.",
              "  titanium_botzone.py       -> new bot version: Python 3, simple IO, long-running OFF", "",
              "sha256:"]
     for root, _, fs in os.walk(OUT):
@@ -141,7 +143,7 @@ def main():
     step("5/5 Linux test (Docker, python:3.6, older glibc)")
     if not shutil.which("docker"):
         fail("docker not found; rerun with --no-test to skip (not recommended)")
-    # (name, stdin, env, shell redirect, expect): "move" = legal move whose debug line names the NNUE,
+    # (name, stdin, env, shell redirect, expect): "move" = legal move whose debug line names the bundled network,
     # "move+ev:<x>" = legal move AND recovery event <x> in the debug line, "fail" = -1s + ENGINE_FAILED/FATAL (a VISIBLE failure)
     t1, t1w, t2 = "1\\n-1 -1 -1 -1\\n", "1\\n0 0 1 1\\n", "2\\n-1 -1 -1 -1\\n6 6 5 5\\n6 0 5 1\\n"
     cases = [("black turn 1", t1, "", "", "move"), ("white turn 1", t1w, "", "", "move"), ("turn 2", t2, "", "", "move"),
@@ -175,7 +177,7 @@ def main():
             if mv != "-1 -1 -1 -1" or not re.search(r"ENGINE_FAILED|FATAL", dbg):
                 bad.append("%s: expected a VISIBLE failure, got %r / %r" % (name, mv, dbg))
         else:
-            if re.fullmatch(r"[0-6] [0-6] [0-6] [0-6]", mv) is None or "nnue_main.tnn" not in dbg:
+            if re.fullmatch(r"[0-6] [0-6] [0-6] [0-6]", mv) is None or "bundled-main" not in dbg:
                 bad.append("%s: expected a legal NNUE move, got %r / %r" % (name, mv, dbg))
             if expect.startswith("move+ev:") and expect[8:] not in dbg:
                 bad.append("%s: recovery event %s missing in %r" % (name, expect[8:], dbg))

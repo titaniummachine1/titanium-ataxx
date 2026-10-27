@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use titanium::board::{Board, Move};
-use titanium::search::{SearchLimits, Searcher, StopReason};
 use titanium::nnue::Nnue;
+use titanium::search::{SearchLimits, Searcher, StopReason};
 use titanium::tuple::TupleTable;
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 const DEFAULT_TT_BITS: u32 = 22;
 
 pub struct TiEngine {
@@ -75,17 +75,26 @@ impl TiEngine {
     }
 }
 
-/// Create an engine. `net_path` = path to the big NNUE (`*.tnn`, e.g. nnue_main.tnn: main's default eval) or to a TUP
-/// tuple net (S57 fallback); NULL = classical hand eval (weak!).
-/// Returns NULL if a net path is given but cannot be loaded (never silently falls back).
+/// Create an engine. NULL = bundled main NNUE; a `.tnn` path overrides it, or a TUP path selects the legacy tuple net.
+/// Returns NULL if an explicit net path cannot be loaded (never silently falls back).
 /// `tt_bits` = log2 of hash entries (0 -> 22, ~100 MB); each entry is 24 bytes.
 #[no_mangle]
 pub extern "C" fn ti_new(net_path: *const c_char, tt_bits: u32) -> *mut TiEngine {
-    let bits = if tt_bits == 0 { DEFAULT_TT_BITS } else { tt_bits.clamp(12, 26) } as usize;
+    let bits = if tt_bits == 0 {
+        DEFAULT_TT_BITS
+    } else {
+        tt_bits.clamp(12, 26)
+    } as usize;
     // the NNUE is loaded BEFORE the hash table is allocated, so the file buffer and the table never coexist (peak RAM)
     let mut nnue: Option<&'static Nnue> = None;
-    if !net_path.is_null() {
-        let p = unsafe { CStr::from_ptr(net_path) }.to_string_lossy().into_owned();
+    if net_path.is_null() {
+        let mut n = Nnue::bundled();
+        n.drop_f32_reference();
+        nnue = Some(Box::leak(Box::new(n)));
+    } else {
+        let p = unsafe { CStr::from_ptr(net_path) }
+            .to_string_lossy()
+            .into_owned();
         if p.ends_with(".tnn") {
             match Nnue::load(&p) {
                 Ok(mut n) => {
@@ -96,10 +105,12 @@ pub extern "C" fn ti_new(net_path: *const c_char, tt_bits: u32) -> *mut TiEngine
             }
         }
     }
-    let mut searcher: Searcher<'static> = Searcher::with_tt_bits(bits);
+    let mut searcher: Searcher<'static> = Searcher::with_tt_bits_unconfigured(bits);
     searcher.set_nnue(nnue);
     if !net_path.is_null() && nnue.is_none() {
-        let p = unsafe { CStr::from_ptr(net_path) }.to_string_lossy().into_owned();
+        let p = unsafe { CStr::from_ptr(net_path) }
+            .to_string_lossy()
+            .into_owned();
         match TupleTable::load(&p) {
             Ok(t) => {
                 let t: &'static TupleTable = Box::leak(Box::new(t));
@@ -111,7 +122,13 @@ pub extern "C" fn ti_new(net_path: *const c_char, tt_bits: u32) -> *mut TiEngine
     let stop = Arc::new(AtomicBool::new(false));
     searcher.set_stop_flag(Some(stop.clone()));
     let board = Board::botzone_start();
-    Box::into_raw(Box::new(TiEngine { snaps: vec![(board.occ[0], board.occ[1])], board, searcher, stop, stats: TiStats::default() }))
+    Box::into_raw(Box::new(TiEngine {
+        snaps: vec![(board.occ[0], board.occ[1])],
+        board,
+        searcher,
+        stop,
+        stats: TiStats::default(),
+    }))
 }
 
 #[no_mangle]
@@ -148,10 +165,17 @@ pub extern "C" fn ti_apply(e: *mut TiEngine, x0: i32, y0: i32, x1: i32, y1: i32)
     if x0 < 0 && y0 < 0 && x1 < 0 && y1 < 0 {
         return 0;
     }
-    if !((0..=6).contains(&x0) && (0..=6).contains(&y0) && (0..=6).contains(&x1) && (0..=6).contains(&y1)) {
+    if !((0..=6).contains(&x0)
+        && (0..=6).contains(&y0)
+        && (0..=6).contains(&x1)
+        && (0..=6).contains(&y1))
+    {
         return -1;
     }
-    let m = Move { from: (y0 * 7 + x0) as u8, to: (y1 * 7 + x1) as u8 };
+    let m = Move {
+        from: (y0 * 7 + x0) as u8,
+        to: (y1 * 7 + x1) as u8,
+    };
     if !e.board.legal_moves().contains(&m) {
         return -1;
     }
@@ -162,11 +186,19 @@ pub extern "C" fn ti_apply(e: *mut TiEngine, x0: i32, y0: i32, x1: i32, y1: i32)
 /// 1 if the judge would reject this move as a repetition, 0 if it is allowed, -1 if it is not even legal.
 #[no_mangle]
 pub extern "C" fn ti_move_banned(e: *mut TiEngine, x0: i32, y0: i32, x1: i32, y1: i32) -> i32 {
-    if e.is_null() || !((0..=6).contains(&x0) && (0..=6).contains(&y0) && (0..=6).contains(&x1) && (0..=6).contains(&y1)) {
+    if e.is_null()
+        || !((0..=6).contains(&x0)
+            && (0..=6).contains(&y0)
+            && (0..=6).contains(&x1)
+            && (0..=6).contains(&y1))
+    {
         return -1;
     }
     let e = unsafe { &*e };
-    let m = Move { from: (y0 * 7 + x0) as u8, to: (y1 * 7 + x1) as u8 };
+    let m = Move {
+        from: (y0 * 7 + x0) as u8,
+        to: (y1 * 7 + x1) as u8,
+    };
     if !e.board.legal_moves().contains(&m) {
         return -1;
     }
@@ -190,17 +222,27 @@ pub extern "C" fn ti_stop(e: *mut TiEngine) {
     }
 }
 
-/// Iterative-deepening cap for Botzone searches. The search stack holds MAX_PLY = 40 plies and the ply < MAX_PLY check
-/// is only a debug_assert, so an uncapped depth (was u32::MAX: decided positions reached "depth 27178") could index past
-/// the stack -> panic -> abort = the bot dies. The CLI/gates cap at 24-30; real Botzone searches reach depth 10-15, so 32
-/// changes nothing but solved positions.
-const FFI_MAX_DEPTH: u32 = 32;
+/// Botzone-specific depth cap. The general search API supports the full u8 range.
+const FFI_MAX_DEPTH: u8 = 30;
 
 /// Search the current position for at most `budget_ms` (wall clock, absolute) and write the move
 /// to out[0..4] = x0,y0,x1,y1. Plays the move on the internal board.
 /// Returns 1 = move written, 0 = no legal move (out = -1s), -1 = bad arguments.
 #[no_mangle]
 pub extern "C" fn ti_search(e: *mut TiEngine, budget_ms: u64, out: *mut i32) -> i32 {
+    ti_search_with_limits(e, budget_ms, 0, FFI_MAX_DEPTH, out)
+}
+
+/// Search with independent optional node and depth caps in addition to the time budget.
+/// `max_nodes = 0` means unlimited; `max_depth` is clamped to at least one ply.
+#[no_mangle]
+pub extern "C" fn ti_search_with_limits(
+    e: *mut TiEngine,
+    budget_ms: u64,
+    max_nodes: u64,
+    max_depth: u8,
+    out: *mut i32,
+) -> i32 {
     if e.is_null() || out.is_null() {
         return -1;
     }
@@ -215,7 +257,11 @@ pub extern "C" fn ti_search(e: *mut TiEngine, budget_ms: u64, out: *mut i32) -> 
         return 0;
     }
     e.stop.store(false, Ordering::Relaxed);
-    let limits = SearchLimits { time: Some(Duration::from_millis(budget_ms.max(1))), max_nodes: None, max_depth: FFI_MAX_DEPTH };
+    let limits = SearchLimits {
+        time: Some(Duration::from_millis(budget_ms.max(1))),
+        max_nodes: (max_nodes > 0).then_some(max_nodes),
+        max_depth: max_depth.max(1),
+    };
     let r = e.searcher.search_bz(&e.board, &limits);
     let mut mv = r.best.unwrap_or_else(|| list.move_at(0));
     let mut overridden = 0u32;
@@ -288,7 +334,10 @@ mod tests {
     fn abi_and_bad_net_path() {
         assert_eq!(ti_abi_version(), 1);
         let bad = CString::new("definitely/not/a/net.tup").unwrap();
-        assert!(ti_new(bad.as_ptr(), 14).is_null(), "a missing net must not silently fall back");
+        assert!(
+            ti_new(bad.as_ptr(), 14).is_null(),
+            "a missing net must not silently fall back"
+        );
     }
 
     #[test]
@@ -305,7 +354,11 @@ mod tests {
                 break;
             }
             let m = play_one(me, 5);
-            assert_eq!(ti_apply(other, m[0], m[1], m[2], m[3]), 1, "move {m:?} rejected at ply {ply}");
+            assert_eq!(
+                ti_apply(other, m[0], m[1], m[2], m[3]),
+                1,
+                "move {m:?} rejected at ply {ply}"
+            );
         }
         // an illegal move is refused and leaves the board untouched
         let n = ti_legal_count(a);
@@ -333,7 +386,10 @@ mod tests {
         let mut out = [0i32; 4];
         for _ in 0..1 {
             assert_eq!(ti_search(e, 20, out.as_mut_ptr()), 1);
-            assert!(!(out == [0, 0, 2, 0]), "search played the banned repetition");
+            assert!(
+                !(out == [0, 0, 2, 0]),
+                "search played the banned repetition"
+            );
         }
         ti_free(e);
     }
@@ -352,7 +408,11 @@ mod tests {
         });
         assert_eq!(ti_search(e, 10_000, out.as_mut_ptr()), 1);
         h.join().unwrap();
-        assert!(t.elapsed().as_millis() < 500, "stop took {} ms", t.elapsed().as_millis());
+        assert!(
+            t.elapsed().as_millis() < 500,
+            "stop took {} ms",
+            t.elapsed().as_millis()
+        );
         ti_free(e);
     }
 }

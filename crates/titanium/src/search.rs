@@ -7,9 +7,9 @@
 const ECACHE_BITS: usize = 16;
 
 use crate::board::{dist_union, jump_union, Board, Move, MoveList, RING1, SQUARES};
-use crate::tuple::TupleTable;
 use crate::nnue::Nnue;
 use crate::sancta::{S1Acc, S1Net};
+use crate::tuple::TupleTable;
 use std::time::Duration;
 
 pub const MATE: i32 = 100_000;
@@ -19,8 +19,8 @@ const MATE_BOUND: i32 = MATE - 2000;
 /// i32::MIN+1 / i32::MAX window ends leaked into null-window searches as "scores" and made score_to_tt overflow.
 const INF: i32 = MATE + 1000;
 
-/// Search stack depth cap (max_depth is clamped well below this).
-const MAX_PLY: usize = 40;
+/// Search stack supports the full u8 depth range plus the root ply.
+const MAX_PLY: usize = u8::MAX as usize + 1;
 
 /// Per-ply move buffers, one alloc per Searcher, reused across searches.
 /// `acc` carries the lazy sancta accumulator per ply (refresh_root once at
@@ -131,7 +131,11 @@ type History = [[[i32; 49]; 49]; 2];
 
 #[inline]
 fn hist_key(m: Move) -> (usize, usize) {
-    if m.is_clone() { (m.to as usize, m.to as usize) } else { (m.from as usize, m.to as usize) }
+    if m.is_clone() {
+        (m.to as usize, m.to as usize)
+    } else {
+        (m.from as usize, m.to as usize)
+    }
 }
 const _: () = assert!(ORD_HISTORY_MAX + 8 * ORD_CAPTURE_UNIT + ORD_CLONE_BONUS < ORD_KILLER);
 const _: () = assert!(ORD_KILLER < ORD_TT);
@@ -261,8 +265,7 @@ fn score_into(
             // exp/ab O1 (hole-aware jumps): a jump vacates its origin —
             // leaving a connected origin breaks formation, so penalty
             // scales with own stones adjacent to the origin square.
-            let conn =
-                (b.occ[b.turn as usize] & RING1[m.from as usize]).count_ones() as i32;
+            let conn = (b.occ[b.turn as usize] & RING1[m.from as usize]).count_ones() as i32;
             score -= ORD_JUMP_PEN + conn * ORD_JUMP_CONN;
         }
         if packed == k1 || packed == k2 {
@@ -294,7 +297,11 @@ fn terminal_score(b: &Board, ply: u32) -> i32 {
 /// is a forced win, not a pass-and-continue. Same MATE shape as `terminal_score`.
 fn bz_terminal_score(b: &Board, ply: u32) -> i32 {
     let (fb, fw) = b.bz_counts();
-    let diff = if b.turn == 0 { fb as i32 - fw as i32 } else { fw as i32 - fb as i32 };
+    let diff = if b.turn == 0 {
+        fb as i32 - fw as i32
+    } else {
+        fw as i32 - fb as i32
+    };
     if diff > 0 {
         MATE - ply as i32
     } else if diff < 0 {
@@ -484,12 +491,12 @@ pub enum StopReason {
 
 #[derive(Clone, Debug)]
 pub struct SearchLimits {
-    /// Soft time budget per move; `None` = unlimited.
+    /// Wall-clock budget per search; `None` = unlimited (polled every 64 nodes).
     pub time: Option<Duration>,
     /// Hard node budget; search stops once `nodes` reaches this.
     pub max_nodes: Option<u64>,
-    /// Hard depth cap.
-    pub max_depth: u32,
+    /// Hard depth cap, in plies (0 is treated as 1 for legacy callers).
+    pub max_depth: u8,
 }
 
 impl Default for SearchLimits {
@@ -497,7 +504,7 @@ impl Default for SearchLimits {
         SearchLimits {
             time: Some(Duration::from_millis(1000)),
             max_nodes: None,
-            max_depth: 20,
+            max_depth: u8::MAX,
         }
     }
 }
@@ -572,13 +579,25 @@ impl Default for Searcher<'_> {
     }
 }
 impl<'a> Searcher<'a> {
-    pub fn new() -> Searcher<'a> {
-        Searcher::with_tt_bits(20)
+    /// Standard production searcher: bundled main NNUE, default TT size.
+    pub fn new() -> Searcher<'static> {
+        Searcher::with_main_network()
     }
 
-    /// Searcher with a `2^bits`-entry transposition table (wasm builds use
-    /// smaller tables).
-    pub fn with_tt_bits(bits: usize) -> Searcher<'a> {
+    /// Low-level unconfigured searcher for custom evaluators or explicit classical experiments.
+    pub fn new_unconfigured() -> Searcher<'a> {
+        Searcher::with_tt_bits_unconfigured(20)
+    }
+
+    /// Production searcher with the strongest NNUE bundled into this build and a custom TT size.
+    pub fn with_tt_bits(bits: usize) -> Searcher<'static> {
+        let mut searcher = Searcher::with_tt_bits_unconfigured(bits);
+        searcher.set_nnue(Some(Nnue::bundled_static()));
+        searcher
+    }
+
+    /// Allocate a searcher without choosing an evaluator. This is intended for explicit model replacement.
+    pub fn with_tt_bits_unconfigured(bits: usize) -> Searcher<'a> {
         Searcher {
             nodes: 0,
             deadline_ms: None,
@@ -600,6 +619,11 @@ impl<'a> Searcher<'a> {
             corr: None,
             stack: MoveStack::new(),
         }
+    }
+
+    /// A production searcher with the strongest NNUE bundled into this build.
+    pub fn with_main_network() -> Searcher<'static> {
+        Searcher::with_tt_bits(20)
     }
 
     /// Attach a sancta net (None = classical). Borrowed for the search
@@ -733,8 +757,7 @@ impl<'a> Searcher<'a> {
         null_allowed: bool,
     ) -> i32 {
         self.nodes += 1;
-        // Hard stack guard (release builds too): never index past the MAX_PLY-sized stacks. Unreachable while
-        // max_depth <= 32 (every recursion lowers depth by >= 1); a last line of defence instead of a panic/abort.
+        // Hard stack guard (release builds too): never index past the MAX_PLY-sized stacks.
         if ply as usize >= MAX_PLY - 1 {
             return self.leaf_eval(b);
         }
@@ -826,14 +849,8 @@ impl<'a> Searcher<'a> {
                 // NMP pass flips stm: sancta acc is color-relative so it
                 // stays valid — just forward the other perspective.
                 // (pass: no stones change, no diff update needed.)
-                let score = -self.negamax::<BZ>(
-                    &child,
-                    -beta,
-                    -beta + 1,
-                    depth - 3,
-                    ply + 1,
-                    false,
-                );
+                let score =
+                    -self.negamax::<BZ>(&child, -beta, -beta + 1, depth - 3, ply + 1, false);
                 if self.stop {
                     return 0;
                 }
@@ -859,7 +876,16 @@ impl<'a> Searcher<'a> {
                     _ => self.leaf_eval(b),
                 };
                 let static_eval = self.corrected(b, raw);
-                self.finish_node(b, alpha_orig, beta, static_eval, 0xFFFF, depth, ply, static_eval);
+                self.finish_node(
+                    b,
+                    alpha_orig,
+                    beta,
+                    static_eval,
+                    0xFFFF,
+                    depth,
+                    ply,
+                    static_eval,
+                );
                 return static_eval;
             }
         }
@@ -878,11 +904,16 @@ impl<'a> Searcher<'a> {
                     let child = b.make(m);
                     let add = if EVORD_CACHE {
                         let (k, v) = self.ecache[(child.hash as usize) & ((1 << ECACHE_BITS) - 1)];
-                        if k == child.hash && v != i32::MIN { (-v).saturating_sub(static_eval) } else { 0 }
+                        if k == child.hash && v != i32::MIN {
+                            (-v).saturating_sub(static_eval)
+                        } else {
+                            0
+                        }
                     } else {
                         -self.leaf_eval(&child)
                     };
-                    self.stack.lists[ply as usize].set_score(i, sc.saturating_add(add.saturating_mul(EVORD_W)));
+                    self.stack.lists[ply as usize]
+                        .set_score(i, sc.saturating_add(add.saturating_mul(EVORD_W)));
                 }
             }
         }
@@ -924,9 +955,17 @@ impl<'a> Searcher<'a> {
                         let hand = evaluate(&child, None, false);
                         let (bt, ct) = (b.turn as usize, child.turn as usize);
                         let sn = small_net();
-                        let pa = *sn_parent.get_or_insert_with(|| sn.acc(b.occ[bt], b.occ[1 - bt], b.blockers));
-                        let ca = sn.child_acc(&pa, b.occ[bt], b.occ[1 - bt], child.occ[ct], child.occ[1 - ct]);
-                        let lo = sn.bound_acc(&ca, child.empty().count_ones(), static_eval, hand) - FUT_SN_M;
+                        let pa = *sn_parent
+                            .get_or_insert_with(|| sn.acc(b.occ[bt], b.occ[1 - bt], b.blockers));
+                        let ca = sn.child_acc(
+                            &pa,
+                            b.occ[bt],
+                            b.occ[1 - bt],
+                            child.occ[ct],
+                            child.occ[1 - ct],
+                        );
+                        let lo = sn.bound_acc(&ca, child.empty().count_ones(), static_eval, hand)
+                            - FUT_SN_M;
                         if new_depth - (alpha.saturating_add(lo) / MB_FUT_DIV).clamp(0, 64) <= 0 {
                             move_idx += 1;
                             continue;
@@ -948,7 +987,14 @@ impl<'a> Searcher<'a> {
                 }
             } else {
                 self.stack.pre_eval[ply as usize + 1] = child_eval;
-                score = -self.negamax::<BZ>(&child, -alpha - 1, -alpha, (new_depth - 1) as u32, ply + 1, true);
+                score = -self.negamax::<BZ>(
+                    &child,
+                    -alpha - 1,
+                    -alpha,
+                    (new_depth - 1) as u32,
+                    ply + 1,
+                    true,
+                );
                 if self.stop {
                     return 0;
                 }
@@ -979,7 +1025,11 @@ impl<'a> Searcher<'a> {
             }
         }
         if best > alpha_orig && best_mv != 0xFFFF {
-            self.hist_add(b.turn as usize, Move::from_u32(best_mv), HIST_SCALE * (depth * depth) as i32);
+            self.hist_add(
+                b.turn as usize,
+                Move::from_u32(best_mv),
+                HIST_SCALE * (depth * depth) as i32,
+            );
         }
         self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply, raw);
         best
@@ -1099,8 +1149,7 @@ impl<'a> Searcher<'a> {
                 result.score = bz_terminal_score(b, 0);
             } else if !b.game_over() {
                 // Pass node: give the caller a meaningful score through the pass.
-                result.score =
-                    -self.negamax::<BZ>(&b.make_pass(), -INF, INF, 1, 1, true);
+                result.score = -self.negamax::<BZ>(&b.make_pass(), -INF, INF, 1, 1, true);
             }
             result.elapsed = self.elapsed();
             result.nodes = self.nodes;
@@ -1143,7 +1192,8 @@ impl<'a> Searcher<'a> {
                     let (a, z) = self.stack.acc.split_at_mut(1);
                     net.update_child(&a[0], &mut z[0], b, &child);
                 }
-                let score = -self.negamax::<BZ>(&child, -INF, -alpha, depth - 1, 1, true);
+                let score =
+                    -self.negamax::<BZ>(&child, -INF, -alpha, u32::from(depth - 1), 1, true);
                 if self.stop {
                     break;
                 }
@@ -1163,7 +1213,7 @@ impl<'a> Searcher<'a> {
                 if best_score != i32::MIN {
                     result.score = best_score;
                 }
-                result.depth = depth;
+                result.depth = u32::from(depth);
                 // Move best move to the front for the next iteration.
                 if !self.stop {
                     if let Some(pos) = (0..n_root).find(|&i| root_moves[i] == m) {
@@ -1192,7 +1242,7 @@ impl<'a> Searcher<'a> {
 
         if self.stop {
             result.stopped_by = Some(self.stop_reason);
-        } else if result.depth >= limits.max_depth {
+        } else if result.depth >= u32::from(limits.max_depth) {
             result.stopped_by = Some(StopReason::Completed);
         } else {
             result.stopped_by = Some(self.stop_reason);
@@ -1215,7 +1265,7 @@ impl<'a> Searcher<'a> {
 
 /// One-shot convenience: best move for `board` under `limits`.
 pub fn best_move(b: &Board, limits: &SearchLimits) -> SearchResult {
-    Searcher::new().search(b, limits)
+    Searcher::with_main_network().search(b, limits)
 }
 
 #[cfg(test)]
@@ -1223,7 +1273,7 @@ mod tests {
     use super::*;
     use crate::board::Board;
 
-    fn no_time(depth: u32) -> SearchLimits {
+    fn no_time(depth: u8) -> SearchLimits {
         SearchLimits {
             time: None,
             max_nodes: None,
@@ -1325,10 +1375,16 @@ mod tests {
     #[test]
     fn bz_full_board_is_instant_terminal() {
         let rows: Vec<String> = (0..7)
-            .map(|r| (0..7).map(|f| if (r + f) % 2 == 0 { 'x' } else { 'o' }).collect())
+            .map(|r| {
+                (0..7)
+                    .map(|f| if (r + f) % 2 == 0 { 'x' } else { 'o' })
+                    .collect()
+            })
             .collect();
-        let s = rows.join("
-") + " b";
+        let s = rows.join(
+            "
+",
+        ) + " b";
         let b = Board::from_str(&s).unwrap();
         assert_eq!(b.counts(), (25, 24));
         assert!(b.bz_over());
@@ -1385,7 +1441,11 @@ xxx....
     fn bz_rules_still_terminates_from_start() {
         let b = Board::botzone_start();
         assert_eq!(b.counts(), (2, 2));
-        assert_eq!(b.legal_moves().len(), 16 * 1 + 0, "2 stones x (3 clones + 5 jumps)");
+        assert_eq!(
+            b.legal_moves().len(),
+            16 * 1 + 0,
+            "2 stones x (3 clones + 5 jumps)"
+        );
         let mut se = Searcher::with_tt_bits(16);
         let r = se.search_bz(&b, &no_time(4));
         assert!(r.best.is_some());

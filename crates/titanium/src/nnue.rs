@@ -12,6 +12,9 @@
 use crate::board::Board;
 use crate::nnfeat::{self, MAX_ACTIVE};
 
+/// The main branch's strongest big NNUE. It is compiled into every native and Botzone build.
+pub const BUNDLED_NNUE: &[u8] = include_bytes!("../../../data/nnue/nnue_main.tnn");
+
 /// exp/nnue-fast: the feature transformer runs in int16 with weights and bias scaled by QA (measured on the ep4 net:
 /// |w| <= 1.05, |acc| <= 11.4 over 40k val perspectives -> max ~11.7k of i16 32767). Plain integer loops: the compiler
 /// vectorises them with AVX2 under x86-64-v3 and with SSE2 on a baseline x86-64 build (no intrinsics, no CPU
@@ -54,13 +57,29 @@ pub struct Nnue {
 impl Nnue {
     pub fn load(path: &str) -> std::io::Result<Nnue> {
         let d = std::fs::read(path)?;
-        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{path}: {m}"));
+        Self::parse(&d).map_err(|e| std::io::Error::new(e.kind(), format!("{path}: {e}")))
+    }
+
+    /// Load the strongest network tracked by this engine revision.
+    pub fn bundled() -> Nnue {
+        Self::parse(BUNDLED_NNUE).expect("the bundled main NNUE is malformed")
+    }
+
+    /// Shared production instance for one-shot engine APIs.
+    pub fn bundled_static() -> &'static Nnue {
+        static NET: std::sync::OnceLock<Nnue> = std::sync::OnceLock::new();
+        NET.get_or_init(Self::bundled)
+    }
+
+    fn parse(d: &[u8]) -> std::io::Result<Nnue> {
+        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
         let v2 = d.len() >= 4 && &d[..4] == b"TNN2";
         if d.len() < 28 || (&d[..4] != b"TNN1" && !v2) {
             return Err(bad("not a TNN1/TNN2 file"));
         }
         let u = |i: usize| u32::from_le_bytes(d[4 + 4 * i..8 + 4 * i].try_into().unwrap()) as usize;
-        let (num_feats, width, l1, l2, buckets, groups) = (u(0), u(1), u(2), u(3), u(4), u(5) as u32);
+        let (num_feats, width, l1, l2, buckets, groups) =
+            (u(0), u(1), u(2), u(3), u(4), u(5) as u32);
         let pairwise = v2 && u(6) != 0;
         if num_feats != nnfeat::NUM_FEATS {
             return Err(bad("feature count differs from this engine's nnfeat"));
@@ -72,7 +91,10 @@ impl Nnue {
         let out_in = if v2 { l1 + l2 } else { l2 };
         let mut p = if v2 { 32 } else { 28 };
         let mut take = |n: usize| -> Vec<f32> {
-            let v = d[p..p + 4 * n].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+            let v = d[p..p + 4 * n]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
             p += 4 * n;
             v
         };
@@ -109,11 +131,29 @@ impl Nnue {
         }
         let q = |x: &f32| -> Option<i16> {
             let v = (x * QA as f32).round();
-            if v.abs() < 32767.0 { Some(v as i16) } else { None }
+            if v.abs() < 32767.0 {
+                Some(v as i16)
+            } else {
+                None
+            }
         };
-        net.ftq = net.ft.iter().map(q).collect::<Option<Vec<_>>>().ok_or_else(|| bad("ft weight overflows int16 at QA"))?;
-        net.ftbq = net.ftb.iter().map(q).collect::<Option<Vec<_>>>().ok_or_else(|| bad("ft bias overflows int16 at QA"))?;
-        let din = if net.pairwise { net.width } else { 2 * net.width };
+        net.ftq = net
+            .ft
+            .iter()
+            .map(q)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| bad("ft weight overflows int16 at QA"))?;
+        net.ftbq = net
+            .ftb
+            .iter()
+            .map(q)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| bad("ft bias overflows int16 at QA"))?;
+        let din = if net.pairwise {
+            net.width
+        } else {
+            2 * net.width
+        };
         let mut t = vec![0f32; net.buckets * din * net.l1];
         for bk in 0..net.buckets {
             for j in 0..net.l1 {
@@ -176,10 +216,14 @@ impl Nnue {
             a.copy_from_slice(&self.ftbq);
             let idx = &idx[..n];
             for k in 0..n {
-                if k + PF < n { self.prefetch_row(idx[k + PF] as usize); }
+                if k + PF < n {
+                    self.prefetch_row(idx[k + PF] as usize);
+                }
                 let f = idx[k] as usize;
                 let row = &self.ftq[f * w..(f + 1) * w];
-                for (x, r) in a.iter_mut().zip(row) { *x = x.wrapping_add(*r); }
+                for (x, r) in a.iter_mut().zip(row) {
+                    *x = x.wrapping_add(*r);
+                }
                 ps[half] += pst[f];
             }
         }
@@ -195,7 +239,11 @@ impl Nnue {
             let mut o = 0;
             while o < bytes {
                 // SAFETY: prefetch is a hint; it never faults, even on an out-of-range address.
-                unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(base.wrapping_add(o)) };
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                        base.wrapping_add(o),
+                    )
+                };
                 o += 64;
             }
         }
@@ -348,12 +396,16 @@ impl Nnue {
     }
 
     pub fn eval(&self, b: &Board, s57_cp: i32) -> i32 {
-        (400.0 * self.forward(b, s57_cp as f32 / 400.0)).round().clamp(-30000.0, 30000.0) as i32
+        (400.0 * self.forward(b, s57_cp as f32 / 400.0))
+            .round()
+            .clamp(-30000.0, 30000.0) as i32
     }
 
     /// Reference eval through `forward_f32` (training parity).
     pub fn eval_f32(&self, b: &Board, s57_cp: i32) -> i32 {
-        (400.0 * self.forward_f32(b, s57_cp as f32 / 400.0)).round().clamp(-30000.0, 30000.0) as i32
+        (400.0 * self.forward_f32(b, s57_cp as f32 / 400.0))
+            .round()
+            .clamp(-30000.0, 30000.0) as i32
     }
 }
 
