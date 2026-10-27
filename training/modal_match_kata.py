@@ -159,15 +159,12 @@ def run_game_logic(args):
         except queue.Empty:
             break
 
-    # Start KataAtaxx with CUDA on GPU
-    # Check model: use transformer ONNX or b18
-    model_path = "/eng/models/kata_transformer.onnx"
-    if not os.path.exists(model_path):
-        model_path = "/eng/models/b18.bin.gz"
+    # Start KataAtaxx with CUDA on GPU using b18.bin.gz (native CUDA model)
+    model_path = "/eng/models/b18.bin.gz"
 
     kata_proc = subprocess.Popen(
         ["/eng/KataGomo/cpp/build/katago", "gtp", "-model", model_path, "-config", "/eng/models/engine.cfg"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1, encoding="utf-8", errors="replace"
     )
 
@@ -179,6 +176,9 @@ def run_game_logic(args):
     threading.Thread(target=kata_reader, daemon=True).start()
 
     def kata_cmd(cmd):
+        if kata_proc.poll() is not None:
+            err = kata_proc.stderr.read()
+            raise RuntimeError(f"KataGo died prematurely! Stderr: {err}")
         kata_proc.stdin.write(cmd + "\n")
         kata_proc.stdin.flush()
         out = []
@@ -189,6 +189,9 @@ def run_game_logic(args):
                 if line.startswith('=') or line.startswith('?'):
                     return out
             except queue.Empty:
+                if kata_proc.poll() is not None:
+                    err = kata_proc.stderr.read()
+                    raise RuntimeError(f"KataGo died waiting for response to {cmd}! Stderr: {err}")
                 return out
 
     # Init KataGo GTP
@@ -335,9 +338,13 @@ def run_game_logic(args):
     }
 
 
-@app.function(gpu="T4", timeout=600)
-def play_match_game(args):
-    return run_game_logic(args)
+@app.function(gpu="T4")
+def test_model():
+    import subprocess
+    cmd = ["/eng/KataGomo/cpp/build/katago", "gtp", "-model", "/eng/models/b18.bin.gz", "-config", "/eng/models/engine.cfg"]
+    p = subprocess.run(cmd, input="quit\n", capture_output=True, text=True)
+    return f"ReturnCode: {p.returncode}\nSTDOUT:\n{p.stdout}\nSTDERR:\n{p.stderr}"
+
 
 
 @app.local_entrypoint()
