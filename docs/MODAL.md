@@ -61,3 +61,13 @@ python -m modal run --detach training/modal_train.py --tag hpo_x --script optuna
 - Unicode console errors on Windows: set `PYTHONIOENCODING=utf-8`; Git Bash path mangling: `MSYS_NO_PATHCONV=1`.
 - `modal_train.py` uploads nothing big; if you see GB-scale uploads something is wrong.
 - Cost surprises come from forgotten `--detach` runs and from parallel runs (each container bills): count containers x hours x $1.2.
+
+## 6. Relabel benchmarks (2026-10-27)
+- `training/modal_relabel_probe.py` benchmarks `labelbin --nodes 5000 --network bundled` on Modal CPU
+- **2 cores:** 25 pos/s/core, ~85 MB RAM per core, 51 pos/s total
+- **4 cores:** 14 pos/s/core, ~85 MB RAM per core, 57 pos/s total — **Modal CPU degrades with more cores** (shared/throttled), don't add cores expecting linear scaling
+- Est. for 29M remaining positions at 2 cores: ~159 hours, ~$15 cost
+- Est. at 4 cores: ~142 hours, ~$27 cost (worse per-core, barely more total throughput)
+- Hard timeout: 4 hours per container — must shard work across containers or relaunch every 4h
+- Modal is **not ideal for CPU relabel** due to per-core degradation. Prefer Docker sandboxes (40 vCPU quota) or local PC for CPU work. Use Modal for GPU training or if Docker quota is exceeded.
+

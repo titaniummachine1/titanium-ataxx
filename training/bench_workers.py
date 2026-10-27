@@ -1,77 +1,123 @@
-import json
+#!/usr/bin/env python3
+"""Clean benchmark: runs N labelbin workers concurrently for fixed duration,
+measures pos/s/core to find optimal worker count."""
+import glob
+import msvcrt
 import os
 import subprocess
-import tempfile
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
-ROOT = r"C:\gitProjects\titanium-ataxx"
-BOARDS = os.path.join(ROOT, "data", "nnue", "lab12m", "boards_0.txt")
-ENGINE = r"C:\gitProjects\titanium-main\target\release\titanium-cli.exe"
-TUPLE = os.path.join(ROOT, "data", "nnue", "tupS55tree.tup")
-CHUNKS = 24
-CHUNK = 5000
+ROOT = os.path.dirname(os.path.abspath(__file__))
+D = os.path.join(os.path.dirname(ROOT), "data", "nnue", "relabel")
+BIN = D + "/dis_positions.bin"
+OUT = D + "/out_dis_bench"
+COUNTER = D + "/next_row_bench.txt"
+EXE = r"C:\gitProjects\main-ataxx\target\release\titanium-cli.exe"
 NODES = 5000
-OUT = os.path.join(ROOT, "data", "nnue", "lab12m_bench")
+CHUNK = 5000
 
 
-def run_one(lines, tag):
-    fd, inp = tempfile.mkstemp(prefix="bin_", dir=OUT)
-    fd2, outp = tempfile.mkstemp(prefix="bout_", dir=OUT)
-    os.close(fd)
-    os.close(fd2)
-    try:
-        with open(inp, "w", encoding="ascii") as f:
-            f.writelines(lines)
-        t0 = time.time()
-        with open(inp, "rb") as fin, open(outp, "wb") as fout:
-            p = subprocess.run(
-                [ENGINE, "label", "--nodes", str(NODES), "--tuple", TUPLE, "--tuple-native"],
-                stdin=fin, stdout=fout, stderr=subprocess.PIPE, timeout=1800,
-            )
-        if p.returncode != 0:
-            raise RuntimeError(p.stderr.decode("utf-8", "replace")[-300:])
-        with open(outp, "rb") as f:
-            got = sum(1 for _ in f)
-        if got != len(lines):
-            raise RuntimeError("rows %d != %d" % (got, len(lines)))
-        return tag, len(lines), time.time() - t0
-    finally:
-        for p in (inp, outp):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+def claim_next():
+    os.makedirs(os.path.dirname(COUNTER), exist_ok=True)
+    if not os.path.exists(COUNTER):
+        with open(COUNTER, "w") as f:
+            f.write("0")
+    total = os.path.getsize(BIN) // 25
+    with open(COUNTER, "r+b") as f:
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            f.seek(0)
+            raw = f.read().strip()
+            lo = int(raw) if raw else 0
+            if lo >= total:
+                return None
+            hi = min(lo + CHUNK, total)
+            f.seek(0)
+            f.truncate()
+            f.write(str(hi).encode())
+            return lo, hi
+        finally:
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
 
 
-def main():
+def worker(wid, stop_time, result):
+    local_rows = 0
+    local_chunks = 0
+    while time.time() < stop_time:
+        rng = claim_next()
+        if rng is None:
+            break
+        lo, hi = rng
+        out = f"{OUT}/c_{wid}_{lo:09d}.txt"
+        cmd = [EXE, "labelbin", "--bin", BIN, "--lo", str(lo), "--hi", str(hi),
+               "--nodes", str(NODES), "--tuple", "none", "--network", "bundled",
+               "--threads", "1"]
+        tmp = out + ".tmp"
+        # create empty tmp file, then close handle before subprocess uses it
+        with open(tmp, "wb") as _f:
+            pass
+        with open(tmp, "wb") as of:
+            p = subprocess.Popen(cmd, stdout=of, stderr=subprocess.PIPE, text=True)
+            _, err = p.communicate()
+        if p.returncode == 0:
+            os.replace(tmp, out)
+            local_rows += hi - lo
+            local_chunks += 1
+        else:
+            print(f"worker {wid}: chunk {lo}..{hi} FAILED rc={p.returncode}", flush=True)
+            with open(COUNTER, "r+b") as f:
+                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    f.seek(0)
+                    cur = int(f.read().strip() or "0")
+                    f.seek(0)
+                    f.truncate()
+                    f.write(str(max(lo, cur - (hi - lo))).encode())
+                finally:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    result["rows"] = local_rows
+    result["chunks"] = local_chunks
+
+
+def run_benchmark(workers, duration):
     os.makedirs(OUT, exist_ok=True)
-    with open(BOARDS, "r", encoding="ascii") as f:
-        all_lines = [f.readline() for _ in range(CHUNKS * CHUNK)]
-    jobs = []
-    for i in range(CHUNKS):
-        lines = all_lines[i * CHUNK:(i + 1) * CHUNK]
-        jobs.append((i, lines))
+    # clean old bench files
+    for f in glob.glob(OUT + "/c_*.txt") + glob.glob(OUT + "/c_*.tmp"):
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+    if os.path.exists(COUNTER):
+        os.remove(COUNTER)
     results = {}
-    for workers in (8, 12, 16, 20, 24):
-        t0 = time.time()
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [ex.submit(run_one, lines, i) for i, lines in jobs]
-            for fut in futs:
-                fut.result()
-        elapsed = time.time() - t0
-        rows = CHUNKS * CHUNK
-        results[workers] = {
-            "rows": rows,
-            "elapsed_s": round(elapsed, 1),
-            "rows_per_s": round(rows / elapsed, 1),
-        }
-        print(json.dumps(results[workers]), flush=True)
-    best = max(results.items(), key=lambda kv: kv[1]["rows_per_s"])
-    print("BEST", best[0], json.dumps(best[1]), flush=True)
-    with open(os.path.join(OUT, "bench.json"), "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
+    stop_time = time.time() + duration
+    threads = []
+    for w in range(workers):
+        t = threading.Thread(target=worker, args=(w, stop_time, results))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    total_rows = sum(r.get("rows", 0) for r in results.values())
+    total_chunks = sum(r.get("chunks", 0) for r in results.values())
+    elapsed = duration
+    pos_per_sec = total_rows / elapsed if elapsed > 0 else 0
+    pos_per_sec_per_core = pos_per_sec / workers if workers > 0 else 0
+    print(f"\n{'='*50}")
+    print(f"WORKERS: {workers}, DURATION: {duration}s")
+    print(f"Total rows: {total_rows:,} ({total_chunks} chunks)")
+    print(f"POS/SEC total: {pos_per_sec:.0f}")
+    print(f"POS/SEC/core:  {pos_per_sec_per_core:.0f}")
+    print(f"{'='*50}\n")
+    return pos_per_sec, pos_per_sec_per_core
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    import glob as _glob
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--duration", type=int, default=60)
+    a = ap.parse_args()
+    run_benchmark(a.workers, a.duration)
