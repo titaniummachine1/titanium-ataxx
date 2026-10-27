@@ -70,16 +70,17 @@ tr:hover { background: #162029; }
 </div>
 
 <div class="section">
-  <b>Disagreement Band</b> — queue sorted highest→lowest |static_eval − 5k_search_score|
+  <b>Disagreement Band &amp; Queue Coverage</b> — queue sorted highest→lowest |static_eval − 5k_search_score|
   <div class="band-bar" id="bandBar">
-    <div class="segment" style="left:0%;width:2%;background:#ff3333;"></div>
-    <div class="segment" style="left:2%;width:8%;background:#ff7733;"></div>
-    <div class="segment" style="left:10%;width:15%;background:#ffbb33;"></div>
-    <div class="segment" style="left:25%;width:25%;background:#bbdd44;"></div>
-    <div class="segment" style="left:50%;width:25%;background:#55bb66;"></div>
-    <div class="segment" style="left:75%;width:15%;background:#4488aa;"></div>
-    <div class="segment" style="left:90%;width:10%;background:#336688;"></div>
-    <div class="marker" id="bandMarker" style="left:0%;"></div>
+    <div class="segment" style="left:0%;width:2%;background:#ff3333;" title="Top 2% (>500 cp)"></div>
+    <div class="segment" style="left:2%;width:8%;background:#ff7733;" title="2-10% (250-500 cp)"></div>
+    <div class="segment" style="left:10%;width:15%;background:#ffbb33;" title="10-25% (150-250 cp)"></div>
+    <div class="segment" style="left:25%;width:25%;background:#bbdd44;" title="25-50% (80-150 cp)"></div>
+    <div class="segment" style="left:50%;width:25%;background:#55bb66;" title="50-75% (35-80 cp)"></div>
+    <div class="segment" style="left:75%;width:15%;background:#4488aa;" title="75-90% (14-35 cp)"></div>
+    <div class="segment" style="left:90%;width:10%;background:#336688;" title="Tail (<14 cp)"></div>
+    <div id="coverageRanges"></div>
+    <div class="marker" id="bandMarker" style="left:0%;" title="PC Head Frontier"></div>
   </div>
   <div class="band-labels">
     <span>TOP 2% (500–2400 cp)</span>
@@ -89,15 +90,15 @@ tr:hover { background: #162029; }
     <span>50–75% (35–80 cp)</span>
     <span>TAIL (&lt;35 cp)</span>
   </div>
-  <div>
+  <div style="margin-top:6px;">
     <span class="highlight" id="bandName">—</span>
     <span id="bandDetail" style="color:#a4b6c1;font-size:13px;margin-left:8px;">—</span>
   </div>
   <div class="small" style="margin-top:6px;">
-    PC Head Frontier: chunk <span class="highlight" id="frontierChunk">—</span> / <span id="totalChunks">—</span>
-    · row <span class="highlight" id="frontierRow">—</span> / <span id="frontierTotal">—</span>
-    (<span class="highlight" id="frontierPct">—</span>%)
-    · true queue |disagree| at frontier: <span class="highlight" id="frontierDis">—</span> cp
+    PC Head Frontier: chunk <span class="highlight" id="frontierChunk">—</span>
+    · row <span class="highlight" id="frontierRow">—</span> (<span class="highlight" id="frontierPct">—</span>%)
+    · |disagree|: <span class="highlight" id="frontierDis">—</span> cp
+    <span style="margin-left:14px;color:#a4b6c1;">Deepest Cloud Chunk: <span class="highlight" id="maxChunk">—</span> (<span id="maxPct">—</span>%, |disagree|: <span class="highlight" id="deepestDis">—</span> cp)</span>
   </div>
 </div>
 
@@ -163,18 +164,30 @@ async function tick() {
     const st = document.getElementById("engStatus");
     st.className = wc > 0 ? "status on" : "status off";
 
-    // Band
+    // Band & Coverage
     document.getElementById("bandName").textContent = d.band_name || "—";
     document.getElementById("bandDetail").textContent = d.band_detail || "";
     document.getElementById("frontierChunk").textContent = d.frontier_chunk >= 0 ? fmt(d.frontier_chunk) : "—";
-    document.getElementById("totalChunks").textContent = fmt(d.total_chunks || 0);
     document.getElementById("frontierRow").textContent = fmt(d.frontier_row || 0);
-    document.getElementById("frontierTotal").textContent = fmt(d.queue_total);
     document.getElementById("frontierPct").textContent = d.frontier_pct || "0";
     document.getElementById("frontierDis").textContent = d.frontier_dis || "—";
+    document.getElementById("maxChunk").textContent = d.max_chunk_reached ? fmt(d.max_chunk_reached) : "—";
+    document.getElementById("maxPct").textContent = d.max_pct_reached ? (d.max_pct_reached + "%") : "—";
+    document.getElementById("deepestDis").textContent = d.deepest_dis || "—";
 
     const markerPct = Math.min(d.frontier_pct || 0, 99.5);
     document.getElementById("bandMarker").style.left = markerPct + "%";
+
+    // Render completed ranges inside the band bar
+    const totalC = d.total_chunks || 6314;
+    const covDiv = document.getElementById("coverageRanges");
+    if (d.completed_ranges && d.completed_ranges.length) {
+      covDiv.innerHTML = d.completed_ranges.map(([s, e]) => {
+        const left = (s / totalC * 100).toFixed(2);
+        const width = Math.max(0.4, ((e - s + 1) / totalC * 100)).toFixed(2);
+        return `<div style="position:absolute;top:0;height:100%;left:${left}%;width:${width}%;background:#66fcf1;opacity:0.6;border:1px solid #fff;z-index:5;" title="Done: chunks ${s}..${e}"></div>`;
+      }).join("");
+    }
 
     // Dir breakdown
     const tbody = document.getElementById("dirRows");

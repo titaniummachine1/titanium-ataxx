@@ -264,41 +264,58 @@ def snapshot():
     pc_head_chunks = [i for i in active_chunk_indices if i < 1200]
     cloud_chunks = [i for i in active_chunk_indices if i >= 1200]
 
+    # Find all contiguous ranges of completed chunks
+    sorted_active = sorted(active_chunk_indices)
+    completed_ranges = []
+    if sorted_active:
+        s = e = sorted_active[0]
+        for x in sorted_active[1:]:
+            if x == e + 1:
+                e = x
+            else:
+                completed_ranges.append((s, e))
+                s = e = x
+        completed_ranges.append((s, e))
+
     frontier_chunk = max(pc_head_chunks) if pc_head_chunks else (max(active_chunk_indices) if active_chunk_indices else -1)
     frontier_row = (frontier_chunk + 1) * CHUNK if frontier_chunk >= 0 else 0
     frontier_pct = min(100.0, 100.0 * frontier_row / total_rows) if total_rows > 0 else 0.0
 
-    # True disagreement at frontier from dis_delta_queue.npy
+    # Max frontier reached across all pools (cloud/modal)
+    max_chunk_reached = max(sorted_active) if sorted_active else 0
+    max_row_reached = min(total_rows, (max_chunk_reached + 1) * CHUNK)
+    max_pct_reached = min(100.0, 100.0 * max_row_reached / total_rows) if total_rows > 0 else 0.0
+
+    # True disagreement at PC head frontier & overall deepest chunk from dis_delta_queue.npy
     frontier_dis = chunk_true_disagreement(frontier_chunk) or (latest[0][3] if latest else 0.0)
+    deepest_dis = chunk_true_disagreement(max_chunk_reached) or 0.0
 
     # Band based on true disagreement percentiles of dis_delta_queue.npy:
-    # 0-2%: >500 cp (HEAD), 2-10%: 250-500 cp (UPPER HEAD), 10-25%: 150-250 cp (UPPER MIDDLE),
-    # 25-50%: 80-150 cp (MIDDLE), 50-75%: 35-80 cp (LOWER MIDDLE), 75-90%: 14-35 cp (LOWER), 90-100%: <14 cp (TAIL)
     band_name = "not started"
     band_detail = ""
     if frontier_chunk >= 0:
         frac = frontier_row / max(1, total_rows)
         if frac < 0.02:
             band_name = "EXTREME HEAD (Top 2%)"
-            band_detail = f"wildest disagreement — static vs 5k gap ~500–2400 cp (now ~{frontier_dis:.0f} cp)"
+            band_detail = f"wildest disagreement — static vs 5k gap ~500–2400 cp (PC head: ~{frontier_dis:.0f} cp, Cloud deepest: ~{deepest_dis:.0f} cp)"
         elif frac < 0.10:
             band_name = "UPPER HEAD (Top 2–10%)"
-            band_detail = f"very high disagreement — gap ~250–500 cp (now ~{frontier_dis:.0f} cp)"
+            band_detail = f"very high disagreement — gap ~250–500 cp (PC: ~{frontier_dis:.0f} cp, Cloud: ~{deepest_dis:.0f} cp)"
         elif frac < 0.25:
             band_name = "UPPER MIDDLE (10–25%)"
-            band_detail = f"high disagreement — gap ~150–250 cp (now ~{frontier_dis:.0f} cp)"
+            band_detail = f"high disagreement — gap ~150–250 cp (PC: ~{frontier_dis:.0f} cp, Cloud: ~{deepest_dis:.0f} cp)"
         elif frac < 0.50:
             band_name = "MIDDLE (25–50%)"
-            band_detail = f"moderate disagreement — gap ~80–150 cp (now ~{frontier_dis:.0f} cp)"
+            band_detail = f"moderate disagreement — gap ~80–150 cp"
         elif frac < 0.75:
             band_name = "LOWER MIDDLE (50–75%)"
-            band_detail = f"low disagreement — gap ~35–80 cp (now ~{frontier_dis:.0f} cp)"
+            band_detail = f"low disagreement — gap ~35–80 cp"
         elif frac < 0.90:
             band_name = "LOWER (75–90%)"
-            band_detail = f"minor disagreement — gap ~14–35 cp (now ~{frontier_dis:.0f} cp)"
+            band_detail = f"minor disagreement — gap ~14–35 cp"
         else:
             band_name = "TAIL (90–100%)"
-            band_detail = f"near-agreement — static eval already within ~{frontier_dis:.0f} cp of search"
+            band_detail = f"near-agreement — static eval already close to search"
 
     # Speed calculation: combine rolling window with sustained run rate so it never reads 0 between chunk completions
     now = time.time()
@@ -362,6 +379,11 @@ def snapshot():
         "frontier_row": frontier_row,
         "frontier_pct": round(frontier_pct, 2),
         "frontier_dis": round(frontier_dis, 1),
+        "max_chunk_reached": max_chunk_reached,
+        "max_row_reached": max_row_reached,
+        "max_pct_reached": round(max_pct_reached, 2),
+        "deepest_dis": round(deepest_dis, 1),
+        "completed_ranges": completed_ranges,
         "pc_chunks_done": len(pc_head_chunks),
         "cloud_chunks_done": len(cloud_chunks),
         "total_chunks": total_chunks,
