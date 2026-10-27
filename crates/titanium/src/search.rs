@@ -33,6 +33,11 @@ struct MoveStack {
     /// exp/search-moonbird: static eval the parent already computed for the child at this ply (futility
     /// reduction), consumed at the child's entry so the eval is not paid twice. i32::MIN = none.
     pre_eval: Box<[i32; MAX_PLY]>,
+    /// Zobrist hash at each ply along the active search path for circular-move / repetition pruning.
+    path_hash: Box<[u64; MAX_PLY]>,
+    /// Lowest ply index since the most recent irreversible (clone) move; positions before this index
+    /// have strictly fewer total stones on the board and can never be repeated.
+    rep_base: Box<[u32; MAX_PLY]>,
 }
 
 impl MoveStack {
@@ -41,6 +46,8 @@ impl MoveStack {
             lists: Box::new([MoveList::new(); MAX_PLY]),
             acc: Box::new([[[0; 64]; 2]; MAX_PLY]),
             pre_eval: Box::new([i32::MIN; MAX_PLY]),
+            path_hash: Box::new([0u64; MAX_PLY]),
+            rep_base: Box::new([0u32; MAX_PLY]),
         }
     }
 }
@@ -775,8 +782,9 @@ impl<'a> Searcher<'a> {
         // Build-time rules selection (const generic: the dead branch is
         // compiled out, zero hot-path cost either way).
         if BZ {
-            // No passes on-platform: stm stuck (or wipeout/full) ends the game.
-            if b.is_over() || !b.has_moves(b.turn) {
+            // Botzone judge checks both sides after every move (!blackHasMove || !whiteHasMove):
+            // if either side has no legal moves, or wipeout/full, the game ends immediately.
+            if b.bz_over() {
                 return bz_terminal_score(b, ply);
             }
         } else if b.game_over() {
@@ -871,6 +879,8 @@ impl<'a> Searcher<'a> {
                 && (b.piece_cnt[0] as u32 + b.piece_cnt[1] as u32) * 50 < 26 * SQUARES as u32
             {
                 let child = b.make_pass();
+                self.stack.path_hash[ply as usize + 1] = child.hash;
+                self.stack.rep_base[ply as usize + 1] = self.stack.rep_base[ply as usize];
                 // NMP pass flips stm: sancta acc is color-relative so it
                 // stays valid — just forward the other perspective.
                 // (pass: no stones change, no diff update needed.)
@@ -949,6 +959,7 @@ impl<'a> Searcher<'a> {
         let mut best = i32::MIN;
         let mut best_mv: u32 = 0xFFFF;
         let mut move_idx = 0usize;
+        let mut rep_skipped = false;
         // futility small net: the parent's accumulator, built at the first child that needs it (D110)
         let mut sn_parent: Option<[f32; 64]> = None;
         let mut lmr_cnt = 0i32;
@@ -965,6 +976,32 @@ impl<'a> Searcher<'a> {
             // first is reduced by how far its child's STATIC eval falls short of alpha, and a move reduced to depth
             // <= 0 is not searched at all. First move: full window, full depth (always searched, so best is set).
             let child = b.make(m);
+            if m.is_clone() {
+                self.stack.path_hash[ply as usize + 1] = child.hash;
+                self.stack.rep_base[ply as usize + 1] = ply + 1;
+            } else {
+                let base = self.stack.rep_base[ply as usize] as usize;
+                let mut is_rep = false;
+                if (ply as usize) >= base + 1 {
+                    let mut i = ply as usize - 1;
+                    loop {
+                        if self.stack.path_hash[i] == child.hash {
+                            is_rep = true;
+                            break;
+                        }
+                        if i < base + 2 {
+                            break;
+                        }
+                        i -= 2;
+                    }
+                }
+                if is_rep {
+                    rep_skipped = true;
+                    continue;
+                }
+                self.stack.path_hash[ply as usize + 1] = child.hash;
+                self.stack.rep_base[ply as usize + 1] = base as u32;
+            }
             if let Some(net) = self.sancta {
                 let (a, z) = self.stack.acc.split_at_mut(ply as usize + 1);
                 net.update_child(&a[ply as usize], &mut z[0], b, &child);
@@ -1065,6 +1102,10 @@ impl<'a> Searcher<'a> {
                 }
             }
         }
+        if best == i32::MIN {
+            // Every legal move from this node repeated an ancestor position (CIRCULAR_MOVE forfeit).
+            return -MATE + ply as i32;
+        }
         if best > alpha_orig && best_mv != 0xFFFF {
             self.hist_add(
                 b.turn as usize,
@@ -1072,7 +1113,9 @@ impl<'a> Searcher<'a> {
                 HIST_SCALE * (depth * depth) as i32,
             );
         }
-        self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply, raw);
+        if !rep_skipped {
+            self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply, raw);
+        }
         best
     }
 
@@ -1256,9 +1299,13 @@ impl<'a> Searcher<'a> {
             // Clean-main ID: FULL window every iteration. No aspiration.
             // (Aspiration reverted: narrowed windows changed PVS cutoffs at
             // fixed node budgets -> bench d8 9.4k=>17k, QB5k 45-53-2.-28.)
+            self.stack.path_hash[0] = b.hash;
+            self.stack.rep_base[0] = 0;
             for i in 0..n_root {
                 let m = root_moves[i];
                 let child = b.make(m);
+                self.stack.path_hash[1] = child.hash;
+                self.stack.rep_base[1] = if m.is_clone() { 1 } else { 0 };
                 // Root children: acc[1] = acc[0] + diffs (sancta lazy path).
                 if let Some(net) = self.sancta {
                     let (a, z) = self.stack.acc.split_at_mut(1);
@@ -1615,5 +1662,24 @@ xxx....
         assert!(!mv.is_clone(), "black must jump c7->a7 to delay loss to 2 plies instead of cloning (1 ply), got {mv:?}");
         assert_eq!(r.score, -MATE + 2, "longest delay is 2 plies (-MATE + 2), got {}", r.score);
         assert!(r.depth <= 3, "exhausted terminal tree must stop without spinning to 255, got depth {}", r.depth);
+    }
+
+    #[test]
+    fn in_tree_circular_repetition_is_pruned() {
+        // Two stones separated by blockers so no captures or immediate wipeouts occur.
+        // Jump moves can shuffle, but in-tree circular repetitions are pruned so search completes cleanly.
+        let board = "x.##.o.
+                     .......
+                     .......
+                     .......
+                     .......
+                     .......
+                     ....... b";
+        let b = Board::from_str(board).unwrap();
+        let mut se = Searcher::with_tt_bits(16);
+        let r = se.search_bz(&b, &no_time(6));
+        assert!(r.best.is_some());
+        assert_eq!(r.depth, 6);
+        assert_eq!(r.stopped_by, Some(StopReason::Completed));
     }
 }
