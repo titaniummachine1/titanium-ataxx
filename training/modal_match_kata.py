@@ -341,7 +341,7 @@ def play_match_game(args):
 
 
 @app.local_entrypoint()
-def main(games: int = 200, ms: int = 1000, early_exit_batch: int = 20):
+def main(games: int = 200, ms: int = 1000, early_exit_batch: int = 10):
     import json
     book_path = os.path.join(ROOT, "data", "nnue", "book50k.txt")
     book = [l.strip() for l in open(book_path) if l.strip()]
@@ -350,7 +350,7 @@ def main(games: int = 200, ms: int = 1000, early_exit_batch: int = 20):
     tasks = [(i, black, ms, book[i]) for i in range(lines) for black in (True, False)]
 
     print(f"=== CLASH: Titanium vs KataAtaxx GPU (T4) ===")
-    print(f"Total Games: {len(tasks)} (ms={ms}, early_stop_batch={early_exit_batch})")
+    print(f"Total Games: {len(tasks)} (ms={ms}, early_stop_threshold={early_exit_batch})")
 
     out_jsonl = os.path.join(ROOT, "data", "nnue", "clash_positions_kata_200g.jsonl")
     log_file = os.path.join(ROOT, "logs", "clash_titanium_vs_kata_gpu.txt")
@@ -361,7 +361,6 @@ def main(games: int = 200, ms: int = 1000, early_exit_batch: int = 20):
     total_positions = 0
 
     with open(out_jsonl, "w", encoding="utf-8") as jf, open(log_file, "w", encoding="utf-8") as lf:
-        # Run in batches to check early-exit criteria
         batch_size = early_exit_batch
         for b_start in range(0, len(tasks), batch_size):
             b_tasks = tasks[b_start: b_start + batch_size]
@@ -397,11 +396,14 @@ def main(games: int = 200, ms: int = 1000, early_exit_batch: int = 20):
                 lf.write(line_str + "\n")
                 lf.flush()
 
-            # Early exit check after first batch
+                # Stop immediately if a wipeout is detected after >= 10 games
+                if total_played >= early_exit_batch and (wins == total_played or losses == total_played):
+                    print(f"\n[EARLY EXIT] WIPEOUT DETECTED: Score is {wins}-{losses} after {total_played} games! Stopping immediately to save compute.")
+                    lf.write(f"\n[EARLY EXIT] WIPEOUT DETECTED: Score is {wins}-{losses} after {total_played} games.\n")
+                    break
+
             total_played = wins + losses + draws
             if total_played >= early_exit_batch and (wins == total_played or losses == total_played):
-                print(f"\n[EARLY EXIT] Score is {wins}-{losses} after {total_played} games! Stopping match early per directive.")
-                lf.write(f"\n[EARLY EXIT] Score is {wins}-{losses} after {total_played} games.\n")
                 break
 
     pairs = [sum(v) / len(v) for v in scores.values() if len(v) == 2]
