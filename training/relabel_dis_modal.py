@@ -109,18 +109,36 @@ def read_chunk_bytes(chunk_idx, total_rows):
     return chunk_idx, data, want
 
 
+def find_first_unlabeled_head_chunk(out_dir, start_after=0):
+    """Find the lowest chunk index not yet completed in out_dir, starting at or above start_after."""
+    import glob
+    existing = set()
+    for f in glob.glob(os.path.join(out_dir, "c_*.txt")):
+        b = os.path.basename(f).split(".")[0].split("_")
+        if len(b) == 2 and b[1].isdigit():
+            existing.add(int(b[1]))
+    cur = max(0, start_after)
+    while cur in existing:
+        cur += 1
+    return cur
+
+
 def run_modal_relabel(budget_usd=10.0, start_chunk=None, max_chunks=None):
     manifest, out_dir = load_manifest()
     total_rows = os.path.getsize(BIN) // RECORD_BYTES
     n_chunks = (total_rows + CH - 1) // CH
 
-    # Check cloud counter if not specified
+    # If start_chunk is not explicitly given, start strictly from the HEAD:
+    # Read the PC local worker counter and give PC a 16-chunk headroom so they don't collide.
     if start_chunk is None:
+        pc_cur = 0
         try:
-            with open(os.path.join(D, "cloud_next_chunk.txt"), "r") as cf:
-                start_chunk = int(cf.read().strip())
+            with open(os.path.join(D, "next_chunk.txt"), "r") as pf:
+                pc_cur = int(pf.read().strip())
         except Exception:
-            start_chunk = 2600
+            pass
+        start_chunk = find_first_unlabeled_head_chunk(out_dir, start_after=pc_cur + 16)
+        print(f"Auto-selected head chunk {start_chunk} (PC counter={pc_cur}, headroom=16)", flush=True)
 
     # Modal chunk range: say 800 chunks = 4,000,000 positions
     # 4M positions @ ~25 pos/s/core / 8 cores ≈ 20 pos/s/vCPU = ~2.5 hrs on 16 vCPUs ≈ ~$2.50-$4.00
@@ -200,5 +218,7 @@ def main(budget: float = 8.0, start_chunk: int = None, max_chunks: int = None):
 
 
 if __name__ == "__main__":
-    b = float(sys.argv[1]) if len(sys.argv) > 1 else 8.0
-    run_modal_relabel(budget_usd=b)
+    budget = float(sys.argv[1]) if len(sys.argv) > 1 else 8.0
+    start = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    count = int(sys.argv[3]) if len(sys.argv) > 3 else None
+    run_modal_relabel(budget_usd=budget, start_chunk=start, max_chunks=count)
