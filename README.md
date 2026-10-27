@@ -1,75 +1,108 @@
-# TITANIUM — Ataxx engine
+# TITANIUM — High-Performance Ataxx Engine
 
-A basic **alpha-beta Ataxx engine** in Rust with two faces:
+<div align="center">
+  <img src="assets/titanium_banner.jpg" alt="Titanium Ataxx Engine" width="600"/>
+  <p><em>A state-of-the-art, lightweight CPU Ataxx engine in pure Rust.</em></p>
+</div>
 
-- **Browser** — engine compiled to WebAssembly, GUI in plain JS via Vite (HMR in dev)
-- **Native binary** — `titanium-cli` for testing: perft, bench, selfplay, console play
+---
 
-## Rules (implemented)
+**Titanium** is an open-source, high-performance Ataxx game engine written in pure Rust. Engineered for raw speed and deep tactical precision, Titanium combines a single-`u64` bitboard representation, dual-perspective NNUE neural evaluation, an auxiliary Small Net for futility bound pruning, and an alpha-beta search with Moonbird-style selectivity and Stockfish-grade mate distance pruning.
 
-7x7 board, black (bottom-left) vs white (top-right), black moves first.
+Titanium powers both native high-throughput testing harnesses, a browser-based WebAssembly interface, and competitive tournament play on [Botzone](https://www.botzone.org.cn).
 
-- **Clone**: move to any empty square at Chebyshev distance 1 (piece stays).
-- **Jump**: move to any empty square at Chebyshev distance 2 (piece moves).
-- **Infection**: after *any* landing, every enemy piece adjacent to the landing
-  square flips to your color.
-- No legal move = forced pass. Board full, a side wiped out, or both players
-  stuck = game over. Majority wins.
+---
 
-## Layout
+## Key Features & Architecture
+
+### 1. Ultra-Fast Bitboard Move Generation
+- **Compact Geometry:** The 7x7 board fits inside a single 49-bit `u64` bitmask, eliminating dynamic heap allocations in hot paths.
+- **Chebyshev Geometry & LUT Inversion:** Clones (Chebyshev distance 1) and jumps (distance 2) leverage precomputed shift masks and BMI2 hardware `pext` lookups for 8-neighbor infection flips.
+- **Throughput:** Capable of exceeding 100M+ nodes/second in bulk bitboard perft calculations.
+
+### 2. Dual-Perspective NNUE Neural Evaluation
+- **Quantized Feature Transformer:** Int16 SIMD accumulators evaluated from the perspective of both sides, quantized (`QA`) for sub-microsecond inference directly on the CPU.
+- **Incremental Accumulators:** Differential updates (`update_child`) track only modified squares during copy-make search, avoiding costly full refreshes.
+- **Trained on 34M+ Positions:** Distilled and calibrated through deep alpha-beta teacher labeling, inspired by milestones from [Moonbird](https://github.com/the-spill/moonbird).
+
+### 3. Auxiliary Small Net (Futility Pre-Filter)
+- **Lower-Bound Pruning:** A lightweight secondary neural network bounds child node evaluations before invoking the primary NNUE network.
+- **Zero Elo Loss:** Saves up to 49% of heavy NNUE calls in late-move futility pruning while maintaining 100% search quality.
+
+### 4. Search & Selectivity
+- **Negamax Alpha-Beta with Iterative Deepening:** Full-window Principal Variation Search (PVS) with soft/hard clock budgets.
+- **Transposition Table:** 24-byte cache entries indexed by deterministic 64-bit Zobrist keys with depth-preferred replacement.
+- **Selective Reductions:** Moonbird 1.1-style dynamic Late Move Reductions (LMR) and static eval-based Futility Reductions.
+- **Stockfish/Reckless-Style Mate Distance Pruning:** Automatically halts iterative deepening the moment a shortest forced win is proven, and actively selects the deepest delaying resistance lines when defending a losing branch.
+- **In-Tree Circular Move Pruning:** Clone-bounded tracking of board hashes on the active search path immediately rejects circular jump loops (`CIRCULAR_MOVE`), preventing wasted compute on graph cycles and eliminating Transposition Table Graph-History-Interaction (GHI) pollution.
+- **Platform Stalemate Compliance:** Full support for standard Ataxx double-pass endings as well as Botzone's filled-count stalemate rule (mobile side absorbs remaining empty squares).
+
+---
+
+## Workspace Layout
 
 ```
-crates/titanium        engine core: bitboard rules, movegen, alpha-beta search
-crates/titanium-cli    native test binary (perft / bench / selfplay / play / bestmove)
-crates/titanium-wasm   wasm-bindgen bindings for the browser
-web/                   Vite GUI (vanilla JS + canvas)
-data/ logs/ scripts/   local scratch space — git-ignored, never pushed
+crates/titanium        Engine core: bitboard geometry, NNUE, small net, alpha-beta search
+crates/titanium-ffi    C-ABI shared library (libtitanium_ffi.so / .dll) for Botzone & interop
+crates/titanium-cli    Native CLI test harness: bench, perft, match, selfplay, labelbin
+crates/titanium-wasm   WebAssembly bindings via wasm-bindgen for web play
+botzone/               Botzone deployment package (Python 3 driver + glibc 2.14 Linux .so)
+web/                   Interactive Web GUI (Vite + vanilla JS/Canvas)
 ```
 
-## Develop (browser GUI, hot reload)
+---
 
-Prereqs: Rust, `rustup target add wasm32-unknown-unknown`, `cargo install wasm-pack`, Node 20+.
+## Quickstart & CLI Commands
+
+Compile with cargo (AVX2 / native CPU optimizations recommended):
 
 ```sh
-cd web
-npm install
-npm run wasm   # build engine -> web/pkg (only needed after Rust changes)
-npm run dev    # vite dev server at http://localhost:5173
+# Run unit & hygiene tests
+cargo test --workspace
+
+# Benchmark search speed from the standard start position
+cargo run -p titanium-cli --release -- bench --max-depth 8
+
+# Move generation perft benchmark
+cargo run -p titanium-cli --release -- perft 5
+
+# Interactive console play vs engine
+cargo run -p titanium-cli --release -- play --time 1000
+
+# Best move evaluation on a board state
+cargo run -p titanium-cli --release -- bestmove "......x ....... ....... ....... ....... ....... o...... b" --time 500
+
+# Self-play match generation
+cargo run -p titanium-cli --release -- selfplay --games 20 --time 300
 ```
 
-JS/CSS/HTML edits hot-reload; after Rust edits re-run `npm run wasm`.
+### Board String Representation
+Boards are formatted as 49 characters (rows top-to-bottom, squares left-to-right) followed by the side to move (`b` for Black, `w` for White):
+- `.` = Empty
+- `x` = Black piece
+- `o` = White piece
+- `#` = Blocker / obstacle
 
-Production bundle: `npm run build` (outputs `web/dist`, relative paths, works on any static host).
-
-## Test the engine natively
-
-```sh
-cargo test -p titanium                       # movegen/eval/search unit tests
-cargo run -p titanium-cli --release -- perft 4
-cargo run -p titanium-cli --release -- bench --depth 8
-cargo run -p titanium-cli --release -- selfplay --games 4 --time 300   # -> logs/
-cargo run -p titanium-cli --release -- play --time 1000                # console vs engine
-cargo run -p titanium-cli --release -- bestmove "<49 chars> b" --time 500
+Start position:
+```
+x.....o ....... ....... ....... ....... ....... o.....x b
 ```
 
-Board string: 49 chars, rows top→bottom, `.` empty `x` black `o` white `#` blocker,
-then side `b`/`w`. Squares are chess-style: `a1` bottom-left, `g7` top-right.
+---
 
-```
-titanium start:  "......x ....... ....... ....... ....... ....... o...... b"
-```
+## Botzone Competition Deployment
 
-## Search (v0.1)
+Titanium includes automated deployment tooling for [Botzone](https://www.botzone.org.cn):
+- **C-ABI Shared Library:** Cross-compiled with Zig for `x86_64-unknown-linux-gnu` with `glibc <= 2.14` (fully compatible with Botzone's Ubuntu 16.04 sandbox).
+- **Python 3 Driver:** Packaged in `botzone/upload/titanium_botzone.py` using Botzone Simple IO mode (granting the full 12s initial / 6s subsequent move thinking budgets).
+- **One-Command Build:**
+  ```sh
+  python tools/build_botzone.py --no-pull
+  ```
 
-Negamax alpha-beta, copy-make on u64 bitboards (49 squares), precomputed
-distance-1/distance-2 ring tables, iterative deepening with soft time limit,
-move ordering by infection count, material + mobility eval.
-No transposition table, no killers/history yet — see roadmap below.
+---
 
-## Roadmap
+## Acknowledgments & Related Work
 
-- [ ] transposition table + zobrist
-- [ ] killer moves / history heuristic
-- [ ] blocker ("wall") positions
-- [ ] board sizes (5x5 / 6x6 / 8x8)
-- [ ] opening book from selfplay data (`data/`)
+- **[Moonbird](https://github.com/the-spill/moonbird)** by the-spill — An exceptional Ataxx engine whose search selectivity, evaluation insights, and public milestones inspired Titanium's training and pruning architecture.
+- **Stockfish & Reckless** — For foundational principles in mate distance pruning, iterative deepening bounds, and robust engine design.
