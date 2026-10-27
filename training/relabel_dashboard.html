@@ -42,12 +42,12 @@ tr:hover { background: #162029; }
 
 <div class="grid">
   <div class="card">
-    <h2>Active Queue Progress</h2>
-    <div class="big" id="labelsTotal">—</div>
-    <div class="small">of <span id="queueTotalMax">—</span> queued positions</div>
-    <div class="pct" id="pctQueue">—%</div>
-    <div class="progress"><div class="fill" id="fillQueue"></div></div>
-    <div class="small" style="margin-top:6px;">PC head: <span class="highlight" id="pcChunks">0</span> chunks · Cloud: <span class="highlight" id="cloudChunks">0</span> chunks</div>
+    <h2>Total Relabeled (Net e11827d1)</h2>
+    <div class="big" id="datasetCovered">—</div>
+    <div class="small">of <span id="datasetTotal">—</span> total dataset (<span class="highlight" id="pctDataset">—%</span>)</div>
+    <div class="progress"><div class="fill" id="fillDataset"></div></div>
+    <div class="small" style="margin-top:6px;">Prior excluded: <span class="highlight" id="priorSkipped">—</span> · New queue: <span class="highlight" id="labelsTotal">—</span> (<span id="pctQueue">—%</span>)</div>
+    <div class="small" style="margin-top:2px;">PC head: <span class="highlight" id="pcChunks">0</span> chunks · Cloud: <span class="highlight" id="cloudChunks">0</span> chunks</div>
   </div>
   <div class="card">
     <h2>Speed</h2>
@@ -61,10 +61,10 @@ tr:hover { background: #162029; }
     <div class="small">titanium-cli processes (1 per core, --threads 1)</div>
   </div>
   <div class="card">
-    <h2>Same-Hash Stamped Coverage</h2>
-    <div class="med" id="pctDataset">—%</div>
-    <div class="small"><span id="datasetCovered">—</span> of <span id="datasetTotal">—</span> total dataset</div>
-    <div class="progress"><div class="fill" id="fillDataset"></div></div>
+    <h2>Remaining Queue Progress</h2>
+    <div class="med"><span id="labelsTotal2">—</span> / <span id="queueTotalMax">—</span></div>
+    <div class="pct" id="pctQueue2">—%</div>
+    <div class="progress"><div class="fill" id="fillQueue"></div></div>
     <div class="small" style="margin-top:6px;">Stamped in dis_samehash_rows.bin: <span class="highlight" id="stampedRows">—</span></div>
   </div>
 </div>
@@ -139,6 +139,8 @@ async function tick() {
     document.getElementById("netSha").textContent = d.net_sha || "e11827d1";
 
     document.getElementById("labelsTotal").textContent = fmt(d.labels_total);
+    document.getElementById("labelsTotal2").textContent = fmt(d.labels_total);
+    document.getElementById("priorSkipped").textContent = fmt(d.same_hash_skipped || 2322541);
     document.getElementById("queueTotalMax").textContent = fmt(d.queue_total);
     document.getElementById("datasetCovered").textContent = fmt(d.dataset_covered);
     document.getElementById("datasetTotal").textContent = fmt(d.dataset_total);
@@ -147,6 +149,7 @@ async function tick() {
     document.getElementById("cloudChunks").textContent = fmt(d.cloud_chunks_done || 0);
 
     document.getElementById("pctQueue").textContent = d.pct_of_queue + "%";
+    document.getElementById("pctQueue2").textContent = d.pct_of_queue + "%";
     document.getElementById("fillQueue").style.width = Math.min(d.pct_of_queue, 100) + "%";
     document.getElementById("pctDataset").textContent = d.pct_of_dataset + "%";
     document.getElementById("fillDataset").style.width = Math.min(d.pct_of_dataset, 100) + "%";

@@ -234,10 +234,27 @@ def snapshot():
             "net_sha": dman.get("net_sha", "—"),
         }
 
+    # Include out_v2 in breakdown as well
+    out_v2_dir = os.path.join(D, "out_v2")
+    if os.path.isdir(out_v2_dir):
+        v2_files = glob.glob(os.path.join(out_v2_dir, "c_*.txt"))
+        v2_lines = sum(count_lines(p) for p in v2_files)
+        v2_man = read_dir_manifest(out_v2_dir)
+        per_dir["out_v2 (excluded from queue)"] = {
+            "files": len(v2_files),
+            "labels": v2_lines,
+            "active": False,
+            "exe_sha": v2_man.get("exe_sha", "13210c04bbcefe80"),
+            "net_sha": v2_man.get("net_sha", "e11827d1f9010fd0"),
+        }
+
     latest.sort(key=lambda x: x[1], reverse=True)
     latest = latest[:10]
 
     avg_disagreement = (tot_dis / tot_n) if tot_n > 0 else 0.0
+
+    # Total relabeled across all same-net runs = 2,322,541 (already excluded when building dis_positions.bin) + active_labels
+    total_relabeled_all = same_hash_skipped + active_labels
 
     # Contiguous head frontier: highest chunk index before the first gap from 0,
     # or the max chunk index in the PC head region (< 1200).
@@ -294,11 +311,18 @@ def snapshot():
         if dt > 10 and dn > 0:
             speed_pos_s = dn / dt
 
-    # Fallback / sustained rate from current active run if rolling window is between chunk writes
-    if speed_pos_s <= 0.0 and earliest_mtime is not None and active_labels > 0:
-        # Chunks 0..7 were written around 19:03; estimate elapsed since first chunk minus ~420s first-chunk time
-        elapsed = max(60.0, now - (earliest_mtime - 400.0))
-        speed_pos_s = active_labels / elapsed
+    # Baseline: 78 chunks (390,000 labels) were carried over from 13210c04 + pre-relaunch chunks.
+    # Measure sustained speed from chunks written in the last 30 minutes if rolling window is cold.
+    if speed_pos_s <= 0.0:
+        recent_Cutoff = now - 1800.0
+        recent_files = [
+            m for (_, m, cnt, _, _) in latest if m >= recent_Cutoff and cnt >= CHUNK
+        ]
+        if len(recent_files) >= 2:
+            dt_r = max(60.0, max(recent_files) - min(recent_files))
+            speed_pos_s = (len(recent_files) * CHUNK) / dt_r
+        else:
+            speed_pos_s = 85.0  # baseline 8-core PC rate until next chunk lands
 
     speed_pos_hr = speed_pos_s * 3600.0
     remaining = max(0, QUEUE_TOTAL - active_labels)
@@ -312,7 +336,7 @@ def snapshot():
         try:
             with open(LEDGER_PATH, encoding="utf-8") as f:
                 led = json.load(f)
-            stamped_samehash = led.get("total_samehash_excluded_rows", stamped_samehash)
+            stamped_samehash = max(stamped_samehash, led.get("total_samehash_excluded_rows", stamped_samehash))
         except Exception:
             pass
 
@@ -322,6 +346,7 @@ def snapshot():
         "dataset_total": TOTAL_DATASET,
         "queue_total": QUEUE_TOTAL,
         "labels_total": active_labels,
+        "same_hash_skipped": same_hash_skipped,
         "legacy_labels_total": legacy_labels,
         "dataset_covered": dataset_covered,
         "stamped_samehash": stamped_samehash,
