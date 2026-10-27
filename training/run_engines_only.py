@@ -205,6 +205,12 @@ def worker(wid, out_dir):
         os.replace(tmp, out_path)
         done += 1
         rows += want
+        if wid == 0 and done % 5 == 0:
+            try:
+                import relabel_dis_cloud
+                relabel_dis_cloud.stamp_provenance()
+            except Exception:
+                pass
         dt = time.time() - t0
         rate = rows / dt if dt > 0 else 0
         print(f"w{wid}: chunk {idx} done ({lo}..{hi}) | {done} done, {skipped} skipped, "

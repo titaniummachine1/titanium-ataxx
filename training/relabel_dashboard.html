@@ -9,7 +9,7 @@
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background: #0b0c10; color: #c5c6c7; padding: 24px; }
 h1 { font-size: 20px; margin-bottom: 4px; color: #66fcf1; }
 .sub { font-size: 13px; color: #888; margin-bottom: 20px; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 20px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 20px; }
 .card { background: #1f2833; border: 1px solid #45a29e; border-radius: 8px; padding: 14px 16px; }
 .card h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #45a29e; margin-bottom: 6px; }
 .card .big { font-size: 30px; font-weight: 700; color: #66fcf1; }
@@ -33,82 +33,86 @@ tr:hover { background: #162029; }
 .status.off { background: #553; }
 .refresh { font-size: 11px; color: #888; margin-top: 10px; text-align: right; }
 .highlight { color: #66fcf1; font-weight: 600; }
+.badge { display: inline-block; font-size: 10px; padding: 2px 6px; border-radius: 4px; background: #24323a; color: #66fcf1; margin-left: 6px; }
 </style>
 </head>
 <body>
 <h1>Titanium Ataxx — Relabel Progress</h1>
-<div class="sub">Auto-refreshes every 3 s · exe e3f8dc6e · net e11827d1 · 5k nodes/pos · disagreement-ranked queue (highest → lowest)</div>
+<div class="sub">Auto-refreshes every 3 s · exe <span id="exeSha">e3f8dc6e</span> · net <span id="netSha">e11827d1</span> · 5k nodes/pos · disagreement-ranked queue (highest → lowest)</div>
 
 <div class="grid">
   <div class="card">
-    <h2>Queue Progress</h2>
+    <h2>Active Queue Progress</h2>
     <div class="big" id="labelsTotal">—</div>
-    <div class="small">of <span id="queueTotalMax">—</span> positions</div>
+    <div class="small">of <span id="queueTotalMax">—</span> queued positions</div>
     <div class="pct" id="pctQueue">—%</div>
     <div class="progress"><div class="fill" id="fillQueue"></div></div>
+    <div class="small" style="margin-top:6px;">PC head: <span class="highlight" id="pcChunks">0</span> chunks · Cloud: <span class="highlight" id="cloudChunks">0</span> chunks</div>
   </div>
   <div class="card">
     <h2>Speed</h2>
-    <div class="big" id="speed">—</div>
-    <div class="small">positions / second</div>
-    <div class="small" id="eta">ETA: —</div>
+    <div class="big"><span id="speedHr">—</span> <span style="font-size:13px;font-weight:400;color:#a4b6c1;">pos/hr</span></div>
+    <div class="small" style="font-size:14px;color:#66fcf1;font-weight:600;margin-top:4px;"><span id="speedSec">—</span> pos/s</div>
+    <div class="small" id="eta" style="margin-top:4px;">ETA: —</div>
   </div>
   <div class="card">
-    <h2>Active Workers</h2>
+    <h2>Active Workers (PC)</h2>
     <div class="big"><span class="status" id="engStatus"></span><span id="workerCount">—</span></div>
     <div class="small">titanium-cli processes (1 per core, --threads 1)</div>
   </div>
   <div class="card">
-    <h2>Dataset Coverage</h2>
+    <h2>Same-Hash Stamped Coverage</h2>
     <div class="med" id="pctDataset">—%</div>
-    <div class="small"><span id="labelsTotal2">—</span> of <span id="datasetTotal">—</span> total</div>
+    <div class="small"><span id="datasetCovered">—</span> of <span id="datasetTotal">—</span> total dataset</div>
     <div class="progress"><div class="fill" id="fillDataset"></div></div>
+    <div class="small" style="margin-top:6px;">Stamped in dis_samehash_rows.bin: <span class="highlight" id="stampedRows">—</span></div>
   </div>
 </div>
 
 <div class="section">
-  <b>Disagreement Band</b> — queue sorted highest→lowest disagreement
+  <b>Disagreement Band</b> — queue sorted highest→lowest |static_eval − 5k_search_score|
   <div class="band-bar" id="bandBar">
-    <div class="segment" style="left:0%;width:5%;background:#ff4444;"></div>
-    <div class="segment" style="left:5%;width:10%;background:#ff8844;"></div>
-    <div class="segment" style="left:15%;width:15%;background:#ffbb44;"></div>
-    <div class="segment" style="left:30%;width:20%;background:#bbdd44;"></div>
-    <div class="segment" style="left:50%;width:20%;background:#66bb66;"></div>
-    <div class="segment" style="left:70%;width:20%;background:#4488aa;"></div>
+    <div class="segment" style="left:0%;width:2%;background:#ff3333;"></div>
+    <div class="segment" style="left:2%;width:8%;background:#ff7733;"></div>
+    <div class="segment" style="left:10%;width:15%;background:#ffbb33;"></div>
+    <div class="segment" style="left:25%;width:25%;background:#bbdd44;"></div>
+    <div class="segment" style="left:50%;width:25%;background:#55bb66;"></div>
+    <div class="segment" style="left:75%;width:15%;background:#4488aa;"></div>
     <div class="segment" style="left:90%;width:10%;background:#336688;"></div>
     <div class="marker" id="bandMarker" style="left:0%;"></div>
   </div>
   <div class="band-labels">
-    <span>HEAD (800–2000+ cp)</span>
-    <span>UPPER (400–900)</span>
-    <span>MIDDLE (80–250)</span>
-    <span>LOWER (10–40)</span>
-    <span>TAIL</span>
+    <span>TOP 2% (500–2400 cp)</span>
+    <span>2–10% (250–500 cp)</span>
+    <span>10–25% (150–250 cp)</span>
+    <span>25–50% (80–150 cp)</span>
+    <span>50–75% (35–80 cp)</span>
+    <span>TAIL (&lt;35 cp)</span>
   </div>
   <div>
     <span class="highlight" id="bandName">—</span>
     <span id="bandDetail" style="color:#a4b6c1;font-size:13px;margin-left:8px;">—</span>
   </div>
   <div class="small" style="margin-top:6px;">
-    Frontier: chunk <span class="highlight" id="frontierChunk">—</span> / <span id="totalChunks">—</span>
+    PC Head Frontier: chunk <span class="highlight" id="frontierChunk">—</span> / <span id="totalChunks">—</span>
     · row <span class="highlight" id="frontierRow">—</span> / <span id="frontierTotal">—</span>
     (<span class="highlight" id="frontierPct">—</span>%)
-    · avg |disagree| at frontier: <span class="highlight" id="frontierDis">—</span> cp
+    · true queue |disagree| at frontier: <span class="highlight" id="frontierDis">—</span> cp
   </div>
 </div>
 
 <div class="section">
-  <b>Per-run breakdown</b>
+  <b>Per-run breakdown &amp; Network Provenance</b>
   <table>
-    <thead><tr><th>Run dir</th><th>Chunk files</th><th>Labels</th></tr></thead>
+    <thead><tr><th>Run dir</th><th>Status</th><th>Exe SHA</th><th>Net SHA</th><th>Chunk files</th><th>Labels</th></tr></thead>
     <tbody id="dirRows"></tbody>
   </table>
 </div>
 
 <div class="section">
-  <b>Latest active slices</b> (most recently written)
+  <b>Latest active slices</b> (most recently written in active output_dir)
   <table>
-    <thead><tr><th>Slice</th><th>Lines</th><th>Avg |disagree| (cp)</th><th>Chunk #</th></tr></thead>
+    <thead><tr><th>Slice</th><th>Lines</th><th>True Queue |disagree| (cp)</th><th>Chunk #</th></tr></thead>
     <tbody id="sliceRows"></tbody>
   </table>
 </div>
@@ -116,7 +120,7 @@ tr:hover { background: #162029; }
 <div class="refresh" id="stamp">—</div>
 
 <script>
-function fmt(n) { return n.toLocaleString(); }
+function fmt(n) { return (n != null) ? n.toLocaleString() : "—"; }
 function fmtEta(h) {
   if (h == null || h <= 0) return "—";
   if (h < 1) return Math.round(h * 60) + " min";
@@ -131,16 +135,24 @@ async function tick() {
     const r = await fetch("/api/progress", { cache: "no-store" });
     const d = await r.json();
 
+    document.getElementById("exeSha").textContent = d.exe_sha || "e3f8dc6e";
+    document.getElementById("netSha").textContent = d.net_sha || "e11827d1";
+
     document.getElementById("labelsTotal").textContent = fmt(d.labels_total);
-    document.getElementById("labelsTotal2").textContent = fmt(d.labels_total);
     document.getElementById("queueTotalMax").textContent = fmt(d.queue_total);
+    document.getElementById("datasetCovered").textContent = fmt(d.dataset_covered);
     document.getElementById("datasetTotal").textContent = fmt(d.dataset_total);
+    document.getElementById("stampedRows").textContent = fmt(d.stamped_samehash);
+    document.getElementById("pcChunks").textContent = fmt(d.pc_chunks_done || 0);
+    document.getElementById("cloudChunks").textContent = fmt(d.cloud_chunks_done || 0);
+
     document.getElementById("pctQueue").textContent = d.pct_of_queue + "%";
     document.getElementById("fillQueue").style.width = Math.min(d.pct_of_queue, 100) + "%";
     document.getElementById("pctDataset").textContent = d.pct_of_dataset + "%";
     document.getElementById("fillDataset").style.width = Math.min(d.pct_of_dataset, 100) + "%";
 
-    document.getElementById("speed").textContent = d.speed_pos_s > 0 ? d.speed_pos_s.toFixed(1) : "—";
+    document.getElementById("speedHr").textContent = d.speed_pos_hr > 0 ? fmt(d.speed_pos_hr) : "—";
+    document.getElementById("speedSec").textContent = d.speed_pos_s > 0 ? d.speed_pos_s.toFixed(1) : "—";
     document.getElementById("eta").textContent = "ETA: " + fmtEta(d.eta_hours);
 
     const wc = d.workers || 0;
@@ -158,14 +170,15 @@ async function tick() {
     document.getElementById("frontierPct").textContent = d.frontier_pct || "0";
     document.getElementById("frontierDis").textContent = d.frontier_dis || "—";
 
-    // Band marker position
     const markerPct = Math.min(d.frontier_pct || 0, 99.5);
     document.getElementById("bandMarker").style.left = markerPct + "%";
 
     // Dir breakdown
     const tbody = document.getElementById("dirRows");
-    tbody.innerHTML = Object.entries(d.dirs || {}).map(([k, v]) =>
-      `<tr><td>${k}</td><td>${v.files}</td><td>${fmt(v.labels)}</td></tr>`).join("");
+    tbody.innerHTML = Object.entries(d.dirs || {}).map(([k, v]) => {
+      const badge = v.active ? `<span class="badge">ACTIVE</span>` : `<span class="badge" style="color:#888;">LEGACY</span>`;
+      return `<tr><td>${k}</td><td>${badge}</td><td><code>${v.exe_sha || "—"}</code></td><td><code>${v.net_sha || "—"}</code></td><td>${fmt(v.files)}</td><td>${fmt(v.labels)}</td></tr>`;
+    }).join("");
 
     // Latest slices
     const stbody = document.getElementById("sliceRows");
