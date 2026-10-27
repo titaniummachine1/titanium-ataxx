@@ -83,23 +83,39 @@ tr:hover { background: #162029; }
     <div class="marker" id="bandMarker" style="left:0%;" title="PC Head Frontier"></div>
   </div>
   <div class="band-labels">
-    <span>TOP 2% (500–2400 cp)</span>
+    <span>HEAD (Top 2% · 500–2400 cp)</span>
     <span>2–10% (250–500 cp)</span>
     <span>10–25% (150–250 cp)</span>
     <span>25–50% (80–150 cp)</span>
     <span>50–75% (35–80 cp)</span>
     <span>TAIL (&lt;35 cp)</span>
   </div>
-  <div style="margin-top:6px;">
-    <span class="highlight" id="bandName">—</span>
-    <span id="bandDetail" style="color:#a4b6c1;font-size:13px;margin-left:8px;">—</span>
+  <div style="margin-top:8px;">
+    <span class="highlight" id="bandName" style="font-size:14px;">—</span>
   </div>
-  <div class="small" style="margin-top:6px;">
-    PC Head Frontier: chunk <span class="highlight" id="frontierChunk">—</span>
-    · row <span class="highlight" id="frontierRow">—</span> (<span class="highlight" id="frontierPct">—</span>%)
+  <div style="margin-top:4px;color:#a4b6c1;font-size:12px;" id="bandDetail">—</div>
+  <div class="small" style="margin-top:8px;line-height:1.6;">
+    <b style="color:#66fcf1;">Contiguous Solid Head:</b> chunk <span class="highlight" id="frontierChunk">—</span>
+    · row <span class="highlight" id="frontierRow">—</span> (<span class="highlight" id="frontierPct">—</span>% of queue)
     · |disagree|: <span class="highlight" id="frontierDis">—</span> cp
-    <span style="margin-left:14px;color:#a4b6c1;">Deepest Cloud Chunk: <span class="highlight" id="maxChunk">—</span> (<span id="maxPct">—</span>%, |disagree|: <span class="highlight" id="deepestDis">—</span> cp)</span>
+    <br/>
+    <b style="color:#45a29e;">Deepest Reached Reach:</b> chunk <span class="highlight" id="maxChunk">—</span>
+    · <span id="maxPct">—</span> towards tail
+    · |disagree|: <span class="highlight" id="deepestDis">—</span> cp
+    · <span style="color:#a4b6c1;">Remaining to Tail: <span class="highlight" id="tailDist">—</span>%</span>
   </div>
+</div>
+
+<div class="section">
+  <b>Fishnet Streaming Fleet</b> (central monotonic head-allocator &amp; prefetch lease status)
+  <div id="fishnetStatus" style="margin-top:6px;font-size:13px;color:#c5c6c7;">
+    <span>In-Flight Leased Chunks: <span class="highlight" id="inFlightCount">0</span></span>
+    <span style="margin-left:14px;">Active Streaming Nodes: <span class="highlight" id="activeNodesCount">0</span></span>
+  </div>
+  <table style="margin-top:8px;">
+    <thead><tr><th>Worker Node</th><th>Last Heartbeat</th><th>Chunks Completed</th><th>In-Flight Leases</th></tr></thead>
+    <tbody id="fishnetRows"><tr><td colspan="4" style="color:#888;">Fleet ready. Workers streaming from head...</td></tr></tbody>
+  </table>
 </div>
 
 <div class="section">
@@ -174,9 +190,27 @@ async function tick() {
     document.getElementById("maxChunk").textContent = d.max_chunk_reached ? fmt(d.max_chunk_reached) : "—";
     document.getElementById("maxPct").textContent = d.max_pct_reached ? (d.max_pct_reached + "%") : "—";
     document.getElementById("deepestDis").textContent = d.deepest_dis || "—";
+    document.getElementById("tailDist").textContent = d.tail_distance_pct != null ? d.tail_distance_pct : "—";
 
     const markerPct = Math.min(d.frontier_pct || 0, 99.5);
     document.getElementById("bandMarker").style.left = markerPct + "%";
+
+    // Fishnet Fleet Status
+    const fn = d.fishnet || {};
+    const workers = fn.active_workers || {};
+    document.getElementById("inFlightCount").textContent = fn.in_flight_count || 0;
+    const nodeKeys = Object.keys(workers);
+    document.getElementById("activeNodesCount").textContent = nodeKeys.length;
+    const fRows = document.getElementById("fishnetRows");
+    if (nodeKeys.length > 0) {
+      fRows.innerHTML = nodeKeys.map(k => {
+        const w = workers[k];
+        const chunks = (w.in_flight && w.in_flight.length > 0) ? w.in_flight.join(", ") : "idle/prefetching";
+        return `<tr><td><b>${k}</b></td><td>${w.last_seen_sec_ago}s ago</td><td>${fmt(w.chunks_done)}</td><td><code>${chunks}</code></td></tr>`;
+      }).join("");
+    } else {
+      fRows.innerHTML = `<tr><td colspan="4" style="color:#888;">Fleet ready. Dynamic workers streaming from queue head...</td></tr>`;
+    }
 
     // Render completed ranges inside the band bar
     const totalC = d.total_chunks || 6314;

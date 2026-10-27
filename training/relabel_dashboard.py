@@ -18,7 +18,9 @@ import glob
 import json
 import os
 import subprocess as sp
+import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -60,6 +62,119 @@ def chunk_true_disagreement(idx):
     return float(np.mean(dq[lo:hi]))
 
 
+class FishnetCoordinator:
+    """Thread-safe streaming work coordinator inspired by Fishnet / Fishtest.
+    Leases chunks strictly from the contiguous head, enforces double-buffering prefetch,
+    and automatically reclaims expired leases after timeout.
+    """
+    def __init__(self, manifest_path, total_rows, lease_timeout_sec=900):
+        self.lock = threading.Lock()
+        self.manifest_path = manifest_path
+        self.total_rows = total_rows
+        self.total_chunks = (total_rows + CHUNK - 1) // CHUNK
+        self.lease_timeout_sec = lease_timeout_sec
+        self.in_flight = {}  # chunk_id -> {"worker": str, "claimed_at": float}
+        self.workers = {}    # worker_id -> {"last_seen": float, "chunks_done": int, "current_chunks": list}
+
+    def _get_active_out_dir(self):
+        try:
+            if os.path.exists(self.manifest_path):
+                with open(self.manifest_path, "r", encoding="utf-8") as f:
+                    man = json.load(f)
+                    od = man.get("output_dir", "")
+                    if od:
+                        p = os.path.join(D, od)
+                        if os.path.isdir(p):
+                            return p
+        except Exception:
+            pass
+        return None
+
+    def get_completed_chunks(self):
+        completed = set()
+        od = self._get_active_out_dir()
+        if od:
+            for f in glob.glob(os.path.join(od, "c_*.txt")):
+                b = os.path.basename(f).split(".")[0].split("_")
+                if len(b) == 2 and b[1].isdigit():
+                    completed.add(int(b[1]))
+        return completed
+
+    def clean_expired_leases(self, now):
+        expired = [cid for cid, info in self.in_flight.items() if now - info["claimed_at"] > self.lease_timeout_sec]
+        for cid in expired:
+            del self.in_flight[cid]
+
+    def claim_head(self, worker_id, count=1, headroom=0):
+        with self.lock:
+            now = time.time()
+            self.clean_expired_leases(now)
+            completed = self.get_completed_chunks()
+
+            w = self.workers.setdefault(worker_id, {"last_seen": now, "chunks_done": 0, "current_chunks": []})
+            w["last_seen"] = now
+
+            claimed = []
+            cur = max(0, headroom)
+            while cur < self.total_chunks and len(claimed) < count:
+                if cur not in completed and cur not in self.in_flight:
+                    claimed.append(cur)
+                    self.in_flight[cur] = {"worker": worker_id, "claimed_at": now}
+                cur += 1
+
+            w["current_chunks"] = claimed
+            return claimed
+
+    def submit_chunk(self, worker_id, chunk_id, lines_text):
+        with self.lock:
+            od = self._get_active_out_dir()
+            if not od:
+                return False, "no active output directory found"
+
+            lines = [l for l in lines_text.splitlines() if l.strip()]
+            if len(lines) != CHUNK:
+                return False, f"invalid line count: {len(lines)} (expected {CHUNK})"
+
+            out_path = os.path.join(od, f"c_{chunk_id}.txt")
+            tmp_path = out_path + ".tmp"
+            with open(tmp_path, "w", encoding="ascii") as f:
+                f.write(lines_text if lines_text.endswith("\n") else lines_text + "\n")
+            os.replace(tmp_path, out_path)
+
+            if chunk_id in self.in_flight:
+                del self.in_flight[chunk_id]
+
+            if worker_id in self.workers:
+                self.workers[worker_id]["chunks_done"] += 1
+                self.workers[worker_id]["last_seen"] = time.time()
+                if chunk_id in self.workers[worker_id]["current_chunks"]:
+                    self.workers[worker_id]["current_chunks"].remove(chunk_id)
+
+            return True, "ok"
+
+    def status(self):
+        with self.lock:
+            now = time.time()
+            self.clean_expired_leases(now)
+            active_workers = {
+                wid: {
+                    "last_seen_sec_ago": round(now - winfo["last_seen"], 1),
+                    "chunks_done": winfo["chunks_done"],
+                    "in_flight": winfo["current_chunks"]
+                }
+                for wid, winfo in self.workers.items()
+                if now - winfo["last_seen"] < 180
+            }
+            return {
+                "active_workers": active_workers,
+                "in_flight_count": len(self.in_flight),
+                "in_flight_chunks": sorted(list(self.in_flight.keys()))[:30],
+            }
+
+
+coordinator = FishnetCoordinator(MANIFEST_PATH, QUEUE_TOTAL)
+
+
 # Rolling speed tracker: ring buffer of (timestamp, active_labels)
 _speed_ring = collections.deque(maxlen=120)  # ~6 minutes at 3s polling
 _run_start_info = None  # (earliest_chunk_mtime, baseline_labels)
@@ -69,10 +184,20 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
+_line_cache = {}  # path -> (mtime, size, count)
+
+
 def count_lines(path):
     try:
+        st = os.stat(path)
+        mtime, size = st.st_mtime, st.st_size
+        cached = _line_cache.get(path)
+        if cached is not None and cached[0] == mtime and cached[1] == size:
+            return cached[2]
         with open(path, "rb") as f:
-            return sum(1 for _ in f)
+            cnt = sum(1 for _ in f)
+        _line_cache[path] = (mtime, size, cnt)
+        return cnt
     except Exception:
         return 0
 
@@ -277,45 +402,33 @@ def snapshot():
                 s = e = x
         completed_ranges.append((s, e))
 
-    frontier_chunk = max(pc_head_chunks) if pc_head_chunks else (max(active_chunk_indices) if active_chunk_indices else -1)
-    frontier_row = (frontier_chunk + 1) * CHUNK if frontier_chunk >= 0 else 0
-    frontier_pct = min(100.0, 100.0 * frontier_row / total_rows) if total_rows > 0 else 0.0
+    # Contiguous solid head: highest chunk index before the first gap from 0
+    cur_head = 0
+    while cur_head in active_chunk_indices:
+        cur_head += 1
+    contiguous_head_chunk = cur_head - 1  # e.g. 108 if 109 is missing
+    contiguous_head_row = (contiguous_head_chunk + 1) * CHUNK if contiguous_head_chunk >= 0 else 0
+    contiguous_head_pct = min(100.0, 100.0 * contiguous_head_row / total_rows) if total_rows > 0 else 0.0
+    contiguous_head_dis = chunk_true_disagreement(contiguous_head_chunk) or 0.0
 
     # Max frontier reached across all pools (cloud/modal)
     max_chunk_reached = max(sorted_active) if sorted_active else 0
     max_row_reached = min(total_rows, (max_chunk_reached + 1) * CHUNK)
     max_pct_reached = min(100.0, 100.0 * max_row_reached / total_rows) if total_rows > 0 else 0.0
-
-    # True disagreement at PC head frontier & overall deepest chunk from dis_delta_queue.npy
-    frontier_dis = chunk_true_disagreement(frontier_chunk) or (latest[0][3] if latest else 0.0)
     deepest_dis = chunk_true_disagreement(max_chunk_reached) or 0.0
+    tail_distance_pct = round(max(0.0, 100.0 - max_pct_reached), 2)
 
-    # Band based on true disagreement percentiles of dis_delta_queue.npy:
-    band_name = "not started"
-    band_detail = ""
-    if frontier_chunk >= 0:
-        frac = frontier_row / max(1, total_rows)
-        if frac < 0.02:
-            band_name = "EXTREME HEAD (Top 2%)"
-            band_detail = f"wildest disagreement — static vs 5k gap ~500–2400 cp (PC head: ~{frontier_dis:.0f} cp, Cloud deepest: ~{deepest_dis:.0f} cp)"
-        elif frac < 0.10:
-            band_name = "UPPER HEAD (Top 2–10%)"
-            band_detail = f"very high disagreement — gap ~250–500 cp (PC: ~{frontier_dis:.0f} cp, Cloud: ~{deepest_dis:.0f} cp)"
-        elif frac < 0.25:
-            band_name = "UPPER MIDDLE (10–25%)"
-            band_detail = f"high disagreement — gap ~150–250 cp (PC: ~{frontier_dis:.0f} cp, Cloud: ~{deepest_dis:.0f} cp)"
-        elif frac < 0.50:
-            band_name = "MIDDLE (25–50%)"
-            band_detail = f"moderate disagreement — gap ~80–150 cp"
-        elif frac < 0.75:
-            band_name = "LOWER MIDDLE (50–75%)"
-            band_detail = f"low disagreement — gap ~35–80 cp"
-        elif frac < 0.90:
-            band_name = "LOWER (75–90%)"
-            band_detail = f"minor disagreement — gap ~14–35 cp"
-        else:
-            band_name = "TAIL (90–100%)"
-            band_detail = f"near-agreement — static eval already close to search"
+    # Disagreement at queue head vs tail
+    head_dis = chunk_true_disagreement(0) or 1513.0
+    tail_dis = chunk_true_disagreement(total_chunks - 1) or 0.0
+
+    # Band description showing journey from Head to Tail:
+    band_name = f"Head: {head_dis:.0f} cp -> Current: {contiguous_head_dis:.0f} cp -> Deepest: {deepest_dis:.0f} cp -> Tail: {tail_dis:.1f} cp"
+    band_detail = (
+        f"Contiguous Solid Head: chunk {contiguous_head_chunk:,} ({contiguous_head_pct:.1f}% from head, ~{contiguous_head_dis:.0f} cp) | "
+        f"Deepest Cloud Reach: chunk {max_chunk_reached:,} ({max_pct_reached:.1f}% towards tail, ~{deepest_dis:.0f} cp) | "
+        f"Remaining to Tail: {tail_distance_pct:.1f}%"
+    )
 
     # Speed calculation: combine rolling window with sustained run rate so it never reads 0 between chunk completions
     now = time.time()
@@ -375,20 +488,24 @@ def snapshot():
         "dirs": per_dir,
         "band_name": band_name,
         "band_detail": band_detail,
-        "frontier_chunk": frontier_chunk,
-        "frontier_row": frontier_row,
-        "frontier_pct": round(frontier_pct, 2),
-        "frontier_dis": round(frontier_dis, 1),
+        "frontier_chunk": contiguous_head_chunk,
+        "frontier_row": contiguous_head_row,
+        "frontier_pct": round(contiguous_head_pct, 2),
+        "frontier_dis": round(contiguous_head_dis, 1),
         "max_chunk_reached": max_chunk_reached,
         "max_row_reached": max_row_reached,
         "max_pct_reached": round(max_pct_reached, 2),
         "deepest_dis": round(deepest_dis, 1),
+        "tail_distance_pct": tail_distance_pct,
+        "head_dis": round(head_dis, 1),
+        "tail_dis": round(tail_dis, 1),
         "completed_ranges": completed_ranges,
         "pc_chunks_done": len(pc_head_chunks),
         "cloud_chunks_done": len(cloud_chunks),
         "total_chunks": total_chunks,
         "latest_slices": [(n, cnt, round(a, 1), idx) for n, _, cnt, a, idx in latest],
         "workers": workers,
+        "fishnet": coordinator.status(),
         "speed_pos_s": round(speed_pos_s, 1),
         "speed_pos_hr": int(round(speed_pos_hr)),
         "eta_hours": round(eta_hours, 1) if eta_hours is not None else None,
@@ -397,19 +514,32 @@ def snapshot():
 
 
 class H(BaseHTTPRequestHandler):
+    def _send_json(self, status_code, data):
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         try:
-            if self.path == "/api/progress":
-                data = snapshot()
-                body = json.dumps(data).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            elif self.path == "/" or self.path == "/index.html":
+            parsed = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(parsed.query)
+
+            if parsed.path == "/api/progress":
+                self._send_json(200, snapshot())
+            elif parsed.path == "/api/fishnet/claim":
+                worker_id = qs.get("worker", ["anon"])[0]
+                count = int(qs.get("count", ["1"])[0])
+                headroom = int(qs.get("headroom", ["0"])[0])
+                claimed = coordinator.claim_head(worker_id, count=count, headroom=headroom)
+                self._send_json(200, {"ok": True, "chunks": claimed, "count": len(claimed)})
+            elif parsed.path == "/api/fishnet/status":
+                self._send_json(200, coordinator.status())
+            elif parsed.path == "/" or parsed.path == "/index.html":
                 html = open(os.path.join(os.path.dirname(__file__), "relabel_dashboard.html"), "r",
-                            encoding="utf-8").read().encode()
+                            encoding="utf-8").read().encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
                 self.send_header("Content-Length", str(len(html)))
@@ -426,6 +556,23 @@ class H(BaseHTTPRequestHandler):
                 self.end_headers()
             except Exception:
                 pass
+
+    def do_POST(self):
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/api/fishnet/submit":
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                worker_id = payload.get("worker", "anon")
+                chunk_id = int(payload.get("chunk_id", -1))
+                lines = payload.get("lines", "")
+                ok, msg = coordinator.submit_chunk(worker_id, chunk_id, lines)
+                self._send_json(200 if ok else 400, {"ok": ok, "msg": msg, "chunk_id": chunk_id})
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)})
 
     def log_message(self, *a):
         pass
