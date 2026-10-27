@@ -98,6 +98,7 @@ def play_match_pair(args):
     tit_side = 0 if titanium_black else 1
     passes = 0
     log = []
+    positions = []  # List of position records for dataset
 
     try:
         for ply in range(250):
@@ -112,16 +113,25 @@ def play_match_pair(args):
                 continue
             passes = 0
             side = state[3]
+            fen = to_fen(state)
+            tit_eval_cp = None
+            cpp_q_eval = None
 
             if side == tit_side:
                 # Titanium to move
-                fen = to_fen(state)
                 tit_proc.stdin.write("position fen " + fen + "\n")
                 tit_proc.stdin.write(f"go movetime {move_time_ms}\n")
                 tit_proc.stdin.flush()
                 token = None
                 while True:
                     l = tit_r.line(30)
+                    if "score cp " in l:
+                        try:
+                            parts = l.split()
+                            idx = parts.index("cp")
+                            tit_eval_cp = int(parts[idx + 1])
+                        except Exception:
+                            pass
                     if l.startswith("bestmove "):
                         t = l.split()[1]
                         token = None if t in ("0000", "pass") else t
@@ -132,32 +142,59 @@ def play_match_pair(args):
                     ns = apply_move(*state, token)
                     if ns is None:
                         token, ns = moves[0]
-                # Tell CPP what Titanium played
+
+                # Tell CPP what Titanium played: "play x0 y0 x1 y1"
                 if len(token) == 2:
                     to = sq_of(token)
                     own = state[0] if state[3] == 0 else state[1]
                     cand = [s for s in RING[to] if (own >> s) & 1]
                     frm = cand[0] if cand else 0
-                    cpp_proc.stdin.write(f"play {name_of(frm)}{token}\n")
+                    tr, tc = divmod(to, 7)
+                    fr, fc = divmod(frm, 7)
+                    cpp_proc.stdin.write(f"play {fr} {fc} {tr} {tc}\n")
                 else:
-                    cpp_proc.stdin.write(f"play {token}\n")
+                    frm = sq_of(token[:2])
+                    to = sq_of(token[2:4])
+                    fr, fc = divmod(frm, 7)
+                    tr, tc = divmod(to, 7)
+                    cpp_proc.stdin.write(f"play {fr} {fc} {tr} {tc}\n")
                 cpp_proc.stdin.flush()
             else:
-                # Ataxx_CPP to move
+                # Ataxx_CPP to move: "go time <sec>"
                 sec = max(0.1, move_time_ms / 1000.0)
-                cpp_proc.stdin.write(f"go {sec:.2f}\n")
+                cpp_proc.stdin.write(f"go time {sec:.2f}\n")
                 cpp_proc.stdin.flush()
                 token = None
                 while True:
                     l = cpp_r.line(30)
-                    if l.startswith("bestmove "):
-                        token = l.split()[1]
+                    parts = l.strip().split()
+                    if len(parts) >= 7:
+                        try:
+                            # format: x0 y0 x1 y1 evals sims q cpu_time
+                            x0, y0, x1, y1 = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+                            cpp_q_eval = float(parts[6])
+                            f_sq = x0 * 7 + y0
+                            t_sq = x1 * 7 + y1
+                            token = f"{name_of(f_sq)}{name_of(t_sq)}"
+                            break
+                        except Exception:
+                            pass
+                    elif l == "pass":
+                        token = None
                         break
                 ns = apply_move(*state, token) if token else None
                 if ns is None:
                     token, ns = moves[0]
 
             log.append(token)
+            positions.append({
+                "ply": ply,
+                "fen": fen,
+                "side": "b" if side == 0 else "w",
+                "move": token,
+                "tit_cp": tit_eval_cp,
+                "cpp_q": cpp_q_eval,
+            })
             state = ns
 
         occ0, occ1, _, _ = state
@@ -167,12 +204,19 @@ def play_match_pair(args):
         if b == w:
             winner = "draw"
             score = 0.5
+            outcome_val = 0.5
         elif (b > w) == titanium_black:
             winner = "titanium"
             score = 1.0
+            outcome_val = 1.0 if titanium_black else 0.0
         else:
             winner = "ataxx_cpp"
             score = 0.0
+            outcome_val = 0.0 if titanium_black else 1.0
+
+        # Annotate positions with game outcome
+        for p in positions:
+            p["outcome"] = outcome_val
 
         return {
             "game_id": game_id,
@@ -183,7 +227,7 @@ def play_match_pair(args):
             "black_score": b,
             "white_score": w,
             "plies": len(log),
-            "log": " ".join(log[:20]),
+            "positions": positions,
         }
     finally:
         try: tit_proc.kill()
@@ -261,3 +305,16 @@ def main(games: int = 400, ms: int = 1000):
             f.write(f"Game {r['game_id']} (seed {r['seed']}, tit_black={r['titanium_black']}): "
                     f"{r['winner']} ({r['black_score']}-{r['white_score']}, {r['plies']} plies)\n")
     print(f"Saved full report to: {log_path}", flush=True)
+
+    # Save every single position with Titanium eval and Ataxx_CPP eval into dataset JSONL
+    import json
+    jsonl_path = os.path.join(ROOT, "data", "nnue", f"clash_positions_{total}g.jsonl")
+    total_positions = 0
+    with open(jsonl_path, "w", encoding="utf-8") as jf:
+        for r in results:
+            for p in r.get("positions", []):
+                p["game_id"] = r["game_id"]
+                p["winner"] = r["winner"]
+                jf.write(json.dumps(p) + "\n")
+                total_positions += 1
+    print(f"Saved {total_positions:,} evaluated positions with dual-engine scores to: {jsonl_path}", flush=True)
