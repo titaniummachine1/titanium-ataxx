@@ -45,7 +45,7 @@ WATCHDOG_GRACE_MS = 12
 RETRY_RESERVE_MS = 400      # a resuscitated search needs at least this much time left
 SCALE = float(os.environ.get("TI_TIME_SCALE", "1.0"))
 DEBUG = os.environ.get("TI_DEBUG") == "1"
-BOTZONE_MAX_DEPTH = 30
+BOTZONE_MAX_DEPTH = 255
 FAULT = os.environ.get("TI_FAULT", "")   # tests only, see the docstring
 HERE = os.path.dirname(os.path.abspath(__file__))
 EVENTS = []                 # recoveries of this turn -> debug line

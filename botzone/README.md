@@ -6,7 +6,7 @@ container). The GitHub workflow runs the same build on every push to main (artif
 Never upload a library built with plain `cargo build` on a modern Linux: it needs glibc 2.34 and crashes the bot on
 Botzone (Ubuntu 16.04, glibc 2.23) on its first move (happened with v5, 2026-10-25).
 Eval: main's strongest big NNUE is embedded in `data/titanium_v2.so`; the upload no longer needs a separate network file. Local `TI_NET` still allows an explicit replacement network.
-Search: the Botzone driver passes a depth cap of 30 along with its time budget; whichever limit is reached first ends the search.
+Search: the Botzone driver passes the full u8 depth limit (255) along with its time budget; solved mates and exhausted terminal trees stop automatically.
 Time: 12 s on the bot's first turn of a match (wiki: first turn doubled, Python 6x), 6 s on every later turn.
 
 Simulator modes: `--mode oneshot` (default, fresh process per move) and `--mode long`.

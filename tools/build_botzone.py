@@ -127,7 +127,7 @@ def main():
              "Upload (Botzone -> avatar menu -> manage storage), then submit the bot:",
              "  data/titanium_v2.so       -> storage /titanium_v2.so",
              "Embedded main NNUE: data/nnue/nnue_main.tnn (sha256 %s)" % sha256(os.path.join(ROOT, "data", "nnue", "nnue_main.tnn")),
-             "Botzone search limits: time budget plus depth cap 30; first limit reached stops the search.",
+             "Botzone search limits: time budget with full u8 depth range (255); solved mates/terminals stop automatically.",
              "  titanium_botzone.py       -> new bot version: Python 3, simple IO, long-running OFF", "",
              "sha256:"]
     for root, _, fs in os.walk(OUT):

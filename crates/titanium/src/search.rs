@@ -527,6 +527,8 @@ pub struct Searcher<'a> {
     stop: bool,
     stop_reason: StopReason,
     node_limit: Option<u64>,
+    /// True if any branch in the current root iteration hit a heuristic leaf, pruning, or unresolved TT cutoff.
+    heuristic_used: bool,
     /// futility small-net pre-filter on (FUT_SN_ON at search start)
     fut_sn: bool,
     /// Monotonic milliseconds. Native builds use `Instant`; wasm builds
@@ -605,6 +607,7 @@ impl<'a> Searcher<'a> {
             stop: false,
             stop_reason: StopReason::Completed,
             node_limit: None,
+            heuristic_used: false,
             fut_sn: true,
             time_src: native_now_ms,
             ext_stop: None,
@@ -759,6 +762,7 @@ impl<'a> Searcher<'a> {
         self.nodes += 1;
         // Hard stack guard (release builds too): never index past the MAX_PLY-sized stacks.
         if ply as usize >= MAX_PLY - 1 {
+            self.heuristic_used = true;
             return self.leaf_eval(b);
         }
         // consume a parent-computed static eval first, so a TT return below can never leave it stale
@@ -779,6 +783,15 @@ impl<'a> Searcher<'a> {
             return terminal_score(b, ply);
         }
 
+        // Mate distance pruning (Stockfish / Reckless):
+        // Even if we mate on the next move, our score is at best MATE - (ply + 1).
+        // Even if we are mated right here, our score is at worst -MATE + ply.
+        alpha = alpha.max(-MATE + ply as i32);
+        beta = beta.min(MATE - (ply as i32 + 1));
+        if alpha >= beta {
+            return alpha;
+        }
+
         // Transposition table probe. Missing entry at depth >= 4 -> IIR
         // (internal iterative reduction, Moonbird): the node has no cached
         // best move to order by, so search one ply less.
@@ -790,7 +803,12 @@ impl<'a> Searcher<'a> {
             if e.depth as u32 >= depth {
                 let s = score_from_tt(e.score, ply);
                 match e.flag {
-                    FLAG_EXACT => return s,
+                    FLAG_EXACT => {
+                        if s.abs() < MATE_BOUND || (MATE - s.abs()) as u32 >= depth {
+                            self.heuristic_used = true;
+                        }
+                        return s;
+                    }
                     FLAG_LOWER => {
                         if s > alpha {
                             alpha = s;
@@ -804,6 +822,9 @@ impl<'a> Searcher<'a> {
                     _ => {}
                 }
                 if alpha >= beta {
+                    if s.abs() < MATE_BOUND || (MATE - s.abs()) as u32 >= depth {
+                        self.heuristic_used = true;
+                    }
                     return s;
                 }
             }
@@ -826,11 +847,15 @@ impl<'a> Searcher<'a> {
         // Reverse futility pruning (autaxx, exact form): standing pat is so
         // far below alpha that even a generous error margin cannot recover
         // -> fail low. Safe in Ataxx because the eval is capture-risk-aware.
+        // Disabled when alpha/beta are mate scores so centipawn evals never prune mate lines.
         if null_allowed
             && ply > 0
             && depth <= 4
+            && alpha.abs() < MATE_BOUND
+            && beta.abs() < MATE_BOUND
             && static_eval + RFP_MARGINS[(depth.max(1) - 1) as usize] < alpha
         {
+            self.heuristic_used = true;
             return alpha;
         }
 
@@ -839,7 +864,7 @@ impl<'a> Searcher<'a> {
         // after another null, depth > 2, enough clone targets (mobility),
         // board not too full (forced-pass danger zone). R = 3.
         // (exp/ab B: R = 2 pooled 108-84-8, straddles, parked for 3rd leg.)
-        if null_allowed && !BZ && depth > 2 {
+        if null_allowed && !BZ && depth > 2 && beta.abs() < MATE_BOUND {
             let clone_targets = (dist_union(b.occ[b.turn as usize], 1) & b.empty()).count_ones();
             // fill < 0.54 as integer: pieces*50 < 26*49 (no per-node float div).
             if clone_targets >= 11
@@ -855,12 +880,14 @@ impl<'a> Searcher<'a> {
                     return 0;
                 }
                 if score >= beta {
-                    return score;
+                    self.heuristic_used = true;
+                    return if score >= MATE_BOUND { beta } else { score };
                 }
             }
         }
 
         if depth == 0 {
+            self.heuristic_used = true;
             return static_eval;
         }
 
@@ -871,6 +898,7 @@ impl<'a> Searcher<'a> {
             // multiplicities, so len>0 always — but double-pass positions
             // have no children to search: score the pass-through.
             if list.is_empty() {
+                self.heuristic_used = true;
                 let raw = match (self.nnue, self.sancta) {
                     (None, Some(net)) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
                     _ => self.leaf_eval(b),
@@ -947,7 +975,11 @@ impl<'a> Searcher<'a> {
                 lmr_cnt += 1;
             }
             let mut child_eval = i32::MIN;
-            if move_idx >= MB_FUT_MIN_IDX && new_depth > 0 && self.sancta.is_none() {
+            if move_idx >= MB_FUT_MIN_IDX
+                && new_depth > 0
+                && self.sancta.is_none()
+                && alpha.abs() < MATE_BOUND
+            {
                 // child eval is from the child's side to move = minus our static value of the move
                 if FUT_CHEAP_M > 0 && self.fut_sn && self.nnue.is_some() {
                     let slot = (child.hash as usize) & ((1 << ECACHE_BITS) - 1);
@@ -966,7 +998,10 @@ impl<'a> Searcher<'a> {
                         );
                         let lo = sn.bound_acc(&ca, child.empty().count_ones(), static_eval, hand)
                             - FUT_SN_M;
-                        if new_depth - (alpha.saturating_add(lo) / MB_FUT_DIV).clamp(0, 64) <= 0 {
+                        if new_depth - (alpha.saturating_add(lo) / MB_FUT_DIV).clamp(0, 64) <= 0
+                            && best > -MATE_BOUND
+                        {
+                            self.heuristic_used = true;
                             move_idx += 1;
                             continue;
                         }
@@ -975,7 +1010,13 @@ impl<'a> Searcher<'a> {
                 child_eval = self.leaf_eval(&child);
                 new_depth -= (alpha.saturating_add(child_eval) / MB_FUT_DIV).clamp(0, 64);
             }
+            // When all moves searched so far at this node lose by forced mate (or when searching
+            // for a shorter mate), never skip remaining legal moves without searching them.
+            if best <= -MATE_BOUND || alpha >= MATE_BOUND {
+                new_depth = new_depth.max(1);
+            }
             if new_depth <= 0 {
+                self.heuristic_used = true;
                 move_idx += 1;
                 continue;
             }
@@ -1095,16 +1136,32 @@ impl<'a> Searcher<'a> {
     /// Whichever limit hits first (nodes / time / depth) stops the search;
     /// partial iterations are discarded, the last completed depth decides.
     pub fn search(&mut self, b: &Board, limits: &SearchLimits) -> SearchResult {
-        self.search_gen::<false>(b, limits)
+        self.search_gen::<false>(b, limits, &[])
     }
 
     /// Same search under the Botzone judge's rules (no passes; either side
     /// stuck ends the game, mobile side absorbs the empties; NMP off).
     pub fn search_bz(&mut self, b: &Board, limits: &SearchLimits) -> SearchResult {
-        self.search_gen::<true>(b, limits)
+        self.search_gen::<true>(b, limits, &[])
     }
 
-    fn search_gen<const BZ: bool>(&mut self, b: &Board, limits: &SearchLimits) -> SearchResult {
+    /// Botzone search excluding repetition-banned root moves up front so the full
+    /// search budget is spent evaluating allowed root moves at full depth.
+    pub fn search_bz_excluding(
+        &mut self,
+        b: &Board,
+        limits: &SearchLimits,
+        banned_root: &[Move],
+    ) -> SearchResult {
+        self.search_gen::<true>(b, limits, banned_root)
+    }
+
+    fn search_gen<const BZ: bool>(
+        &mut self,
+        b: &Board,
+        limits: &SearchLimits,
+        banned_root: &[Move],
+    ) -> SearchResult {
         self.start_ms = (self.time_src)();
         self.nodes = 0;
         self.stop = false;
@@ -1158,12 +1215,25 @@ impl<'a> Searcher<'a> {
         // Root best-so-far: drained best-first into a fixed array.
         // Root acc refreshed once (sancta lazy path: children diff from it).
         let mut root_moves = [Move::PASS; 256];
-        {
+        let n_root = {
             let root = &mut self.stack.lists[0];
-            for m in root_moves.iter_mut().take(n_root) {
-                *m = root.pop_best();
+            let mut all_moves = [Move::PASS; 256];
+            let mut kept = 0usize;
+            for slot in all_moves.iter_mut().take(n_root) {
+                let m = root.pop_best();
+                *slot = m;
+                if !banned_root.contains(&m) {
+                    root_moves[kept] = m;
+                    kept += 1;
+                }
             }
-        }
+            if kept > 0 {
+                kept
+            } else {
+                root_moves[..n_root].copy_from_slice(&all_moves[..n_root]);
+                n_root
+            }
+        };
         if let Some(net) = self.sancta {
             net.refresh_root(b, &mut self.stack.acc[0]);
         }
@@ -1176,8 +1246,10 @@ impl<'a> Searcher<'a> {
         // Iteration cost prediction: project the next iteration as the max
         // of the last two completed iterations.
         let mut it_ms: [f64; 2] = [0.0, 0.0];
+        let mut has_completed_iter = false;
         for depth in 1..=limits.max_depth.max(1) {
             let iter_start = self.elapsed_ms();
+            self.heuristic_used = false;
             let mut alpha = -INF;
             let mut best_this = None;
             let mut best_score = i32::MIN;
@@ -1205,24 +1277,53 @@ impl<'a> Searcher<'a> {
                     }
                 }
             }
-            // Partial-iteration adoption (titanium/Lague): moves recorded in
-            // best_this completed their search before the stop, so their
-            // scores are valid — adopt instead of discarding.
+            // Partial-iteration adoption (Stockfish / Reckless):
+            // - A completed iteration is adopted unless it forgot a shorter proven winning mate
+            //   from a previous completed iteration (`forgotten_mate`).
+            // - An aborted partial iteration (`self.stop`) is adopted only if no full iteration
+            //   has completed yet, OR if a searched root move strictly beat the previous
+            //   completed iteration's score without walking into a forced loss (`best_score > -MATE_BOUND`).
             if let Some(m) = best_this {
-                result.best = Some(m);
-                if best_score != i32::MIN {
-                    result.score = best_score;
+                let forgotten_mate = has_completed_iter
+                    && result.score >= MATE_BOUND
+                    && best_score < result.score;
+                let adopt = if !self.stop {
+                    !forgotten_mate
+                } else {
+                    !has_completed_iter
+                        || (best_score > result.score
+                            && best_score > -MATE_BOUND
+                            && !forgotten_mate)
+                };
+                if adopt {
+                    result.best = Some(m);
+                    if best_score != i32::MIN {
+                        result.score = best_score;
+                    }
+                    result.depth = u32::from(depth);
                 }
-                result.depth = u32::from(depth);
                 // Move best move to the front for the next iteration.
                 if !self.stop {
-                    if let Some(pos) = (0..n_root).find(|&i| root_moves[i] == m) {
-                        root_moves[pos] = root_moves[0];
-                        root_moves[0] = m;
+                    has_completed_iter = true;
+                    if !forgotten_mate {
+                        if let Some(pos) = (0..n_root).find(|&i| root_moves[i] == m) {
+                            root_moves[pos] = root_moves[0];
+                            root_moves[0] = m;
+                        }
                     }
                 }
             }
             if self.stop {
+                break;
+            }
+            // Stop iterative deepening once the shortest forced win is proven within the current
+            // depth horizon, or once the entire game tree is resolved to exact terminal states
+            // (`!self.heuristic_used`). When losing (`best_score <= -MATE_BOUND`) and heuristic
+            // leaves remain, keep searching deeper to find the longest sequence delaying the loss.
+            if (best_score >= MATE_BOUND && u32::from(depth) >= (MATE - best_score) as u32)
+                || !self.heuristic_used
+            {
+                self.stop_reason = StopReason::Completed;
                 break;
             }
             // exp/full-time: no "next iteration would overrun" early stop any more. A partial iteration is adopted
@@ -1232,9 +1333,9 @@ impl<'a> Searcher<'a> {
             let proj_ms = it_ms[0].max(it_ms[1]);
             // Botzone variant: no early exit. The clock is a hard limit there, so use all of it;
             // a deeper iteration cut by the deadline still contributes its completed root moves
-            // (partial-iteration adoption above). Classic search keeps the prediction rule.
-            // exp/full-time: no early exit for any mode; deadline check handles it.
-            if !BZ && self.elapsed_ms() + proj_ms > budget_ms {
+            // (partial-iteration adoption above). Classic search keeps the prediction rule unless
+            // defending a forced loss, where all available time is used to maximize delay.
+            if !BZ && result.score > -MATE_BOUND && self.elapsed_ms() + proj_ms > budget_ms {
                 self.stop_reason = StopReason::Time;
                 break;
             }
@@ -1470,5 +1571,49 @@ xxx....
         let cut = se.search(&b, &no_time(30));
         assert!(cut.nodes <= 4096, "stopped late: {} nodes", cut.nodes);
         assert!(cut.best.is_some());
+    }
+
+    #[test]
+    fn winning_mate_stops_at_mate_depth_not_max_depth() {
+        // Black can wipe out white in 1 ply with a clone next to the lone white stone.
+        // Even with max_depth = u8::MAX (255), iterative deepening must stop at depth 1.
+        let board = ".......
+                     .......
+                     .......
+                     .....o.
+                     ......x
+                     .......
+                     ....... b";
+        let b = Board::from_str(board).unwrap();
+        let mut se = Searcher::with_tt_bits(16);
+        let r = se.search_bz(&b, &no_time(u8::MAX));
+        assert_eq!(r.score, MATE - 1, "must find mate in 1 ply");
+        assert_eq!(r.depth, 1, "must stop at depth 1 instead of looping to 255, got {}", r.depth);
+        assert_eq!(r.stopped_by, Some(StopReason::Completed));
+    }
+
+    #[test]
+    fn losing_mate_picks_longest_delay_and_does_not_spin_to_255() {
+        // White dominates the board; only two empty squares remain (a7 and g7).
+        // Black has one stone at b7 and one at g5:
+        // - If black clones to a7 (filling a7), white immediately fills g7 on ply 2 -> mate in 2 (-MATE + 2).
+        // - If black jumps b7->a7 (vacating b7), white still has to fill more squares; or we test
+        //   two concrete legal moves with different terminal lengths.
+        // Here: 1 empty square at a7 (sq 0), except black can either clone to a7 (fills board in 1 ply -> -MATE + 1)
+        // or jump c7->a7 (leaves c7 empty, so white must move on ply 2 -> -MATE + 2).
+        let board = ".oxoooo
+                     ooooooo
+                     ooooooo
+                     ooooooo
+                     ooooooo
+                     ooooooo
+                     ooooooo b";
+        let b = Board::from_str(board).unwrap();
+        let mut se = Searcher::with_tt_bits(16);
+        let r = se.search_bz(&b, &no_time(u8::MAX));
+        let mv = r.best.expect("must return a delaying move");
+        assert!(!mv.is_clone(), "black must jump c7->a7 to delay loss to 2 plies instead of cloning (1 ply), got {mv:?}");
+        assert_eq!(r.score, -MATE + 2, "longest delay is 2 plies (-MATE + 2), got {}", r.score);
+        assert!(r.depth <= 3, "exhausted terminal tree must stop without spinning to 255, got depth {}", r.depth);
     }
 }

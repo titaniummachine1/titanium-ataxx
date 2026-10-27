@@ -222,8 +222,8 @@ pub extern "C" fn ti_stop(e: *mut TiEngine) {
     }
 }
 
-/// Botzone-specific depth cap. The general search API supports the full u8 range.
-const FFI_MAX_DEPTH: u8 = 30;
+/// Full u8 depth range; solved-mate / terminal stopping in `search_gen` prevents runaway depths.
+const FFI_MAX_DEPTH: u8 = u8::MAX;
 
 /// Search the current position for at most `budget_ms` (wall clock, absolute) and write the move
 /// to out[0..4] = x0,y0,x1,y1. Plays the move on the internal board.
@@ -262,9 +262,20 @@ pub extern "C" fn ti_search_with_limits(
         max_nodes: (max_nodes > 0).then_some(max_nodes),
         max_depth: max_depth.max(1),
     };
-    let r = e.searcher.search_bz(&e.board, &limits);
+    let mut banned = [Move::PASS; 256];
+    let mut n_banned = 0usize;
+    for i in 0..list.len() {
+        let m = list.move_at(i);
+        if e.banned(m) && n_banned < banned.len() {
+            banned[n_banned] = m;
+            n_banned += 1;
+        }
+    }
+    let r = e
+        .searcher
+        .search_bz_excluding(&e.board, &limits, &banned[..n_banned]);
     let mut mv = r.best.unwrap_or_else(|| list.move_at(0));
-    let mut overridden = 0u32;
+    let mut overridden = u32::from(n_banned > 0);
     // Judge rule: a move that repeats an earlier transition is rejected as illegal input. If the
     // engine's move is such a move, play the allowed move that wins the most discs instead.
     if e.banned(mv) {
@@ -332,7 +343,7 @@ mod tests {
 
     #[test]
     fn abi_and_bad_net_path() {
-        assert_eq!(ti_abi_version(), 1);
+        assert_eq!(ti_abi_version(), ABI_VERSION);
         let bad = CString::new("definitely/not/a/net.tup").unwrap();
         assert!(
             ti_new(bad.as_ptr(), 14).is_null(),
