@@ -1265,10 +1265,11 @@ impl<'a> Searcher<'a> {
                 }
             }
         }
+        let root_tt = self.tt.probe(b.hash);
+        let tt_mv = root_tt.map(|e| e.mv).unwrap_or(0);
         {
             // Root ordering: score once, drain by pop_best into a fixed
             // array (best-first). Each iteration reorders the array.
-            let tt_mv = self.tt.probe(b.hash).map(|e| e.mv).unwrap_or(0);
             let (kill, hist) = (&self.killers, &self.history);
             let root = &mut self.stack.lists[0];
             score_into(b, root, tt_mv, 0, kill, hist);
@@ -1312,6 +1313,11 @@ impl<'a> Searcher<'a> {
             net.refresh_root(b, &mut self.stack.acc[0]);
         }
         result.best = Some(root_moves[0]);
+        if let Some(entry) = root_tt {
+            if entry.score.abs() < MATE_BOUND {
+                result.score = entry.score;
+            }
+        }
 
         let budget_ms = limits
             .time
@@ -1321,7 +1327,27 @@ impl<'a> Searcher<'a> {
         // of the last two completed iterations.
         let mut it_ms: [f64; 2] = [0.0, 0.0];
         let mut has_completed_iter = false;
-        for depth in 1..=limits.max_depth.max(1) {
+
+        // Dynamic iterative-deepening startup (Quoridor / persistent session):
+        // If the prior search (or opponent move in persistent TT) left a deep entry
+        // from the recent turn, skip the shallow iterations we already know the answer to
+        // and resume from near that depth.
+        let start_depth = if let Some(entry) = root_tt {
+            let age_diff = self.tt.age.wrapping_sub(entry.age);
+            if age_diff <= 2
+                && entry.depth >= 3
+                && (entry.flag == FLAG_EXACT || entry.flag == FLAG_LOWER)
+                && entry.score.abs() < MATE_BOUND
+            {
+                (entry.depth.saturating_sub(1) as u8).min(limits.max_depth).max(1)
+            } else {
+                1
+            }
+        } else {
+            1
+        };
+
+        for depth in start_depth..=limits.max_depth.max(1) {
             let iter_start = self.elapsed_ms();
             self.heuristic_used = false;
             let mut alpha = -INF;
@@ -1737,5 +1763,21 @@ xxx....
         let other_key = key ^ (1 << 10); // same hash slot, different key
         tt.store(other_key, 99, 200, 3, FLAG_EXACT);
         assert_eq!(tt.probe(other_key).unwrap().key, other_key);
+    }
+
+    #[test]
+    fn warm_iterative_deepening_skips_shallow_iterations() {
+        let b = Board::start();
+        let mut se = Searcher::with_tt_bits(16);
+        // Initial search to depth 6
+        let r1 = se.search(&b, &no_time(6));
+        assert_eq!(r1.depth, 6);
+        let nodes1 = r1.nodes;
+
+        // In a persistent session, searching the same root position again
+        // should start from depth 5 (tt_depth - 1), skipping depths 1..4.
+        let r2 = se.search(&b, &no_time(6));
+        assert_eq!(r2.depth, 6);
+        assert!(r2.nodes < nodes1, "warm start nodes ({}) must be fewer than cold start ({})", r2.nodes, nodes1);
     }
 }
