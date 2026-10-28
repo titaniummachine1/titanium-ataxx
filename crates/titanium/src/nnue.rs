@@ -175,7 +175,42 @@ impl Nnue {
 
     /// Fast path (int16 feature transformer, allocation-free, sparse L1); differs from `forward_f32` only by the
     /// QA rounding of the first layer (measured by `nneval`).
+    /// Automatically dispatches to 512-bit AVX-512 (`vpaddw zmm`, 8 ops per 256-wide row) on AVX-512 hosts
+    /// (such as Botzone's Xeon/EPYC servers) and 256-bit AVX-2 (`vpaddw ymm`, 16 ops per 256-wide row) on AVX-2 PCs.
     pub fn forward(&self, b: &Board, s57: f32) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx512bw")
+                && std::arch::is_x86_feature_detected!("avx512vl")
+                && std::arch::is_x86_feature_detected!("fma")
+            {
+                // SAFETY: AVX-512F/BW/VL and FMA support verified at runtime above.
+                return unsafe { self.forward_avx512(b, s57) };
+            }
+            if std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma")
+            {
+                // SAFETY: AVX-2 and FMA support verified at runtime above.
+                return unsafe { self.forward_avx2(b, s57) };
+            }
+        }
+        self.forward_inner(b, s57)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,fma")]
+    unsafe fn forward_avx512(&self, b: &Board, s57: f32) -> f32 {
+        self.forward_inner(b, s57)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn forward_avx2(&self, b: &Board, s57: f32) -> f32 {
+        self.forward_inner(b, s57)
+    }
+
+    #[inline(always)]
+    fn forward_inner(&self, b: &Board, s57: f32) -> f32 {
         let (us, nu, them, nt) = nnfeat::both(b, self.groups);
         let w = self.width;
         let empties = b.empty().count_ones() as usize;
@@ -253,6 +288,7 @@ impl Nnue {
 
     /// Everything after the feature transformer: int16 accumulators -> activations -> sparse L1 -> L2 -> output.
     /// Activations are computed on the fly (no zeroed scratch array); arithmetic and order are exactly as before.
+    #[inline(always)]
     fn head(&self, acc: &[[i16; MAX_W]; 2], bucket: usize, ps: [f32; 2], s57: f32) -> f32 {
         let w = self.width;
         let inv = 1.0 / QA as f32;
