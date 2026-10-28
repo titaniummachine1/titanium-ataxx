@@ -85,6 +85,8 @@ A curated compilation of competitive benchmarks, superhuman datasets, open-sourc
 ### 3.3 Engine References & Architecture
 * **Sanctaphraxx (Rust):** [Ciekce/sanctaphraxx](https://github.com/Ciekce/sanctaphraxx) — Reference for [NNUE inference](https://github.com/Ciekce/sanctaphraxx/blob/main/src/nnue/mod.rs#L206) and [PR #11](https://github.com/Ciekce/sanctaphraxx/pull/11).
 * **libataxx:** [kz04px/libataxx](https://github.com/kz04px/libataxx) — Standard C++ reference for [gameover.cpp](https://github.com/kz04px/libataxx/blob/master/src/gameover.cpp) and [perft.cpp](https://github.com/kz04px/libataxx/blob/master/tests/perft.cpp).
+* **AI-ataxx (fffasttime):** [fffasttime/AI-ataxx](https://github.com/fffasttime/AI-ataxx) — High-speed x86-64 assembly bitboard implementation utilizing BMI2 instructions (`pext`, `popcnt`) for accelerated movegen and capture propagation.
+* **Avataxx:** Classical alpha-beta searcher with bitwise ASM acceleration.
 * **Cvazz (C++):** [Jigglypuffed/Cvazz](https://github.com/Jigglypuffed/Cvazz/blob/main/src/core/Move.cc) — Compact move representation and bitboard logic.
 * **Anthraxx:** [Vast342/Anthraxx](https://github.com/Vast342/Anthraxx/compare/tt-cutoff) — TT cutoffs and move ordering.
 * **ataxx-dot-cpp:** [GediminasMasaitis/ataxx-dot-cpp](https://github.com/GediminasMasaitis/ataxx-dot-cpp) — Hand-crafted evaluation [evaluation_hce.cpp](https://github.com/GediminasMasaitis/ataxx-dot-cpp/blob/main/src/evaluation_hce.cpp) and [changelog.md](https://github.com/GediminasMasaitis/ataxx-dot-cpp/blob/main/changelog.md).
