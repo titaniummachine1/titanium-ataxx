@@ -1,40 +1,27 @@
-## STATE FOR NEW SESSION (2026-10-28 - UNIFIED SEARCH PROMOTED TO MAIN; 31.57M v5 DATASET READY; DUAL-NET BAKEOFF W=512 WINS)
+## STATE FOR NEW SESSION (2026-10-28 - SATURATION W=512 RUNNING; WARM ID SEARCH GATE ACTIVE; GATING RULES ENFORCED)
 
-**1. Unified Search Upgrades Promoted & Pushed to `main` (`31de097`):**
-- Fast-forward merged `exp/search-all` to `main` after triple gate confirmation:
-  1. 100 ms match (200g): `+107 -88 =5 (54.8%) | Elo +33.1 +- 39.3 | LOS 95.2%`
-  2. 5,000-node match (200g): `+106 -88 =6 (54.5%) | Elo +31.4 +- 36.9 | LOS 95.3%`
-  3. Open-ended 258g match on `book50k.txt`: `+152 -96 =10 (60.9%) | Elo +76.6 +- 39.3 | LOS 100.0% | LLR +1.00`
-- All 49 unit tests, 4 FFI tests, and 2 hygiene tests pass cleanly on `main`. Fresh binary `titanium-cli.exe` compiled and `main` pushed to `origin/main`.
+**1. Mandatory Gating Rules Enacted (D124, D125):**
+- **D124 (Pre- and Post-Gating vs Main)**: Strictly enforce that any candidate net (fine-tuned, distilled, or retrained) must be gated in a 100+ game SPRT match against `main` before promotion, grounded in the D98/D99 lesson (-130 Elo collapse from fitting KataGo).
+- **D125 (Gentle Difficulty Nudge & Drift Avoidance)**: Upweighting hard/disagreement positions carries severe risk of eval drift and scale distortion on the 90%+ quiet search manifold (mirroring Stockfish/Leela findings). Difficulty nudge capped at 0.15 (or 0.0 baseline), and candidates must prove zero eval drift against uniform ground truth.
 
-**2. 31.57M v5 Dataset Assembly (100% Complete & Verified):**
-- Relabeling fleet destroyed ($0 ongoing cloud spend).
-- All 6,314 chunk files (31,568,598 new 5k labels) assembled into `data/nnue/relabel/labels_v5.npz` (33,891,139 rows, 100% valid).
-- Joined into `data/nnue/final/final_{train,val,test}_v5.npz`.
-- Slim bundles `final_train_v5.npz` (714.5 MB) and `final_val_v5.npz` (16.3 MB) uploaded to Modal volume `ti-train` under `/vol/up/`.
+**2. Full Saturation Training on Modal GPU (`sat_w512` @ App `ap-6HxiWZvVs88GpDIiZqxF4H`):**
+- Architecture: W=512, full feature groups (G1+G2+G3+G5+G6), Ranger optimizer, batch size 16384, cosine LR 8e-4 -> 1e-5, gentle nudge 0.15.
+- Dataset: 100% clean 31.57M v5 Titanium self-search dataset (depth-5k consensus ground truth).
+- Progress: Warm-started from `net_ep2.pt`. Epoch 1 finished in 213s (`train_loss: 0.010994`, EMA val `0.022500`). Epoch 2 actively training.
+- Caching & Optimization: Zero feature recomputation during training. Positions pre-dumped to binary index (`train.idx`), streaming at ~6s per 1M chunk.
 
-**3. Feature Screening & Geometric Analysis (`screen_features.py` & `docs/NET_ANALYSIS.md`):**
-- Moonbird environment rings (`G3`) and unconvertible anchors (`G1`/`G2`) deliver the dominant signals ($r = 0.45$ and $0.33$).
-- Raw 2-ply capture exchange counts (`G5`) were found noisy due to ignoring jumps (which account for 60% of search mass), and dropping `G5` improves generalization MSE by $-0.0060$.
-- Weak difficulty nudge (`--diff-nudge 0.15`) added to `train_nnue.py` based on $|\text{Search}_{5k} - \text{StaticEval}|$ to focus learning on ambiguous tactical positions without game-distribution distortion.
+**3. Search: Warm Iterative Deepening Startup (`exp/search-warm-id @ ca9ea34`):**
+- Adapted from Quoridor best-AI engine: searches initialize `start_depth = (root_tt.depth - 1).max(1)` when a fresh, non-mate exact/lower TT entry exists at the root.
+- Skips shallow dummy depths 1..(D-2) in persistent sessions, investing the full 4.0s budget into deep plies.
+- All 50 unit tests, 4 FFI tests, and 2 hygiene tests pass cleanly. Committed and pushed to `origin/exp/search-warm-id`.
 
-**4. Dual-Net Capacity Bakeoff (Modal GPU):**
-- **Net 1 ($W=256$, Lean Baseline / Register-Optimized)**: Ep2 val target MSE `0.022803`, train loss `0.010838`.
-- **Net 2 ($W=512$, Double Capacity)**: Ep2 val target MSE `0.022424`, train loss `0.010593`.
-- **Verdict**: Net 2 wins decisively by $-0.000379$ MSE. The model is **capacity-bound**, proving that $W=512$ is required for the master teacher network.
-- Pruned candidate (`bakeoff_w512_nog5`) launched on Modal GPU (`ap-kqbflHketVAFpt5V5aP74Z`).
+**4. Botzone Asymmetric Gates (4.0s Persistent TT vs 6.0s Cold Reset):**
+- **Initial Baseline Gate (100g)**: `45-48-7 (48.5%) | Elo -10.4 +- 56.3`. Proves persistent TT state alone recovers ~45 Elo, matching an opponent with a +50% time advantage.
+- **Warm ID Gate (In Progress, task-5210)**: 6 threads / 12 engine instances actively playing. At 8 pairs (16 games): Penta `[1, 0, 7, 0, 0]`, with 7 out of 8 pairs splitting 1-1 against 6s cold reset.
 
-**5. PUCT $\leftrightarrow$ Alpha-Beta Integration Architecture (`TNN3` Disagreement Head):**
-- In MCTS, PUCT allocates visits using epistemic uncertainty $U$. In Alpha-Beta, static minimax lacks uncertainty awareness.
-- A Disagreement Prediction Head (`TNN3`) trained to predict $|\text{Search}_{5k} - \text{StaticEval}|$ serves as this uncertainty metric:
-  - Cancels or lowers LMR reductions on uncertain positions ($\text{Reduction} = \text{LMR}(d, m) - k \cdot \text{Disagreement}$).
-  - Triggers dynamic +1 ply volatility extensions.
-  - Aggressively prunes / deepens reductions on quiescent, settled nodes.
-
-**6. Botzone Gate: 4.0s Persistent TT vs 6.0s Cold Reset:**
-- Gate running on `book100.txt` across 6 CPU threads.
-- At 92 games (`Pair 46`): `+42 -44 =6 (48.9%) | Elo -7.6 +- 58.9 | LLR -0.14`.
-- Confirms persistent TT state recovers essentially the entire 50% time handicap.
+**5. Architecture Bakeoffs (Modal GPU):**
+- **W=256 vs W=512**: W=512 won decisively (Ep2 val MSE 0.022424 vs 0.022803, Delta -0.000379).
+- **G5 Ablation**: Full W=512 beat pruned no-G5 (0.022424 vs 0.022563). All feature groups retained.
 
 ---
 
