@@ -178,3 +178,9 @@ In alpha-beta search with Transposition Tables, tree depth scales with node thro
 * **Micro Model ($W=128$):** ~2.40 Mnps (**7x faster**), Depth ~14 at 100ms (**+4 plies**).
 
 In tournament play with short time controls, each additional ply of search depth provides far greater Elo gain (+40 to +60 Elo per ply) than the marginal evaluation accuracy gained from an oversized feature layer.
+
+### 6.4 Zero-Cost PUCT: Disagreement & Tactical Volatility Head (`TNN3`)
+* **Specification Document:** [docs/DISAGREEMENT_HEAD_SPEC.md](DISAGREEMENT_HEAD_SPEC.md)
+* **Core Principle:** An auxiliary scalar output head on the 32-dim latent embedding ($L_1 + L_2$) predicting expected search volatility $\hat{\Delta} \approx |\text{Search}_{5k} - \text{StaticEval}|$.
+* **Zero Overhead:** Requires only 32 FMAs (1 AVX2 vector instruction, ~0.8 ns) while reusing the existing incrementally updated accumulator.
+* **PUCT-Style Search:** Modulates Reverse Futility Pruning (RFP) and Late Move Reductions (LMR) dynamically—deep pruning when confidence is high ($\hat{\Delta} < 15$ cp), search extension and zero reductions when tactical volatility is detected ($\hat{\Delta} > 75$ cp).
