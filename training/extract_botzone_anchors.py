@@ -184,7 +184,7 @@ def extract_anchors(raw_path: str, out_dir: str):
                 "engine_cp": round(mean_eng, 1) if mean_eng is not None else None,
             }
             f_json.write(json.dumps(record) + "\n")
-            f_bin.write(struct.pack("<QQQBB", v["occ0"], v["occ1"], v["blockers"], v["turn"], min(255, v["n"])))
+            f_bin.write(struct.pack("<QQQB", v["occ0"], v["occ1"], v["blockers"], v["turn"]))
 
     print(f"Wrote {len(anchors):,} ground-truth anchors -> {out_jsonl}")
     print(f"Wrote binary index -> {out_bin} ({os.path.getsize(out_bin):,} bytes)")
