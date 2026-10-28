@@ -37,10 +37,10 @@ if MODE == "long":
 else:
     FIRST_LIMIT_MS = int(os.environ.get("TI_FIRST_MS", "12000"))
     TURN_LIMIT_MS = 6000
-SAFETY_MS = 100
+SAFETY_MS = 10
 STARTUP_MS = 120            # assumed interpreter start-up when the process age cannot be measured
 MAX_SANE_AGE_MS = 3000      # a measured process age above this (or below 0) is a measurement error
-OUT_RESERVE_MS = 5
+OUT_RESERVE_MS = 2
 WATCHDOG_GRACE_MS = 12
 RETRY_RESERVE_MS = 400      # a resuscitated search needs at least this much time left
 SCALE = float(os.environ.get("TI_TIME_SCALE", "1.0"))
