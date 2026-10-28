@@ -1241,9 +1241,10 @@ impl<'a> Searcher<'a> {
         self.stop_reason = StopReason::Completed;
         self.node_limit = limits.max_nodes;
         self.fut_sn = FUT_SN_ON.load(std::sync::atomic::Ordering::Relaxed);
+        let safety_margin_ms = 10.0;
         self.deadline_ms = limits
             .time
-            .map(|t| self.start_ms + t.as_secs_f64() * 1000.0);
+            .map(|t| self.start_ms + (t.as_secs_f64() * 1000.0 - safety_margin_ms).max(1.0));
 
         let mut result = SearchResult::default();
         // Instant terminal fast path (Botzone rules): a full board or a stuck
@@ -1430,11 +1431,11 @@ impl<'a> Searcher<'a> {
             it_ms[1] = it_ms[0];
             it_ms[0] = self.elapsed_ms() - iter_start;
             let proj_ms = it_ms[0].max(it_ms[1]);
-            // Botzone variant: no early exit. The clock is a hard limit there, so use all of it;
-            // a deeper iteration cut by the deadline still contributes its completed root moves
-            // (partial-iteration adoption above). Classic search keeps the prediction rule unless
-            // defending a forced loss, where all available time is used to maximize delay.
-            if !BZ && result.score > -MATE_BOUND && self.elapsed_ms() + proj_ms > budget_ms {
+            // Iteration cost prediction: project if the next iteration would overrun the budget.
+            // On Botzone, overrunning by even 1 ms deducts time from future moves and risks time forfeit.
+            // We stop cleanly at the completed depth. Only when defending a forced loss do we use all
+            // remaining time to find delay paths.
+            if result.score > -MATE_BOUND && self.elapsed_ms() + proj_ms > budget_ms {
                 self.stop_reason = StopReason::Time;
                 break;
             }
