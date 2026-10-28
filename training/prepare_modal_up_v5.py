@@ -14,7 +14,7 @@ FINAL = os.path.join(ROOT, "data", "nnue", "final")
 MODAL_UP = os.path.join(ROOT, "data", "nnue", "modal_up")
 COLS = [
     "occ0", "occ1", "stm", "outcome_p", "teacher_kind",
-    "kata_td_win", "kata_td_draw", "titanium_cp", "teacher_p3", "wsum"
+    "kata_td_win", "kata_td_draw", "titanium_cp", "titanium_cp_old", "teacher_p3", "wsum"
 ]
 
 def main():

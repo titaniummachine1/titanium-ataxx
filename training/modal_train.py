@@ -43,7 +43,10 @@ app = modal.App("titanium-train", image=image)
 DATA = "/data/ti"
 
 
-def build_features():
+DATA_TAG = os.environ.get("TI_DATA_TAG", "v5")
+
+
+def build_features(data_tag: str = DATA_TAG):
     """npz -> raw occ files -> engine nndump -> sha256 check (exactly the local feature files)."""
     import hashlib
     import shutil
@@ -58,8 +61,8 @@ def build_features():
     os.makedirs(feat, exist_ok=True)
     for sp in ("train", "val"):
         t0 = time.time()
-        shutil.copy("/vol/up/final_%s_v4.npz" % sp, "%s/final_%s_v4.npz" % (fin, sp))
-        with zipfile.ZipFile("%s/final_%s_v4.npz" % (fin, sp)) as z:
+        shutil.copy("/vol/up/final_%s_%s.npz" % (sp, data_tag), "%s/final_%s_%s.npz" % (fin, sp, data_tag))
+        with zipfile.ZipFile("%s/final_%s_%s.npz" % (fin, sp, data_tag)) as z:
             for c in ("occ0", "occ1", "stm"):
                 with z.open(c + ".npy") as f:
                     F.read_array(f).tofile("%s/%s.%s" % (feat, sp, c))
@@ -84,10 +87,10 @@ def train(tag: str, args: str, script: str = "train_nnue.py"):
     import subprocess
     import threading
     import time
-    build_features()
+    build_features(DATA_TAG)
     out = "/vol/ckpt/" + tag
     os.makedirs(out, exist_ok=True)
-    env = dict(os.environ, TI_ROOT=DATA, TI_DEVICE="cuda", TI_DATA_TAG="v4")
+    env = dict(os.environ, TI_ROOT=DATA, TI_DEVICE="cuda", TI_DATA_TAG=DATA_TAG)
     stop = threading.Event()
 
     def committer():

@@ -71,7 +71,7 @@ def free_gb():
 class Split:
     """Feature indices + targets of one split, gathered per batch."""
 
-    def __init__(self, split, stage, keep_mask):
+    def __init__(self, split, stage, keep_mask, diff_nudge=0.0):
         z = np.load("%s/final_%s_%s.npz" % (FINAL, split, DATA_TAG))
         self.cnt = np.fromfile("%s/%s.cnt" % (FEAT, split), dtype=np.uint8)
         self.idx = np.memmap("%s/%s.idx" % (FEAT, split), dtype=np.uint16, mode="r")
@@ -96,6 +96,10 @@ class Split:
             self.target = (0.75 * z["teacher_p3"].astype(np.float32) + 0.25 * out).astype(np.float32)
             self.rows = np.nonzero(self.is_kata)[0]
         self.w = z["wsum"].astype(np.float32)
+        if diff_nudge > 0 and "titanium_cp_old" in z.files:
+            delta = np.abs(z["titanium_cp"].astype(np.float32) - z["titanium_cp_old"].astype(np.float32))
+            nudge = 1.0 + diff_nudge * np.clip(delta / 400.0, 0.0, 1.0)
+            self.w = (self.w * nudge).astype(np.float32)
         self.keep = keep_mask
         # stage-target part without the outcome mix, for the lambda schedule (target = lam * tpart + (1 - lam) * outcome)
         self.tpart = (ti if stage == "base" else z["teacher_p3"].astype(np.float32)).astype(np.float32)
@@ -308,6 +312,7 @@ def parser():
     ap.add_argument("--rows", type=int, default=0, help="subset of training rows (ablation / smoke)")
     ap.add_argument("--max-chunks", type=int, default=0, help="smoke test only: stop after N chunks")
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--diff-nudge", type=float, default=0.0, help="weak difficulty nudge factor for disagreement (e.g. 0.15)")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--min-free-gb", type=float, default=1.0)
     ap.add_argument("--save-every", type=int, default=8, help="chunks between resume checkpoints")
@@ -352,9 +357,9 @@ def parser():
 _CACHE = {}
 
 
-def load_splits(stage, drop):
+def load_splits(stage, drop, diff_nudge=0.0):
     """Splits are cached so optuna / PBT members share one copy in RAM."""
-    key = (stage, drop)
+    key = (stage, drop, diff_nudge)
     if key not in _CACHE:
         _CACHE.clear()
         keep = None
@@ -363,7 +368,7 @@ def load_splits(stage, drop):
             for g in drop.split(","):
                 lo, hi = GROUPS[g.strip()]
                 keep[lo:hi] = False
-        _CACHE[key] = (Split("train", stage, keep), Split("val", stage, keep))
+        _CACHE[key] = (Split("train", stage, keep, diff_nudge), Split("val", stage, keep, diff_nudge))
     return _CACHE[key]
 
 
@@ -571,7 +576,7 @@ def run(a, trial=None):
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
     t0 = time.time()
-    tr, va = load_splits(a.stage, a.drop)
+    tr, va = load_splits(a.stage, a.drop, a.diff_nudge)
     tr.rows_all = getattr(tr, "rows_all", tr.rows)
     tr.rows = tr.rows_all
     if a.rows:
