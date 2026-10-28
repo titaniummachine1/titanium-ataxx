@@ -207,6 +207,7 @@ def main():
     ap.add_argument("--extra", action="store_true", help="10 tactical scalars (precomputed by --make-extras)")
     ap.add_argument("--alpha-in", action="store_true", help="the call's alpha as an input")
     ap.add_argument("--focus", type=float, default=0.0, help="weight rows near the prune threshold (cp/400 scale)")
+    ap.add_argument("--data-name", default="sn_train", help="npz dataset name inside SN_DATA")
     ap.add_argument("--make-extras", action="store_true")
     a = ap.parse_args()
     if a.make_extras:
@@ -216,7 +217,7 @@ def main():
     torch.set_num_threads(a.threads)
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
-    z = dict(np.load(D + "/sn_train.npz"))
+    z = dict(np.load(D + f"/{a.data_name}.npz"))
     ex = np.load(D + "/sn_train_ex.npy", mmap_mode="r") if a.extra else None
     n = len(z["nn"])
     perm = rng.permutation(n)
