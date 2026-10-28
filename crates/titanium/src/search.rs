@@ -1312,7 +1312,15 @@ impl<'a> Searcher<'a> {
         if let Some(net) = self.sancta {
             net.refresh_root(b, &mut self.stack.acc[0]);
         }
-        result.best = Some(root_moves[0]);
+        // Initial fallback move: prioritize the proven TT move if legal, else first root move.
+        let tt_legal_mv = if tt_mv != 0 {
+            (0..n_root)
+                .find(|&i| root_moves[i].to_u32() == tt_mv)
+                .map(|i| root_moves[i])
+        } else {
+            None
+        };
+        result.best = tt_legal_mv.or(Some(root_moves[0]));
         if let Some(entry) = root_tt {
             if entry.score.abs() < MATE_BOUND {
                 result.score = entry.score;
@@ -1328,26 +1336,13 @@ impl<'a> Searcher<'a> {
         let mut it_ms: [f64; 2] = [0.0, 0.0];
         let mut has_completed_iter = false;
 
-        // Dynamic iterative-deepening startup (Quoridor / persistent session):
-        // If the prior search (or opponent move in persistent TT) left a deep entry
-        // from the recent turn, skip the shallow iterations we already know the answer to
-        // and resume from near that depth.
-        let start_depth = if let Some(entry) = root_tt {
-            let age_diff = self.tt.age.wrapping_sub(entry.age);
-            if age_diff <= 2
-                && entry.depth >= 3
-                && (entry.flag == FLAG_EXACT || entry.flag == FLAG_LOWER)
-                && entry.score.abs() < MATE_BOUND
-            {
-                (entry.depth.saturating_sub(1) as u8).min(limits.max_depth).max(1)
-            } else {
-                1
-            }
-        } else {
-            1
-        };
-
-        for depth in start_depth..=limits.max_depth.max(1) {
+        // Iterative deepening MUST always start at depth 1.
+        // Skipping shallow iterations (even if TT has a deep entry) is fatal under hard time
+        // limits (e.g. Botzone): if the high-depth iteration is cut short by the deadline before
+        // completing, no iteration ever finishes, leaving depth at 0 and blundering with an
+        // unverified move. Shallow iterations take <0.1% of search time and guarantee that a
+        // verified completed iteration always exists.
+        for depth in 1..=limits.max_depth.max(1) {
             let iter_start = self.elapsed_ms();
             self.heuristic_used = false;
             let mut alpha = -INF;
@@ -1766,7 +1761,7 @@ xxx....
     }
 
     #[test]
-    fn warm_iterative_deepening_skips_shallow_iterations() {
+    fn warm_tt_reduces_search_nodes() {
         let b = Board::start();
         let mut se = Searcher::with_tt_bits(16);
         // Initial search to depth 6
@@ -1775,7 +1770,7 @@ xxx....
         let nodes1 = r1.nodes;
 
         // In a persistent session, searching the same root position again
-        // should start from depth 5 (tt_depth - 1), skipping depths 1..4.
+        // starts from depth 1 but TT cutoffs massively prune the tree.
         let r2 = se.search(&b, &no_time(6));
         assert_eq!(r2.depth, 6);
         assert!(r2.nodes < nodes1, "warm start nodes ({}) must be fewer than cold start ({})", r2.nodes, nodes1);
