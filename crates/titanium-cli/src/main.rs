@@ -27,7 +27,11 @@ fn main() -> ExitCode {
             std::env::set_var("TITANIUM_TUNE", val);
         }
     }
-    let cmd = args.first().map(String::as_str).unwrap_or("help");
+    let cmd = args
+        .iter()
+        .find(|x| matches!(x.as_str(), "perft" | "bench" | "selfplay" | "bestmove" | "label" | "labelbin" | "snparity" | "nnbench" | "nndump" | "s57dump" | "nnevaldump" | "nneval" | "play" | "show" | "genbench" | "uai" | "serve" | "match" | "sperft"))
+        .map(String::as_str)
+        .unwrap_or("help");
     // exact full-strength search without the lossy futility small net (D112); any command, `serve` included
     if args
         .iter()
