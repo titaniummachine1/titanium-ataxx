@@ -1,85 +1,64 @@
 # ⚡ Persistent vs. One-Shot Mode on Botzone: State-Preservation Optimizations
 
-A strategic and architectural analysis of **4.0s Persistent Mode** (`>>>BOTZONE_REQUEST_KEEP_RUNNING<<<`) versus **6.0s One-Shot Mode** on Botzone, and the exact state-preservation techniques needed to make 4s persistent search decisively outperform 6s cold search.
+A code-audited specification for **Track A (Immediate Execution while Relabel Runs)**: fixing the 4 persistence bottlenecks in [`crates/titanium/src/search.rs`](../crates/titanium/src/search.rs) and gating **4.0s Persistent Mode** (`>>>BOTZONE_REQUEST_KEEP_RUNNING<<<`) against **6.0s Cold One-Shot Mode**.
 
 ---
 
-## 1. The Botzone Trade-Off Dilemma
+## 1. Competitive Evidence: Why Botzone #1 (`atx`) Uses Persistent Mode
 
-| Feature | One-Shot Mode (Cold Restart) | Persistent Mode (`enable_keep_running`) |
-| :--- | :--- | :--- |
-| **Turn Time Budget** | **6.0 seconds** (12.0s first move) | **4.0 seconds** (12.0s first move) |
-| **Startup Overhead** | ~120–250 ms (Python interpreter + `.so` dlopen + 100MB TT alloc) | **0.0 ms** (resident in RAM) |
-| **History Replay** | Replays all past moves from move 1 on every turn | **0 ms** (`ti_apply` called once for opponent's latest move) |
-| **Transposition Table** | **Completely wiped** every turn (starts empty at depth 1) | **Preserved across all 100+ turns** |
-| **History Heuristic** | **Reset to 0** every turn (starts move ordering blind) | **Preserved and aged** across the entire match |
-| **Killer Moves** | **Reset to empty** every turn | **Shifted and reused** from previous plies |
-| **Eval Cache (`ecache`)** | **Wiped** every turn | **Preserved** (1 MiB table avoids repeat NNUE calls) |
+From our Botzone ranklist scrape (`ranklist_ataxx.html`), #1 ranked bot **`atx`** (`2562.93` Elo by `sqz`) states as its literal description:
+> **`"Neural evaluation with persistent tree search."`**
 
-### Why 6.0s One-Shot Was the Default:
-Historically, one-shot was chosen because 6s granted **+50% raw clock time** per move, which masked the lack of state persistence in early engine revisions. 
-
-### Why Optimized 4.0s Persistent Mode Wins (+1.5 to +2.5 Plies Net Depth):
-In a midgame position (move 25):
-* A **cold 6s engine** spends the first 1.5 seconds searching depths 1..8 from scratch to populate its TT and learn move ordering, only reaching depth 13 by second 5.5.
-* A **persistent 4s engine** already evaluated the opponent's move at depth 11 during the *previous* turn. Its TT already holds the subtree to depth 9! Depths 1..9 resolve in **`< 15 ms`**, and the remaining 3.7 seconds push the search to **depth 15–16**!
+`atx` deliberately gives up the extra 2 seconds of One-Shot mode (`6.0s` $\to$ `4.0s`) because **a warm Transposition Table, warm Move-Ordering History, warm Killers, and warm Eval Cache across moves save 1.5–2.5 seconds of shallow re-search on every turn** and provide deeper subtree accuracy than a cold 6.0s restart.
 
 ---
 
-## 2. The 5 Progress Preservation Optimizations for Persistent Mode
+## 2. Four Concrete Persistence Bottlenecks Found in `search.rs`
 
-To maximize the advantage of persistent mode, Titanium implements 5 state-preservation optimizations across turns:
+Auditing [`crates/titanium/src/search.rs`](../crates/titanium/src/search.rs) revealed why persistent mode was previously handicapped:
 
-### 2.1 Transposition Table Subtree Recycling & TT Generation Aging
-* **Generation Counter:** Add an `age: u8` field to TT entries. At the start of each new turn, increment `tt.generation += 1`.
-* **Subtree Carry-Over:** When the opponent plays move $m_{\text{opp}}$, the new root board $B_{\text{new}} = B_{\text{old}} \cdot m_{\text{my}} \cdot m_{\text{opp}}$ was already searched at depth $D - 2$. 
-* **PV Seeding:** Root move ordering probes the TT entry of $B_{\text{new}}$ directly, instantly ordering the true principal variation as move 0 (`ORD_TT`).
+### Bottleneck A1: TT "Zombie Clogging" Across Moves (`search.rs:326` & `452`)
+* **Current Code ([`search.rs:326-332`](../crates/titanium/src/search.rs) & [`448-461`](../crates/titanium/src/search.rs)):**
+  ```rust
+  struct TtEntry {
+      key: u64,   // 8B
+      mv: u32,    // 4B
+      score: i32, // 4B
+      depth: u8,  // 1B
+      flag: u8,   // 1B (+ 6 bytes of unused struct padding = 24 bytes!)
+  }
+  // In Tt::store:
+  if e.flag == FLAG_EMPTY || e.depth <= depth || e.key == key { *e = ... }
+  ```
+* **Why This Hurts Persistent Games:**
+  In Ataxx, every clone move permanently increases total stone count on the board. Therefore, positions from Turn 1–5 are **mathematically unreachable** by Turn 10. However, because `Tt::store` has **no `age` (`generation`) check**, a `depth = 11` entry stored on Turn 1 **permanently blocks** Turn 25 from storing any `depth = 1..10` entry in that hash slot! Over a 60-turn game, the TT becomes progressively clogged with unreachable early-game zombie entries.
+* **Zero-RAM Fix:**
+  Add `age: u8` inside the existing 6-byte struct padding of `TtEntry` (`size_of::<TtEntry>()` remains exactly `24` bytes). Increment `self.tt.step_age()` at the start of `search_gen`. Replace whenever `e.flag == FLAG_EMPTY || e.key == key || e.age != self.age || e.depth <= depth`.
 
-### 2.2 Countermove / Continuation History (`conthist`)
-* Stockfish and top engines use **Continuation History** (moves that historically refuted the opponent's previous move):
-  $$\text{Table: } \mathbf{H}_{\text{cont}}[\text{prev\_piece}][\text{prev\_to}][\text{curr\_from}][\text{curr\_to}]$$
-* In one-shot mode, this table is lost on every move.
-* In persistent mode, countermove quality is refined over dozens of turns, improving quiet move ordering by **~12–18% fewer nodes to cutoff**.
+### Bottleneck A2: Fail-Low (`FLAG_UPPER`) Overwrites Existing TT Best Move (`search.rs:452` & `1175`)
+* **Current Code ([`search.rs:960`](../crates/titanium/src/search.rs), [`1095`](../crates/titanium/src/search.rs), [`1175`](../crates/titanium/src/search.rs)):**
+  When a PVS zero-window scout fails low (`best <= alpha_orig`, `FLAG_UPPER`), `best_mv` is simply the first move searched that failed to beat `alpha` (or `0xFFFF`). Yet `Tt::store` unconditionally overwrites `e.mv` when `e.key == key`!
+* **Fix:**
+  In `Tt::store`, when `e.key == key && (flag == FLAG_UPPER || mv == 0xFFFF || mv == 0) && e.mv != 0 && e.mv != 0xFFFF`, preserve the existing `e.mv` refutation move.
 
-### 2.3 History Aging vs. Wiping
-In [`crates/titanium/src/search.rs:1229-1236`](../crates/titanium/src/search.rs):
-```rust
-// Age the history table so old cutoffs don't dominate forever
-for side in self.history.iter_mut() {
-    for row in side.iter_mut() {
-        for h in row.iter_mut() {
-            *h = (*h * 7) / 8; // gentle decay instead of clearing
-        }
-    }
-}
-```
-Gentle decay preserves long-term positional move preferences while allowing recent tactical motifs to take precedence.
+### Bottleneck A3: Unshifted `killers` & Over-Aggressive History Decay (`search.rs:1229-1236`)
+* **Current Code ([`search.rs:1229-1236`](../crates/titanium/src/search.rs)):**
+  - `self.killers` is indexed by search `ply` (`0..MAX_PLY`), and is **never shifted** when the game advances by 2 plies (our move + opponent reply). Thus `killers[0]` at Turn $T+1$ holds stale root killers from Turn $T$ instead of `killers[2]`!
+  - `self.history` is divided by 2 (`*h /= 2`) every turn—erasing $1 - (1/2)^4 = 93.75\%$ of learned move-ordering signal after just 4 turns!
+* **Fix:**
+  - Shift killers by 2 plies at the start of each consecutive turn (`self.killers.copy_within(2..MAX_PLY, 0); self.killers[MAX_PLY - 2..] = [(0, 0); 2];`).
+  - Soften per-turn history decay from `*h /= 2` ($0.50\times$) to `*h = (*h * 3) / 4` ($0.75\times$).
 
-### 2.4 Killer Moves Shifting
-* When two plies are played (our move + opponent move), shift killer moves up by 2 plies:
-  $$\text{killers}[p] \gets \text{killers}[p + 2]$$
-  Killers discovered deep in the previous turn's tree remain active candidate refutations at the new search root.
-
-### 2.5 Static Eval Cache (`ecache`) Persistence
-* In Ataxx, many move sequences transpose into identical bitboard states (different jump/clone order).
-* Preserving `ecache` (65,536 entries, 1 MiB) across turns allows Titanium to retrieve exact Big Net evaluations instantly without re-running the 6.5 µs NNUE feature transformer.
+### Bottleneck A4: 1-Ply Countermove Table (`countermoves[stm][prev_from][prev_to]`)
+* Store the quiet/jump move `m` that most recently caused a beta cutoff in response to the opponent's move `(prev_from, prev_to)` in `stack`, giving a countermove ordering bonus in `score_into`. Across a persistent game, recurring opponent jump maneuvers are refuted on the very first quiet move tried.
 
 ---
 
-## 3. Head-to-Head Gating Plan: 4s Persistent vs. 6s One-Shot
+## 3. Execution & Gating Order (Immediate Track A)
 
-Using `titaniumtest sprt`, we gate the two modes head-to-head under true Botzone constraints:
-
-```powershell
-# Gate 4s Persistent (with warm TT/History) vs 6s Cold Restart (with cleared TT/History per turn)
-titaniumtest sprt `
-  --candidate "titanium-cli serve --mode persistent --time-ms 3800" `
-  --baseline  "titanium-cli serve --mode oneshot --time-ms 5700" `
-  --book data/nnue/book100.txt `
-  --elo0 0 --elo1 10 --max-games 200 --threads 6
-```
-
-### Verification Criteria for Switching Botzone Default:
-1. **Pass Condition:** `+15 Elo` or better at $95\%$ confidence ($LLR \ge 2.944$).
-2. **Safety Check:** Zero timeouts over 200 consecutive games in the Linux Docker test harness (`tools/build_botzone.py`).
-3. **Deployment:** Flip `MODE = "long"` in `botzone/titanium_botzone.py` and upload to Botzone.
+1. **Step A1–A4 Implementation in `crates/titanium/src/search.rs`:**
+   - Implement `Tt::age` + fail-low `e.mv` preservation + 2-ply killer shift + $0.75\times$ history decay.
+   - Gate at equal time (`100ms/move`, persistent `Searcher` across moves of each game) via `titaniumtest sprt`.
+2. **Step A5 Asymmetric Botzone Gate (`3.8s Persistent` vs `5.7s Cold One-Shot`):**
+   - Run 200-game paired opening match where Candidate keeps `Searcher` warm at `3800 ms/move` and Baseline calls `reset_for_new_game()` before each move at `5700 ms/move`.
+   - Upon passing, set `MODE = "long"` (`>>>BOTZONE_REQUEST_KEEP_RUNNING<<<`) in [`botzone/titanium_botzone.py`](../botzone/titanium_botzone.py).
