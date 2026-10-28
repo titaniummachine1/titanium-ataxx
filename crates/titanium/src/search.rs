@@ -329,7 +329,10 @@ struct TtEntry {
     score: i32,
     depth: u8,
     flag: u8, // 0 empty, 1 exact, 2 lower, 3 upper
+    age: u8,  // Generation age for FIFO/LRU eviction without RAM increase (fits in compiler padding)
 }
+
+const _: () = assert!(std::mem::size_of::<TtEntry>() == 24);
 
 const FLAG_EMPTY: u8 = 0;
 const FLAG_EXACT: u8 = 1;
@@ -407,10 +410,11 @@ impl CorrHist {
 pub struct Tt {
     buf: Vec<TtEntry>,
     mask: usize,
+    pub age: u8,
 }
 
 impl Tt {
-    /// `2^bits` entries (bits=20 -> 1M entries, 24 MB).
+    /// 2^bits entries (bits=20 -> 1M entries, 24 MB).
     pub fn new(bits: usize) -> Tt {
         let size = 1usize << bits.min(24);
         Tt {
@@ -420,11 +424,13 @@ impl Tt {
                     mv: 0,
                     score: 0,
                     depth: 0,
-                    flag: FLAG_EMPTY
+                    flag: FLAG_EMPTY,
+                    age: 0,
                 };
                 size
             ],
             mask: size - 1,
+            age: 0,
         }
     }
 
@@ -432,30 +438,54 @@ impl Tt {
         for e in self.buf.iter_mut() {
             e.flag = FLAG_EMPTY;
         }
+        self.age = 0;
     }
 
     #[inline]
-    fn probe(&self, key: u64) -> Option<&TtEntry> {
-        let e = &self.buf[(key as usize) & self.mask];
+    pub fn step_age(&mut self) {
+        self.age = self.age.wrapping_add(1);
+    }
+
+    #[inline]
+    fn probe(&mut self, key: u64) -> Option<TtEntry> {
+        let e = &mut self.buf[(key as usize) & self.mask];
         if e.flag != FLAG_EMPTY && e.key == key {
-            Some(e)
+            e.age = self.age;
+            Some(*e)
         } else {
             None
         }
     }
 
     #[inline]
-    fn store(&mut self, key: u64, mv: u32, score: i32, depth: u8, flag: u8) {
+    fn store(&mut self, key: u64, mut mv: u32, score: i32, depth: u8, flag: u8) {
         let e = &mut self.buf[(key as usize) & self.mask];
-        // Depth-preferred replacement; always replace same position so a
-        // fresh search overwrites stale bounds.
-        if e.flag == FLAG_EMPTY || e.depth <= depth || e.key == key {
+        let same_pos = e.flag != FLAG_EMPTY && e.key == key;
+
+        // Preserve refutation move on fail-low (FLAG_UPPER):
+        if same_pos && flag == FLAG_UPPER && e.mv != 0 && e.mv != 0xFFFF {
+            mv = e.mv;
+        }
+
+        // Replacement policy:
+        // 1. Slot is empty
+        // 2. Same position (always update bounds/depth)
+        // 3. Stale generation/age (older turns aged out from dead subtrees)
+        // 4. Deeper or equal depth
+        let age_diff = self.age.wrapping_sub(e.age);
+        let replace = e.flag == FLAG_EMPTY
+            || same_pos
+            || (!same_pos && (age_diff >= 2 || (age_diff == 1 && depth.saturating_add(4) >= e.depth)))
+            || e.depth <= depth;
+
+        if replace {
             *e = TtEntry {
                 key,
                 mv,
                 score,
                 depth,
                 flag,
+                age: self.age,
             };
         }
     }
@@ -1226,11 +1256,12 @@ impl<'a> Searcher<'a> {
             result.stopped_by = Some(StopReason::Completed);
             return result;
         }
+        self.tt.step_age();
         // Age the history table so old cutoffs don't dominate forever.
         for side in self.history.iter_mut() {
             for row in side.iter_mut() {
                 for h in row.iter_mut() {
-                    *h /= 2;
+                    *h = (*h * 3) / 4;
                 }
             }
         }
@@ -1681,5 +1712,30 @@ xxx....
         assert!(r.best.is_some());
         assert_eq!(r.depth, 6);
         assert_eq!(r.stopped_by, Some(StopReason::Completed));
+    }
+
+    #[test]
+    fn tt_aging_and_fail_low_preservation() {
+        let mut tt = Tt::new(10);
+        let key = 123456789u64;
+        let mv_good = 42u32;
+
+        // 1. Store an exact bound with a good move
+        tt.store(key, mv_good, 150, 6, FLAG_EXACT);
+        assert_eq!(tt.probe(key).unwrap().mv, mv_good);
+        assert_eq!(tt.probe(key).unwrap().score, 150);
+
+        // 2. A deeper search on the same position fails low (FLAG_UPPER)
+        tt.store(key, 0xFFFF, 50, 8, FLAG_UPPER);
+        // The good move must be preserved!
+        assert_eq!(tt.probe(key).unwrap().mv, mv_good, "refutation move must be preserved on fail-low");
+        assert_eq!(tt.probe(key).unwrap().score, 50);
+
+        // 3. Test age replacement: position from old turn gets evicted by fresh search
+        tt.step_age();
+        tt.step_age();
+        let other_key = key ^ (1 << 10); // same hash slot, different key
+        tt.store(other_key, 99, 200, 3, FLAG_EXACT);
+        assert_eq!(tt.probe(other_key).unwrap().key, other_key);
     }
 }
