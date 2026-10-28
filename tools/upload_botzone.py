@@ -61,7 +61,7 @@ def upload_to_botzone(email: str, password: str, so_bytes: bytes, py_bytes: byte
         "simpleio": "true",
         "enable_keep_running": "true",
         "opensource": "false",
-        "description": "v8: persistent session, warm ID search, 4s/turn",
+        "description": "v9: d1 startup fix, universal overrun prediction, 100ms safety",
     }
     r_bot = s.post("https://www.botzone.org.cn/mybots/create", data=data_bot, files=files_bot, timeout=30)
     print("Add bot version response:", r_bot.status_code, r_bot.text[:300])
@@ -71,6 +71,15 @@ def upload_to_botzone(email: str, password: str, so_bytes: bytes, py_bytes: byte
 def main():
     email = os.environ.get("BOTZONE_EMAIL", "")
     password = os.environ.get("BOTZONE_PASSWORD", "")
+    if not email or not password:
+        try:
+            import sys
+            sys.path.insert(0, "C:/gitProjects/botzone-bots/tools")
+            import creds
+            email = creds.EMAIL
+            password = creds.PASSWORD
+        except Exception:
+            pass
     if not email or not password:
         raise ValueError("BOTZONE_EMAIL and BOTZONE_PASSWORD environment variables required")
     so_bytes = b""
