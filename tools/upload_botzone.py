@@ -61,7 +61,7 @@ def upload_to_botzone(email: str, password: str, so_bytes: bytes, py_bytes: byte
         "simpleio": "true",
         "enable_keep_running": "true",
         "opensource": "false",
-        "description": "v10: d1 startup fix, universal overrun prediction, 10ms safety",
+        "description": "v11: +72 Elo D4 champion net, TNN3 Disagreement Head, SmallNet futility",
     }
     r_bot = s.post("https://www.botzone.org.cn/mybots/create", data=data_bot, files=files_bot, timeout=30)
     print("Add bot version response:", r_bot.status_code, r_bot.text[:300])
