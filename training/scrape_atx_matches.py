@@ -9,27 +9,17 @@ import requests
 
 ATAXX_GAME_ID = "5809c7647f65182b044b5e3b"
 ATX_BOT_ID = "6aa07f142418e3081fb60ede"
-TOP_BOT_IDS = {
-    "6aa07f142418e3081fb60ede": "atx",            # 2561 Elo
-    "6ad3afdef80b7d76046b6c37": "Ataxx_Python",   # 2560 Elo
-    "6ad29fd3f80b7d76046a9501": "Ataxx_CPP",      # 2368 Elo
-    "65bc052713e80a09c4e39327": "cheetax",        # 2245 Elo
-    "6a4132631ba515095a0bbd65": "KataAtaxx_mini", # 2224 Elo
-    "68ed1a4cdcee294b521dda28": "Kissin_Flash",   # 2216 Elo
-    "699f2e47f382575c2a73cb96": "PyJataxx",       # 2137 Elo
-    "65fd7af4dc83c705baebcbe7": "Sincerely",      # 1981 Elo
-    "6a7832260fbd680d7c6d1d2b": "evo",            # 1964 Elo
-    "63eccef96ce79f4b2db9dde7": "hce",            # 1951 Elo
-    "6acd0738d10ddc72074192a1": "Daybreak",       # 1939 Elo
-    "65b3950413e80a09c4ddd5df": "sotax",          # 1933 Elo
-    "622eadd4b25b5629b5c03554": "xie",            # 1929 Elo
-    "620d12d6bbc22c318db6ef02": "RawNN",          # 1920 Elo
-    "6a89fbcb0fbd680d7c7f692a": "waffle_ataxx",   # 1902 Elo
-    "5ce25d84d2337e01c7a3c0fc": "Ataxx",          # 1805 Elo
-    "6a3bd61a7e8f174717a20396": "aaa",
-    "5af3313d1c45dc7bf64a16f7": "Master",
-    "6ad7e0c3bdad901f323f6516": "titanium_ataxx_PY6",
+# Elite bots with rating >= 2100 Elo (Top 7 on Botzone)
+ELITE_2100_BOTS = {
+    "6aa07f142418e3081fb60ede": ("atx", 2561),
+    "6ad3afdef80b7d76046b6c37": ("Ataxx_Python", 2560),
+    "6ad29fd3f80b7d76046a9501": ("Ataxx_CPP", 2368),
+    "65bc052713e80a09c4e39327": ("cheetax", 2245),
+    "6a4132631ba515095a0bbd65": ("KataAtaxx_mini", 2224),
+    "68ed1a4cdcee294b521dda28": ("Kissin_Flash", 2216),
+    "699f2e47f382575c2a73cb96": ("PyJataxx", 2137),
 }
+TOP_BOT_IDS = {bid: name for bid, (name, _) in ELITE_2100_BOTS.items()}
 
 OUT_DIR = r"C:\gitProjects\titanium-ataxx\data\nnue\atx_scraped"
 
