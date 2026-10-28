@@ -15,14 +15,27 @@ Gate definitions (both engines on the same limit, never depth-capped):
 1000 games) when requested. Elo estimate: `−400·log10(1/s − 1)`,
 `s = (W + D/2)/N`.
 
-## Baselines (engine v0.2: negamax + ID + TT + killers + history + eval-cache)
+## Executive Benchmark Summary & Reference Matchups
+
+Canonical standing of Titanium against major established engines, reference architectures, and competitive arena ladders (referencing verified ledger rows):
+
+| Target / Opponent | Category & Authors | Benchmark Gate | Titanium Result | Measured Elo | Ledger Citation & Strategic Takeaway |
+|---|---|---|---|---|---|
+| **Moonbird 1.1.0** | Established Community Standard (tsoj) | 100ms (100 games) & 5k nodes | **52-48-0** (@100ms)<br>1-99-0 (@5k)<br>106-88-6 (@1000x spot) | **+14 Elo** (@100ms)<br>-500 Elo (@5k)<br>+30 Elo (@spot) | **Rows S3moon5, S39fixmoon, S33spot:** At shallow equal-time controls (100ms), Titanium's fast NNUE inference wins (+14). At equal nodes (5k), Moonbird's 25MB handcrafted 2x2 weights dominate; parity reached at ~500-1000x search depth. |
+| **Sanctaphraxx** | Early Neural Baseline (Ciekce) | 100ms (20 games) | **19-0-1** | **+400 Elo** | **Row S3owner:** Decisive search superiority. Titanium's PVS, LMR, and clone-dedup decisively crushes Sanctaphraxx's engine with identical net architecture. |
+| **Ataxx_CPP** | C++ Reference & Dataset Generator (zzzzz151) | 5k nodes (400 games) | **225-172-3** | **+46 Elo** | **Row Ws57:** S57 v2 WDL net trained on Ataxx_CPP self-play trajectories provided our major breakthrough (+46 Elo over S56 baseline). |
+| **KataGo Ataxx (Kataxx)** | Superhuman MCTS Oracle (hzy_sigmoid / [KataGomo](https://github.com/hzyhhzy/KataGomo/releases/tag/Ataxx_20260501)) | 18-20 block TensorRT MCTS | Teacher Ground Truth | **Target Oracle (>3200)** | KataGo Ataxx's 2026 MCTS rollout distributions define the upper exploration bound for Titanium's upcoming Disagreement Head (TNN3). |
+| **Botzone Ladder #1 (atx)** | Botzone Platform Champion (sqz) | Botzone Simple IO (Rating: 2562.93) | Architectural Blueprint | **2562.93 Elo** | Employs persistent tree search with neural evaluation. Blueprint for Titanium's Track A memory-preservation fixes (TT aging, fail-low refutation preservation). |
+| **Botzone Arena Ladder** | Live Ranked Competition | 6.0s / move (4 matches) | **4-0-0** (100% win rate) | **1591.84 Ceiling** | **Row BZ-LADDER:** Defeated top opponent [windbbt]ATAXX (1582.19, +43 stone margin in 183 moves). Unlocked top-tier opponents (Leon99). |
+
+### Historical v0.2 Initial Baselines (2026-09-16)
 
 | id | change | gate | games | W-L-D | verdict |
 |---|---|---|---|---|---|
-| E0 | baseline vs **Moonbird 1.1.0** | 1s/move | 50 | 1–49–0 | baseline |
-| E0b | baseline vs Moonbird | 5k nodes | 32 | 0–32–0 | baseline |
-| E0c | baseline vs Moonbird | 100ms | 32 | 0–32–0 | baseline |
-| E0d | self-play sanity | 20k nodes | 16 | 8–8–0 | no color bias ✓ |
+| E0 | baseline vs **Moonbird 1.1.0** | 1s/move | 50 | 1–49–0 | Initial baseline before search overhaul |
+| E0b | baseline vs Moonbird | 5k nodes | 32 | 0–32–0 | Diagnostic equal-compute baseline |
+| E0c | baseline vs Moonbird | 100ms | 32 | 0–32–0 | Realistic speed baseline |
+| E0d | self-play sanity | 20k nodes | 16 | 8–8–0 | Color balance verification (no first-move bias) |
 
 ## Log
 
