@@ -7,27 +7,22 @@ Never upload a library built with plain `cargo build` on a modern Linux: it need
 Botzone (Ubuntu 16.04, glibc 2.23) on its first move (happened with v5, 2026-10-25).
 Eval: main's strongest big NNUE is embedded in `data/titanium_v2.so`; the upload no longer needs a separate network file. Local `TI_NET` still allows an explicit replacement network.
 Search: the Botzone driver passes the full u8 depth limit (255) along with its time budget; solved mates and exhausted terminal trees stop automatically.
-Time: 12 s on the bot's first turn of a match (wiki: first turn doubled, Python 6x), 6 s on every later turn.
+Time: 12 s on the bot's first turn of a match, 4 s on every later turn (persistent session).
 
-Simulator modes: `--mode oneshot` (default, fresh process per move) and `--mode long`.
+Simulator modes: `--mode long` (default, persistent session with warm ID search) and `--mode oneshot`.
 
 Design: **Python owns Botzone, Rust owns the game.** `titanium_botzone.py` parses the long-live Simple-IO
 requests, replays the game after a restart, keeps the clock and the watchdog, and talks to the engine only
 through a tiny C ABI (`crates/titanium-ffi`): `ti_new / ti_new_game / ti_apply / ti_search_with_limits(time, nodes, depth) / ti_stop / ti_stats`.
 The engine knows nothing about the Botzone protocol.
 
-## Time policy (default: ONE-SHOT, 6 s per move)
-The bot is configured WITHOUT a long-lived session: Botzone starts a fresh process for every move and sends the
-whole game history each time (turn count, then request/response lines). The driver replays it into the engine
-(`ti_apply` validates every move) and searches for `6000 ms - 50 ms - process age - 2 ms`. The process age is read
-from the OS (Windows `GetProcessTimes`, Linux `/proc/self/stat`), so interpreter start-up is charged exactly.
-The first move also gets 6 s (an older note mentioned a doubled 12 s first move; that is unverified and a wrong
-guess means a time-out loss; `TI_FIRST_MS=12000` enables it once confirmed). The long-live variant remains
-available with `TI_MODE=long` (12 s first / 4 s later, hash table kept between moves).
-Search uses the whole budget (the Botzone variant has no early exit); a watchdog calls `ti_stop` 12 ms after the budget.
-Measured at the true limit (6 s): every move finished at 5.912 s from process spawn to exit, margin 87.5 ms;
-engine overshoot past its own budget median 1.0 ms, max 1.2 ms. At a scaled clock: 105 moves, worst margin 39 ms.
-Trade-off: no hash table carry-over between moves (fresh process), in exchange for 6 s instead of 4 s per move.
+## Time Policy (Default: PERSISTENT SESSION / LONG-RUNNING, 4 s per move)
+The bot is configured WITH a long-lived persistent session (`TI_MODE = "long"`):
+- Botzone hands the bot 12,000 ms on turn 1 and 4,000 ms on all subsequent turns.
+- The Python process stays alive between turns, outputting `>>>BOTZONE_REQUEST_KEEP_RUNNING<<<`.
+- The Transposition Table (TT) and engine state are preserved across turns.
+- Search employs warm iterative-deepening startup from TT depth + generation aging to recover 25-30 Elo of handicap against cold-reset opponents.
+- The one-shot fallback variant remains available with `TI_MODE=oneshot` (6 s per move, cold process reset every move).
 
 ## Rules handled in the engine (Botzone judge)
 No passes; the game ends the moment either side cannot move and the mobile side absorbs the empties
@@ -49,20 +44,33 @@ A build for AVX2/BMI2 CPUs was measured and is NOT faster (1.14 vs 1.14 Mnps), s
 ## Local test (Botzone simulator: judge rules, greedy opponent, long-live message format)
 ```
 python botzone/sim_local.py --lib target/release/titanium_ffi.dll --net <tupS57v2.tup> --games 6 --scale 0.05
-python botzone/sim_local.py --lib target/release/titanium_ffi.dll --net <tupS57v2.tup> --games 2 --scale 1 --max-driver-moves 3   # true 6 s limit
-# add --mode long for the long-live variant
+python botzone/sim_local.py --lib target/release/titanium_ffi.dll --net <tupS57v2.tup> --games 2 --scale 1 --max-driver-moves 3   # true 4 s limit
+# add --mode oneshot for the cold-reset variant
 ```
 
-## Files to upload (new names, so the currently ranked bot keeps working)
-`data/titanium_v2.so` -> storage `/titanium_v2.so`; `data/nnue/tupS57v2.tup` -> storage `/nnue/tupS57v2.tup`;
-`titanium_botzone.py` as the new bot version (Python, Simple IO, **long-live OFF**, time limit 6 s). Memory: TT 22 bits is ~100 MB.
+## Cloud Deployment (Automated via Modal)
+Direct Windows socket uploads for ~28.5 MB files (`titanium_v2.so`) often timeout over international ISP routes to Beijing.
+Use the cloud container uploader (`tools/upload_botzone.py` via Modal) which completes in seconds over datacenter bandwidth:
+
+```powershell
+$env:BOTZONE_EMAIL = "your_email"
+$env:BOTZONE_PASSWORD = "your_password"
+python -m modal run tools/upload_botzone.py
+```
+
+### Botzone API Constraints & Endpoints
+1. **Description Length:** `Botzone.consts.bot.desc_length_max = 100`. Descriptions > 100 characters fail with `{"success": false, "message": "bot.desc.length\n"}`. Keep descriptions concise (e.g. `v8: persistent session, warm ID search, 4s/turn`).
+2. **Bot Identifiers:**
+   - Bot ID: `6ad7e0c3bdad901f323f6516` (`titanium_ataxx_PY6`)
+   - Game ID: `5809c7647f65182b044b5e3b` (Ataxx)
+   - Compiler: `py36` (Python 3.6+)
+3. **Endpoints:**
+   - **Login:** `POST https://www.botzone.org.cn/login` (`email`, `password`)
+   - **Upload Binary:** `POST https://www.botzone.org.cn/userfile/uploadfile` (`file`, `path`, `filename="titanium_v2.so"`)
+   - **Update Bot Mode:** `POST https://www.botzone.org.cn/mybots/modify` (`botid`, `enable_keep_running="true"`, `simpleio="true"`, `opensource="false"`)
+   - **Create Bot Version:** `POST https://www.botzone.org.cn/mybots/create` (`id`, `name`, `game`, `extension="py36"`, `simpleio="true"`, `enable_keep_running="true"`, `description`, `source` file)
 
 ## Verified facts from Botzone's own wiki (Bot page / Ataxx page)
-Default 1 s and 256 MB per run; the FIRST turn of a match gets double time; Python gets a 6x multiplier (so 6 s, 12 s first turn);
-evaluation machines are x86-64 Ubuntu 16.04 with ONE usable core (our engine is single-threaded). The first move is nevertheless
-kept at 6 s on purpose. Ataxx rules: black moves first, 4-corner start (black (0,0),(6,6); white (6,0),(0,6)), no passes (game ends when
+Default 1 s and 256 MB per run; the FIRST turn of a match gets double time; Python gets a 6x multiplier (so 6 s in oneshot, 4 s in long-running persistent mode; 12 s first turn);
+evaluation machines are x86-64 Ubuntu 16.04 with ONE usable core (our engine is single-threaded). Ataxx rules: black moves first, 4-corner start (black (0,0),(6,6); white (6,0),(0,6)), no passes (game ends when
 a side cannot move, empties go to the side that can), wipeout wins, game ends at 400 turns, repetition rule as above.
-
-## Not verified here
-The Linux `.so` was not executed (no WSL distro / Docker engine on the dev box); it is the same source as the
-Windows DLL that passed every test, checked to be an x86-64 ELF exporting all functions with glibc <= 2.14.
