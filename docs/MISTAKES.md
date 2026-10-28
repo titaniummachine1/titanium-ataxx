@@ -80,3 +80,14 @@
     - *Incidents:* Kataxx developer claimed Kataxx cannot lose to Titanium because Titanium lost to PyJataxx.
     - *Root Cause:* Zero-sum adversarial games have non-transitive skill geometry (Condorcet cycles / rock-paper-scissors dynamics). Different engines possess divergent search/evaluation strengths (e.g., MCTS territory expansion in PyJataxx vs deep alpha-beta singular extension tactical solving in Titanium vs neural policy heuristics in Kataxx). In Ataxx, Player 0 also has a massive first-mover tempo advantage.
     - *Rule:* Never judge engine strength from single-game second-player anomalies or intransitive match triads. Always evaluate engine supremacy via controlled multi-hundred game SPRT gates under opening book diversity (`book100k_diverse.txt`) with alternating seats.
+
+
+37. **Attempting to resume iterative deepening by cutting tree branches or jumping to high depths across moves (2026-10-28).**
+    - *Inquiry / Trap:* Why not preserve the search tree across moves, cut the branches that did not happen after the opponent plays, and resume iterative deepening at a safe depth (e.g. depth 16) rather than restarting from depth 1?
+    - *Theoretical & Practical Realities:*
+      1. *Memory Model (Alpha-Beta vs MCTS):* Unlike MCTS (which allocates an explicit node graph in RAM and can reparent root = root->children[m]), Alpha-Beta Minimax is a stack-based recursive execution model (negamax) with no persistent tree object in memory. In Alpha-Beta, all knowledge across moves is preserved entirely within the Transposition Table (TT).
+      2. *The Unbalanced Subtree Trap:* If the opponent plays a non-PV or suboptimal move, that branch was pruned early in our previous search (beta cutoffs at depth 2-4) to prove its inferiority. Starting at depth 16 under an opponent deviation means launching a massive, unguided search with cold move ordering and zero deep TT entries.
+      3. *Shallow Iterations Are Free:* Depths 1-12 with a warm TT take <0.1% of the search time (<2 ms) because nearly all nodes are instant TT hits. Skipping them saves essentially 0 ms.
+      4. *Move-Ordering Backbone:* Shallow iterations dynamically calibrate the Killer Moves table, History Heuristic (history[stm][from][to]), and root move PV ordering for the current position. Without these, deep iterations suffer exponential node explosion.
+      5. *Safety Invariant:* Always starting at depth 1 ensures that within 0.05 ms, a verified completed iteration exists, completely preventing d0 timeouts and unsearched move blunders.
+    - *Rule:* Always restart iterative deepening from depth = 1 on every move. Let the Transposition Table provide tree reuse and cutoff speedups while shallow iterations establish move ordering and error-free safety.
