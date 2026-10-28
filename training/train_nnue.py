@@ -52,6 +52,66 @@ GROUPS = {"G1": (G1_OFF, G2_OFF), "G2": (G2_OFF, G3_OFF), "G3": (G3_OFF, G5_OFF)
 NB = 8
 
 
+def build_feat_perm():
+    """Build exact 8-mode D4 dihedral symmetry permutation table for all 26,196 NNUE features (419 KB)."""
+    maps = []
+    for mode in range(8):
+        m = np.zeros(49, dtype=np.int64)
+        for r in range(7):
+            for c in range(7):
+                idx = r * 7 + c
+                if mode == 0: nr, nc = r, c           # Identity
+                elif mode == 1: nr, nc = c, 6 - r     # 90 deg CW
+                elif mode == 2: nr, nc = 6 - r, 6 - c # 180 deg
+                elif mode == 3: nr, nc = 6 - c, r     # 270 deg CW
+                elif mode == 4: nr, nc = r, 6 - c     # Flip horizontal
+                elif mode == 5: nr, nc = 6 - r, c     # Flip vertical
+                elif mode == 6: nr, nc = c, r         # Transpose
+                elif mode == 7: nr, nc = 6 - c, 6 - r # Anti-transpose
+                m[idx] = nr * 7 + nc
+        maps.append(m)
+
+    perm = np.zeros((8, NUM_FEATS), dtype=np.int64)
+    for mode in range(8):
+        P = maps[mode]
+        for f in range(NUM_FEATS):
+            if f < G2_OFF:
+                sq = f // SQ_STATES
+                code = f % SQ_STATES
+                perm[mode, f] = G1_OFF + P[sq] * SQ_STATES + code
+            elif f < G3_OFF:
+                if f == G2_NONE:
+                    perm[mode, f] = G2_NONE
+                else:
+                    d = f - G2_OFF
+                    side = d % 2
+                    pair = d // 2
+                    anchor = pair // 49
+                    stone = pair % 49
+                    perm[mode, f] = G2_OFF + (P[anchor] * 49 + P[stone]) * 2 + side
+            elif f < G5_OFF:
+                d = f - G3_OFF
+                ef = d % 9
+                tmp = d // 9
+                on = tmp % 9
+                tmp2 = tmp // 9
+                col = tmp2 % 2
+                sq = tmp2 // 2
+                perm[mode, f] = G3_OFF + ((P[sq] * 2 + col) * 9 + on) * 9 + ef
+            elif f < G6_OFF:
+                d = f - G5_OFF
+                v = d % 9
+                sq = d // 9
+                perm[mode, f] = G5_OFF + P[sq] * 9 + v
+            else:
+                perm[mode, f] = f
+    return perm
+
+
+FEAT_PERM = build_feat_perm()
+
+
+
 def free_gb():
     if os.name != "nt":
         for line in open("/proc/meminfo"):
@@ -71,7 +131,7 @@ def free_gb():
 class Split:
     """Feature indices + targets of one split, gathered per batch."""
 
-    def __init__(self, split, stage, keep_mask, diff_nudge=0.0):
+    def __init__(self, split, stage, keep_mask, diff_nudge=0.0, rot_aug=False):
         z = np.load("%s/final_%s_%s.npz" % (FINAL, split, DATA_TAG))
         self.cnt = np.fromfile("%s/%s.cnt" % (FEAT, split), dtype=np.uint8)
         self.idx = np.memmap("%s/%s.idx" % (FEAT, split), dtype=np.uint16, mode="r")
@@ -101,6 +161,7 @@ class Split:
             nudge = 1.0 + diff_nudge * np.clip(delta / 400.0, 0.0, 1.0)
             self.w = (self.w * nudge).astype(np.float32)
         self.keep = keep_mask
+        self.rot_aug = rot_aug
         # stage-target part without the outcome mix, for the lambda schedule (target = lam * tpart + (1 - lam) * outcome)
         self.tpart = (ti if stage == "base" else z["teacher_p3"].astype(np.float32)).astype(np.float32)
         # S57 eval per row EXACTLY as the engine computes it (logit units), for the v2 skip term:
@@ -136,6 +197,7 @@ class Split:
         for k in ("bucket", "target", "w", "kata", "is_kata", "outcome", "tpart", "s57"):
             setattr(c, k, getattr(self, k)[rows])
         c.keep = self.keep
+        c.rot_aug = getattr(self, "rot_aug", False)
         c.rows = np.arange(len(rows)) if len(self.rows) == len(self.target) else np.nonzero(np.isin(rows, self.rows))[0]
         return c
 
@@ -147,6 +209,10 @@ class Split:
         excl = np.concatenate([[0], np.cumsum(ln)[:-1]])
         pos = np.repeat(st - excl, ln) + np.arange(tot)
         ix = np.asarray(self.idx[pos], dtype=np.int64)
+        if getattr(self, "rot_aug", False):
+            mode = np.random.randint(0, 8)
+            if mode != 0:
+                ix = FEAT_PERM[mode, ix]
         if self.keep is not None:
             k = self.keep[ix]
             seg = np.repeat(np.arange(len(ln)), ln)
@@ -314,6 +380,7 @@ def parser():
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--diff-nudge", type=float, default=0.0, help="weak difficulty nudge factor for disagreement (e.g. 0.15)")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--no-rot-aug", action="store_true", help="disable online D4 rotational/reflection data augmentation")
     ap.add_argument("--min-free-gb", type=float, default=1.0)
     ap.add_argument("--save-every", type=int, default=8, help="chunks between resume checkpoints")
     ap.add_argument("--opt", choices=["adam", "adamw", "radam", "ranger"], default="ranger")
@@ -357,9 +424,9 @@ def parser():
 _CACHE = {}
 
 
-def load_splits(stage, drop, diff_nudge=0.0):
+def load_splits(stage, drop, diff_nudge=0.0, rot_aug=True):
     """Splits are cached so optuna / PBT members share one copy in RAM."""
-    key = (stage, drop, diff_nudge)
+    key = (stage, drop, diff_nudge, rot_aug)
     if key not in _CACHE:
         _CACHE.clear()
         keep = None
@@ -368,7 +435,7 @@ def load_splits(stage, drop, diff_nudge=0.0):
             for g in drop.split(","):
                 lo, hi = GROUPS[g.strip()]
                 keep[lo:hi] = False
-        _CACHE[key] = (Split("train", stage, keep, diff_nudge), Split("val", stage, keep, diff_nudge))
+        _CACHE[key] = (Split("train", stage, keep, diff_nudge, rot_aug=rot_aug), Split("val", stage, keep, diff_nudge, rot_aug=False))
     return _CACHE[key]
 
 
@@ -576,7 +643,7 @@ def run(a, trial=None):
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
     t0 = time.time()
-    tr, va = load_splits(a.stage, a.drop, a.diff_nudge)
+    tr, va = load_splits(a.stage, a.drop, a.diff_nudge, rot_aug=not a.no_rot_aug)
     tr.rows_all = getattr(tr, "rows_all", tr.rows)
     tr.rows = tr.rows_all
     if a.rows:
