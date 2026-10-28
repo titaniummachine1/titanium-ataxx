@@ -33,9 +33,11 @@ pub struct Nnue {
     pub l2: usize,
     pub buckets: usize,
     pub groups: u32,
-    /// v2 (TNN2): pairwise product, output over both hidden layers, S57 skip term.
+    /// v2 (TNN2/TNN3): pairwise product, output over both hidden layers, S57 skip term.
     pub v2: bool,
     pub pairwise: bool,
+    /// v3 (TNN3): includes zero-cost auxiliary Disagreement Head (`dis_w`, `dis_b`) over `h1 || h2`.
+    pub has_dis: bool,
     ft: Vec<f32>,
     ftb: Vec<f32>,
     psqt: Vec<f32>,
@@ -46,6 +48,8 @@ pub struct Nnue {
     out_w: Vec<f32>,
     out_b: Vec<f32>,
     s57w: Vec<f32>,
+    dis_w: Vec<f32>,
+    dis_b: Vec<f32>,
     ftq: Vec<i16>,
     ftbq: Vec<i16>,
     /// l1 weights transposed per bucket: [bucket][din][l1] (one contiguous l1 column per input, for sparse L1)
@@ -73,9 +77,10 @@ impl Nnue {
 
     fn parse(d: &[u8]) -> std::io::Result<Nnue> {
         let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
-        let v2 = d.len() >= 4 && &d[..4] == b"TNN2";
+        let has_dis = d.len() >= 4 && &d[..4] == b"TNN3";
+        let v2 = has_dis || (d.len() >= 4 && &d[..4] == b"TNN2");
         if d.len() < 28 || (&d[..4] != b"TNN1" && !v2) {
-            return Err(bad("not a TNN1/TNN2 file"));
+            return Err(bad("not a TNN1/TNN2/TNN3 file"));
         }
         let u = |i: usize| u32::from_le_bytes(d[4 + 4 * i..8 + 4 * i].try_into().unwrap()) as usize;
         let (num_feats, width, l1, l2, buckets, groups) =
@@ -109,6 +114,8 @@ impl Nnue {
             out_w: take(buckets * out_in),
             out_b: take(buckets),
             s57w: if v2 { take(buckets) } else { Vec::new() },
+            dis_w: if has_dis { take(buckets * out_in) } else { Vec::new() },
+            dis_b: if has_dis { take(buckets) } else { Vec::new() },
             ftq: Vec::new(),
             ftbq: Vec::new(),
             l1_wt: Vec::new(),
@@ -121,6 +128,7 @@ impl Nnue {
             groups,
             v2,
             pairwise,
+            has_dis,
         };
         if p != d.len() {
             return Err(bad("trailing or missing bytes"));
@@ -176,6 +184,11 @@ impl Nnue {
     /// Fast path (int16 feature transformer, allocation-free, sparse L1); differs from `forward_f32` only by the
     /// QA rounding of the first layer (measured by `nneval`).
     pub fn forward(&self, b: &Board, s57: f32) -> f32 {
+        self.forward_with_dis(b, s57).0
+    }
+
+    /// Fast path returning both `(eval_logit, dis_cp)` from a single shared accumulator + hidden pass.
+    pub fn forward_with_dis(&self, b: &Board, s57: f32) -> (f32, i32) {
         let (us, nu, them, nt) = nnfeat::both(b, self.groups);
         let w = self.width;
         let empties = b.empty().count_ones() as usize;
@@ -200,7 +213,7 @@ impl Nnue {
                 ps[half] += pst[f];
             }
         }
-        self.head(&acc, bucket, ps, s57)
+        self.head_with_dis(&acc, bucket, ps, s57)
     }
 
     pub fn bench_ft(&self, b: &Board) -> i32 {
@@ -253,7 +266,7 @@ impl Nnue {
 
     /// Everything after the feature transformer: int16 accumulators -> activations -> sparse L1 -> L2 -> output.
     /// Activations are computed on the fly (no zeroed scratch array); arithmetic and order are exactly as before.
-    fn head(&self, acc: &[[i16; MAX_W]; 2], bucket: usize, ps: [f32; 2], s57: f32) -> f32 {
+    fn head_with_dis(&self, acc: &[[i16; MAX_W]; 2], bucket: usize, ps: [f32; 2], s57: f32) -> (f32, i32) {
         let w = self.width;
         let inv = 1.0 / QA as f32;
         let qa = QA as i16;
@@ -320,7 +333,16 @@ impl Nnue {
             let row = &self.out_w[bucket * l2..(bucket + 1) * l2];
             row.iter().zip(&h2[..l2]).map(|(a, b)| a * b).sum::<f32>() + self.out_b[bucket]
         };
-        o + 0.5 * (ps[0] - ps[1])
+        let dis_cp = if self.has_dis {
+            let k = l1 + l2;
+            let dis_row = &self.dis_w[bucket * k..(bucket + 1) * k];
+            let d1: f32 = dis_row[..l1].iter().zip(&h1[..l1]).map(|(a, b)| a * b).sum();
+            let d2: f32 = dis_row[l1..].iter().zip(&h2[..l2]).map(|(a, b)| a * b).sum();
+            ((400.0 * (d1 + d2 + self.dis_b[bucket]).max(0.0)).round() as i32).clamp(0, 30000)
+        } else {
+            0
+        };
+        (o + 0.5 * (ps[0] - ps[1]), dis_cp)
     }
 
     /// Exact training-parity path (plain f32, allocating): the reference the fast path is measured against.
@@ -396,9 +418,13 @@ impl Nnue {
     }
 
     pub fn eval(&self, b: &Board, s57_cp: i32) -> i32 {
-        (400.0 * self.forward(b, s57_cp as f32 / 400.0))
-            .round()
-            .clamp(-30000.0, 30000.0) as i32
+        self.eval_with_dis(b, s57_cp).0
+    }
+
+    pub fn eval_with_dis(&self, b: &Board, s57_cp: i32) -> (i32, i32) {
+        let (logit, dis_cp) = self.forward_with_dis(b, s57_cp as f32 / 400.0);
+        let eval_cp = (400.0 * logit).round().clamp(-30000.0, 30000.0) as i32;
+        (eval_cp, dis_cp)
     }
 
     /// Reference eval through `forward_f32` (training parity).
