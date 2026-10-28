@@ -47,8 +47,19 @@ crates/titanium-ffi    C-ABI shared library (libtitanium_ffi.so / .dll) for Botz
 crates/titanium-cli    Native CLI test harness: bench, perft, match, selfplay, labelbin
 crates/titanium-wasm   WebAssembly bindings via wasm-bindgen for web play
 botzone/               Botzone deployment package (Python 3 driver + glibc 2.14 Linux .so)
+docs/                  Architectural specifications, community research, and persistent search design
 web/                   Interactive Web GUI (Vite + vanilla JS/Canvas)
 ```
+
+---
+
+## Technical Documentation & Research
+
+Comprehensive architecture guides and research benchmarks are organized in [`docs/`](docs/README.md):
+- **[Zero-Cost PUCT Disagreement Head (`TNN3`)](docs/DISAGREEMENT_HEAD_SPEC.md):** Dual-headed NNUE with packed `ecache` for PUCT-like selectivity.
+- **[Persistent Search Tree vs. One-Shot Engine on Botzone](docs/PERSISTENT_VS_ONESHOT_BOTZONE.md):** Search state preservation, TT age rotation, and fail-low refutation preservation.
+- **[Community Research & Competitive Intelligence (2025–2026)](docs/COMMUNITY_RESEARCH_2026.md):** KataGo Ataxx MCTS, Monty, Mexx, and BMI2 `pext` bitboards.
+- **[Experiment Ledger](LEDGER.md):** Complete gate logs from E0 baseline through S57 and Botzone Ladder matches.
 
 ---
 
