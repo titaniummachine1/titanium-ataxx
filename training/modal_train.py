@@ -82,7 +82,7 @@ def build_features(data_tag: str = DATA_TAG):
         print("features %s ready in %.0fs" % (sp, time.time() - t0), flush=True)
 
 
-@app.function(gpu="L4", cpu=4.0, memory=24576, timeout=4 * 3600, volumes={"/vol": vol})
+@app.function(gpu=["L4", "A10G"], cpu=4.0, memory=24576, timeout=4 * 3600, volumes={"/vol": vol})
 def train(tag: str, args: str, script: str = "train_nnue.py"):
     import subprocess
     import threading
