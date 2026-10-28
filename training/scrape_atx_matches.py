@@ -10,10 +10,25 @@ import requests
 ATAXX_GAME_ID = "5809c7647f65182b044b5e3b"
 ATX_BOT_ID = "6aa07f142418e3081fb60ede"
 TOP_BOT_IDS = {
-    "6aa07f142418e3081fb60ede": "atx",
-    "6ad3afdef80b7d76046b6c37": "Ataxx_Python",
+    "6aa07f142418e3081fb60ede": "atx",            # 2561 Elo
+    "6ad3afdef80b7d76046b6c37": "Ataxx_Python",   # 2560 Elo
+    "6ad29fd3f80b7d76046a9501": "Ataxx_CPP",      # 2368 Elo
+    "65bc052713e80a09c4e39327": "cheetax",        # 2245 Elo
+    "6a4132631ba515095a0bbd65": "KataAtaxx_mini", # 2224 Elo
+    "68ed1a4cdcee294b521dda28": "Kissin_Flash",   # 2216 Elo
+    "699f2e47f382575c2a73cb96": "PyJataxx",       # 2137 Elo
+    "65fd7af4dc83c705baebcbe7": "Sincerely",      # 1981 Elo
+    "6a7832260fbd680d7c6d1d2b": "evo",            # 1964 Elo
+    "63eccef96ce79f4b2db9dde7": "hce",            # 1951 Elo
+    "6acd0738d10ddc72074192a1": "Daybreak",       # 1939 Elo
+    "65b3950413e80a09c4ddd5df": "sotax",          # 1933 Elo
+    "622eadd4b25b5629b5c03554": "xie",            # 1929 Elo
+    "620d12d6bbc22c318db6ef02": "RawNN",          # 1920 Elo
+    "6a89fbcb0fbd680d7c7f692a": "waffle_ataxx",   # 1902 Elo
+    "5ce25d84d2337e01c7a3c0fc": "Ataxx",          # 1805 Elo
     "6a3bd61a7e8f174717a20396": "aaa",
     "5af3313d1c45dc7bf64a16f7": "Master",
+    "6ad7e0c3bdad901f323f6516": "titanium_ataxx_PY6",
 }
 
 OUT_DIR = r"C:\gitProjects\titanium-ataxx\data\nnue\atx_scraped"
@@ -116,6 +131,24 @@ def replay_match_positions(log_entries: list, final_scores: list):
     return positions
 
 
+from training.stockfish_wdl_updater import canonical_key
+
+def get_match_outcome(rec):
+    bots = rec.get("bots", [])
+    if len(bots) >= 2 and len(bots[0]) >= 2 and len(bots[1]) >= 2:
+        try:
+            s0 = int(bots[0][1])
+            s1 = int(bots[1][1])
+            if s0 > s1:
+                return 1.0
+            elif s0 < s1:
+                return 0.0
+            else:
+                return 0.5
+        except (ValueError, TypeError):
+            pass
+    return 0.5
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     raw_jsonl_path = os.path.join(OUT_DIR, "atx_matches_raw.jsonl")
@@ -141,7 +174,7 @@ def main():
     s = make_session()
 
     start_id = last_seen_id
-    max_pages = 120
+    max_pages = 500
     downloaded = 0
 
     with open(raw_jsonl_path, "a", encoding="utf-8") as f_raw:
@@ -207,8 +240,8 @@ def main():
                     f"Page {page}: downloaded +{len(page_targets)} (session new={downloaded}, total={len(existing_records)}, oldest={oldest_on_page})",
                     flush=True,
                 )
-            if oldest_on_page and oldest_on_page[:8] < "6aa00000":
-                print(f"Reached matches older than atx creation ({oldest_on_page}), stopping pagination.")
+            if oldest_on_page and oldest_on_page[:8] < "60000000":
+                print(f"Reached matches older than 60000000 ({oldest_on_page}), stopping pagination.")
                 break
             next_match = re.search(
                 r"/globalmatchlist\?startid=([0-9a-f]{24})&game=" + ATAXX_GAME_ID, content
@@ -227,13 +260,17 @@ def main():
         else:
             top_games_count += 1
         m_id = rec["match_id"]
-        positions = replay_match_positions(rec.get("logs", []), rec.get("scores", []))
-        for ply, occ0, occ1, blockers, turn, outcome_black in positions:
+        outcome_black = get_match_outcome(rec)
+        positions = replay_match_positions(rec.get("logs", []), [1 if outcome_black==1.0 else 0, 1 if outcome_black==0.0 else 0])
+        for ply, occ0, occ1, blockers, turn, _ in positions:
             if ply <= 2:
                 continue
-            key = (occ0, occ1, blockers, turn)
-            if key not in unique_positions:
-                unique_positions[key] = {
+            stm_win = (outcome_black == 1.0) if turn == 0 else (outcome_black == 0.0)
+            stm_loss = (outcome_black == 0.0) if turn == 0 else (outcome_black == 1.0)
+
+            k = canonical_key(occ0, occ1, blockers, turn)
+            if k not in unique_positions:
+                unique_positions[k] = {
                     "match_id": m_id,
                     "tag": rec.get("tag", "atx"),
                     "ply": ply,
@@ -241,8 +278,22 @@ def main():
                     "occ1": occ1,
                     "blockers": blockers,
                     "turn": turn,
-                    "outcome_black": outcome_black,
+                    "w": 1 if stm_win else 0,
+                    "l": 1 if stm_loss else 0,
+                    "d": 0 if (stm_win or stm_loss) else 1,
+                    "n": 1,
+                    "outcome_p": 1.0 if stm_win else (0.0 if stm_loss else 0.5),
                 }
+            else:
+                entry = unique_positions[k]
+                if stm_win:
+                    entry["w"] += 1
+                elif stm_loss:
+                    entry["l"] += 1
+                else:
+                    entry["d"] += 1
+                entry["n"] += 1
+                entry["outcome_p"] = (entry["w"] + 0.5 * entry["d"]) / entry["n"]
 
     with open(pos_jsonl_path, "w", encoding="utf-8") as f_jsonl, open(pos_bin_path, "wb") as f_bin:
         for key, item in unique_positions.items():
