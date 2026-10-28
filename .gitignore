@@ -48,3 +48,10 @@ Thumbs.db
 # Botzone build output (tools/build_botzone.py)
 /botzone/upload/
 /botzone/dist/
+
+# Agent & assistant configs (untracked)
+/AGENTS.md
+/BEHAVIOR.md
+/CLAUDE.md
+/opencode.json
+/.opencode/
