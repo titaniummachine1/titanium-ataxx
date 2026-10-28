@@ -53,15 +53,35 @@ A curated compilation of competitive benchmarks, superhuman datasets, open-sourc
   * Standalone single-binary Rust framework implementing OpenBench's exact Pentanomial SPRT math (`[-2.944, +2.944]`), continuous LLR stopping, and paired book openings.
   * Tailored for native UAI Ataxx, HTTP worker coordination, and Bullet-style sparse-feature NNUE training.
 
-### 3.2 Tournament Runners & GUIs
-* **Coliseum:** [PhelRin/Coliseum](https://github.com/PhelRin/Coliseum) — UAI-compatible tournament runner and GUI for Ataxx and chess.
-* **CuteAtaxx:** [kz04px/cuteataxx](https://github.com/kz04px/cuteataxx) — Ataxx tournament CLI.
-* **AtaxxGUI:** [tsoj/AtaxxGUI](https://github.com/tsoj/AtaxxGUI) — UAI engine-vs-engine and human interface.
-* **Autaxx:** [kz04px/autaxx](https://github.com/kz04px/autaxx) — Traditional alpha-beta Ataxx engine.
+### 3.2 Reference Engines & Core Implementations
+* **Sanctaphraxx (Rust):** [Ciekce/sanctaphraxx](https://github.com/Ciekce/sanctaphraxx) — Ciekce's Rust Ataxx engine based on Stormphrax; reference for [NNUE inference](https://github.com/Ciekce/sanctaphraxx/blob/main/src/nnue/mod.rs#L206).
+* **Moonbird (Nim):** [tsoj/Moonbird](https://github.com/tsoj/Moonbird/releases/tag/1.0.0) — One of the strongest open-source Ataxx engines (written in Nim). Notable for [2x2 tuple evaluation](https://github.com/tsoj/Moonbird/blob/5281d7d8aa17125a01af520b74a502e6a8e4262e/src/evaluation.nim#L47), [training data generation](https://github.com/tsoj/Moonbird/blob/main/src/tuning/generateTrainingData.nim), and [Lazy SMP](https://github.com/tsoj/Moonbird/releases/tag/1.1.0).
+* **Mexx & ataxx-rs (Rust):** [raklaptudirm/mexx](https://github.com/raklaptudirm/mexx) — Clean pure-Rust Ataxx engine and [crates.io/crates/ataxx](https://crates.io/crates/ataxx); reference for [board representation](https://github.com/raklaptudirm/mexx/blob/f0fdfccd7a3052d3cd778a7547994ae665f2258c/ataxx/src/position.rs#L139) and MCTS tree implementation.
+* **libataxx & Autaxx:** [kz04px/libataxx](https://github.com/kz04px/libataxx), [kz04px/autaxx](https://github.com/kz04px/autaxx), and [kz04px/rustaxx](https://github.com/kz04px/rustaxx) — Reference C++ and Rust movegen, [gameover logic](https://github.com/kz04px/libataxx/blob/master/src/gameover.cpp), and perft suites.
+* **Anthraxx:** [Vast342/Anthraxx](https://github.com/Vast342/Anthraxx/compare/tt-cutoff) — TT cutoff and move-ordering reference.
+* **ataxx-dot-cpp:** [GediminasMasaitis/ataxx-dot-cpp](https://github.com/GediminasMasaitis/ataxx-dot-cpp) — Reference C++ engine and [evaluation_hce.cpp](https://github.com/GediminasMasaitis/ataxx-dot-cpp/blob/main/src/evaluation_hce.cpp).
+* **Gotaxx:** [cpirc/gotaxx](https://github.com/cpirc/gotaxx) — Go-based Ataxx engine.
+* **Balanced Opening Books:** [zzzzz151/Ataxxer balanced_openings.txt](https://github.com/zzzzz151/Ataxxer/blob/main/balanced_openings.txt) — Standard community opening book for tournament gating.
+* **Sotax Dataset:** [sotax.zip on Google Drive](https://drive.google.com/file/d/1Or5aB7WdD_4FgDMRNq2tfu02LWRVlWtc/view?usp=drive_link) — Community dataset by *metaroots*.
+* **Botzone Top Bot `sigmoid rawnn`:** [Botzone Bot ID `6397649a1688b565e8f38fcd`](https://botzone.org.cn/game/ranklist/5809c7647f65182b044b5e3b?page=0#6397649a1688b565e8f38fcd) by *hzy_sigmoid*.
 
-### 3.3 Training & Tuning Tools
+### 3.3 Tournament Runners & GUIs
+* **Coliseum:** [PhelRin/Coliseum](https://github.com/PhelRin/Coliseum) — UAI-compatible tournament runner and GUI for Ataxx and chess.
+* **CuteAtaxx:** [kz04px/cuteataxx](https://github.com/kz04px/cuteataxx) — Ataxx tournament CLI, [adjudication logic](https://github.com/kz04px/cuteataxx/blob/4df2abe471d8564e47beca270fa2c97a969c9d6b/src/core/ataxx/adjudicate.cpp#L11-L62), and [TUI match runner](https://github.com/kz04px/cuteataxx/blob/tui/src/core/match/worker.cpp).
+* **AtaxxGUI:** [tsoj/AtaxxGUI](https://github.com/tsoj/AtaxxGUI) — UAI engine-vs-engine and human interface (with [tournament_maybe branch](https://github.com/tsoj/AtaxxGUI/tree/tournament_maybe)).
+
+### 3.4 Training & Tuning Principles
+* **Karpathy's Recipe for Training Neural Networks:** [http://karpathy.github.io/2019/04/25/recipe/](http://karpathy.github.io/2019/04/25/recipe/)
+  * *Step 1: Inspect data thoroughly* — know distributions and outliers before feeding them to loss functions.
+  * *Step 2: End-to-end skeleton + overfit a small batch* — verify that the model can achieve zero training error on a tiny batch before scaling.
+  * *Step 3: Monitor learning rate and loss curves* — ensure gradients are neither vanishing nor blowing up.
+  * *Step 4: Regularize only after capacity is proven.*
+* **D4 Dihedral Symmetry Expansion:** [jw1912/monty expand.rs](https://github.com/jw1912/monty/blob/main/train/value/src/bin/expand.rs#L5) — 8-fold dihedral symmetry transforms (horizontal/vertical flip, 90-degree rotations) to expand training dataset volume by up to 8x without collecting new games.
 * **Bullet:** [jw1912/bullet](https://github.com/jw1912/bullet) — Pure-Rust / CUDA high-throughput sparse NNUE trainer.
 * **Texel Tuner:** [lynx-chess/texel-tuner](https://github.com/lynx-chess/texel-tuner) — SPSA and Texel parameter optimization for heuristic margins and evaluation terms.
+* **Delta Universal Hashing (Nguyen & Roscoe 2011):**
+  * Fast $2^{-63}$-almost delta universal hash function using 3 64-bit integer constants:
+    `X = 6364136223846793005`, `Y = 1442695040888963407`, `Z = 2305843009213693951`, with bitwise complement on Black STM. High-speed alternative or complement to Zobrist keys.
 
 ---
 
