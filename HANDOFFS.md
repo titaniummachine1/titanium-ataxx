@@ -23,11 +23,14 @@
   - At 48 games: `+24 -22 =2 (+14.5 Elo)`.
   - Over 76 games: matches 6.0s cold reset within margin, proving persistent TT state and warm ID startup bridges the 50% time advantage.
 
-**4. Mandatory Rules & Directives (D124, D125, D126, D127):**
+**4. Mandatory Rules & Directives (D124 - D130):**
 - **D124**: Mandatory pre- and post-gating vs `main` for all neural candidates.
-- **D125**: Gentle difficulty nudge $\le 0.15$ to avoid eval drift on the quiet search manifold.
+- **D125**: Avoid eval drift on the quiet search manifold (difficulty nudge deprecated).
 - **D126**: Botzone persistent session promoted to default (`TI_MODE = "long"`).
 - **D127**: Botzone upload protocol and API constraints documented.
+- **D128**: Stockfish-style canonical WLD deduplication & external game collection (Botzone / Little Golem / KataAtaxx).
+- **D129**: Pure uniform weighting (`diff_nudge = 0.0`) on all future training.
+- **D130 (Immutable Law)**: **At all costs, never train a network from scratch when increasing or decreasing capacity.** Always upscale or downscale via function-preserving Net2Net / weight interpolation so the larger net inherits 100% of the champion's representations at step 0 ($f_{\text{new}}(x) \equiv f_{\text{old}}(x)$, exact 0.000 cp parity). Upscaled champion generated at `champion_w512_net2net.pt` (uploaded to Modal volume `ti-train /up/champion_w512_net2net.pt`).
 
 ---
 
