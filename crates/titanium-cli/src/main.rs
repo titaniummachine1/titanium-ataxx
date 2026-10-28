@@ -22,6 +22,11 @@ use titanium::{Board, Move, SearchLimits, Searcher, RING1};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(pos) = args.iter().position(|x| x == "--tune") {
+        if let Some(val) = args.get(pos + 1) {
+            std::env::set_var("TITANIUM_TUNE", val);
+        }
+    }
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     // exact full-strength search without the lossy futility small net (D112); any command, `serve` included
     if args

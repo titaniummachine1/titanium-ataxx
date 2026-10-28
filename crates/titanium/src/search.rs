@@ -58,18 +58,66 @@ const MATERIAL: i32 = 100;
 const TEMPO: i32 = 150;
 /// Reverse futility pruning margins, index = depth-1 (autaxx, stone = 100).
 const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774];
-/// exp/search-moonbird A: Moonbird 1.1.0 reduction scheme (searchParams.nim) in place of the universal LMR.
-/// LMR from the 7th move: new_depth = depth * HALF / (HALF + n_reduced_so_far).
-const MB_LMR_MIN_IDX: usize = 6;
-const MB_LMR_HALFLIFE: i32 = 47;
-/// Futility reduction from the 2nd move: one ply per FUT_DIV cp the child's static eval falls short of alpha
-/// (Moonbird futilityReductionDiv 35 in its units; x1.62 to Titanium cp: 568/ln10 vs 400 per logit). Reduce only.
 const MB_FUT_MIN_IDX: usize = 1;
-const MB_FUT_DIV: i32 = 57;
-/// Volatility scaling numerator (scaled by 128) for Reverse Futility Pruning: +25% of predicted disagreement.
-const DIS_RFP_NUM: i32 = 32;
-/// Volatility credit numerator (scaled by 128) for Child Futility Pruning: 37.5% credit.
-const DIS_FUT_NUM: i32 = 48;
+
+/// exp/search-spsa-disagree: Selectivity search tuning (TweakSels) modulated by TNN3 Disagreement Head.
+/// Values read once from TITANIUM_TUNE="name=val,..."; defaults preserve main bit-identically.
+#[derive(Clone, Copy, Debug)]
+pub struct Tune {
+    pub fut_div: i32,        // child futility divisor: 1 ply per fut_div cp below alpha (default 57)
+    pub rfp_scale: i32,      // RFP base margins scale in percent of [257, 347, 478, 774] (default 100)
+    pub lmr_half: i32,       // LMR depth * half / (half + n) (default 47)
+    pub lmr_min: i32,        // LMR starting move index (default 6)
+    pub dis_rfp_num: i32,    // Disagreement head RFP volatility dampening (scaled by 128) (default 32)
+    pub dis_fut_num: i32,    // Disagreement head Futility volatility credit (scaled by 128) (default 48)
+    pub dis_lmr_num: i32,    // Disagreement head LMR discount on volatile nodes (scaled by 256) (default 0)
+    pub dis_vol_thresh: i32, // Disagreement threshold (cp) for tactical +1 extension (default 300)
+}
+
+impl Default for Tune {
+    fn default() -> Self {
+        Tune {
+            fut_div: 57,
+            rfp_scale: 100,
+            lmr_half: 47,
+            lmr_min: 6,
+            dis_rfp_num: 32,
+            dis_fut_num: 48,
+            dis_lmr_num: 0,
+            dis_vol_thresh: 300,
+        }
+    }
+}
+
+fn tune_from_env() -> Tune {
+    let mut t = Tune::default();
+    if let Ok(v) = std::env::var("TITANIUM_TUNE") {
+        for kv in v.split(',') {
+            let mut it = kv.splitn(2, '=');
+            let (Some(k), Some(x)) = (it.next(), it.next()) else { continue };
+            let Ok(x) = x.trim().parse::<i32>() else { continue };
+            match k.trim() {
+                "fut_div" => t.fut_div = x.max(1),
+                "rfp_scale" => t.rfp_scale = x.max(0),
+                "lmr_half" => t.lmr_half = x.max(1),
+                "lmr_min" => t.lmr_min = x.max(1),
+                "dis_rfp_num" => t.dis_rfp_num = x.max(0),
+                "dis_fut_num" => t.dis_fut_num = x.max(0),
+                "dis_lmr_num" => t.dis_lmr_num = x.max(0),
+                "dis_vol_thresh" => t.dis_vol_thresh = x.max(0),
+                _ => {}
+            }
+        }
+    }
+    t
+}
+
+static TUNE: std::sync::OnceLock<Tune> = std::sync::OnceLock::new();
+
+#[inline]
+pub fn tune() -> &'static Tune {
+    TUNE.get_or_init(tune_from_env)
+}
 
 #[inline(always)]
 pub fn pack_eval_dis(eval: i32, dis: i32) -> i32 {
@@ -916,7 +964,10 @@ impl<'a> Searcher<'a> {
             && depth <= 4
             && alpha.abs() < MATE_BOUND
             && beta.abs() < MATE_BOUND
-            && static_eval + RFP_MARGINS[(depth.max(1) - 1) as usize] + ((node_dis * DIS_RFP_NUM) >> 7) < alpha
+            && static_eval
+                + RFP_MARGINS[(depth.max(1) - 1) as usize] * tune().rfp_scale / 100
+                + ((node_dis * tune().dis_rfp_num) >> 7)
+                < alpha
         {
             self.heuristic_used = true;
             return alpha;
@@ -1063,8 +1114,11 @@ impl<'a> Searcher<'a> {
                 net.update_child(&a[ply as usize], &mut z[0], b, &child);
             }
             let mut new_depth = depth as i32;
-            if move_idx >= MB_LMR_MIN_IDX {
-                new_depth = depth as i32 * MB_LMR_HALFLIFE / (MB_LMR_HALFLIFE + lmr_cnt);
+            if move_idx >= tune().lmr_min as usize {
+                let base_red = (depth as i32) - (depth as i32 * tune().lmr_half / (tune().lmr_half + lmr_cnt));
+                let dis_red_discount = (node_dis * tune().dis_lmr_num) >> 8;
+                let red = (base_red - dis_red_discount).max(0);
+                new_depth = (depth as i32) - red;
                 lmr_cnt += 1;
             }
             let mut child_eval = i32::MIN;
@@ -1091,7 +1145,7 @@ impl<'a> Searcher<'a> {
                         );
                         let lo = sn.bound_acc(&ca, child.empty().count_ones(), static_eval, hand)
                             - FUT_SN_M;
-                        if new_depth - (alpha.saturating_add(lo) / MB_FUT_DIV).clamp(0, 64) <= 0
+                        if new_depth - (alpha.saturating_add(lo) / tune().fut_div).clamp(0, 64) <= 0
                             && best > -MATE_BOUND
                         {
                             self.heuristic_used = true;
@@ -1102,10 +1156,10 @@ impl<'a> Searcher<'a> {
                 }
                 let (ce, child_dis) = self.leaf_eval_with_dis(&child);
                 child_eval = pack_eval_dis(ce, child_dis);
-                let vol_credit = (child_dis * DIS_FUT_NUM) >> 7;
+                let vol_credit = (child_dis * tune().dis_fut_num) >> 7;
                 let shortfall = alpha.saturating_add(ce) - vol_credit;
-                new_depth -= (shortfall / MB_FUT_DIV).clamp(0, 64);
-                if child_dis > 300 && new_depth < depth as i32 {
+                new_depth -= (shortfall / tune().fut_div).clamp(0, 64);
+                if child_dis > tune().dis_vol_thresh && new_depth < depth as i32 {
                     new_depth += 1;
                 }
             }
