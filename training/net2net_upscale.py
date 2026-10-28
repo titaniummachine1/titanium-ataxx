@@ -6,8 +6,13 @@ import os
 import torch
 import numpy as np
 
-CHAMP_PT = "C:/gitProjects/titanium-ataxx/data/nnue/modal_ckpt/s1c_hg/net.pt"
-OUT_PT = "C:/gitProjects/titanium-ataxx/data/nnue/champion_w512_net2net.pt"
+import argparse
+import os
+import torch
+import numpy as np
+
+CHAMP_PT = "C:/gitProjects/titanium-ataxx/data/nnue/modal_ckpt/avx2_w256_d4_rot/net.pt"
+OUT_PT = "C:/gitProjects/titanium-ataxx/data/nnue/champion_w512_d4_net2net.pt"
 
 def upscale_champion(champ_path=CHAMP_PT, out_path=OUT_PT, noise_std=1e-4):
     print(f"Loading champion checkpoint from {champ_path}...")
@@ -19,17 +24,14 @@ def upscale_champion(champ_path=CHAMP_PT, out_path=OUT_PT, noise_std=1e-4):
     assert m_old["ftb"].shape[0] == W_old, f"Expected W={W_old}, got {m_old['ftb'].shape[0]}"
     
     # 1. Feature Transformer: duplicate neurons with micro-noise to break symmetry during SGD
-    # ftb: [256] -> [512]
     torch.manual_seed(42)
     noise_b = torch.randn_like(m_old["ftb"]) * noise_std
     ftb_new = torch.cat([m_old["ftb"], m_old["ftb"] + noise_b], dim=0)
     
-    # ft.weight: [26196, 256] -> [26196, 512]
     noise_w = torch.randn_like(m_old["ft.weight"]) * noise_std
     ft_weight_new = torch.cat([m_old["ft.weight"], m_old["ft.weight"] + noise_w], dim=1)
     
     # 2. Layer 1: split output weights across duplicated neuron pairs (Net2Net-Wider)
-    # Output = W0*x0 + W1*x1 = 0.5*W0*x0_a + 0.5*W0*x0_b + 0.5*W1*x1_a + 0.5*W1*x1_b
     W_l1_old = m_old["l1.weight"] # [128, 512]
     W0 = W_l1_old[:, :256] * 0.5
     W1 = W_l1_old[:, 256:] * 0.5
@@ -53,7 +55,7 @@ def upscale_champion(champ_path=CHAMP_PT, out_path=OUT_PT, noise_std=1e-4):
         "args": {
             "stage": "base",
             "width": 512,
-            "net2net_from": "s1c_hg (e11827d1)",
+            "net2net_from": "avx2_w256_d4_rot (7b25ac9d)",
             "upscaled": True,
         },
         "epoch": 0,
@@ -63,4 +65,9 @@ def upscale_champion(champ_path=CHAMP_PT, out_path=OUT_PT, noise_std=1e-4):
     print("Net2Net expansion successfully completed with function-preservation guarantee.")
 
 if __name__ == "__main__":
-    upscale_champion()
+    parser = argparse.ArgumentParser(description="Net2Net Function-Preserving Network Expansion (W=256 -> W=512)")
+    parser.add_argument("--in", dest="champ_path", default=CHAMP_PT, help="Path to champion .pt checkpoint")
+    parser.add_argument("--out", dest="out_path", default=OUT_PT, help="Output .pt checkpoint")
+    parser.add_argument("--noise", dest="noise_std", type=float, default=1e-4, help="Micro-noise std to break symmetry")
+    args = parser.parse_args()
+    upscale_champion(champ_path=args.champ_path, out_path=args.out_path, noise_std=args.noise_std)

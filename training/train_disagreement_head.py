@@ -45,24 +45,24 @@ def main():
 
     print(f"[2/4] Loading dataset and extracting activations for {args.rows} rows...")
     tr_split = T.Split("train", "base", None)
+    tr_split.rot_aug = True
     n_rows = min(args.rows, len(tr_split.target))
     rows = np.random.default_rng(42).choice(len(tr_split.target), n_rows, replace=False)
 
-    # Load targets from final_train_v5.npz
+    # Load search targets from final_train_v5.npz
     train_npz = np.load(T.FINAL + "/final_train_v5.npz")
-    delta_all = np.clip(np.abs(train_npz["titanium_cp"][rows] - train_npz["sc"][rows]), 0, 2000).astype(np.float32) / 400.0
 
     # Accumulate ridge statistics per bucket: A_b = X_b^T X_b, v_b = X_b^T y_b
     dim_in = L1 + L2  # 16 + 32 = 48
     A = [np.zeros((dim_in + 1, dim_in + 1), dtype=np.float64) for _ in range(T.NB)]
     V = [np.zeros(dim_in + 1, dtype=np.float64) for _ in range(T.NB)]
     counts = [0 for _ in range(T.NB)]
+    sum_y2 = [0.0 for _ in range(T.NB)]
 
     bs = args.batch_size
     for i in range(0, n_rows, bs):
         batch_idx = rows[i : i + bs]
         ix, off, bk, _, _ = tr_split.batch(batch_idx)
-        delta_batch = delta_all[i : i + bs]
         
         with torch.no_grad():
             a = model.ft(ix, off) + model.ftb
@@ -76,6 +76,17 @@ def main():
             h2 = model.l2(h1).view(n, T.NB, model.L2)[ar, bk].clamp(0, 1)
             feat = torch.cat([h1, h2], dim=1).numpy()
 
+            if v2:
+                o = model.out(torch.cat([h1, h2], dim=1))[ar, bk]
+            else:
+                o = model.out(h2)[ar, bk]
+            ps = model.psqt(ix, off)
+            static_logit = o + 0.5 * (ps[0::2] - ps[1::2])[ar, bk]
+            static_cp = (400.0 * static_logit).numpy()
+
+        search_cp = train_npz["titanium_cp"][batch_idx]
+        delta_batch = np.clip(np.abs(static_cp - search_cp), 0.0, 2000.0).astype(np.float32) / 400.0
+
         bk_np = bk.numpy()
         for b in range(T.NB):
             mask = (bk_np == b)
@@ -87,6 +98,7 @@ def main():
             y_b = delta_batch[mask]
             A[b] += X_b.T @ X_b
             V[b] += X_b.T @ y_b
+            sum_y2[b] += float(np.sum(y_b**2))
 
     print("[3/4] Solving closed-form ridge regressions per phase bucket...")
     dis_w = np.zeros((T.NB, dim_in), dtype=np.float32)
@@ -103,7 +115,7 @@ def main():
         dis_w[b] = w_sol[:dim_in]
         dis_b[b] = w_sol[dim_in]
         # Evaluate training MAE on bucket summary
-        mean_err = np.sqrt(np.maximum(0.0, (w_sol @ A[b] @ w_sol - 2 * w_sol @ V[b] + np.sum(delta_all**2)) / counts[b])) * 400.0
+        mean_err = np.sqrt(np.maximum(0.0, (w_sol @ A[b] @ w_sol - 2 * w_sol @ V[b] + sum_y2[b]) / counts[b])) * 400.0
         print(f"  Bucket {b} (N={counts[b]}): solved w in R^{dim_in}, bias={dis_b[b]:.4f}, approx RMSE={mean_err:.1f} cp")
 
     print(f"[4/4] Exporting to TNN3 format: {args.out}...")
