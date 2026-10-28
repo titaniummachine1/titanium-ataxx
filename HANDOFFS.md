@@ -1,4 +1,35 @@
-## STATE FOR NEW SESSION (2026-10-28 - SATURATION W=512 RUNNING; WARM ID SEARCH GATE ACTIVE; GATING RULES ENFORCED)
+## STATE FOR NEW SESSION (2026-10-28 - BOTZONE V8 DEPLOYED & LIVE; MASTER SATURATION NET EP4 EXPORTED; ASYMMETRIC WARM ID GATE VERIFIED)
+
+**1. Botzone Version 8 Deployed & Live (titanium_ataxx_PY6 @ 6ad7e0c3bdad901f323f6516):**
+- **Settings**: Persistent long-running session mode (`enable_keep_running = true`, `simpleio = true`, `TI_MODE = "long"`, 4.0s/turn with 12.0s first turn).
+- **Engine Library**: `titanium_v2.so` (28,487,512 bytes, ELF x86-64, Zig 0.13 glibc 2.14, embedded champion net `e11827d1`) uploaded to `/userfiles/titanium_v2.so`.
+- **Search Capabilities**: Warm iterative-deepening startup directly from TT root depth (`start_depth = (root_tt.depth - 1).max(1)`), full u8 depth limits (255), solved-mate early cutoff, circular jump loop prevention.
+- **Automated Cloud Uploader (`tools/upload_botzone.py` / `training/modal_botzone_upload.py`)**:
+  - Overcomes local ISP Windows socket buffer timeout on international 28.5 MB uploads to Beijing.
+  - Documents Botzone API limits: `desc_length_max <= 100` (`Botzone.consts.bot.desc_length_max = 100`). Exceeding this returns `{"success":false,"message":"bot.desc.length\n"}`.
+  - Endpoints: `POST /login`, `POST /userfile/uploadfile`, `POST /mybots/modify`, `POST /mybots/create`.
+  - Credentials passed safely via `$env:BOTZONE_EMAIL` and `$env:BOTZONE_PASSWORD`.
+
+**2. Master Saturation Net W=512 (`sat_w512_ep4.tnn`):**
+- 8-epoch saturation training completed on Modal L4 GPU (app `ap-6HxiWZvVs88GpDIiZqxF4H`) over 31.57M v5 dataset.
+- Epoch 4 EMA hit the global validation target MSE minimum: `0.021261` (train loss `0.009092`).
+- Checkpoint downloaded and exported to `.tnn` format: `C:\gitProjects\titanium-ataxx\data\nnue\sat_w512_ep4.tnn` (55,033,020 bytes, TNN1 $W=512$, $L1=16$, $L2=32$, groups=55).
+- Rust/PyTorch parity verified: `1000 positions, max |rust - torch| = 0 cp, mean 0.000 cp` (exact bit-identical).
+- Per D124 (mandatory pre- and post-gating) and user guidance, this net must be gated against `main` before any promotion.
+
+**3. Warm Iterative Deepening Search & Asymmetric Gate:**
+- Merged into `main` at `ca9ea34` and `81b463f`.
+- 4.0s persistent session with warm ID search vs 6.0s cold reset opponent (+50% time advantage for baseline):
+  - At 48 games: `+24 -22 =2 (+14.5 Elo)`.
+  - Over 76 games: matches 6.0s cold reset within margin, proving persistent TT state and warm ID startup bridges the 50% time advantage.
+
+**4. Mandatory Rules & Directives (D124, D125, D126, D127):**
+- **D124**: Mandatory pre- and post-gating vs `main` for all neural candidates.
+- **D125**: Gentle difficulty nudge $\le 0.15$ to avoid eval drift on the quiet search manifold.
+- **D126**: Botzone persistent session promoted to default (`TI_MODE = "long"`).
+- **D127**: Botzone upload protocol and API constraints documented.
+
+---
 
 **1. Mandatory Gating Rules Enacted (D124, D125):**
 - **D124 (Pre- and Post-Gating vs Main)**: Strictly enforce that any candidate net (fine-tuned, distilled, or retrained) must be gated in a 100+ game SPRT match against `main` before promotion, grounded in the D98/D99 lesson (-130 Elo collapse from fitting KataGo).
