@@ -91,3 +91,15 @@ With `(child_eval, child_dis)` unpacked from `leaf_eval_with_dis(&child)`:
 | **Botzone Top-Bot Scrape (`atx_positions.bin`)** | `95,235` | ✅ On disk (`data/nnue/atx_scraped/`) | Deduplicate hashes $\to$ Relabel at 5k nodes |
 | **`KataGo_Ataxx_202604` (ModelScope)** | Multi-million | 📌 Cataloged in `COMMUNITY_RESEARCH_2026.md` | Extract **raw board states only**, filter top 30% highest $\hat{\Delta}$, relabel with **Titanium 5k search** |
 | **`sotax.zip` + `zzzzz` + Moonbird sets** | Multi-million | 📌 Cataloged in `COMMUNITY_RESEARCH_2026.md` | Extract unique opening/blocker geometries, relabel with **Titanium 5k search** |
+
+---
+
+## 4. Botzone Engine Persistence Optimization (4s Persistent vs. 6s One-Shot)
+* **Detailed Strategy & Gating Plan:** [docs/PERSISTENT_VS_ONESHOT_BOTZONE.md](PERSISTENT_VS_ONESHOT_BOTZONE.md)
+* **Core Concept:** Instead of restarting Python and clearing the TT every turn for 6.0s, run in persistent mode (`enable_keep_running`) for 4.0s with **5 state-preservation optimizations**:
+  1. TT Subtree recycling & PV move seeding.
+  2. Countermove / Continuation history (`conthist`).
+  3. History table gentle aging (`*h = *h * 7 / 8`).
+  4. Killer moves 2-ply shifting.
+  5. Static eval cache (`ecache`) persistence across turns.
+* **Gating:** Head-to-head SPRT (`3800 ms` persistent with state vs. `5700 ms` cold restart) via `titaniumtest sprt`. Gate winner deploys as default on Botzone.
