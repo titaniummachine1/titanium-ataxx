@@ -66,6 +66,26 @@ const MB_LMR_HALFLIFE: i32 = 47;
 /// (Moonbird futilityReductionDiv 35 in its units; x1.62 to Titanium cp: 568/ln10 vs 400 per logit). Reduce only.
 const MB_FUT_MIN_IDX: usize = 1;
 const MB_FUT_DIV: i32 = 57;
+/// Volatility scaling numerator (scaled by 128) for Reverse Futility Pruning: +25% of predicted disagreement.
+const DIS_RFP_NUM: i32 = 32;
+/// Volatility credit numerator (scaled by 128) for Child Futility Pruning: 37.5% credit.
+const DIS_FUT_NUM: i32 = 48;
+
+#[inline(always)]
+pub fn pack_eval_dis(eval: i32, dis: i32) -> i32 {
+    let e = (eval.clamp(-16384, 16383) + 16384) as u32;
+    let d = (dis.clamp(0, 16383) as u32) & 0x3FFF;
+    let packed = ((d << 15) | e) as i32;
+    if packed == i32::MIN { packed + 1 } else { packed }
+}
+
+#[inline(always)]
+pub fn unpack_eval_dis(packed: i32) -> (i32, i32) {
+    let p = packed as u32;
+    let e = ((p & 0x7FFF) as i32) - 16384;
+    let d = ((p >> 15) & 0x3FFF) as i32;
+    (e, d)
+}
 /// exp/fut-cheap (D108): before the NNUE child eval of the futility step, a cheap estimate of it
 /// pred = (357 * hand(child) - 542 * parent static eval) / 1000 + 248 (least squares on 4.1M recorded futility calls of
 /// e11827d1, residual sd 191 cp; the hand eval costs ~72 ns vs ~6.5 us for the NNUE; S57 was a better fit but costs
@@ -706,23 +726,28 @@ impl<'a> Searcher<'a> {
 
     #[inline]
     fn leaf_eval(&mut self, b: &Board) -> i32 {
-        let slot = (b.hash as usize) & ((1 << ECACHE_BITS) - 1);
-        let (k, v) = self.ecache[slot];
-        if k == b.hash && v != i32::MIN {
-            return v;
-        }
-        let v = self.leaf_eval_raw(b);
-        self.ecache[slot] = (b.hash, v);
-        v
+        self.leaf_eval_with_dis(b).0
     }
 
     #[inline]
-    fn leaf_eval_raw(&self, b: &Board) -> i32 {
+    fn leaf_eval_with_dis(&mut self, b: &Board) -> (i32, i32) {
+        let slot = (b.hash as usize) & ((1 << ECACHE_BITS) - 1);
+        let (k, v) = self.ecache[slot];
+        if k == b.hash && v != i32::MIN {
+            return unpack_eval_dis(v);
+        }
+        let (eval, dis) = self.leaf_eval_raw_with_dis(b);
+        self.ecache[slot] = (b.hash, pack_eval_dis(eval, dis));
+        (eval, dis)
+    }
+
+    #[inline]
+    fn leaf_eval_raw_with_dis(&self, b: &Board) -> (i32, i32) {
         match self.nnue {
             // v2 nets carry an S57 skip input (the tuple eval of the same board); v1 ignores it
-            Some(nn) if nn.v2 => nn.eval(b, evaluate(b, self.tuple, self.tup_native)),
-            Some(nn) => nn.eval(b, 0),
-            None => evaluate(b, self.tuple, self.tup_native),
+            Some(nn) if nn.v2 => nn.eval_with_dis(b, evaluate(b, self.tuple, self.tup_native)),
+            Some(nn) => nn.eval_with_dis(b, 0),
+            None => (evaluate(b, self.tuple, self.tup_native), 0),
         }
     }
 
@@ -875,10 +900,10 @@ impl<'a> Searcher<'a> {
         // OFF = single branch to classical, zero-cost.
         // forward_ready(acc, stm) is ALREADY stm-relative (like evaluate) —
         // no negation (that was the 0-50 bug: double-negated white nodes).
-        let raw = match (self.nnue, self.sancta) {
-            (None, Some(net)) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
-            _ if pre != i32::MIN => pre,
-            _ => self.leaf_eval(b),
+        let (raw, node_dis) = match (self.nnue, self.sancta) {
+            (None, Some(net)) => (net.forward_ready(&self.stack.acc[ply as usize], b.turn), 0),
+            _ if pre != i32::MIN => unpack_eval_dis(pre),
+            _ => self.leaf_eval_with_dis(b),
         };
         let static_eval = self.corrected(b, raw);
 
@@ -891,7 +916,7 @@ impl<'a> Searcher<'a> {
             && depth <= 4
             && alpha.abs() < MATE_BOUND
             && beta.abs() < MATE_BOUND
-            && static_eval + RFP_MARGINS[(depth.max(1) - 1) as usize] < alpha
+            && static_eval + RFP_MARGINS[(depth.max(1) - 1) as usize] + ((node_dis * DIS_RFP_NUM) >> 7) < alpha
         {
             self.heuristic_used = true;
             return alpha;
@@ -973,7 +998,8 @@ impl<'a> Searcher<'a> {
                     let add = if EVORD_CACHE {
                         let (k, v) = self.ecache[(child.hash as usize) & ((1 << ECACHE_BITS) - 1)];
                         if k == child.hash && v != i32::MIN {
-                            (-v).saturating_sub(static_eval)
+                            let (ce, _) = unpack_eval_dis(v);
+                            (-ce).saturating_sub(static_eval)
                         } else {
                             0
                         }
@@ -1074,8 +1100,14 @@ impl<'a> Searcher<'a> {
                         }
                     }
                 }
-                child_eval = self.leaf_eval(&child);
-                new_depth -= (alpha.saturating_add(child_eval) / MB_FUT_DIV).clamp(0, 64);
+                let (ce, child_dis) = self.leaf_eval_with_dis(&child);
+                child_eval = pack_eval_dis(ce, child_dis);
+                let vol_credit = (child_dis * DIS_FUT_NUM) >> 7;
+                let shortfall = alpha.saturating_add(ce) - vol_credit;
+                new_depth -= (shortfall / MB_FUT_DIV).clamp(0, 64);
+                if child_dis > 300 && new_depth < depth as i32 {
+                    new_depth += 1;
+                }
             }
             // When all moves searched so far at this node lose by forced mate (or when searching
             // for a shorter mate), never skip remaining legal moves without searching them.
@@ -1775,5 +1807,18 @@ xxx....
         let r2 = se.search(&b, &no_time(6));
         assert_eq!(r2.depth, 6);
         assert!(r2.nodes < nodes1, "warm start nodes ({}) must be fewer than cold start ({})", r2.nodes, nodes1);
+    }
+
+    #[test]
+    fn pack_and_unpack_eval_dis_roundtrips_without_sentinel_collision() {
+        for eval_cp in [-30000, -12345, -1, 0, 1, 420, 30000] {
+            for dis_cp in [0, 1, 75, 450, 2500, 30000] {
+                let packed = pack_eval_dis(eval_cp, dis_cp);
+                assert_ne!(packed, i32::MIN, "packed value must never collide with i32::MIN sentinel");
+                let (e, d) = unpack_eval_dis(packed);
+                assert_eq!(e, eval_cp.clamp(-16384, 16383));
+                assert_eq!(d, dis_cp.clamp(0, 16383));
+            }
+        }
     }
 }
