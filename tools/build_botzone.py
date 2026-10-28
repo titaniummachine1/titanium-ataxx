@@ -74,6 +74,8 @@ def main():
     ap.add_argument("--no-pull", action="store_true", help="build the current checkout without pulling")
     ap.add_argument("--no-test", action="store_true", help="skip the Docker Linux test")
     ap.add_argument("--full-time", action="store_true", help="Linux test also plays one real 12 s first move")
+    ap.add_argument("--cpu", default="x86-64-v3", choices=["x86-64-v3", "x86-64-v4"],
+                    help="Target microarchitecture level (default x86-64-v3 AVX2 + runtime AVX-512 dispatch; x86-64-v4 = full AVX-512)")
     a = ap.parse_args()
 
     step("1/5 git")
@@ -96,6 +98,7 @@ def main():
                 break
         else:
             fail("zig not found (install zig 0.13 and cargo-zigbuild: `cargo install cargo-zigbuild`)")
+    env["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"] = "-C target-cpu=%s" % a.cpu
     run(["cargo", "zigbuild", "--release", "-p", "titanium-ffi", "--target", "%s.%s" % (TARGET, GLIBC_BUILD)], env=env)
 
     step("3/5 check the library")
