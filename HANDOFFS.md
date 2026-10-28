@@ -31,6 +31,7 @@
 - **D128**: Stockfish-style canonical WLD deduplication & external game collection (Botzone / Little Golem / KataAtaxx).
 - **D129**: Pure uniform weighting (`diff_nudge = 0.0`) on all future training.
 - **D130 (Immutable Law)**: **At all costs, never train a network from scratch when increasing or decreasing capacity.** Always upscale or downscale via function-preserving Net2Net / weight interpolation so the larger net inherits 100% of the champion's representations at step 0 ($f_{\text{new}}(x) \equiv f_{\text{old}}(x)$, exact 0.000 cp parity). Upscaled champion generated at `champion_w512_net2net.pt` (uploaded to Modal volume `ti-train /up/champion_w512_net2net.pt`).
+- **D131**: Active training run `w512_net2net_uniform` running on Modal L4 GPU (`app ap-KD3w41e0iQygZhQtXW89lA`). Warm-started from upscaled champion `champion_w512_net2net.pt`, uniform weighting `diff_nudge = 0.0`, fine-tuning lr `3e-4 -> 1e-5`, bs `8192`.
 
 ---
 
