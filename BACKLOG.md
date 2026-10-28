@@ -1,5 +1,17 @@
 # BACKLOG - living queue (newest first)
 
+## CURRENT ACTIVE BACKLOG (2026-10-28)
+
+| # | Priority Task | Motivation & Evidence | Execution Path | Status |
+|---|---|---|---|---|
+| **1** | **Master Net Saturation ($W=512$)** | Bakeoff proved $W=512$ drops val MSE to `0.022424` (wins by $-0.000379$). 31.57M rows ready on Modal `ti-train`. | 8-10 epochs Lookahead Ranger, cosine LR ($10^{-3} \to 10^{-5}$), weak difficulty nudge (`--diff-nudge 0.15`). Checkpoints committed per-minute to `/vol/ckpt/sat_w512`. | **IN PROGRESS** (Candidate pruning `bakeoff_w512_nog5` running first) |
+| **2** | **Disagreement Head Training (`TNN3`)** | Predicts $|\text{Search}_{5k} - \text{StaticEval}|$. Directly mimics PUCT epistemic exploration term in Alpha-Beta minimax. | Gather static predictions from saturated teacher, compute absolute search gap, train auxiliary quantile/residual head. | **QUEUED** (Awaiting saturated net) |
+| **3** | **PUCT-Inspired AB Search Integration** | Dynamic LMR depth cancellation on high-uncertainty lines; +1 ply volatility extensions; aggressive pruning on quiescent nodes. | Wire `disagreement(s)` into `search.rs` LMR reduction formula: $\Delta d = \text{LMR}(d, m) - k \cdot \text{Disagreement}$. Gate vs `main @ 31de097`. | **DESIGNED** (Ready for implementation) |
+| **4** | **Small Net Distillation (`fut_small.tsn`)** | Deployed engine requires high NPS. Distill saturated $W=512$ master net into lean $W=64 / W=32$ futility small net. | `smallnet_pack.py` $\to$ `smallnet_train.py` (bound mode) $\to$ `smallnet_export2.py`. | **QUEUED** |
+| **5** | **Botzone Deployment Package** | Unified search upgrades (`31de097`) + persistent search state validated (+48.9% at 4s vs 6s). | Package hardened `.so` + new saturated NNUE, run 12-case Linux sanity test, ready for Botzone. | **PENDING MATCH COMPLETION** |
+
+---
+
 ## CURRENT BACKLOG (2026-10-26 ~12:00; replaces everything below, which is history)
 
 Method for every item (it is how fut-cheap/fut-sn were found and proven): PROFILE (count where the cost is) -> RECORD +

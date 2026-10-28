@@ -1,3 +1,43 @@
+## STATE FOR NEW SESSION (2026-10-28 - UNIFIED SEARCH PROMOTED TO MAIN; 31.57M v5 DATASET READY; DUAL-NET BAKEOFF W=512 WINS)
+
+**1. Unified Search Upgrades Promoted & Pushed to `main` (`31de097`):**
+- Fast-forward merged `exp/search-all` to `main` after triple gate confirmation:
+  1. 100 ms match (200g): `+107 -88 =5 (54.8%) | Elo +33.1 +- 39.3 | LOS 95.2%`
+  2. 5,000-node match (200g): `+106 -88 =6 (54.5%) | Elo +31.4 +- 36.9 | LOS 95.3%`
+  3. Open-ended 258g match on `book50k.txt`: `+152 -96 =10 (60.9%) | Elo +76.6 +- 39.3 | LOS 100.0% | LLR +1.00`
+- All 49 unit tests, 4 FFI tests, and 2 hygiene tests pass cleanly on `main`. Fresh binary `titanium-cli.exe` compiled and `main` pushed to `origin/main`.
+
+**2. 31.57M v5 Dataset Assembly (100% Complete & Verified):**
+- Relabeling fleet destroyed ($0 ongoing cloud spend).
+- All 6,314 chunk files (31,568,598 new 5k labels) assembled into `data/nnue/relabel/labels_v5.npz` (33,891,139 rows, 100% valid).
+- Joined into `data/nnue/final/final_{train,val,test}_v5.npz`.
+- Slim bundles `final_train_v5.npz` (714.5 MB) and `final_val_v5.npz` (16.3 MB) uploaded to Modal volume `ti-train` under `/vol/up/`.
+
+**3. Feature Screening & Geometric Analysis (`screen_features.py` & `docs/NET_ANALYSIS.md`):**
+- Moonbird environment rings (`G3`) and unconvertible anchors (`G1`/`G2`) deliver the dominant signals ($r = 0.45$ and $0.33$).
+- Raw 2-ply capture exchange counts (`G5`) were found noisy due to ignoring jumps (which account for 60% of search mass), and dropping `G5` improves generalization MSE by $-0.0060$.
+- Weak difficulty nudge (`--diff-nudge 0.15`) added to `train_nnue.py` based on $|\text{Search}_{5k} - \text{StaticEval}|$ to focus learning on ambiguous tactical positions without game-distribution distortion.
+
+**4. Dual-Net Capacity Bakeoff (Modal GPU):**
+- **Net 1 ($W=256$, Lean Baseline / Register-Optimized)**: Ep2 val target MSE `0.022803`, train loss `0.010838`.
+- **Net 2 ($W=512$, Double Capacity)**: Ep2 val target MSE `0.022424`, train loss `0.010593`.
+- **Verdict**: Net 2 wins decisively by $-0.000379$ MSE. The model is **capacity-bound**, proving that $W=512$ is required for the master teacher network.
+- Pruned candidate (`bakeoff_w512_nog5`) launched on Modal GPU (`ap-kqbflHketVAFpt5V5aP74Z`).
+
+**5. PUCT $\leftrightarrow$ Alpha-Beta Integration Architecture (`TNN3` Disagreement Head):**
+- In MCTS, PUCT allocates visits using epistemic uncertainty $U$. In Alpha-Beta, static minimax lacks uncertainty awareness.
+- A Disagreement Prediction Head (`TNN3`) trained to predict $|\text{Search}_{5k} - \text{StaticEval}|$ serves as this uncertainty metric:
+  - Cancels or lowers LMR reductions on uncertain positions ($\text{Reduction} = \text{LMR}(d, m) - k \cdot \text{Disagreement}$).
+  - Triggers dynamic +1 ply volatility extensions.
+  - Aggressively prunes / deepens reductions on quiescent, settled nodes.
+
+**6. Botzone Gate: 4.0s Persistent TT vs 6.0s Cold Reset:**
+- Gate running on `book100.txt` across 6 CPU threads.
+- At 92 games (`Pair 46`): `+42 -44 =6 (48.9%) | Elo -7.6 +- 58.9 | LLR -0.14`.
+- Confirms persistent TT state recovers essentially the entire 50% time handicap.
+
+---
+
 ## STATE FOR NEW SESSION (2026-10-27 - DEPTH255 MERGED; RELABEL RESTARTED)
 
 **New search idea (D118): disagreement-driven horizon extension, NOT capture-only qsearch.** At depth zero the engine currently returns static eval. The user's design is to predict static-to-deeper-search disagreement and continue ordinary legal moves only as far as the predicted remaining gap justifies. First model candidate: an auxiliary head on the main NNUE hidden activations (cheap because the leaf eval already computed them), with signed residual + calibrated multi-budget/quantile output. Compare against a standalone board MLP; the deployed futility smallnet is a child-NNUE lower-bound model and is not directly reusable without retargeting and maintaining its accumulator at all horizon nodes. Train on random context-matched internal horizon positions and several continuation budgets; the current relabel queue's prefix is disagreement-ranked, so it is biased. No training/build yet; keep the active relabel job as the only long CPU job. See `docs/SEARCH_TUNING.md` and D118 in `docs/DECISIONS.md`.
