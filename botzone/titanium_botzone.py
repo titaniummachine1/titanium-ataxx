@@ -31,7 +31,7 @@ import time
 T_START = time.perf_counter()
 
 MARKER = ">>>BOTZONE_REQUEST_KEEP_RUNNING<<<"
-MODE = os.environ.get("TI_MODE", "oneshot")
+MODE = os.environ.get("TI_MODE", "long")
 if MODE == "long":
     FIRST_LIMIT_MS, TURN_LIMIT_MS = 12000, 4000
 else:
