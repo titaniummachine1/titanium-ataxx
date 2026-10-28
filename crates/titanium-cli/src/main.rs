@@ -86,6 +86,12 @@ fn main() -> ExitCode {
             flag_str(&args, "--tuple"),
         ),
         "nnevaldump" => nnevaldump_cmd(network_flag(&args), flag_str(&args, "--boards")),
+        "snevalbatch" => snevalbatch_cmd(
+            network_flag(&args),
+            flag_str(&args, "--in"),
+            flag_str(&args, "--out"),
+            flag_int(&args, "--threads").unwrap_or(8) as usize,
+        ),
         "nneval" => nneval_cmd(
             network_flag(&args),
             flag_str(&args, "--boards"),
@@ -733,6 +739,84 @@ fn s57dump_cmd(inp: Option<String>, out: Option<String>, tup_spec: Option<String
 
 /// exp/nnue parity check: lines "<49 chars> <b|w> <expected cp>" (export_nnue.py .ref.txt) -> max |diff|.
 /// exp/nnue-speed: one fast-path eval per board line (bit-identity check across optimisations).
+fn snevalbatch_cmd(
+    nn: Option<String>,
+    in_bin: Option<String>,
+    out_bin: Option<String>,
+    threads: usize,
+) -> ExitCode {
+    let (Some(nn_path), Some(in_path), Some(out_path)) = (nn, in_bin, out_bin) else {
+        eprintln!("snevalbatch: --network FILE --in FILE --out FILE required");
+        return ExitCode::FAILURE;
+    };
+    let net = match titanium::nnue::Nnue::load(&nn_path) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("snevalbatch load net: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let data = match fs::read(&in_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("snevalbatch read in: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if data.len() % 24 != 0 {
+        eprintln!("snevalbatch: in file length {} not multiple of 24", data.len());
+        return ExitCode::FAILURE;
+    }
+    let n = data.len() / 24;
+    eprintln!("snevalbatch: evaluating {n} positions with {} threads...", threads);
+    let t0 = Instant::now();
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+    let out_scores: Vec<AtomicI32> = (0..n).map(|_| AtomicI32::new(0)).collect();
+    let next_chunk = AtomicUsize::new(0);
+    const CHUNK: usize = 4096;
+
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| {
+                loop {
+                    let start = next_chunk.fetch_add(CHUNK, Ordering::Relaxed);
+                    if start >= n {
+                        break;
+                    }
+                    let end = (start + CHUNK).min(n);
+                    for i in start..end {
+                        let off = i * 24;
+                        let own = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+                        let opp = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
+                        let blk = u64::from_le_bytes(data[off + 16..off + 24].try_into().unwrap());
+                        let b = Board::from_occ(own, opp, blk, 0);
+                        let cp = (400.0 * net.forward(&b, 0.0)).round() as i32;
+                        out_scores[i].store(cp, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+
+    let dt = t0.elapsed();
+    eprintln!(
+        "snevalbatch: evaluated {n} positions in {:.2?} ({:.0} pos/s)",
+        dt,
+        n as f64 / dt.as_secs_f64().max(1e-6)
+    );
+
+    let mut out_bytes = Vec::with_capacity(n * 4);
+    for x in out_scores {
+        out_bytes.extend_from_slice(&x.into_inner().to_le_bytes());
+    }
+    if let Err(e) = fs::write(&out_path, out_bytes) {
+        eprintln!("snevalbatch write out: {e}");
+        return ExitCode::FAILURE;
+    }
+    eprintln!("snevalbatch: wrote {}", out_path);
+    ExitCode::SUCCESS
+}
+
 fn nnevaldump_cmd(nn: Option<String>, boards: Option<String>) -> ExitCode {
     let net = titanium::nnue::Nnue::load(&nn.expect("--nnue")).expect("nnue");
     let text = fs::read_to_string(boards.expect("--boards")).expect("boards");
