@@ -36,7 +36,8 @@ blob = b"TSN1" + struct.pack("<2I", W, H)
 for arr in (sd["ft.weight"].T, sd["ft.bias"], sd["l1.weight"], sd["l1.bias"], out_w, out_b, sd["skip"]):
     blob += np.ascontiguousarray(arr, dtype="<f4").tobytes()
 open(a.out, "wb").write(blob)
-z = dict(np.load(S.D + "/sn_eval.npz"))
+eval_name = "sn_eval_sat" if os.path.exists(S.D + "/sn_eval_sat.npz") else "sn_eval"
+z = dict(np.load(S.D + f"/{eval_name}.npz"))
 idx = np.random.default_rng(5).choice(len(z["nn"]), 2000, replace=False)
 rows = S.Rows(z, idx)
 m.eval()
