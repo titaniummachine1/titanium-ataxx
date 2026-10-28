@@ -2,10 +2,9 @@
 
 Monitors tit-d1 (16 vCPU), tit-d2 (16 vCPU), tit-d3 (8 vCPU):
 1. Periodically syncs completed chunks from /tmp/job/out to the coordinator output dir.
-2. Resilient against local WiFi / network drops (5 retries with 10s backoff).
+2. Resilient against local WiFi / network drops and transient `sbx cp` SystemExit errors.
 3. When a sandbox finishes its current slice (status.txt == 'DONE'):
    - Collects all completed chunks from /tmp/job/out.
-   - Pops the next remaining slice from SHARED_SLICES (or dynamically builds a slice of any remaining missing chunks) and calls `rdc.reuse(...)` without rebuilding Rust.
    - Once no slices remain, calls `sbx --cloud rm --force <sandbox>` to immediately shut down and delete the container.
 4. Exits cleanly ONLY once all cloud sandboxes have completed and been shut down.
 """
@@ -28,16 +27,8 @@ SANDBOXES = list(SANDBOX_VCPU.keys())
 LOG_FILE = os.path.join(ROOT, "logs", "cloud_autonomous_watcher.log")
 OUT_DIR = os.path.join(ROOT, "data", "nnue", "relabel", "out_dis_remaining_e3f8dc6e_e11827d1_d8a135ce")
 
-# Follow-up contiguous slices after initial launch:
-# tit-d1 launched on 2000..2320 (320)
-# tit-d2 launched on 2393..2600 (207)
-# tit-d3 launched on 4483..4640 (157)
-SHARED_SLICES = [
-    (5640, 5800),  # 160 chunks
-    (1660, 1760),  # 100 chunks
-    (6247, 6314),  # 67 chunks
-    (4640, 4700),  # 60 chunks
-]
+# All follow-up slices are now actively running on tit-d1 (6247..6314), tit-d2 (4640..4700), tit-d3 (1660..1760).
+SHARED_SLICES = []
 
 def log(msg):
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -85,10 +76,10 @@ def pop_next_slice():
     return None
 
 def main():
-    log("=== Cloud Autonomous Watcher (Wave 2 + Multi-Slice Reuse) Started ===")
+    log("=== Cloud Autonomous Watcher (Final Drain) Started ===")
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 
-    poll_interval = 120  # 2 minutes
+    poll_interval = 90  # 1.5 minutes
     iteration = 0
     deleted_sandboxes = set()
 
@@ -110,15 +101,18 @@ def main():
                 if status in ("running", "DONE"):
                     try:
                         rdc.collect(argparse.Namespace(name=name, keep=True))
-                    except Exception as ce:
+                    except (Exception, SystemExit) as ce:
                         log(f"[{name}] collect warning: {ce}")
 
                 if status == "DONE":
                     log(f"[{name}] FINISHED CURRENT SLICE! Running final slice collect...")
-                    try:
-                        rdc.collect(argparse.Namespace(name=name, keep=False))
-                    except Exception:
-                        pass
+                    for retry in range(3):
+                        try:
+                            rdc.collect(argparse.Namespace(name=name, keep=False))
+                            break
+                        except (Exception, SystemExit) as ce:
+                            log(f"[{name}] final collect retry {retry+1}/3 warning: {ce}")
+                            time.sleep(5)
 
                     nxt = pop_next_slice()
                     if nxt is not None:
@@ -130,15 +124,16 @@ def main():
                                 name=name, vcpu=vcpu, first_chunk=lo, last_chunk=hi, hours=1.5
                             ))
                             continue
-                        except Exception as re_err:
+                        except (Exception, SystemExit) as re_err:
                             log(f"[{name}] reuse failed ({re_err}), pushing slice back to queue")
                             SHARED_SLICES.insert(0, (lo, hi))
+                            continue
 
                     log(f"[{name}] No more slices in queue; deleting container...")
                     del_res = subprocess.run(["sbx", "--cloud", "rm", "--force", name], capture_output=True, text=True)
                     log(f"[{name}] deleted: returncode={del_res.returncode}, out={del_res.stdout.strip()}")
                     deleted_sandboxes.add(name)
-            except Exception as e:
+            except (Exception, SystemExit) as e:
                 log(f"[{name}] iteration error: {e}")
 
         if len(deleted_sandboxes) == len(SANDBOXES):
