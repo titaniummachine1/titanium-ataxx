@@ -18,7 +18,7 @@ import modal
 
 ROOT = "C:/gitProjects/titanium-ataxx"
 ENGINE_SRC = os.environ.get("ENGINE_SRC", "C:/gitProjects/main-ataxx")
-IGNORE = ["target", "data", "logs", "web", "training", "docs", "downlaods", "botzone", "**/*.pt", "**/*.npz", "node_modules", ".git"]
+IGNORE = ["target", "logs", "web", "training", "docs", "downlaods", "botzone", "**/*.pt", "**/*.npz", "**/*.bin", "node_modules", ".git"]
 CARGO = "/root/.cargo/bin/cargo"
 # sha256 of the LOCAL feature files (data/nnue/nnfeat, 2026-10-25): the container's nndump output must match exactly
 SHA = {
