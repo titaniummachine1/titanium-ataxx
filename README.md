@@ -1,7 +1,7 @@
 # TITANIUM — High-Performance Ataxx Engine
 
 <div align="center">
-  <img src="assets/titanium_banner.jpg" alt="Titanium Ataxx Engine" width="600"/>
+  <img src="assets/titanium_banner.png" alt="Titanium Ataxx Engine" width="600"/>
   <p><em>A state-of-the-art, lightweight CPU Ataxx engine in pure Rust.</em></p>
 </div>
 
