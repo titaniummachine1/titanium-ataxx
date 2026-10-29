@@ -54,13 +54,13 @@ Living audit tracking all completed engineering milestones, empirical gates, and
 
 ### 🔴 Phase A: Model Architecture & Training (Current Priority)
 
-1. **Net2Net W=512 (AVX-512) Saturated Training with Online D4 Augmentation:**
+1. **Net2Net W=512 (AVX-512) Saturated Training with Online D4 Augmentation (D150, D151):**
    - **Goal:** Expand network capacity from $W=256 \to W=512$ via function-preserving Net2Net-Wider ($<0.02$ cp initial error).
    - **Data:** Trained on `final_train_v7.npz` (incorporating 2,025,000 fresh 5k search labels + 88,295 Botzone anchors).
    - **Regularization:** Online D4 dihedral augmentation across all 8 configurations per batch + uniform weighting (`diff_nudge=0.0`) to prevent over-saturation collapse (D133 vs D146).
-   - **Status:** Checkpoint and dataset uploaded to Modal; ready to launch.
+   - **Result:** Gated over 416 games at 5,000 nodes vs reigning champion `nnue_main.tnn`: **232W – 170L – 14D (+52 Elo)**, scoreCI `[0.5270, 0.6220] > 0.5000` (**PASS**, Gate Law v5). Shard 0 determinism tripwire replayed 100% bit-identically across all 26 games.
 
-2. **Net2Net Downscale & Noise Cleaning ($W=512 \to W=256$):**
+2. **Net2Net Downscale & Noise Cleaning ($W=512 \to W=256$) (Current Priority):**
    - **Concept:** User's capacity breathing cycle: upscale gives expanded capacity to absorb new patterns and sharp disagreement targets; downscaling cleans parameter noise and compresses essential features back into a lean, fast AVX2 model for maximum NPS in search.
    - **Tooling:** Implemented in [`training/net2net_downscale.py`](file:///C:/gitProjects/titanium-ataxx/training/net2net_downscale.py).
 
