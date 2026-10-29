@@ -32,6 +32,11 @@ SHA = {
     "train_v6.idx": "8496557b730d318c154989a505c3950dac008715d530f703c644bf1b44c08695",
     "val_v6.cnt": "b621f279a867a78569b0475ed67607eceaff40be77f589d6177161c5ceb36a35",
     "val_v6.idx": "b6b680e06c4433aa464908ff244ddb65ae65396dab03d25bddbb5bec165c97c3",
+    # v7 (32,622,551 rows = 32,534,256 base + 88,295 anchors with 2,025,000 fresh 5k relabels)
+    "train_v7.cnt": "444dc8e3c9d87cce487c84347d80a31f07970584790eb6c1360d3b9837ed8caa",
+    "train_v7.idx": "8496557b730d318c154989a505c3950dac008715d530f703c644bf1b44c08695",
+    "val_v7.cnt": "b621f279a867a78569b0475ed67607eceaff40be77f589d6177161c5ceb36a35",
+    "val_v7.idx": "b6b680e06c4433aa464908ff244ddb65ae65396dab03d25bddbb5bec165c97c3",
     # fallbacks
     "train.cnt": "ed9cac3fb156c3cae30b204d241cbd735cbbfd260d6f8e4c3eb2baf8a7d3e99b",
     "train.idx": "80452e0b9452081004045c1285b20963525c32bf2f06a77d6ba42b8bc95eea3e",
