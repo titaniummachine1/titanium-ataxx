@@ -82,7 +82,7 @@ fn main() -> ExitCode {
             max_depth_flag(&args),
             flag_int_alias(&args, "--time-limit-ms", "--time").map(|ms| ms as u64),
         ),
-        "snparity" => snparity_cmd(flag_str(&args, "--ref")),
+        "snparity" => snparity_cmd(flag_str(&args, "--ref"), flag_str(&args, "--sn")),
         "nnbench" => nnbench_cmd(
             flag_str(&args, "--boards"),
             flag_str(&args, "--tuple"),
@@ -2139,13 +2139,31 @@ fn genbench_cmd(iters: u64) -> ExitCode {
 
 /// exp/fut-sn: compiled-in futility small net vs the torch reference (training/smallnet_export.py <out>.ref.txt), and
 /// its speed on those inputs.
-fn snparity_cmd(refp: Option<String>) -> ExitCode {
+fn snparity_cmd(refp: Option<String>, snp: Option<String>) -> ExitCode {
     let Some(p) = refp else {
         eprintln!("snparity: --ref FILE required");
         return ExitCode::FAILURE;
     };
     let text = fs::read_to_string(&p).unwrap_or_default();
-    let net = titanium::smallnet::SmallNet::builtin();
+    let net = match snp {
+        Some(path) => {
+            let data = match fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("snparity: failed to read {path}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match titanium::smallnet::SmallNet::parse(&data) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("snparity: invalid smallnet {path}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => titanium::smallnet::SmallNet::builtin(),
+    };
     let rows: Vec<(u64, u64, u64, i32, i32, f64)> = text
         .lines()
         .filter_map(|l| {
