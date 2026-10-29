@@ -34,7 +34,7 @@ fn main() -> ExitCode {
     }
     let cmd = args
         .iter()
-        .find(|x| matches!(x.as_str(), "perft" | "bench" | "selfplay" | "bestmove" | "label" | "labelbin" | "snparity" | "nnbench" | "nndump" | "s57dump" | "nnevaldump" | "nneval" | "play" | "show" | "genbench" | "uai" | "serve" | "match" | "sperft"))
+        .find(|x| matches!(x.as_str(), "perft" | "bench" | "selfplay" | "bestmove" | "label" | "labelbin" | "snparity" | "nnbench" | "nndump" | "s57dump" | "nnevaldump" | "nneval" | "play" | "show" | "genbench" | "uai" | "serve" | "match" | "sperft" | "treebook"))
         .map(String::as_str)
         .unwrap_or("help");
     // exact full-strength search without the lossy futility small net (D112); any command, `serve` included
@@ -152,6 +152,14 @@ fn main() -> ExitCode {
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
             network_flag(&args),
+        ),
+        "treebook" => treebook_cmd(
+            flag_int(&args, "--target").unwrap_or(50_000) as usize,
+            flag_int(&args, "--max-ply").unwrap_or(10) as usize,
+            flag_int_alias(&args, "--node-limit", "--nodes").unwrap_or(400) as u64,
+            flag_int(&args, "--margin").unwrap_or(35) as i32,
+            network_flag(&args),
+            flag_str(&args, "--out"),
         ),
         _ => {
             print_help();
@@ -2230,4 +2238,151 @@ fn snparity_cmd(refp: Option<String>, snp: Option<String>) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+
+// ---------- treebook ----------
+
+fn treebook_cmd(
+    target: usize,
+    max_ply: usize,
+    nodes: u64,
+    margin_cp: i32,
+    nnue_spec: Option<String>,
+    out_path: Option<String>,
+) -> ExitCode {
+    let nnue_spec = resolve_nnue_spec(&nnue_spec);
+    let net = match load_nnue_spec(&nnue_spec) {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            eprintln!("treebook: no NNUE network specified or bundled");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("treebook: failed to load NNUE: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!(
+        "treebook: target={target}, max-ply={max_ply}, nodes={nodes}, margin={margin_cp} cp, net={}",
+        network_description(&nnue_spec)
+    );
+
+    let mut searcher = Searcher::new_unconfigured();
+    searcher.set_nnue(Some(&net));
+
+    let limits = SearchLimits {
+        time: None,
+        max_nodes: Some(nodes),
+        max_depth: 30,
+    };
+
+    let mut queue = std::collections::VecDeque::new();
+    let mut visited_hashes = std::collections::HashSet::new();
+    let mut book_fens = std::collections::HashSet::new();
+    let mut scored: Vec<(i32, i32, i32, usize, String)> = Vec::new();
+
+    let starts = [
+        Board::start(),
+        Board::botzone_start(),
+    ];
+    for b in &starts {
+        visited_hashes.insert(b.hash);
+        queue.push_back((*b, 0));
+    }
+
+    let t0 = Instant::now();
+    let mut positions_evaluated = 0usize;
+
+    while let Some((b, ply)) = queue.pop_front() {
+        if b.game_over() {
+            continue;
+        }
+
+        let (eval_cp, _) = net.eval_with_dis(&b, 0);
+        let abs_eval = eval_cp.abs();
+        let (b_cnt, w_cnt) = b.counts();
+        let diff = (b_cnt as i32 - w_cnt as i32).abs();
+
+        if ply >= 4 && diff <= 1 && abs_eval <= 120 {
+            let fen = b.to_string();
+            if book_fens.insert(fen.clone()) {
+                let penalty = abs_eval + diff * 35;
+                scored.push((penalty, abs_eval, eval_cp, diff as usize, fen));
+                if scored.len() % 5000 == 0 || scored.len() == target {
+                    println!(
+                        "  [{:>5.1}s] Generated {:>6} / {} openings (queue: {:>5}, evaluated: {})",
+                        t0.elapsed().as_secs_f64(),
+                        scored.len(),
+                        target,
+                        queue.len(),
+                        positions_evaluated
+                    );
+                }
+                if scored.len() >= target {
+                    break;
+                }
+            }
+        }
+
+        if ply >= max_ply {
+            continue;
+        }
+
+        let mut banned: Vec<Move> = Vec::new();
+        let mut chosen_moves: Vec<Move> = Vec::new();
+        let mut best_score: Option<i32> = None;
+
+        for _ in 0..4 {
+            let res = searcher.search_excluding(&b, &limits, &banned);
+            let Some(mv) = res.best else { break };
+            if res.score.abs() > 3000 {
+                break;
+            }
+            if let Some(top) = best_score {
+                if top - res.score > margin_cp {
+                    break;
+                }
+            } else {
+                best_score = Some(res.score);
+            }
+            chosen_moves.push(mv);
+            banned.push(mv);
+            positions_evaluated += 1;
+        }
+
+        for mv in chosen_moves {
+            let next_b = b.make(mv);
+            if visited_hashes.insert(next_b.hash) {
+                queue.push_back((next_b, ply + 1));
+            }
+        }
+    }
+
+    println!(
+        "\nExpansion finished in {:.2}s. Total openings collected: {}",
+        t0.elapsed().as_secs_f64(),
+        scored.len()
+    );
+
+    scored.sort_by_key(|x| x.0);
+
+    let out_file = out_path.unwrap_or_else(|| "C:/gitProjects/titanium-ataxx/data/nnue/book50k.txt".to_string());
+    println!("Writing sorted openings to {out_file}...");
+    if let Some(parent) = std::path::Path::new(&out_file).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_file).expect("create book file"));
+    for (_, _, _, _, fen) in &scored {
+        use std::io::Write as _;
+        let _ = writeln!(writer, "{fen}");
+    }
+
+    println!("\nTop 5 openings generated:");
+    for (i, (pen, _, ev, diff, fen)) in scored.iter().take(5).enumerate() {
+        println!("  #{i}: penalty={pen:3} | eval={ev:+5} cp | diff={diff} | {fen}");
+    }
+
+    ExitCode::SUCCESS
 }

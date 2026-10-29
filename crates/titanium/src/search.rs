@@ -1337,6 +1337,16 @@ impl<'a> Searcher<'a> {
 
     /// Botzone search excluding repetition-banned root moves up front so the full
     /// search budget is spent evaluating allowed root moves at full depth.
+    /// Standard search excluding specified root moves (Multi-PV tree generation).
+    pub fn search_excluding(
+        &mut self,
+        b: &Board,
+        limits: &SearchLimits,
+        banned_root: &[Move],
+    ) -> SearchResult {
+        self.search_gen::<false>(b, limits, banned_root)
+    }
+
     pub fn search_bz_excluding(
         &mut self,
         b: &Board,
