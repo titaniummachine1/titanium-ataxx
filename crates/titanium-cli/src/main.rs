@@ -139,6 +139,14 @@ fn main() -> ExitCode {
             args.iter().any(|x| x == "--tuple-native"),
             network_flag(&args),
         ),
+        "treebook" => treebook_cmd(
+            flag_int(&args, "--target").unwrap_or(50_000) as usize,
+            flag_int(&args, "--max-ply").unwrap_or(10) as usize,
+            flag_int_alias(&args, "--node-limit", "--nodes").unwrap_or(400) as u64,
+            flag_int(&args, "--margin").unwrap_or(35) as i32,
+            network_flag(&args),
+            flag_str(&args, "--out"),
+        ),
         _ => {
             print_help();
             ExitCode::SUCCESS
@@ -2192,4 +2200,192 @@ fn snparity_cmd(refp: Option<String>) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+
+// ---------- treebook ----------
+
+/// Canonical key of a position's symmetry class: the minimum over the 8
+/// square symmetries of (side-to-move stones, opponent stones, blockers).
+/// Side-relative, so a colour-swapped twin maps to the same key too.
+fn symmetry_key(b: &Board) -> (u64, u64, u64) {
+    fn map(bb: u64, t: usize) -> u64 {
+        let mut out = 0u64;
+        let mut rest = bb;
+        while rest != 0 {
+            let sq = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            let (r, c) = (sq / 7, sq % 7);
+            let (r2, c2) = match t {
+                0 => (r, c),
+                1 => (r, 6 - c),
+                2 => (6 - r, c),
+                3 => (6 - r, 6 - c),
+                4 => (c, r),
+                5 => (c, 6 - r),
+                6 => (6 - c, r),
+                _ => (6 - c, 6 - r),
+            };
+            out |= 1u64 << (r2 * 7 + c2);
+        }
+        out
+    }
+    (0..8)
+        .map(|t| (map(b.me(), t), map(b.opp(), t), map(b.blockers, t)))
+        .min()
+        .unwrap()
+}
+
+fn treebook_cmd(
+    target: usize,
+    max_ply: usize,
+    nodes: u64,
+    margin_cp: i32,
+    nnue_spec: Option<String>,
+    out_path: Option<String>,
+) -> ExitCode {
+    if out_path.is_none() {
+        eprintln!("treebook: --out <file> is required (never overwrite a live book by default)");
+        return ExitCode::FAILURE;
+    }
+    let nnue_spec = resolve_nnue_spec(&nnue_spec);
+    let net = match load_nnue_spec(&nnue_spec) {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            eprintln!("treebook: no NNUE network specified or bundled");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("treebook: failed to load NNUE: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!(
+        "treebook: target={target}, max-ply={max_ply}, nodes={nodes}, margin={margin_cp} cp, net={}",
+        network_description(&nnue_spec)
+    );
+
+    let mut searcher = Searcher::new_unconfigured();
+    searcher.set_nnue(Some(&net));
+
+    let limits = SearchLimits {
+        time: None,
+        max_nodes: Some(nodes),
+        max_depth: 30,
+    };
+
+    // Dedup on the symmetry class (8 board symmetries, side-to-move relative):
+    // the standard start is symmetric, so raw hashes keep mirror twins and
+    // every paired gate line would be played several times.
+    let mut queue = std::collections::VecDeque::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut book_keys = std::collections::HashSet::new();
+    let mut scored: Vec<(i32, i32, i32, usize, String)> = Vec::new();
+
+    let start = Board::start();
+    visited.insert(symmetry_key(&start));
+    queue.push_back((start, 0));
+
+    let t0 = Instant::now();
+    let mut positions_evaluated = 0usize;
+
+    while let Some((b, ply)) = queue.pop_front() {
+        if b.game_over() || !b.has_moves(b.turn) {
+            continue;
+        }
+
+        // Balance = search score at the node (side to move), not static eval.
+        let first = searcher.search_excluding(&b, &limits, &[]);
+        let Some(first_mv) = first.best else { continue };
+        positions_evaluated += 1;
+        let eval_cp = first.score;
+        let abs_eval = eval_cp.abs();
+        let (b_cnt, w_cnt) = b.counts();
+        let diff = (b_cnt as i32 - w_cnt as i32).abs();
+
+        if ply >= 4 && diff <= 1 && abs_eval <= 120 {
+            let fen = b.to_string();
+            if book_keys.insert(symmetry_key(&b)) {
+                let penalty = abs_eval + diff * 35;
+                scored.push((penalty, abs_eval, eval_cp, diff as usize, fen));
+                if scored.len() % 5000 == 0 || scored.len() == target {
+                    println!(
+                        "  [{:>5.1}s] Generated {:>6} / {} openings (queue: {:>5}, evaluated: {})",
+                        t0.elapsed().as_secs_f64(),
+                        scored.len(),
+                        target,
+                        queue.len(),
+                        positions_evaluated
+                    );
+                }
+                if scored.len() >= target {
+                    break;
+                }
+            }
+        }
+
+        if ply >= max_ply {
+            continue;
+        }
+
+        // Multi-PV: up to 4 distinct children (by symmetry class) within
+        // margin of the best line; twins and duplicate clone sources are
+        // banned without spending a branch slot.
+        if first.score.abs() > 3000 {
+            continue;
+        }
+        let mut banned: Vec<Move> = Vec::new();
+        let mut kept = 0;
+        let mut res_mv = Some(first_mv);
+        let mut res_score = first.score;
+        for _ in 0..12 {
+            let Some(mv) = res_mv else { break };
+            if first.score - res_score > margin_cp {
+                break;
+            }
+            banned.push(mv);
+            let next_b = b.make(mv);
+            if visited.insert(symmetry_key(&next_b)) {
+                queue.push_back((next_b, ply + 1));
+                kept += 1;
+                if kept == 4 {
+                    break;
+                }
+            }
+            let res = searcher.search_excluding(&b, &limits, &banned);
+            positions_evaluated += 1;
+            res_mv = res.best;
+            res_score = res.score;
+        }
+    }
+
+    println!(
+        "\nExpansion finished in {:.2}s. Total openings collected: {}",
+        t0.elapsed().as_secs_f64(),
+        scored.len()
+    );
+
+    scored.sort_by_key(|x| x.0);
+
+    let Some(out_file) = out_path else {
+        eprintln!("treebook: --out <file> is required (never overwrite a live book by default)");
+        return ExitCode::FAILURE;
+    };
+    println!("Writing sorted openings to {out_file}...");
+    if let Some(parent) = std::path::Path::new(&out_file).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_file).expect("create book file"));
+    for (_, _, _, _, fen) in &scored {
+        use std::io::Write as _;
+        let _ = writeln!(writer, "{fen}");
+    }
+
+    println!("\nTop 5 openings generated:");
+    for (i, (pen, _, ev, diff, fen)) in scored.iter().take(5).enumerate() {
+        println!("  #{i}: penalty={pen:3} | eval={ev:+5} cp | diff={diff} | {fen}");
+    }
+
+    ExitCode::SUCCESS
 }
