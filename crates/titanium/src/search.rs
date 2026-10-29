@@ -73,6 +73,9 @@ pub struct Tune {
     pub dis_sn_num: i32,     // Disagreement head SmallNet prefilter volatility credit (scaled by 128) (default 48)
     pub dis_lmr_num: i32,    // Disagreement head LMR discount on volatile nodes (scaled by 256) (default 1)
     pub dis_vol_thresh: i32, // Disagreement threshold (cp) for tactical +1 extension (default 300)
+    pub dis_lmr_quiet_thresh: i32, // Disagreement threshold below which node is quiet (cp) (default 0)
+    pub dis_lmr_quiet_min: i32,    // Move index threshold for quiet LMR boost (default 10)
+    pub dis_lmr_quiet_red: i32,    // Extra reduction plies on quiet late moves (default 0)
 }
 
 impl Default for Tune {
@@ -84,9 +87,12 @@ impl Default for Tune {
             lmr_min: 6,
             dis_rfp_num: 32,
             dis_fut_num: 48,
-            dis_sn_num: 48,
-            dis_lmr_num: 1,
+            dis_sn_num: 0,
+            dis_lmr_num: 0,
             dis_vol_thresh: 300,
+            dis_lmr_quiet_thresh: 0,
+            dis_lmr_quiet_min: 10,
+            dis_lmr_quiet_red: 0,
         }
     }
 }
@@ -108,6 +114,9 @@ fn tune_from_env() -> Tune {
                 "dis_sn_num" => t.dis_sn_num = x.max(0),
                 "dis_lmr_num" => t.dis_lmr_num = x.max(0),
                 "dis_vol_thresh" => t.dis_vol_thresh = x.max(0),
+                "dis_lmr_quiet_thresh" => t.dis_lmr_quiet_thresh = x.max(0),
+                "dis_lmr_quiet_min" => t.dis_lmr_quiet_min = x.max(1),
+                "dis_lmr_quiet_red" => t.dis_lmr_quiet_red = x.max(0),
                 _ => {}
             }
         }
@@ -1120,7 +1129,15 @@ impl<'a> Searcher<'a> {
             if move_idx >= tune().lmr_min as usize {
                 let base_red = (depth as i32) - (depth as i32 * tune().lmr_half / (tune().lmr_half + lmr_cnt));
                 let dis_red_discount = (node_dis * tune().dis_lmr_num) >> 8;
-                let red = (base_red - dis_red_discount).max(0);
+                let quiet_extra_red = if tune().dis_lmr_quiet_red > 0
+                    && node_dis < tune().dis_lmr_quiet_thresh
+                    && move_idx >= tune().dis_lmr_quiet_min as usize
+                {
+                    tune().dis_lmr_quiet_red
+                } else {
+                    0
+                };
+                let red = (base_red - dis_red_discount + quiet_extra_red).max(0);
                 new_depth = (depth as i32) - red;
                 lmr_cnt += 1;
             }
