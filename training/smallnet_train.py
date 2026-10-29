@@ -115,6 +115,28 @@ def bits(x):
     return b.astype(np.float32)
 
 
+def build_sq49_perm():
+    """Exact 8-mode D4 dihedral symmetry permutation table for 49 board squares."""
+    maps = np.zeros((8, 49), dtype=np.int64)
+    for mode in range(8):
+        for r in range(7):
+            for c in range(7):
+                idx = r * 7 + c
+                if mode == 0: nr, nc = r, c           # Identity
+                elif mode == 1: nr, nc = c, 6 - r     # 90 deg CW
+                elif mode == 2: nr, nc = 6 - r, 6 - c # 180 deg
+                elif mode == 3: nr, nc = 6 - c, r     # 270 deg CW
+                elif mode == 4: nr, nc = r, 6 - c     # Flip horizontal
+                elif mode == 5: nr, nc = 6 - r, c     # Flip vertical
+                elif mode == 6: nr, nc = c, r         # Transpose
+                elif mode == 7: nr, nc = 6 - c, 6 - r # Anti-transpose
+                maps[mode, idx] = nr * 7 + nc
+    return maps
+
+
+SQ49_PERM = build_sq49_perm()
+
+
 class Rows:
     def __init__(self, z, idx, ex=None, alpha_in=False, focus=0.0):
         self.own, self.opp, self.blk = z["own"][idx], z["opp"][idx], z["blk"][idx]
@@ -137,8 +159,13 @@ class Rows:
     def __len__(self):
         return len(self.nn)
 
-    def batch(self, r):
+    def batch(self, r, rot_aug=False):
         o, e, k = bits(self.own[r]), bits(self.opp[r]), bits(self.blk[r])
+        if rot_aug:
+            mode = np.random.randint(0, 8)
+            if mode != 0:
+                P = SQ49_PERM[mode]
+                o, e, k = o[:, P], e[:, P], k[:, P]
         us = np.concatenate([o, e, k], 1)
         them = np.concatenate([e, o, k], 1)
         t = lambda a: torch.from_numpy(np.ascontiguousarray(a))
@@ -208,6 +235,7 @@ def main():
     ap.add_argument("--alpha-in", action="store_true", help="the call's alpha as an input")
     ap.add_argument("--focus", type=float, default=0.0, help="weight rows near the prune threshold (cp/400 scale)")
     ap.add_argument("--data-name", default="sn_train", help="npz dataset name inside SN_DATA")
+    ap.add_argument("--no-rot-aug", action="store_true", help="disable online D4 rotational/reflection data augmentation")
     ap.add_argument("--make-extras", action="store_true")
     a = ap.parse_args()
     if a.make_extras:
@@ -266,7 +294,7 @@ def main():
         idx = rng.choice(len(tr), size=a.epoch_rows, replace=False)
         tl, k = 0.0, 0
         for i in range(0, len(idx), a.bs):
-            us, them, bk, pst, hand, ex_, t, w = tr.batch(np.sort(idx[i:i + a.bs]))
+            us, them, bk, pst, hand, ex_, t, w = tr.batch(np.sort(idx[i:i + a.bs]), rot_aug=not a.no_rot_aug)
             y = m(us, them, bk, pst, hand, ex_)
             loss = lossf(y, t, w)
             opt.zero_grad()
