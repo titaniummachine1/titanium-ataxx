@@ -4,6 +4,8 @@
 
 **Upload trap (new):** `requests` fails the 28.5 MB POST with `ConnectionError: ('Connection aborted.', TimeoutError('The write operation timed out'))` after ~60 s - from BOTH the Modal container and the local PC, 5/3 attempts. `curl.exe` succeeded in 640 s (HTTP/1.1, `-F file=@... -F path= -F filename=titanium_v2.so`). `tools/upload_botzone.py` now has worktree-relative paths + retries + a curl fallback note (main `4e15c8d`). Storage listing page is `/userfiles` (not `/userfile`).
 
+**Other traps now in AGENTS section 7 + docs/MISTAKES 40-42:** (a) the upload folder driver must be rebuilt from the LF git blob (`9550316F`, 14,257 B) - a CRLF checkout gives 14,594 B; (b) `requests` cannot upload the 28.5 MB .so, use curl; (c) a rust:1.97 gnu build needs glibc 2.39 and dies on Modal -> build musl static-pie; (d) AVX-512 exists only on Modal GPU hosts, not CPU containers or Docker sandboxes; (e) `modal volume get` of a dir with --force can create a file -> fetch shards individually; (f) a stripped .so hides `avx512` strings - verify with llvm-objdump `%zmm` count + a net-byte probe.
+
 **Credential law added:** BEHAVIOR law 32 (user order): creds may be used freely in conversation but are never stored in repo files, commits, artifacts, or upload folders; pass via env vars at the moment of use.
 
 **Next:** watch a V12 match log (expect the debug line to end `nnue_main.tnn/22`, no first-move RE), then the Botzone Elo climber.

@@ -121,8 +121,9 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 - `serve --tournament [--threads N] [--bz-rules]`: 128 MB TT default
   (tt_bits 23), startup autotune, silent auto-ponder after `bestmove`, next
   `position`+`go` aborts and converts with warm TT.
-- NOT built: per-move thread auto-scale; position-without-go premature search;
-  AVX-512 Botzone library.
+- NOT built: per-move thread auto-scale; position-without-go premature search.
+  The Botzone `.so` DOES carry the AVX-512 kernel (runtime CPUID dispatch, no
+  separate library); it was compiled into V12 (`3F9E10BA`).
 
 ## 6. Commands (PowerShell 5.1 — no `head`/`sed`/`&&`)
 
@@ -130,13 +131,14 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 cargo test --workspace
 cargo run -p titanium-cli --release -- bench --depth 8
 cargo run -p titanium-cli --release -- sperft --depth 8   # speed truth, alternating pairs
-python training/gate_summary.py --log <gate log>          # W/L/D, seats, score, Elo, CI
-python training/gate_net_vs_main.py --cand <net>          # 416 g, 5k nodes, paired book, tripwire
+python training/gate_summary.py <pooled.txt> [more...]    # positional paths (no --log): W/L/D, seats, score, Elo, CI
+python training/gate_net_vs_main.py --tnn <net> --tag <t> --book0 N --shards 16 --games 26 --nodes 5000 --par 10
+                                                          # resumes: shards with .done are skipped; tripwire on shard 0
 python training/net2net_downscale.py / upscale.py         # capacity change, 0 cp parity at step 0
 python training/assemble_v7_dataset.py                    # relabel chunks + Botzone anchors -> v7
 python training/overnight_pc_relabel.py --resume          # skips existing chunks, heartbeat
-python tools/build_botzone.py                             # V11 package: zig .so + upload/
-python -m modal run tools/upload_botzone.py               # cloud upload (user's creds)
+python tools/build_botzone.py --no-pull                   # V12 package: zig glibc-2.14 .so + upload/
+python -m modal run tools/upload_botzone.py               # cloud upload (creds via env); if it stalls, curl (docstring)
 ```
 
 ## 7. Box traps (do not relearn)
@@ -163,6 +165,32 @@ python -m modal run tools/upload_botzone.py               # cloud upload (user's
   while a relabel job reads its exe/net.
 - Cloud: `sbx --cloud ls` (Docker) and `python -m modal app list` are the
   only truth for "what is running"; check both before claiming idle.
+- **Botzone upload (2026-10-29):** `requests` dies on the 28.5 MB POST with
+  `TimeoutError('The write operation timed out')` after ~60 s from BOTH Modal
+  and the local PC (5+3 attempts). `curl.exe` works (~640 s): login with
+  `-c cookies`, then `-F "file=@...so;type=application/octet-stream" -F "path="
+  -F "filename=titanium_v2.so"` to `/userfile/uploadfile`. Storage page is
+  `/userfiles` (not `/userfile`); verify by downloading `/userfiles/titanium_v2.so`
+  and comparing sha256.
+- **Botzone upload folder driver must be LF.** Git blob = sha `9550316F`,
+  14,257 B; a Windows checkout can hand the script a CRLF copy (14,594 B).
+  Rebuild it from `git cat-file blob HEAD:botzone/titanium_botzone.py` and
+  re-hash before uploading.
+- **Modal hosts:** GPU hosts (A10G/L4) DO have AVX-512 (`avx512f/bw/vl/vnni/vbmi/
+  vpopcntdq`); CPU-only containers do NOT. A binary built on rust:1.97 needs
+  glibc 2.39 and dies on Modal's image -> build
+  `--target x86_64-unknown-linux-musl` (static-pie) and upload that. Set
+  `$env:PYTHONIOENCODING="utf-8"; $env:PYTHONUTF8="1"` for the CLI.
+- **`modal volume get <vol> <dir> <local>` with `--force` can create a FILE**
+  when `<local>` does not exist; fetch shard files one by one instead. `modal
+  volume put -f` is needed to overwrite.
+- **Verifying a stripped .so:** `strings` shows no `avx512`/symbol names. Count
+  `%zmm` lines from `llvm-objdump -d` (AVX-512 kernel present) and probe a
+  64-byte slice from the middle of the net file to prove the embedded net.
+- **sbx:** inline `bash -c '...$var...'` is mangled by PowerShell -> upload an
+  LF `.sh` and run it; `sbx cp` prints to stderr (noise, but works). Log actual
+  spend in `logs/docker_spend.csv` and delete the sandbox (`sbx --cloud rm
+  --force <id>`) when done - `ls` is the truth.
 - Held decisions (need user letter-choice): W=512 `8AB5B82E` deploy (AVX-512),
   and every merge/rejection. Do NOT merge anything until told.
 

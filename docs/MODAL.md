@@ -71,3 +71,11 @@ python -m modal run --detach training/modal_train.py --tag hpo_x --script optuna
 - Hard timeout: 4 hours per container — must shard work across containers or relaunch every 4h
 - Modal is **not ideal for CPU relabel** due to per-core degradation. Prefer Docker sandboxes (40 vCPU quota) or local PC for CPU work. Use Modal for GPU training or if Docker quota is exceeded.
 
+
+## 1b. CPU features and portable binaries (added 2026-10-29)
+
+- **GPU hosts (A10G, L4) have AVX-512** (`avx512f/bw/vl/vnni/vbmi/vpopcntdq/bitalg`); **CPU-only containers do not** (only `avx2/bmi2/fma`). Any AVX-512 gate must run on a GPU host; verify with the `flags` line from `/proc/cpuinfo` inside the function.
+- **Portable binary:** a release built on `rust:1.97` needs glibc 2.39 and fails on Modal's image (`version 'GLIBC_2.39' not found`). Build the gate engine with `cargo build --release --target x86_64-unknown-linux-musl -p titanium-cli` (static-pie; works on Modal, Docker and Botzone-like hosts). Example: `8850E588` (29,064,128 B).
+- **Volume quirks:** `modal volume put -f` is required to overwrite; `modal volume get <vol> <dir> <local> --force` can create a FILE when `<local>` does not exist - create the directory first or fetch `p00.txt..p03.txt` individually. After writing results inside a function call `vol.commit()`.
+- **Windows CLI:** set `$env:PYTHONIOENCODING="utf-8"; $env:PYTHONUTF8="1"` or the progress glyphs crash with a charmap error.
+- **Cost reference:** A10G gate leg = 4 shards x 52 games at 100 ms ran in ~15 min; L4 is cheaper per hour but had queue delays.
