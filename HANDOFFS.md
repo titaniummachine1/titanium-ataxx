@@ -1,3 +1,22 @@
+## STATE FOR NEW SESSION (2026-10-29 ~15:20 — MAIN `9dfc209` = D4 CHAMPION `31212A7B`; W512 +52 PASSED; W256 DOWNSCALE +30 INCONCLUSIVE -> EXTEND; RELABEL 405/6314 STOPPED; BOTZONE V11 LIVE; NOTHING RUNNING)
+
+**1. Strongest build = origin/main `9dfc209` (PUSHED).** `1ab68c7` D4 champion + LEDGER docs. Default net `data/nnue/nnue_main.tnn` sha `31212A7B0C9A…C8ED37` (W=256, TNN3 Disagreement Head; +72 Elo vs `e11827d1`, D140/D141: 237-152-27 over 416 g). Builtin SmallNet `fut_small.tsn` (52,844 B) FROZEN (D148: D4 smallnet 185-208-23 = -19, rejected). `C:\gitProjects\main-ataxx` worktree is on `exp/search-spsa-disagree` `5eea2d3` (clean, pushed; LEDGER sync only on top of `824e101` treebook multi-PV). `staging` still `0f27043` (stale).
+
+**2. Candidates gated vs main, NOT merged (user calls every merge):**
+- **W=512 D4 v7 ep7 disagree `8AB5B82E` = +52 Elo** (232-170-14, 57.45%, 95% CI [+19,+87], scoreCI [0.5270,0.6220]) — **PASS D151**, LEDGER `GATE-w512-d4-v7-vs-champ`. AVX-512 tier; needs the user's deploy/merge call.
+- **W=256 downscale ep7 disagree `7AE0122F` = +30.1 Elo** (219-183-14, score 0.5433, scoreCI [0.4954,0.5911]) — **INCONCLUSIVE -> EXTEND**. Exact recipe to repeat: 5k nodes, 16x26 games, `--book0 208`, exe `A4937F3F` vs champ `31212A7B`, logs `logs/gate_w256_downscaled_ep7`. Raw downscale val MSE 0.020419.
+- **W=256 sat ep6 `976C515F` = 0-413-3 (0.36%, -977 Elo, scoreCI [0.0000,0.0094])** — representation collapse after fine-tuning a downscale 6 epochs at lr 2e-4 (val MSE 0.020419 -> 0.021647 at ep1). **D153 / Mistake 39: never fine-tune a downscale at 2e-4; keep val parity first.**
+
+**3. Data (D149):** `data/nnue/modal_up/final_{train,val}_v7.npz` = 32,622,551 train rows (740.8 MB) + 677,670 val (16.9 MB) = v6 + 2,025,000 fresh 5k disagreement relabels + 88,295 Botzone >=2200 WDL anchors. Prior full relabel `out_dis_remaining_e3f8dc6e_e11827d1_d8a135ce` = 6314/6314 chunks (31,568,598 labels).
+
+**4. Relabel STOPPED (nothing running):** `data/nnue/relabel/out_dis_remaining_37c9a163_31212a7b_d8a135ce` = **405/6314 chunks (2,025,000 / 31,568,598 = 6.41%)**, last `c_404.txt` 11:31:22 today, heartbeat `logs/overnight_pc_relabel.heartbeat` (67.0 pos/s avg). MANIFEST: exe `37c9a163…`, net `31212A7B`, bin `d8a135ce…`, 5000 nodes, 6 threads. Resume = `python training/overnight_pc_relabel.py --resume` (skips existing chunks; ~18.6 h left). The 405 chunks are already consumed by v7, so resuming only adds future data.
+
+**5. Botzone V11 live:** bot `titanium_ataxx_PY6` `6ad7e0c3bdad901f323f6516`; driver `9550316F` (14,257 B, hardened); library `a9e63aca` (28,492,848 B, embedded `31212A7B`); long-running ON, 4 s/turn + 12 s first. Elo 1515.91, rank #147 (D145). The old Oct-26 crash match `6adf3db7…` (RE at 97 ms, 509 MB, exit 120, no stdout) predates V11; the V11 package has not been observed crashing. Next: AVX-512 `.so` + autonomous Elo climber (`training/botzone_elo_climber.py`, BACKLOG_AUDIT Phase C).
+
+**6. Nothing running (verified):** `sbx --cloud ls` = "No sandboxes found"; `python -m modal app list` = both `titanium-train` apps stopped (14:35, 14:27); no relabel/gate process; no `C:\gitProjects\logs\STOP`. Docker spend last row `tit-gate100` launched 15:02 (~$1.12 worst case) but the sandbox is gone and it left no local gate output.
+
+**7. Next (ranked):** (1) EXTEND `7AE0122F` with `--book0 208` (416 g) -> if scoreCI lower > 0.5, staging/merge per law 24; (2) W=512 `8AB5B82E` AVX-512 Botzone build + deploy (user call); (3) policy-guided move ordering / cheap safety-after-move (BACKLOG_AUDIT Phase B); (4) resume the relabel from chunk 405 only on the user's order; (5) Botzone AVX-512 + Elo climber.
+
 ## STATE FOR NEW SESSION (2026-10-28 - BOTZONE V8 DEPLOYED & LIVE; MASTER SATURATION NET EP4 EXPORTED; ASYMMETRIC WARM ID GATE VERIFIED)
 
 **1. Botzone Version 8 Deployed & Live (titanium_ataxx_PY6 @ 6ad7e0c3bdad901f323f6516):**

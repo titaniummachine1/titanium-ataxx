@@ -59,17 +59,22 @@ then side `b`/`w`. Squares are chess-style: `a1` bottom-left, `g7` top-right.
 titanium start:  "......x ....... ....... ....... ....... ....... o...... b"
 ```
 
-## Search (v0.1)
+## Search (current)
 
-Negamax alpha-beta, copy-make on u64 bitboards (49 squares), precomputed
-distance-1/distance-2 ring tables, iterative deepening with soft time limit,
-move ordering by infection count, material + mobility eval.
-No transposition table, no killers/history yet — see roadmap below.
+Negamax alpha-beta on u64 bitboards (49 squares) with a transposition table
+(Zobrist, generation aging), PVS, killers/history, LMR, null-move pruning,
+reverse futility, and a futility leaf filter (SmallNet quantile lower bound).
+Iterative deepening runs to the deadline; in Botzone long mode it warm-starts
+from the root TT depth. Eval is the embedded NNUE `data/nnue/nnue_main.tnn`
+(W=256, TNN3 with a zero-cost Disagreement Head; `--network none` = classical
+material/mobility). The SmallNet (`data/nnue/fut_small.tsn`) and the LMR
+baseline are frozen (D147/D148).
 
 ## Roadmap
 
-- [ ] transposition table + zobrist
-- [ ] killer moves / history heuristic
-- [ ] blocker ("wall") positions
-- [ ] board sizes (5x5 / 6x6 / 8x8)
-- [ ] opening book from selfplay data (`data/`)
+- [x] transposition table + zobrist
+- [x] killer moves / history heuristic
+- [x] NNUE eval + NNUE-guided ordering
+- [ ] policy-guided move ordering / safety-after-move
+- [ ] AVX-512 Botzone library
+- [ ] blocker ("wall") positions, board sizes

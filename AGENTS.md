@@ -18,28 +18,14 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 - **DOCKER: docs/DOCKER_SANDBOXES.md = how to run, watch, STOP and pay for `sbx --cloud` sandboxes (money rules, ledger, current sandbox tit-sn2 and how to stop it). Read it before touching any sandbox.**
 - **MODAL (GPU training, cloud gates): docs/MODAL.md = commands, $30/month hard cap, how to list/STOP apps, no secrets. Docker preferred for CPU work.**
 
-- **UPDATE 2026-10-26 ~12:30: STRONGEST = main 343ab02 (PUSHED 12:45, CI green) = 1b286f2 + futility small net (D108-D112; vs 1b286f2: 100 ms +84, 50 ms +123, 5k +3). `--no-fut-sn` = exact full-strength search (identical to 1b286f2). Ranked next work: BACKLOG.md CURRENT BACKLOG. The small net is fitted to e11827d1: retrain it with every new big net (TRAINING_RUNBOOK). Botzone package rebuilt from it (botzone/upload, .so c3427453, 12/12 Linux cases).**
-- **READ FIRST for training/relabel/Botzone work: docs/TRAINING_RUNBOOK.md, docs/RELABEL_RUNBOOK.md, HANDOFFS top entry. No external teacher beats Titanium (D105); never fine-tune on the Kata columns (D98/D101).**
-- **UPDATE 2026-10-26 (later): STRONGEST = main 1b286f2 (PUSHED) = c7c44a3 + critical fixes (Botzone driver hardening, FFI depth cap, overflow fix; LEDGER MAIN-critical).**
-- **UPDATE 2026-10-26: STRONGEST = main c7c44a3 (LOCAL, not pushed) = 0f27043 + default NNUE e11827d1 (stage-1 retrain on the full 33.9M-row relabel, +132 Elo @5k vs c4829350; LEDGER MAIN-net-s1chg). The Kata fine-tune (stage 2) LOSES -137 to it (D98) - do not use.**
-- **UPDATE 2026-10-25 evening: STRONGEST = main 8b51d92 (pushed) = big NNUE c4829350 by default + eval cache/2x speed (d1e0055) + full-time search to the deadline (dc937b3) + cache-only eval move ordering (8b51d92, gate stopped early by user). Botzone .so is still the OLD engine (branch exp/botzone-ffi, S57 only) - another agent is updating it.**
-- **UPDATE 2026-10-25 later: STRONGEST = main d1e0055 (pushed) = 923dbea + exp/nnue-speed (eval cache, prefetch, faster head; same moves at equal nodes, ~2x faster, +135 @100ms vs 923dbea). Relabel tools: labelbin + training/relabel_run.py on this build.**
-- **UPDATE 2026-10-25: STRONGEST = main 923dbea (pushed): fast int16 NNUE nnue_t1ep4 c4829350 loaded BY DEFAULT (data/nnue/nnue_main.tnn; --nnue none = old S57 b0c4329 engine). Hybrid P=20 (exp/nnue-hybrid 2a2056b) is the next candidate.**
-- **UPDATE 2026-10-24 night: STRONGEST = main b0c4329 (pushed) + S57 tupS57v2.tup (53F2B29C).** b0c4329 = a3c9b74 + Moonbird history (from-to key, +d^2 / -d^2/24 malus, ordering weight 2 conversions): +200 @5k, +159 @100ms, +169 @50ms vs a3c9b74.
-- **UPDATE 2026-10-24 evening: main a3c9b74 (pushed) + S57 tupS57v2.tup (53F2B29C).** a3c9b74 = Moonbird-style search (LMR from move 7 depth*47/(47+n) + futility reduction by the child's static eval, NET_ANALYSIS section 30): +263 @5k (flattered: child evals uncounted), +48 @100ms, +96 @50ms vs 653d9a1. titanium-wasm fails to compile (Searcher lifetime, predates a3c9b74).
-- **UPDATE 2026-10-24 late: main 653d9a1 (pushed) + S57 tupS57v2.tup (53F2B29C).** 653d9a1 = the engine now evaluates TUP7 nets exactly as trained (NET_ANALYSIS section 27; +77 @5k, +45 @100ms, +26 @50ms vs 298b7ae). Any tuple-net work must keep training/tuple_parity.py at 0 cp.
-- **UPDATE 2026-10-24 (read with HANDOFFS top entry): strongest is still main 298b7ae + S57. A real NNUE is in progress on branch `exp/nnue` (worktree `C:\gitProjects\nnue-ataxx`, committed locally 02c3f29). Its design must follow `docs/NET_ANALYSIS.md` (what Kata/Ataxx_CPP/Moonbird/autaxx/Stockfish look at, anchor test, policies). Titanium 5k labels = BASE stage data, KataGo = TEACHER.**
-- **UPDATE 2026-10-23 (supersedes the bullet below): strongest = `main-ataxx` 298b7ae (S57) + net `data/nnue/final_v2_wdl_ep8.tup` (sha 53F2B29C, main default name tupS57v2.tup). Dataset v3 plan + the Ataxx_CPP/Kata findings: `docs/AXNET_PROBE.md` (read it for any teacher/eval/dataset work).**
-- `main @ 73a859d` + default net `data/nnue/tupS55tree.tup` (726440 B,
-  sha256 `F66A00FE…899D7C`) is the STRONGEST. `main` default eval IS that net.
-- THIS folder is usually on an `exp/*` branch (e.g. `exp/search-buckets`),
-  which defaults to CLASSICAL hand-eval (`net: none`) ≈ **-500 Elo** vs
-  net-main. Classical-vs-classical gates NEVER prove strength.
-- Clean copies: `C:\gitProjects\main-ataxx` (`[main]` worktree),
-  `C:\gitProjects\titanium-main` (detached `73a859d`).
-  `C:\gitProjects\baseline-ataxx` = pre-batch baseline `b62a78e`.
+- **UPDATE 2026-10-29 ~15:20: STRONGEST = origin/main `9dfc209` (PUSHED) = `1ab68c7` D4 champion + LEDGER docs. Default net `data/nnue/nnue_main.tnn` sha `31212A7B` (W=256, TNN3 Disagreement Head; +72 Elo vs `e11827d1`, D140/D141: 237-152-27 over 416 g). Builtin SmallNet `fut_small.tsn` (52,844 B) is FROZEN (D148: D4 smallnet -19 -> rejected). `C:\gitProjects\main-ataxx` worktree sits on `exp/search-spsa-disagree` `5eea2d3` (clean, pushed; docs/LEDGER on top of `824e101`).**
+- **Candidates gated vs that main, NOT merged:** W=512 D4 v7 ep7 disagree `8AB5B82E` = +52 Elo (232-170-14, scoreCI [0.5270,0.6220]) **PASS D151** — AVX-512 tier, awaiting the user's merge/deploy call. W=256 downscale ep7 disagree `7AE0122F` = +30.1 Elo (219-183-14, scoreCI [0.4954,0.5911]) **INCONCLUSIVE -> EXTEND** (`--book0 208`, 416 g, 5k nodes, 16x26, exe `A4937F3F` vs champ `31212A7B`; `logs/gate_w256_downscaled_ep7`). W=256 sat ep6 `976C515F` = 0-413-3 (-977) representation collapse (D153 / Mistake 39) — never fine-tune a downscale at lr 2e-4.
+- **Data (D149):** `data/nnue/modal_up/final_{train,val}_v7.npz` = 32,622,551 train rows (740.8 MB) + 677,670 val (16.9 MB) = v6 + 2,025,000 fresh 5k disagreement relabels + 88,295 Botzone >=2200 WDL anchors.
+- **READ FIRST for training/relabel/Botzone work: docs/TRAINING_RUNBOOK.md, docs/RELABEL_RUNBOOK.md, docs/BACKLOG_AUDIT.md, HANDOFFS top entry. No external teacher beats Titanium (D105); never fine-tune on the Kata columns (D98/D101).**
+- THIS folder is usually on an `exp/*` branch; check the exe sha AND net sha on both sides before any gate (a branch can default to no net or classical eval).
+- Clean copies: `C:\gitProjects\main-ataxx` (worktree of `main`), `C:\gitProjects\staging-ataxx` (`staging`, stale at `0f27043`).
 - First question on any strength task: "which binary + which net hash on BOTH
-  sides?" Log exe sha + tup sha in every gate (harness does this).
+  sides?" Log exe sha + net sha in every gate (harness does this).
 
 ## 3. Iron laws (verbatim from BEHAVIOR.md — never re-litigate)
 
@@ -95,6 +81,7 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
     commit + net, after a staging-vs-main confirmation gate. Staging is not pushed unless the user says so.
 
 15. **(2026-10-25, BEHAVIOR 25) DOCS IN REAL TIME:** every important change (LR algorithm, data, labels, recipe, what a net was really trained with, run start/stop) goes into DECISIONS + HANDOFFS the moment it happens, with a TRUE status; read DECISIONS + run logs + the nnue-pytorch recipe before choosing any training setting.
+16. **(2026-10-29, BEHAVIOR 27-31) NNUE + SAFETY LAWS:** every candidate is gated pre- and post-promotion vs `main` >=100 g/leg (D124); capacity changes only via Net2Net with 0 cp step-0 parity, never from scratch (D130); cold ID starts at depth 1, warm ID only from a valid non-mate root entry, depth u8 255, solved mates stop (D138); SmallNet tau 0.02 and the LMR baseline are frozen (D147/D148); a fresh downscale must keep val-MSE parity and is never fine-tuned at lr 2e-4 (D153/Mistake 39).
 
 ## 4. Rules: two of them (do not mix)
 
@@ -104,24 +91,33 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
   2-position repetition = loss. Engine has BOTH via build-time const generic:
   `search`/`parallel_search` = classic, `search_bz`/`parallel_search_bz` =
   Botzone (NMP off, `bz_over`/`bz_counts`). Zero hot-path runtime flag.
-- Judge wire format is JSON-in/out; the shipped bundle
-  (`C:\gitProjects\botzoo\titanium-ataxx-v1.rs`, built by
-  `training/bundle_botzone.py`, checked by `training/verify_bundle.py`) still
-  speaks the LINE simple-protocol — JSON front-end NOT built (needs
-  player-side schema confirmation).
+- **Botzone deployment = V11 (live, 2026-10-29):** bot `titanium_ataxx_PY6`
+  `6ad7e0c3bdad901f323f6516`, driver `botzone/upload/titanium_botzone.py`
+  sha `9550316F` (14,257 B; hardened: guarded stderr, `os.write` + `os._exit(0)`,
+  engine resuscitation `ev ...`), library `data/titanium_v2.so` sha `a9e63aca`
+  (28,492,848 B, glibc 2.14, **embedded** `31212A7B`), long-running ON
+  (4 s/turn, 12 s first), Elo 1515.91 / rank #147 (D145). Older crashes were
+  exit-120 stderr flush (Mistake 30/31) and glibc 2.34 (v5). Build with
+  `python tools/build_botzone.py`; upload via `python -m modal run tools/upload_botzone.py`.
+  Next: AVX-512 target + autonomous Elo climber (BACKLOG_AUDIT Phase C).
 
 ## 5. Tournament entry (current shape)
 
+- **Botzone = Python driver + `titanium-ffi` C ABI** (`ti_new`,
+  `ti_new_game`, `ti_apply`, `ti_search_with_limits(time,nodes,depth)`,
+  `ti_stop`, `ti_stats`). The engine knows nothing about the protocol; the
+  driver replays history after a restart, keeps the clock/watchdog and sends
+  `>>>BOTZONE_REQUEST_KEEP_RUNNING<<<`. `TI_MODE=long` (default) = persistent
+  TT + warm ID from root TT depth; `TI_MODE=oneshot` = cold 6 s reset.
+- Botzone judge: 12 s first turn / 4 s later, 256 MB, one core, Ubuntu 16.04
+  (glibc 2.23 -> build the `.so` with zig glibc 2.14, never plain cargo on a
+  modern Linux). Warm ID starts at `(root_tt.depth-1).max(1)`, depth u8 255,
+  solved mates stop.
 - `serve --tournament [--threads N] [--bz-rules]`: 128 MB TT default
-  (tt_bits 23, ~192 MiB actual), startup autotune 1,2,3,4,6,8… while total
-  grows >5%, `Threads` + `BotzoneRules` setoptions, silent auto-ponder after
-  `bestmove`, next `position`+`go` aborts and converts with warm TT.
-- `training/botzone_main.rs`: stateless per-turn, 800 ms / 1500 ms first move,
-  TT bits 23, threads = `available_parallelism` clamped 1..=4, hardcoded
-  `_bz`, repetition guard stricter than judge. Turn peak ≈196 MB vs 256 MB
-  cap (bits 23 kept; bits 22 fallback if MLE signals).
-- NOT built: Botzone JSON I/O; per-move thread auto-scale; position-without-go
-  premature search.
+  (tt_bits 23), startup autotune, silent auto-ponder after `bestmove`, next
+  `position`+`go` aborts and converts with warm TT.
+- NOT built: per-move thread auto-scale; position-without-go premature search;
+  AVX-512 Botzone library.
 
 ## 6. Commands (PowerShell 5.1 — no `head`/`sed`/`&&`)
 
@@ -129,9 +125,13 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 cargo test --workspace
 cargo run -p titanium-cli --release -- bench --depth 8
 cargo run -p titanium-cli --release -- sperft --depth 8   # speed truth, alternating pairs
-python training/results.py backfill; python training/results.py gates
-python training/gate_check.py --cand <tag>
-python training/bundle_botzone.py; python training/verify_bundle.py
+python training/gate_summary.py --log <gate log>          # W/L/D, seats, score, Elo, CI
+python training/gate_net_vs_main.py --cand <net>          # 416 g, 5k nodes, paired book, tripwire
+python training/net2net_downscale.py / upscale.py         # capacity change, 0 cp parity at step 0
+python training/assemble_v7_dataset.py                    # relabel chunks + Botzone anchors -> v7
+python training/overnight_pc_relabel.py --resume          # skips existing chunks, heartbeat
+python tools/build_botzone.py                             # V11 package: zig .so + upload/
+python -m modal run tools/upload_botzone.py               # cloud upload (user's creds)
 ```
 
 ## 7. Box traps (do not relearn)
@@ -147,9 +147,19 @@ python training/bundle_botzone.py; python training/verify_bundle.py
 - `uai_probe.py` hangs here — use direct `serve` smoke via `uai_smoke.in`.
 - Determinism proven (identical engines replay bit-identical 200g). Any wild
   swing = INFRA BUG until proven otherwise; check beta/INF arithmetic first.
-- Held decisions (need user letter-choice): (a) cherry-pick guard+saturation
-  onto main, (b) rebase batch onto main + re-gate, (c) park branch as Botzone
-  line. Do NOT merge anything until told.
+- Downscale fine-tune collapse (Mistake 39, D153): never fine-tune a fresh
+  downscale at lr 2e-4 (0-413-3). Downscale must keep val MSE parity first.
+- Botzone exit 120 = CPython stream flush at shutdown (Mistake 30/31). The
+  driver must never write to a raw stream after the move is sent; hardened
+  driver uses `os.write` + `os._exit(0)`. A match log with no stdout and
+  `status 120` means the OLD driver ran.
+- Relabel resume: `training/overnight_pc_relabel.py` skips existing chunks;
+  never delete/rebuild the output dir mid-run, and never rebuild `main-ataxx`
+  while a relabel job reads its exe/net.
+- Cloud: `sbx --cloud ls` (Docker) and `python -m modal app list` are the
+  only truth for "what is running"; check both before claiming idle.
+- Held decisions (need user letter-choice): W=512 `8AB5B82E` deploy (AVX-512),
+  and every merge/rejection. Do NOT merge anything until told.
 
 ## 8. Memory protocol (knowledge accumulates, sessions never start lobotomized)
 
