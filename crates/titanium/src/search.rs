@@ -169,7 +169,16 @@ pub fn set_fut_sn(on: bool) {
 
 fn small_net() -> &'static crate::smallnet::SmallNet {
     static SN: std::sync::OnceLock<crate::smallnet::SmallNet> = std::sync::OnceLock::new();
-    SN.get_or_init(crate::smallnet::SmallNet::builtin)
+    SN.get_or_init(|| {
+        if let Ok(p) = std::env::var("TITANIUM_SN") {
+            if let Ok(b) = std::fs::read(&p) {
+                if let Ok(net) = crate::smallnet::SmallNet::parse(&b) {
+                    return net;
+                }
+            }
+        }
+        crate::smallnet::SmallNet::builtin()
+    })
 }
 
 // Ordering tiers (titanium-engine pattern: compile-asserted bands so no

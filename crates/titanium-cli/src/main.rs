@@ -27,6 +27,11 @@ fn main() -> ExitCode {
             std::env::set_var("TITANIUM_TUNE", val);
         }
     }
+    if let Some(pos) = args.iter().position(|x| x == "--sn") {
+        if let Some(val) = args.get(pos + 1) {
+            std::env::set_var("TITANIUM_SN", val);
+        }
+    }
     let cmd = args
         .iter()
         .find(|x| matches!(x.as_str(), "perft" | "bench" | "selfplay" | "bestmove" | "label" | "labelbin" | "snparity" | "nnbench" | "nndump" | "s57dump" | "nnevaldump" | "nneval" | "play" | "show" | "genbench" | "uai" | "serve" | "match" | "sperft"))
@@ -1456,12 +1461,19 @@ struct UaiOpp {
 impl UaiOpp {
     fn start(cmd: &str) -> io::Result<UaiOpp> {
         use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-        let mut parts = cmd.split_whitespace();
-        let program = parts
-            .next()
+        let args: Vec<&str> = cmd.split_whitespace().collect();
+        let program = args
+            .first()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty command"))?;
         let mut command = Command::new(program);
-        command.args(parts);
+        command.args(&args[1..]);
+        if let Some(pos) = args.iter().position(|x| *x == "--sn") {
+            if let Some(val) = args.get(pos + 1) {
+                command.env("TITANIUM_SN", val);
+            }
+        } else {
+            command.env_remove("TITANIUM_SN");
+        }
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
