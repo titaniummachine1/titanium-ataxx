@@ -1,3 +1,13 @@
+## UPDATE 2026-10-29 ~18:30 - BOTZONE V12 UPLOADED (engine .so 3F9E10BA = embedded 7AE0122F); NEW BOT VERSION 6ae375db
+
+**Done:** storage `/titanium_v2.so` now holds the new library (sha `3F9E10BA`, 28,492,848 B, glibc 2.14, embedded W256 ep7 `7AE0122F`, AVX-512 kernel compiled in and runtime-dispatched). Verified by downloading `/userfiles/titanium_v2.so` and hashing. New bot version `6ae375db9eb7df09d05cede4` created on `titanium_ataxx_PY6` (driver unchanged `9550316F`, simple IO, long-running ON). `last_version_update_at` 2026-10-29T16:14Z (first create; second create after the .so landed).
+
+**Upload trap (new):** `requests` fails the 28.5 MB POST with `ConnectionError: ('Connection aborted.', TimeoutError('The write operation timed out'))` after ~60 s - from BOTH the Modal container and the local PC, 5/3 attempts. `curl.exe` succeeded in 640 s (HTTP/1.1, `-F file=@... -F path= -F filename=titanium_v2.so`). `tools/upload_botzone.py` now has worktree-relative paths + retries + a curl fallback note (main `4e15c8d`). Storage listing page is `/userfiles` (not `/userfile`).
+
+**Credential law added:** BEHAVIOR law 32 (user order): creds may be used freely in conversation but are never stored in repo files, commits, artifacts, or upload folders; pass via env vars at the moment of use.
+
+**Next:** watch a V12 match log (expect the debug line to end `nnue_main.tnn/22`, no first-move RE), then the Botzone Elo climber.
+
 ## STATE FOR NEW SESSION (2026-10-29 ~17:10 - MAIN `55a62ab` = W256 EP7 `7AE0122F` PROMOTED FOR BOTH AVX2 AND AVX-512; BOTZONE V12 PACKAGE BUILT, UPLOAD PENDING; W512 PARKED; NOTHING RUNNING)
 
 **1. Strongest build = origin/main `55a62ab` (PUSHED).** Commit: `net: promote W256 downscale ep7 (7AE0122F) as default for AVX2 and AVX-512`. Default net `data/nnue/nnue_main.tnn` sha `7AE0122F43BEAF0DE6114D54193ABD61D8F211B4E8B5A7CC28CC38C202BF00EC` (27,946,720 B, W=256, TNN3 Disagreement Head). Previous champion `31212A7B` (+72 vs `e11827d1`) retired. Builtin SmallNet `fut_small.tsn` (52,844 B) FROZEN (D148). Worktrees: `C:\gitProjects\main-ataxx` on `exp/search-spsa-disagree` `5eea2d3`; `C:\gitProjects\mainpromo-ataxx` on `main` `55a62ab` (promoted net + V12 Botzone upload folder); `staging` still `0f270de`-era stale at `0f27043`.

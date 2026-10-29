@@ -82,6 +82,7 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 
 15. **(2026-10-25, BEHAVIOR 25) DOCS IN REAL TIME:** every important change (LR algorithm, data, labels, recipe, what a net was really trained with, run start/stop) goes into DECISIONS + HANDOFFS the moment it happens, with a TRUE status; read DECISIONS + run logs + the nnue-pytorch recipe before choosing any training setting.
 16. **(2026-10-29, BEHAVIOR 27-31) NNUE + SAFETY LAWS:** every candidate is gated pre- and post-promotion vs `main` >=100 g/leg (D124); capacity changes only via Net2Net with 0 cp step-0 parity, never from scratch (D130); cold ID starts at depth 1, warm ID only from a valid non-mate root entry, depth u8 255, solved mates stop (D138); SmallNet tau 0.02 and the LMR baseline are frozen (D147/D148); a fresh downscale must keep val-MSE parity and is never fine-tuned at lr 2e-4 (D153/Mistake 39).
+17. **(2026-10-29, BEHAVIOR 32) CREDENTIALS: USE FREELY, NEVER STORE.** Creds the user gives in conversation may be used for their intended action, but are NEVER written into any repo file, committed, pushed, or bundled into artifacts/upload folders. Pass them via env vars or function args at the moment of use; never echo them in logs or commit messages.
 
 ## 4. Rules: two of them (do not mix)
 
@@ -91,18 +92,18 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
   2-position repetition = loss. Engine has BOTH via build-time const generic:
   `search`/`parallel_search` = classic, `search_bz`/`parallel_search_bz` =
   Botzone (NMP off, `bz_over`/`bz_counts`). Zero hot-path runtime flag.
-- **Botzone deployment = V11 live; V12 package built 2026-10-29, awaiting the user's upload:** bot `titanium_ataxx_PY6`
-  `6ad7e0c3bdad901f323f6516`, driver `botzone/upload/titanium_botzone.py`
-  sha `9550316F` (14,257 B; hardened: guarded stderr, `os.write` + `os._exit(0)`,
-  engine resuscitation `ev ...`). V11 library `data/titanium_v2.so` sha `a9e63aca`
-  (28,492,848 B, glibc 2.14, embedded `31212A7B`), long-running ON
-  (4 s/turn, 12 s first), Elo 1515.91 / rank #147 (D145). V12 (in
-  `C:\gitProjects\mainpromo-ataxx\botzone\upload`, MANIFEST from main `55a62ab`)
-  = same driver + `.so` sha `3f9e10ba` with **embedded `7AE0122F`**; upload the
-  `.so` (storage `/titanium_v2.so`) then a new bot version. Older crashes were
-  exit-120 stderr flush (Mistake 30/31) and glibc 2.34 (v5). Build with
-  `python tools/build_botzone.py` (Docker test step needs Docker Desktop running);
-  upload via `python -m modal run tools/upload_botzone.py`.
+- **Botzone deployment = V12 LIVE (uploaded 2026-10-29):** bot `titanium_ataxx_PY6`
+  `6ad7e0c3bdad901f323f6516`, latest version `6ae375db9eb7df09d05cede4`, driver
+  `botzone/upload/titanium_botzone.py` sha `9550316F` (14,257 B; hardened: guarded
+  stderr, `os.write` + `os._exit(0)`, engine resuscitation `ev ...`). Storage
+  `/titanium_v2.so` sha `3F9E10BA` (28,492,848 B, glibc 2.14, **embedded W256 ep7
+  `7AE0122F`**, AVX-512 kernel runtime-dispatched), verified by download hash;
+  long-running ON (4 s/turn, 12 s first). V11 (`a9e63aca`, `31212A7B`) retired.
+  Older crashes were exit-120 stderr flush (Mistake 30/31) and glibc 2.34 (v5).
+  Build with `python tools/build_botzone.py` (Docker test step needs Docker Desktop
+  running). **Upload trap: `requests` times out the 28.5 MB POST after ~60 s from
+  both Modal and the local PC; `curl.exe` works (~640 s)** — see the docstring of
+  `tools/upload_botzone.py`. Verify with `GET /userfiles/titanium_v2.so` + sha256.
   Next: autonomous Elo climber (BACKLOG_AUDIT Phase C).
 
 ## 5. Tournament entry (current shape)
