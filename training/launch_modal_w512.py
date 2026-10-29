@@ -3,8 +3,8 @@ import os
 import subprocess
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8")
-sys.stderr.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 ROOT = r"C:\gitProjects\titanium-ataxx"
 
