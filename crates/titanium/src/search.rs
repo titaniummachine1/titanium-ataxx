@@ -70,7 +70,8 @@ pub struct Tune {
     pub lmr_min: i32,        // LMR starting move index (default 6)
     pub dis_rfp_num: i32,    // Disagreement head RFP volatility dampening (scaled by 128) (default 32)
     pub dis_fut_num: i32,    // Disagreement head Futility volatility credit (scaled by 128) (default 48)
-    pub dis_lmr_num: i32,    // Disagreement head LMR discount on volatile nodes (scaled by 256) (default 0)
+    pub dis_sn_num: i32,     // Disagreement head SmallNet prefilter volatility credit (scaled by 128) (default 48)
+    pub dis_lmr_num: i32,    // Disagreement head LMR discount on volatile nodes (scaled by 256) (default 1)
     pub dis_vol_thresh: i32, // Disagreement threshold (cp) for tactical +1 extension (default 300)
 }
 
@@ -83,7 +84,8 @@ impl Default for Tune {
             lmr_min: 6,
             dis_rfp_num: 32,
             dis_fut_num: 48,
-            dis_lmr_num: 0,
+            dis_sn_num: 48,
+            dis_lmr_num: 1,
             dis_vol_thresh: 300,
         }
     }
@@ -103,6 +105,7 @@ fn tune_from_env() -> Tune {
                 "lmr_min" => t.lmr_min = x.max(1),
                 "dis_rfp_num" => t.dis_rfp_num = x.max(0),
                 "dis_fut_num" => t.dis_fut_num = x.max(0),
+                "dis_sn_num" => t.dis_sn_num = x.max(0),
                 "dis_lmr_num" => t.dis_lmr_num = x.max(0),
                 "dis_vol_thresh" => t.dis_vol_thresh = x.max(0),
                 _ => {}
@@ -1145,7 +1148,9 @@ impl<'a> Searcher<'a> {
                         );
                         let lo = sn.bound_acc(&ca, child.empty().count_ones(), static_eval, hand)
                             - FUT_SN_M;
-                        if new_depth - (alpha.saturating_add(lo) / tune().fut_div).clamp(0, 64) <= 0
+                        let sn_vol_credit = (node_dis * tune().dis_sn_num) >> 7;
+                        let sn_shortfall = alpha.saturating_add(lo) - sn_vol_credit;
+                        if new_depth - (sn_shortfall / tune().fut_div).clamp(0, 64) <= 0
                             && best > -MATE_BOUND
                         {
                             self.heuristic_used = true;
