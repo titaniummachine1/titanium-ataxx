@@ -66,9 +66,10 @@ Negamax alpha-beta on u64 bitboards (49 squares) with a transposition table
 reverse futility, and a futility leaf filter (SmallNet quantile lower bound).
 Iterative deepening runs to the deadline; in Botzone long mode it warm-starts
 from the root TT depth. Eval is the embedded NNUE `data/nnue/nnue_main.tnn`
-(W=256, TNN3 with a zero-cost Disagreement Head; `--network none` = classical
-material/mobility). The SmallNet (`data/nnue/fut_small.tsn`) and the LMR
-baseline are frozen (D147/D148).
+(sha `7AE0122F`, W=256 Net2Net downscale of the W=512 ep7 teacher, TNN3 with a
+zero-cost Disagreement Head; best net on both AVX2 and AVX-512, D154;
+`--network none` = classical material/mobility). The SmallNet
+(`data/nnue/fut_small.tsn`) and the LMR baseline are frozen (D147/D148).
 
 ## Roadmap
 

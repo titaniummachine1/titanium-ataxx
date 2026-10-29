@@ -18,8 +18,8 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
 - **DOCKER: docs/DOCKER_SANDBOXES.md = how to run, watch, STOP and pay for `sbx --cloud` sandboxes (money rules, ledger, current sandbox tit-sn2 and how to stop it). Read it before touching any sandbox.**
 - **MODAL (GPU training, cloud gates): docs/MODAL.md = commands, $30/month hard cap, how to list/STOP apps, no secrets. Docker preferred for CPU work.**
 
-- **UPDATE 2026-10-29 ~15:20: STRONGEST = origin/main `9dfc209` (PUSHED) = `1ab68c7` D4 champion + LEDGER docs. Default net `data/nnue/nnue_main.tnn` sha `31212A7B` (W=256, TNN3 Disagreement Head; +72 Elo vs `e11827d1`, D140/D141: 237-152-27 over 416 g). Builtin SmallNet `fut_small.tsn` (52,844 B) is FROZEN (D148: D4 smallnet -19 -> rejected). `C:\gitProjects\main-ataxx` worktree sits on `exp/search-spsa-disagree` `5eea2d3` (clean, pushed; docs/LEDGER on top of `824e101`).**
-- **Candidates gated vs that main, NOT merged:** W=512 D4 v7 ep7 disagree `8AB5B82E` = +52 Elo (232-170-14, scoreCI [0.5270,0.6220]) **PASS D151** — AVX-512 tier, awaiting the user's merge/deploy call. W=256 downscale ep7 disagree `7AE0122F` = +30.1 Elo (219-183-14, scoreCI [0.4954,0.5911]) **INCONCLUSIVE -> EXTEND** (`--book0 208`, 416 g, 5k nodes, 16x26, exe `A4937F3F` vs champ `31212A7B`; `logs/gate_w256_downscaled_ep7`). W=256 sat ep6 `976C515F` = 0-413-3 (-977) representation collapse (D153 / Mistake 39) — never fine-tune a downscale at lr 2e-4.
+- **UPDATE 2026-10-29 ~17:00: STRONGEST = origin/main `55a62ab` (PUSHED), default net `data/nnue/nnue_main.tnn` sha `7AE0122F` (W=256 Net2Net downscale of the W=512 ep7 teacher, TNN3 Disagreement Head).** Promoted for BOTH target tiers after gating: 5k +34 Elo over 832 g (scoreCI [0.5015,0.5971] PASS, tripwire BIT-IDENTICAL), 100 ms on AVX2 +47 (208 g, scoreCI [0.5000,0.6346]), 100 ms on AVX-512 +73 (208 g, scoreCI [0.5369,0.6698] PASS, Modal A10G). One net is strongest on both tiers (D154). Previous champion `31212A7B` (+72 vs `e11827d1`) is history. Builtin SmallNet `fut_small.tsn` (52,844 B) is FROZEN (D148). `C:\gitProjects\main-ataxx` worktree sits on `exp/search-spsa-disagree` `5eea2d3`; `C:\gitProjects\mainpromo-ataxx` is a worktree on `main` `55a62ab` (holds the promoted net + the V12 Botzone upload folder).
+- **Candidates:** W=512 D4 v7 ep7 disagree `8AB5B82E` = +52 Elo per node (D151) but at 100 ms on AVX-512 only +8 (100-95-13, scoreCI [0.4441,0.5800] INCONCLUSIVE) with NPS 149k vs 230k for W=256 -> **PARKED, not deployed**. W=256 sat ep6 `976C515F` = 0-413-3 (-977) representation collapse (D153 / Mistake 39) — never fine-tune a downscale at lr 2e-4.
 - **Data (D149):** `data/nnue/modal_up/final_{train,val}_v7.npz` = 32,622,551 train rows (740.8 MB) + 677,670 val (16.9 MB) = v6 + 2,025,000 fresh 5k disagreement relabels + 88,295 Botzone >=2200 WDL anchors.
 - **READ FIRST for training/relabel/Botzone work: docs/TRAINING_RUNBOOK.md, docs/RELABEL_RUNBOOK.md, docs/BACKLOG_AUDIT.md, HANDOFFS top entry. No external teacher beats Titanium (D105); never fine-tune on the Kata columns (D98/D101).**
 - THIS folder is usually on an `exp/*` branch; check the exe sha AND net sha on both sides before any gate (a branch can default to no net or classical eval).
@@ -91,15 +91,19 @@ Rust alpha-beta Ataxx engine (7x7), workspace `C:\gitProjects\titanium-ataxx`:
   2-position repetition = loss. Engine has BOTH via build-time const generic:
   `search`/`parallel_search` = classic, `search_bz`/`parallel_search_bz` =
   Botzone (NMP off, `bz_over`/`bz_counts`). Zero hot-path runtime flag.
-- **Botzone deployment = V11 (live, 2026-10-29):** bot `titanium_ataxx_PY6`
+- **Botzone deployment = V11 live; V12 package built 2026-10-29, awaiting the user's upload:** bot `titanium_ataxx_PY6`
   `6ad7e0c3bdad901f323f6516`, driver `botzone/upload/titanium_botzone.py`
   sha `9550316F` (14,257 B; hardened: guarded stderr, `os.write` + `os._exit(0)`,
-  engine resuscitation `ev ...`), library `data/titanium_v2.so` sha `a9e63aca`
-  (28,492,848 B, glibc 2.14, **embedded** `31212A7B`), long-running ON
-  (4 s/turn, 12 s first), Elo 1515.91 / rank #147 (D145). Older crashes were
+  engine resuscitation `ev ...`). V11 library `data/titanium_v2.so` sha `a9e63aca`
+  (28,492,848 B, glibc 2.14, embedded `31212A7B`), long-running ON
+  (4 s/turn, 12 s first), Elo 1515.91 / rank #147 (D145). V12 (in
+  `C:\gitProjects\mainpromo-ataxx\botzone\upload`, MANIFEST from main `55a62ab`)
+  = same driver + `.so` sha `3f9e10ba` with **embedded `7AE0122F`**; upload the
+  `.so` (storage `/titanium_v2.so`) then a new bot version. Older crashes were
   exit-120 stderr flush (Mistake 30/31) and glibc 2.34 (v5). Build with
-  `python tools/build_botzone.py`; upload via `python -m modal run tools/upload_botzone.py`.
-  Next: AVX-512 target + autonomous Elo climber (BACKLOG_AUDIT Phase C).
+  `python tools/build_botzone.py` (Docker test step needs Docker Desktop running);
+  upload via `python -m modal run tools/upload_botzone.py`.
+  Next: autonomous Elo climber (BACKLOG_AUDIT Phase C).
 
 ## 5. Tournament entry (current shape)
 
