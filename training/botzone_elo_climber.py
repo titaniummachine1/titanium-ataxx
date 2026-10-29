@@ -222,20 +222,14 @@ def main():
     print("=== TITANIUM BOTZONE AUTONOMOUS ELO CLIMBER ===")
     print("=" * 60)
     print(f"Max matches in this session: {max_matches}")
-    print("Rule: No rematches, strictly challenge highest-Elo opponent available.\n")
+    print("Rule: Always challenge opponent with HIGHEST Elo gain (rematches fully allowed).\n")
 
     history = load_history()
-    played_opponents = set(history.get("played_bots", {}).keys())
 
     s = get_session()
     bot = get_bot_details(s)
     current_elo = bot.get("score", 0.0)
-    print(f"Titanium Current Elo: {current_elo:.2f} | Total rank games played: {bot.get('realrankplaycount', 0)}")
-
-    # Add historical opponents from Botzone account
-    account_played = get_historical_opponent_ids(bot)
-    played_opponents.update(account_played)
-    print(f"Known historical opponents to avoid rematching: {len(played_opponents):,}\n")
+    print(f"Titanium Current Elo: {current_elo:.2f} | Total rank games played: {bot.get('realrankplaycount', 0)}\n")
 
     matches_played = 0
     while matches_played < max_matches:
@@ -246,15 +240,9 @@ def main():
             time.sleep(15)
             continue
 
-        # Filter out played opponents
-        unplayed = [c for c in candidates if c["id"] not in played_opponents]
-        if not unplayed:
-            print("  All visible candidates have been played! Resetting unplayed filter to lowest frequency...")
-            unplayed = candidates
-
-        # Sort strictly descending by Elo score (highest Elo first)
-        unplayed.sort(key=lambda x: x["score"], reverse=True)
-        target = unplayed[0]
+        # Sort strictly descending by Elo score (highest Elo first, regardless of previous matches)
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        target = candidates[0]
 
         print(f"  Selected target: {target['name']} | Elo: {target['score']:.2f} | ID: {target['id']}")
         initial_score = current_elo
@@ -266,9 +254,8 @@ def main():
             time.sleep(10)
             continue
 
-        # Mark as played immediately
-        played_opponents.add(target["id"])
-        history["played_bots"][target["id"]] = {
+        # Record challenge in history
+        history.setdefault("played_bots", {})[target["id"]] = {
             "name": target["name"],
             "score": target["score"],
             "last_challenged": time.strftime("%Y-%m-%d %H:%M:%S"),
