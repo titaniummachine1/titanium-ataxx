@@ -144,6 +144,7 @@ fn main() -> ExitCode {
             flag_int(&args, "--max-ply").unwrap_or(10) as usize,
             flag_int_alias(&args, "--node-limit", "--nodes").unwrap_or(400) as u64,
             flag_int(&args, "--margin").unwrap_or(35) as i32,
+            flag_int(&args, "--max-abs").unwrap_or(120) as i32,
             network_flag(&args),
             flag_str(&args, "--out"),
         ),
@@ -2241,6 +2242,7 @@ fn treebook_cmd(
     max_ply: usize,
     nodes: u64,
     margin_cp: i32,
+    max_abs_cp: i32,
     nnue_spec: Option<String>,
     out_path: Option<String>,
 ) -> ExitCode {
@@ -2262,7 +2264,7 @@ fn treebook_cmd(
     };
 
     println!(
-        "treebook: target={target}, max-ply={max_ply}, nodes={nodes}, margin={margin_cp} cp, net={}",
+        "treebook: target={target}, max-ply={max_ply}, nodes={nodes}, margin={margin_cp} cp, max-abs={max_abs_cp} cp, net={}",
         network_description(&nnue_spec)
     );
 
@@ -2304,7 +2306,7 @@ fn treebook_cmd(
         let (b_cnt, w_cnt) = b.counts();
         let diff = (b_cnt as i32 - w_cnt as i32).abs();
 
-        if ply >= 4 && diff <= 1 && abs_eval <= 120 {
+        if ply >= 4 && diff <= 1 && abs_eval <= max_abs_cp {
             let fen = b.to_string();
             if book_keys.insert(symmetry_key(&b)) {
                 let penalty = abs_eval + diff * 35;
