@@ -520,7 +520,7 @@ mod tests {
         // Cross-language anchor guard (mirrored in train_tuple.py): black
         // a1 + white g7, black to move. Anchor (5,0) -> 9 (own digit 1 in
         // 3rd cell), anchor (0,5) -> 6 (enemy digit 2 in 2nd cell).
-        let b = Board::start();
+        let b = Board::from_occ(1u64 << 42, 1u64 << 6, 0, 0); // lone black a1 + white g7
         for a in 0..36 {
             let idx = block2_index(b.occ[0], b.occ[1], a);
             let (r, c) = (a / 6, a % 6);
@@ -662,7 +662,7 @@ mod tests {
     fn per_anchor_pair_spot() {
         // Startpos: H pair ((5,0),(5,2)) = global pair 20, feats 9+0.
         // Rigged per-anchor entry must be picked exactly there.
-        let b = Board::start();
+        let b = Board::from_occ(1u64 << 42, 1u64 << 6, 0, 0); // lone black a1 + white g7
         let mut t = TupleTable::zeros();
         t.has_pa = true;
         t.pa[20 * PAIR_PATTERNS + 9] = 5;
@@ -675,7 +675,7 @@ mod tests {
         // H pair ((5,0),(5,2)) = anchors 30,32: b1=9, b2=0 -> index 9.
         let (pairs, _) = &PAIR_BLOCKS;
         assert_eq!(pairs[0][5 * 4 + 0], (30, 32));
-        let b = Board::start();
+        let b = Board::from_occ(1u64 << 42, 1u64 << 6, 0, 0); // lone black a1 + white g7
         let own = b.me();
         let enemy = b.opp();
         assert_eq!(block2_index(own, enemy, 30), 9);

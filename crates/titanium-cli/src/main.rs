@@ -1377,10 +1377,11 @@ fn serve_cmd(
             out_line("readyok");
         } else if t == "uainewgame" {
             searcher.reset_for_new_game();
-        } else if t == "position startpos" {
-            current = Some(Board::start());
-        } else if let Some(fen) = t.strip_prefix("position fen ") {
-            current = Board::from_ataxx_fen(fen.trim());
+        } else if let Some(args) = t.strip_prefix("position ") {
+            current = Board::from_uai_position(args);
+            if current.is_none() {
+                out_line(&format!("info string bad position: {args}"));
+            }
         } else if t.starts_with("go") {
             let mut nodes = None;
             let mut movetime = None;

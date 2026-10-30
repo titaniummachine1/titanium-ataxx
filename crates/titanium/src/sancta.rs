@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn s1_incremental_matches_refresh() {
         let net = tiny_net();
-        let b0 = Board::start();
+        let b0 = Board::from_occ(1u64 << 42, 1u64 << 6, 0, 0); // lone black a1 + white g7
         let mut root = [[0i16; S1_L1]; 2];
         net.refresh_root(&b0, &mut root);
         let b1 = b0.make(crate::board::Move { from: 42, to: 33 });
@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn s1_position_sense() {
         let net = tiny_net();
-        let b0 = Board::start();
+        let b0 = Board::from_occ(1u64 << 42, 1u64 << 6, 0, 0); // lone black a1 + white g7
         let mut sc = [[0i16; S1_L1]; 2];
         let v0 = net.evaluate(&b0, 0, &mut sc);
         let b1 = b0.make(crate::board::Move { from: 42, to: 33 });

@@ -674,18 +674,20 @@ pub struct Board {
 }
 
 impl Board {
-    /// Standard start: black bottom-left, white top-right, black to move.
+    /// Standard Ataxx start (libataxx `x5o/7/7/7/7/7/o5x x`, Botzone):
+    /// black a7+g1 (sq 0, 48), white g7+a1 (sq 6, 42), black to move.
+    /// Two pieces per side; the old one-piece-per-side start was a bug.
     pub fn start() -> Board {
         Board {
-            occ: [bit_of(6 * 7), bit_of(6)],
+            occ: [bit_of(0) | bit_of(48), bit_of(6) | bit_of(42)],
             blockers: 0,
             turn: 0,
             passes: 0,
             ply: 0,
-            piece_cnt: [1, 1],
+            piece_cnt: [2, 2],
             blocker_cnt: 0,
-            hash: ZOB_PIECE[0][42] ^ ZOB_PIECE[1][6],
-            pst: PST[6 * 7] - PST[6],
+            hash: ZOB_PIECE[0][0] ^ ZOB_PIECE[0][48] ^ ZOB_PIECE[1][6] ^ ZOB_PIECE[1][42],
+            pst: PST[0] + PST[48] - PST[6] - PST[42],
         }
     }
 
@@ -921,20 +923,7 @@ impl Board {
     /// Standard 4-corner opening used by Botzone/libataxx: black a7+g1
     /// (sq 0, 48), white g7+a1 (sq 6, 42), black to move.
     pub fn botzone_start() -> Board {
-        let mut b = Board {
-            occ: [bit_of(0) | bit_of(48), bit_of(6) | bit_of(42)],
-            blockers: 0,
-            turn: 0,
-            passes: 0,
-            ply: 0,
-            piece_cnt: [2, 2],
-            blocker_cnt: 0,
-            hash: 0,
-            pst: 0,
-        };
-        b.hash = ZOB_PIECE[0][0] ^ ZOB_PIECE[0][48] ^ ZOB_PIECE[1][6] ^ ZOB_PIECE[1][42];
-        b.pst = PST[0] + PST[48] - PST[6] - PST[42];
-        b
+        Board::start()
     }
 
     /// Parse a 49-char board string (rows top->bottom, chars `.xo#`) plus a
@@ -1184,6 +1173,56 @@ impl Board {
         format!("{file}{rank}")
     }
 
+    /// Parse a UAI move for this position: "b6" (clone), "a7c5" (jump, or a
+    /// long-form clone), "0000" (pass, only when the side to move is stuck).
+    /// Returns None for anything illegal so callers can fail loudly.
+    pub fn parse_uai_move(&self, text: &str) -> Option<Move> {
+        match text.len() {
+            4 if text == "0000" => (!self.has_moves(self.turn)).then_some(Move::PASS),
+            2 => {
+                let to = Board::parse_sq(text)?;
+                let clones = self.me() & RING1[to as usize];
+                if (self.empty() >> to) & 1 == 0 || clones == 0 {
+                    return None;
+                }
+                Some(Move { from: clones.trailing_zeros() as u8, to })
+            }
+            4 => {
+                let m = Move { from: Board::parse_sq(&text[0..2])?, to: Board::parse_sq(&text[2..4])? };
+                self.legal_moves().contains(&m).then_some(m)
+            }
+            _ => None,
+        }
+    }
+
+    /// Apply a UAI move from `parse_uai_move` (handles the pass encoding).
+    pub fn make_uai(&self, m: Move) -> Board {
+        if m.is_pass() {
+            self.make_pass()
+        } else {
+            self.make(m)
+        }
+    }
+
+    /// Parse a UAI `position` argument: `startpos` or `fen <fen>`, optionally
+    /// followed by `moves m1 m2 ...`. Any unparsable or illegal move = None.
+    pub fn from_uai_position(args: &str) -> Option<Board> {
+        let (base, moves) = match args.split_once(" moves") {
+            Some((b, m)) => (b.trim(), m),
+            None => (args.trim(), ""),
+        };
+        let mut b = if base == "startpos" {
+            Board::start()
+        } else {
+            Board::from_ataxx_fen(base.strip_prefix("fen ")?.trim())?
+        };
+        for tok in moves.split_whitespace() {
+            let m = b.parse_uai_move(tok)?;
+            b = b.make_uai(m);
+        }
+        Some(b)
+    }
+
     /// Parse a square name like "d4".
     pub fn parse_sq(name: &str) -> Option<u8> {
         let bytes = name.as_bytes();
@@ -1298,8 +1337,8 @@ mod tests {
     #[test]
     fn corner_geometry() {
         // From a1: clones a2 b2 b1; jumps a3 b3 c3 c2 c1 (full 5x5 ring,
-        // knight offsets included). 8 moves total.
-        let b = Board::start();
+        // knight offsets included). 8 moves total. Lone black a1 vs white g7.
+        let b = Board::from_occ(bit_of(42), bit_of(6), 0, 0);
         let targets = b.targets(0);
         let expect = bit_of(35)  // a2
             | bit_of(36)         // b2
@@ -1313,9 +1352,52 @@ mod tests {
     }
 
     #[test]
-    fn start_has_8_moves() {
-        // One corner piece each: 3 clones + 5 jumps.
-        assert_eq!(Board::start().legal_moves().len(), 8);
+    fn start_is_standard_four_corner() {
+        // Two corner pieces per side (8 moves each, disjoint targets).
+        let b = Board::start();
+        assert_eq!(b.occ, [bit_of(0) | bit_of(48), bit_of(6) | bit_of(42)]);
+        assert_eq!(Board::sq_name(0), "a7");
+        assert_eq!(Board::sq_name(48), "g1");
+        assert_eq!(b.legal_moves().len(), 16);
+        let rt = Board::from_str(&b.to_string()).unwrap();
+        assert_eq!((rt.occ, rt.hash, rt.pst), (b.occ, b.hash, b.pst));
+    }
+
+    #[test]
+    fn uai_position_with_moves() {
+        let s = Board::start();
+        // Clone short form, clone long form and jump all apply; illegal = None.
+        let b6 = Board::from_uai_position("startpos moves b6").unwrap();
+        assert_eq!(b6.occ[0], s.occ[0] | bit_of(8));
+        assert_eq!(b6.turn, 1);
+        assert_eq!(Board::from_uai_position("startpos moves a7b6").unwrap().occ, b6.occ);
+        let jump = Board::from_uai_position("startpos moves a7c5 g7e5").unwrap();
+        assert_eq!(jump.occ[0], bit_of(16) | bit_of(48));
+        assert_eq!(jump.occ[1], bit_of(18) | bit_of(42));
+        assert!(Board::from_uai_position("startpos moves d4").is_none());
+        assert!(Board::from_uai_position("startpos moves 0000").is_none());
+        assert!(Board::from_uai_position("startpos moves a7b6 a7b6").is_none());
+        let fen = Board::from_uai_position("fen x5o/7/7/7/7/7/o5x x 0 1 moves b6").unwrap();
+        assert_eq!(fen.occ, b6.occ);
+        assert_eq!(Board::from_uai_position("startpos").unwrap().occ, s.occ);
+    }
+
+    #[test]
+    fn start_perft_matches_libataxx() {
+        // Reference counts for x5o/7/7/7/7/7/o5x x (libataxx, Zataxx tests).
+        // libataxx counts a clone once per destination, i.e. the dedup list
+        // search uses; `legal_moves()` keeps one clone per source (6652 at d3).
+        fn perft_dedup(b: &Board, depth: u32) -> u64 {
+            if depth == 0 {
+                return 1;
+            }
+            let mut list = MoveList::new();
+            b.legal_moves_dedup_into(&mut list);
+            (0..list.len()).map(|i| perft_dedup(&b.make(list.move_at(i)), depth - 1)).sum()
+        }
+        let b = Board::start();
+        let counts: Vec<u64> = (1..=5).map(|d| perft_dedup(&b, d)).collect();
+        assert_eq!(counts, [16, 256, 6460, 155888, 4752668]);
     }
 
     #[test]
