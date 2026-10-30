@@ -1121,7 +1121,8 @@ impl Board {
                         return None;
                     }
                 }
-                'x' | 'o' | '#' => {
+                // '-' = libataxx/UAI blocker, '#' = our older spelling
+                'x' | 'o' | '#' | '-' => {
                     if col >= SIZE {
                         return None;
                     }
@@ -1380,6 +1381,48 @@ mod tests {
         let fen = Board::from_uai_position("fen x5o/7/7/7/7/7/o5x x 0 1 moves b6").unwrap();
         assert_eq!(fen.occ, b6.occ);
         assert_eq!(Board::from_uai_position("startpos").unwrap().occ, s.occ);
+    }
+
+    #[test]
+    fn perft_suite_matches_libataxx() {
+        // libataxx reference suite (copied from Zataxx src/tests.rs, r -> x, b -> o).
+        // libataxx counting: a clone once per destination; a forced pass is one move.
+        // The halfmove-clock (100-ply) entries are left out: classic rules here have no such draw.
+        // libataxx ends the game as soon as NEITHER side can move; our classic game_over() first plays
+        // the pass and ends on the double pass (same result, one extra leaf: 175 vs 174 at d6 on the
+        // walled position below). The terminal test here is libataxx's.
+        fn perft_lib(b: &Board, depth: u32) -> u64 {
+            if depth == 0 {
+                return 1;
+            }
+            if b.game_over() || (!b.has_moves(0) && !b.has_moves(1)) {
+                return 0;
+            }
+            let mut list = MoveList::new();
+            b.legal_moves_dedup_into(&mut list);
+            if list.len() == 0 {
+                return perft_lib(&b.make_pass(), depth - 1);
+            }
+            (0..list.len()).map(|i| perft_lib(&b.make(list.move_at(i)), depth - 1)).sum()
+        }
+        let suite: [(&str, &[u64]); 11] = [
+            ("7/7/7/7/7/7/7 x 0 1", &[1, 0, 0]),
+            ("7/7/7/7/-------/-------/x5o x 0 1", &[1, 2, 4, 13, 30, 73, 174]),
+            ("7/7/7/7/-------/-------/x5o o 0 1", &[1, 2, 4, 13, 30, 73, 174]),
+            ("x5o/7/2-1-2/7/2-1-2/7/o5x x 0 1", &[1, 14, 196, 4184, 86528]),
+            ("x5o/7/2-1-2/3-3/2-1-2/7/o5x o 0 1", &[1, 14, 196, 4100, 83104]),
+            ("x5o/7/3-3/2-1-2/3-3/7/o5x x 0 1", &[1, 16, 256, 5948, 133264]),
+            ("x5o/7/7/7/7/7/o5x o 0 1", &[1, 16, 256, 6460, 155888]),
+            ("7/7/7/2x1o2/7/7/7 x 0 1", &[1, 23, 419, 7887, 168317]),
+            ("7/7/7/7/ooooooo/ooooooo/xxxxxxx x 0 1", &[1, 1, 75, 249, 14270]),
+            ("7/7/7/7/xxxxxxx/xxxxxxx/ooooooo o 0 1", &[1, 1, 75, 249, 14270]),
+            ("7/7/7/7/ooooooo/ooooooo/xxxxxxx o 0 1", &[1, 75, 249, 14270, 452980]),
+        ];
+        for (fen, want) in suite {
+            let b = Board::from_ataxx_fen(fen).unwrap_or_else(|| panic!("fen does not parse: {fen}"));
+            let got: Vec<u64> = (0..want.len() as u32).map(|d| perft_lib(&b, d)).collect();
+            assert_eq!(got, want, "perft mismatch for {fen}");
+        }
     }
 
     #[test]
