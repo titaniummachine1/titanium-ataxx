@@ -1260,7 +1260,7 @@ impl<'a> Searcher<'a> {
     }
     /// Iterative deepening root search. Falls back to any legal move.
     /// Whichever limit hits first (nodes / time / depth) stops the search;
-    /// partial iterations are discarded, the last completed depth decides.
+    /// an aborted iteration is adopted by the Stockfish rule (see the adoption block in `search_gen`).
     pub fn search(&mut self, b: &Board, limits: &SearchLimits) -> SearchResult {
         self.search_gen::<false>(b, limits, &[])
     }
@@ -1537,6 +1537,39 @@ mod tests {
             max_nodes: None,
             max_depth: depth,
         }
+    }
+
+    /// Cutting the search mid-iteration (partial adoption) must always leave a legal move, a real score and a depth.
+    #[test]
+    fn partial_iteration_adoption_keeps_a_legal_move() {
+        let mut seed = 0x51ed_270b_0f13_a7c9u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut list = crate::board::MoveList::new();
+        let mut b = Board::start();
+        let mut checked = 0;
+        for _ in 0..40 {
+            b.legal_moves_dedup_into(&mut list);
+            if list.len() == 0 {
+                break;
+            }
+            for nodes in [20u64, 60, 150, 400, 1200, 3000] {
+                let mut se = Searcher::with_tt_bits(16);
+                let lim = SearchLimits { time: None, max_nodes: Some(nodes), max_depth: u8::MAX };
+                let r = se.search(&b, &lim);
+                let m = r.best.expect("a move must always come back");
+                assert!((0..list.len()).any(|i| list.move_at(i) == m), "illegal move at {nodes} nodes");
+                assert!(r.depth >= 1 && r.score != i32::MIN);
+                checked += 1;
+            }
+            let i = (next() % list.len() as u64) as usize;
+            b = b.make(list.move_at(i));
+        }
+        assert!(checked >= 60);
     }
 
     #[test]
