@@ -69,7 +69,7 @@ const MB_FUT_DIV: i32 = 57;
 /// Volatility scaling numerator (scaled by 128) for Reverse Futility Pruning: +25% of predicted disagreement.
 const DIS_RFP_NUM: i32 = 32;
 /// Volatility credit numerator (scaled by 128) for Child Futility Pruning: 37.5% credit.
-const DIS_FUT_NUM: i32 = 48;
+const DIS_FUT_NUM: i32 = 24;
 
 #[inline(always)]
 pub fn pack_eval_dis(eval: i32, dis: i32) -> i32 {
