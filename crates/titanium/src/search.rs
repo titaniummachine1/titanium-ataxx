@@ -1443,21 +1443,15 @@ impl<'a> Searcher<'a> {
             // Partial-iteration adoption (Stockfish / Reckless):
             // - A completed iteration is adopted unless it forgot a shorter proven winning mate
             //   from a previous completed iteration (`forgotten_mate`).
-            // - An aborted partial iteration (`self.stop`) is adopted only if no full iteration
-            //   has completed yet, OR if a searched root move strictly beat the previous
-            //   completed iteration's score without walking into a forced loss (`best_score > -MATE_BOUND`).
+            // - An aborted partial iteration (`self.stop`) is adopted whenever a root move finished (it
+            //   exists as `best_this`), unless it forgot a proven mate: Stockfish semantics.
             if let Some(m) = best_this {
                 let forgotten_mate = has_completed_iter
                     && result.score >= MATE_BOUND
                     && best_score < result.score;
-                let adopt = if !self.stop {
-                    !forgotten_mate
-                } else {
-                    !has_completed_iter
-                        || (best_score > result.score
-                            && best_score > -MATE_BOUND
-                            && !forgotten_mate)
-                };
+                // Stockfish rule: the previous best move is searched first, so once any root move of an aborted
+                // iteration has finished, that iteration's best so far is at least as informed as the older depth.
+                let adopt = !forgotten_mate;
                 if adopt {
                     result.best = Some(m);
                     if best_score != i32::MIN {
