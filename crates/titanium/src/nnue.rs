@@ -233,22 +233,47 @@ impl Nnue {
         let mut ps = [0f32; 2];
         for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
             let a = &mut acc[half][..w];
-            a.copy_from_slice(&self.ftbq);
             let idx = &idx[..n];
-            for k in 0..n {
-                // the 13 MB row table misses cache: request the row PF features ahead while adding this one
-                if k + PF < n {
-                    self.prefetch_row(idx[k + PF] as usize);
-                }
-                let f = idx[k] as usize;
-                let row = &self.ftq[f * w..(f + 1) * w];
-                for (x, r) in a.iter_mut().zip(row) {
-                    *x = x.wrapping_add(*r);
-                }
-                ps[half] += pst[f];
+            self.ft_sum(a, idx);
+            for &f in idx {
+                ps[half] += pst[f as usize];
             }
         }
         self.head_with_dis(&acc, bucket, ps, s57)
+    }
+
+    /// a = bias + sum of the active rows (wrapping i16, so any order is bit-identical). The accumulator is kept in
+    /// registers one CH-lane block at a time: each row costs one load+add per vector instead of load/add/store.
+    #[inline(always)]
+    fn ft_sum(&self, a: &mut [i16], idx: &[u32]) {
+        const CH: usize = 128;
+        let w = a.len();
+        if w % CH != 0 {
+            a.copy_from_slice(&self.ftbq[..w]);
+            for &f in idx {
+                let row = &self.ftq[f as usize * w..(f as usize + 1) * w];
+                for (x, r) in a.iter_mut().zip(row) {
+                    *x = x.wrapping_add(*r);
+                }
+            }
+            return;
+        }
+        let n = idx.len();
+        for c in (0..w).step_by(CH) {
+            let mut r = [0i16; CH];
+            r.copy_from_slice(&self.ftbq[c..c + CH]);
+            for k in 0..n {
+                if false && c == 0 && k + PF < n {
+                    self.prefetch_row(idx[k + PF] as usize);
+                }
+                let f = idx[k] as usize;
+                let row = &self.ftq[f * w + c..f * w + c + CH];
+                for j in 0..CH {
+                    r[j] = r[j].wrapping_add(row[j]);
+                }
+            }
+            a[c..c + CH].copy_from_slice(&r);
+        }
     }
 
     pub fn bench_ft(&self, b: &Board) -> i32 {
@@ -261,18 +286,10 @@ impl Nnue {
         let mut ps = [0f32; 2];
         for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
             let a = &mut acc[half][..w];
-            a.copy_from_slice(&self.ftbq);
             let idx = &idx[..n];
-            for k in 0..n {
-                if k + PF < n {
-                    self.prefetch_row(idx[k + PF] as usize);
-                }
-                let f = idx[k] as usize;
-                let row = &self.ftq[f * w..(f + 1) * w];
-                for (x, r) in a.iter_mut().zip(row) {
-                    *x = x.wrapping_add(*r);
-                }
-                ps[half] += pst[f];
+            self.ft_sum(a, idx);
+            for &f in idx {
+                ps[half] += pst[f as usize];
             }
         }
         std::hint::black_box(&acc);

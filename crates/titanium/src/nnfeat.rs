@@ -24,7 +24,7 @@
 //!    G6_PAR_OFF + phase * 2 + (empties & 1). phase = empties / 7 (0..7).
 //! (G4 = 8-cell pattern pairs stays OUTSIDE the accumulator: the existing tuple net as a linear skip path.)
 
-use crate::board::{dist_union, jump_union, Board, RING1, SQUARES};
+use crate::board::{dist_union, jump_union, Board, FILE_A, FILE_G, FULL, RING1, SQUARES};
 
 pub const G1: u32 = 1;
 pub const G2: u32 = 2;
@@ -72,15 +72,74 @@ const fn build_box2() -> [u64; SQUARES] {
 
 pub static BOX2: [u64; SQUARES] = build_box2();
 
-#[inline]
+/// 3x3 dilation (the stones and their 8 neighbours), separable: 10 ops instead of eight masked shifts.
+#[inline(always)]
+fn box1(x: u64) -> u64 {
+    let h = x | ((x & !FILE_A) >> 1) | ((x & !FILE_G) << 1);
+    (h | (h >> 7) | (h << 7)) & FULL
+}
+
+/// Empty squares a side with `stones` can land on (clone or jump) = the 5x5 box minus the stones themselves.
+#[inline(always)]
 fn landing(stones: u64, empty: u64) -> u64 {
+    box1(box1(stones)) & empty
+}
+
+/// Best number of `victims` stones converted by one landing of `attacker` (clone or jump) on `empty`.
+/// The victim count around every square is built at once with a carry-save adder over the 8 shifted masks
+/// (planes 1/2/4/8), then the maximum over the candidate squares is read off the planes: no per-candidate loop.
+#[inline]
+fn best_capture(attacker: u64, victims: u64, empty: u64) -> u32 {
+    let cand = landing(attacker, empty) & box1(victims);
+    if cand == 0 {
+        return 0;
+    }
+    let v = victims;
+    let s0 = (v >> 1) & !FILE_G;
+    let s1 = (v << 1) & !FILE_A;
+    let s2 = v >> 7;
+    let s3 = (v << 7) & FULL;
+    let s4 = (v >> 8) & !FILE_G;
+    let s5 = (v << 8) & !FILE_A & FULL;
+    let s6 = (v >> 6) & !FILE_A;
+    let s7 = (v << 6) & !FILE_G & FULL;
+    let t0 = s0 ^ s1 ^ s2;
+    let c0 = (s0 & s1) | (s2 & (s0 ^ s1));
+    let t1 = s3 ^ s4 ^ s5;
+    let c1 = (s3 & s4) | (s5 & (s3 ^ s4));
+    let t2 = s6 ^ s7;
+    let c2 = s6 & s7;
+    let ones = t0 ^ t1 ^ t2;
+    let k0 = (t0 & t1) | (t2 & (t0 ^ t1));
+    let u0 = c0 ^ c1 ^ c2;
+    let uc = (c0 & c1) | (c2 & (c0 ^ c1));
+    let twos = u0 ^ k0;
+    let tc = u0 & k0;
+    let fours = uc ^ tc;
+    let eights = uc & tc;
+    let mut m = cand;
+    let mut best = 0u32;
+    for (k, plane) in [(3u32, eights), (2, fours), (1, twos), (0, ones)] {
+        let x = m & plane;
+        if x != 0 {
+            best |= 1 << k;
+            m = x;
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+#[inline]
+fn landing_ref(stones: u64, empty: u64) -> u64 {
     (dist_union(stones, 1) | jump_union(stones)) & empty
 }
 
 /// Best number of `victims` stones converted by one landing of `attacker` (clone or jump) on `empty`.
+#[cfg(test)]
 #[inline]
-fn best_capture(attacker: u64, victims: u64, empty: u64) -> u32 {
-    let mut cand = landing(attacker, empty) & dist_union(victims, 1);
+fn best_capture_ref(attacker: u64, victims: u64, empty: u64) -> u32 {
+    let mut cand = landing_ref(attacker, empty) & dist_union(victims, 1);
     let mut best = 0;
     while cand != 0 {
         let t = cand.trailing_zeros() as usize;
@@ -96,10 +155,124 @@ pub fn features(b: &Board, side: usize, groups: u32, out: &mut [u32; MAX_ACTIVE]
     let own = b.occ[side];
     let en = b.occ[1 - side];
     let empty = b.empty();
-    let clone_o = dist_union(own, 1) & empty;
-    let clone_e = dist_union(en, 1) & empty;
+    let clone_o = box1(own) & empty;
+    let clone_e = box1(en) & empty;
     let land_o = landing(own, empty);
     let land_e = landing(en, empty);
+    let near_land_e = box1(land_e);
+    let near_land_o = box1(land_o);
+
+    let mut n = 0;
+    let mut anchor = usize::MAX;
+    let mut best = (0u32, 0u32); // (gain, clone flag) of the anchor so far
+    // codes by square class, branch-free over the class bit sets (the old per-square 3-way branch mispredicted ~half the time)
+    let mut codes = [0u16; SQUARES];
+    let mut m = own;
+    while m != 0 {
+        let sq = m.trailing_zeros() as usize;
+        codes[sq] = ((((near_land_e >> sq) & 1) as usize) * 9 + (RING1[sq] & empty).count_ones() as usize) as u16;
+        m &= m - 1;
+    }
+    let mut m = en;
+    while m != 0 {
+        let sq = m.trailing_zeros() as usize;
+        codes[sq] = (18 + (((near_land_o >> sq) & 1) as usize) * 9 + (RING1[sq] & empty).count_ones() as usize) as u16;
+        m &= m - 1;
+    }
+    let mut m = FULL & !(own | en | empty);
+    while m != 0 {
+        codes[m.trailing_zeros() as usize] = BLOCKER_CODE as u16;
+        m &= m - 1;
+    }
+    let mut m = empty;
+    while m != 0 {
+        let sq = m.trailing_zeros() as usize;
+        let ring = RING1[sq];
+        let go = (ring & en).count_ones();
+        let ge = (ring & own).count_ones();
+        let ro = if (clone_o >> sq) & 1 != 0 { 2 } else { ((land_o >> sq) & 1) as usize };
+        let re = if (clone_e >> sq) & 1 != 0 { 2 } else { ((land_e >> sq) & 1) as usize };
+        if ro > 0 && go > 0 {
+            let key = (go, (ro == 2) as u32);
+            if key > best {
+                best = key;
+                anchor = sq;
+            }
+        }
+        codes[sq] = (36 + ((ro * 3 + re) * 5 + go.min(4) as usize) * 5 + ge.min(4) as usize) as u16;
+        m &= m - 1;
+    }
+    if groups & G1 != 0 {
+        for sq in 0..SQUARES {
+            out[sq] = (G1_OFF + sq * SQ_STATES + codes[sq] as usize) as u32;
+        }
+        n = SQUARES;
+    }
+    if groups & G2 != 0 {
+        if anchor == usize::MAX {
+            out[n] = G2_NONE as u32;
+            n += 1;
+        } else {
+            let mut stones = (own | en) & BOX2[anchor];
+            while stones != 0 {
+                let t = stones.trailing_zeros() as usize;
+                out[n] = (G2_OFF + (anchor * SQUARES + t) * 2 + ((en >> t) & 1) as usize) as u32;
+                n += 1;
+                stones &= stones - 1;
+            }
+        }
+    }
+    if groups & G3 != 0 {
+        let mut stones = own | en;
+        while stones != 0 {
+            let t = stones.trailing_zeros() as usize;
+            let colour = ((en >> t) & 1) as usize;
+            let (mine, foe) = if colour == 0 { (own, en) } else { (en, own) };
+            let on = (RING1[t] & mine).count_ones() as usize;
+            let ef = (RING1[t] & foe).count_ones() as usize;
+            out[n] = (G3_OFF + ((t * 2 + colour) * 9 + on) * 9 + ef) as u32;
+            n += 1;
+            stones &= stones - 1;
+        }
+    }
+    if groups & G5 != 0 {
+        let mut c = clone_o;
+        while c != 0 {
+            let s = c.trailing_zeros() as usize;
+            let conv = en & RING1[s];
+            let own2 = own | (1u64 << s) | conv;
+            let en2 = en & !conv;
+            let empty2 = empty & !(1u64 << s);
+            let v = 1 + conv.count_ones() as i32 - best_capture(en2, own2, empty2) as i32;
+            out[n] = (G5_OFF + s * 9 + (v.clamp(-3, 5) + 3) as usize) as u32;
+            n += 1;
+            c &= c - 1;
+        }
+    }
+    if groups & G6 != 0 {
+        let e = empty.count_ones() as usize;
+        let phase = (e / 7).min(7);
+        for (rel, land) in [(0usize, land_o), (1usize, land_e)] {
+            let bucket = (land.count_ones() as usize / 3).min(9);
+            out[n] = (G6_OFF + (rel * 8 + phase) * 10 + bucket) as u32;
+            n += 1;
+        }
+        out[n] = (G6_PAR_OFF + phase * 2 + (e & 1)) as u32;
+        n += 1;
+    }
+    n
+}
+
+#[cfg(test)]
+/// Straightforward reference implementation (square-by-square); `features` must match it exactly.
+pub fn features_ref(b: &Board, side: usize, groups: u32, out: &mut [u32; MAX_ACTIVE]) -> usize {
+    let own = b.occ[side];
+    let en = b.occ[1 - side];
+    let empty = b.empty();
+    let clone_o = dist_union(own, 1) & empty;
+    let clone_e = dist_union(en, 1) & empty;
+    let land_o = landing_ref(own, empty);
+    let land_e = landing_ref(en, empty);
     let near_land_e = dist_union(land_e, 1);
     let near_land_o = dist_union(land_o, 1);
 
@@ -169,7 +342,7 @@ pub fn features(b: &Board, side: usize, groups: u32, out: &mut [u32; MAX_ACTIVE]
             let own2 = own | (1u64 << s) | conv;
             let en2 = en & !conv;
             let empty2 = empty & !(1u64 << s);
-            let v = 1 + conv.count_ones() as i32 - best_capture(en2, own2, empty2) as i32;
+            let v = 1 + conv.count_ones() as i32 - best_capture_ref(en2, own2, empty2) as i32;
             out[n] = (G5_OFF + s * 9 + (v.clamp(-3, 5) + 3) as usize) as u32;
             n += 1;
             c &= c - 1;
@@ -308,6 +481,23 @@ mod tests {
                     let mut o2 = [0u32; MAX_ACTIVE];
                     let m = features(&b, side, ALL_GROUPS & !g, &mut o2);
                     assert!(m < n || (g == G5 && ncl == 0) || (g == G3 && nst == 0), "group mask {g}");
+                }
+            }
+        }
+    }
+
+    /// The optimised `features` must equal the square-by-square reference for every group mask.
+    #[test]
+    fn matches_reference_all_masks() {
+        let mut seed = 0x0bad_cafe_1234_5678u64;
+        for _ in 0..4000 {
+            let b = rand_board(&mut seed);
+            for side in 0..2 {
+                for g in 0..64u32 {
+                    let (mut x, mut y) = ([0u32; MAX_ACTIVE], [0u32; MAX_ACTIVE]);
+                    let nx = features(&b, side, g, &mut x);
+                    let ny = features_ref(&b, side, g, &mut y);
+                    assert_eq!(&x[..nx], &y[..ny], "groups {g}");
                 }
             }
         }
