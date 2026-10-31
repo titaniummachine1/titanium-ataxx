@@ -1426,7 +1426,10 @@ fn serve_cmd(
                         max_nodes: nodes,
                         max_depth: depth as u8,
                     };
-                    match searcher.search(b, &limits).best {
+                    let r = searcher.search(b, &limits);
+                    // mandatory for gate analysis: what the engine thought of the move it played
+                    out_line(&uai_info(&r));
+                    match r.best {
                         Some(m) => {
                             if m.is_clone() {
                                 Board::sq_name(m.to)
@@ -1540,6 +1543,19 @@ impl UaiOpp {
         self.send("quit");
         let _ = self.child.wait();
     }
+}
+
+/// UAI `info` line for a finished search (`score mate N` in moves for proven results, else `score cp`).
+fn uai_info(r: &titanium::search::SearchResult) -> String {
+    let mate = titanium::search::MATE;
+    let score = if r.score.abs() >= mate - 2000 {
+        let plies = mate - r.score.abs();
+        format!("mate {}", r.score.signum() * (plies + 1) / 2)
+    } else {
+        format!("cp {}", r.score)
+    };
+    let ms = r.elapsed.as_millis().max(1);
+    format!("info depth {} score {} nodes {} time {} nps {}", r.depth, score, r.nodes, ms, r.nodes as u128 * 1000 / ms)
 }
 
 /// Convert a UAI bestmove token to a titanium move in the context of `board`.
