@@ -70,6 +70,12 @@ const MB_FUT_DIV: i32 = 57;
 const DIS_RFP_NUM: i32 = 32;
 /// Volatility credit numerator (scaled by 128) for Child Futility Pruning: 37.5% credit.
 const DIS_FUT_NUM: i32 = 24;
+/// ProbCut (gated +20 Elo @100 ms vs main, user-approved 2026-10-31): min depth, depth reduction, margin cp,
+/// disagreement-head credit (/128). A shallow null-window search at pc_beta; if it clears pc_beta the node cuts.
+const PC_D: u32 = 6;
+const PC_R: u32 = 3;
+const PC_T: i32 = 140;
+const PC_K: i32 = 32;
 
 #[inline(always)]
 pub fn pack_eval_dis(eval: i32, dis: i32) -> i32 {
@@ -947,6 +953,21 @@ impl<'a> Searcher<'a> {
                 if score >= beta {
                     self.heuristic_used = true;
                     return if score >= MATE_BOUND { beta } else { score };
+                }
+            }
+        }
+
+        // ProbCut: non-PV, not right after a null, margin widens with the net's disagreement output.
+        if null_allowed && ply > 0 && depth >= PC_D && beta - alpha == 1 && beta.abs() < MATE_BOUND {
+            let pc_beta = beta + PC_T + ((node_dis * PC_K) >> 7);
+            if pc_beta < MATE_BOUND && static_eval + 50 >= pc_beta - 2 * PC_T {
+                let score = self.negamax::<BZ>(b, pc_beta - 1, pc_beta, depth - PC_R, ply, false);
+                if self.stop {
+                    return 0;
+                }
+                if score >= pc_beta && score < MATE_BOUND {
+                    self.heuristic_used = true;
+                    return score - (pc_beta - beta);
                 }
             }
         }
