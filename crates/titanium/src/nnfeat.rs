@@ -415,37 +415,21 @@ pub fn features_ref(b: &Board, side: usize, groups: u32, out: &mut [u32; MAX_ACT
     n
 }
 
-/// Both perspectives, side to move first: (us, n_us, them, n_them). One joint pass: the landing sets, the stone
-/// codes (they differ by 18 between the perspectives) and the G3 neighbour counts (perspective independent) are
-/// computed once; each output equals `features` for that side, in the same order.
-pub fn both(b: &Board, groups: u32) -> ([u32; MAX_ACTIVE], usize, [u32; MAX_ACTIVE], usize) {
-    let mut us = [0u32; MAX_ACTIVE];
-    let mut them = [0u32; MAX_ACTIVE];
-    let (nu, nt) = both_into(b, groups, &mut us, &mut them);
-    (us, nu, them, nt)
-}
-
-/// `both` writing into the caller's arrays and returning only the counts: returning the two 700-byte arrays by value
-/// cost two copies whose vector loads hit scalar stores that had just been written (store-forwarding stalls, ~1,900
-/// cycles per eval measured); entries past the returned counts are not touched and not meaningful.
-pub fn both_into(b: &Board, groups: u32, us: &mut [u32; MAX_ACTIVE], them: &mut [u32; MAX_ACTIVE]) -> (usize, usize) {
-    let stm = b.turn as usize;
-    let pa = b.occ[stm];
-    let pb = b.occ[1 - stm];
-    let empty = b.empty();
-    let clone_a = box1(pa) & empty;
-    let clone_b = box1(pb) & empty;
-    let land_a = landing(pa, empty);
-    let land_b = landing(pb, empty);
-    let nl_a = box1(land_a);
-    let nl_b = box1(land_b);
-    // neighbour-count planes of each side's stones: they drive both the anchors and the G5 base
-    let pla = victim_planes(pa);
-    let plb = victim_planes(pb);
-    let anc_a = anchor_of(land_a & box1(pb), &plb, clone_a);
-    let anc_b = anchor_of(land_b & box1(pa), &pla, clone_b);
-
-    let (mut nu, mut nt) = (0usize, 0usize);
+/// Reference G1 fill (49 entries per perspective): per-square codes by bit iteration. Used when AVX2 is missing.
+#[allow(clippy::too_many_arguments)]
+fn g1_scalar(
+    pa: u64,
+    pb: u64,
+    empty: u64,
+    clone_a: u64,
+    clone_b: u64,
+    land_a: u64,
+    land_b: u64,
+    nl_a: u64,
+    nl_b: u64,
+    us: &mut [u32; MAX_ACTIVE],
+    them: &mut [u32; MAX_ACTIVE],
+) {
     let mut ca = [0u16; SQUARES];
     let mut cb = [0u16; SQUARES];
     let mut m = pa;
@@ -483,11 +467,179 @@ pub fn both_into(b: &Board, groups: u32, us: &mut [u32; MAX_ACTIVE], them: &mut 
         cb[sq] = (36 + ((re * 3 + ro) * 5 + ge.min(4) as usize) * 5 + go.min(4) as usize) as u16;
         m &= m - 1;
     }
-    if groups & G1 != 0 {
+    {
         for sq in 0..SQUARES {
             us[sq] = (G1_OFF + sq * SQ_STATES + ca[sq] as usize) as u32;
             them[sq] = (G1_OFF + sq * SQ_STATES + cb[sq] as usize) as u32;
         }
+    }
+}
+
+/// Expand bit `k` of `bits` (k = 0..31 for the low half, 32..48 for the high half) to byte `k % 32` = 0xFF / 0x00.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn expand_bytes(bits: u64, hi: bool) -> core::arch::x86_64::__m256i {
+    use core::arch::x86_64::*;
+    let w = if hi { (bits >> 32) as u32 } else { bits as u32 };
+    let sel = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+    let m = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
+    let v = _mm256_shuffle_epi8(_mm256_set1_epi32(w as i32), sel);
+    _mm256_cmpeq_epi8(_mm256_and_si256(v, m), m)
+}
+
+/// Per-square count (0..15) from the four bit planes, one byte per square.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn plane_count(p: &[u64; 4], hi: bool) -> core::arch::x86_64::__m256i {
+    use core::arch::x86_64::*;
+    let c0 = _mm256_and_si256(expand_bytes(p[0], hi), _mm256_set1_epi8(1));
+    let c1 = _mm256_and_si256(expand_bytes(p[1], hi), _mm256_set1_epi8(2));
+    let c2 = _mm256_and_si256(expand_bytes(p[2], hi), _mm256_set1_epi8(4));
+    let c3 = _mm256_and_si256(expand_bytes(p[3], hi), _mm256_set1_epi8(8));
+    _mm256_or_si256(_mm256_or_si256(c0, c1), _mm256_or_si256(c2, c3))
+}
+
+/// x * 3 per byte (x <= 85).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn mul3_u8(x: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m256i {
+    use core::arch::x86_64::*;
+    _mm256_add_epi8(x, _mm256_add_epi8(x, x))
+}
+
+/// x * 5 per byte (x <= 51; the 16-bit shift leaks nothing because bits 6 and 7 of every byte are clear).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn mul5_u8(x: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m256i {
+    use core::arch::x86_64::*;
+    _mm256_add_epi8(x, _mm256_and_si256(_mm256_slli_epi16(x, 2), _mm256_set1_epi8(0xFCu8 as i8)))
+}
+
+/// G1 codes of all 49 squares for both perspectives at once, 32 squares per vector (squares 0..31, then 32..63 of
+/// which 49..63 are junk written past the 49 live entries). Bit-exact with `g1_scalar`.
+///
+/// # Safety
+/// AVX2 must be available; `us` / `them` must have room for 64 entries (MAX_ACTIVE >= 64 is asserted below).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn g1_avx2(
+    pa: u64,
+    pb: u64,
+    empty: u64,
+    clone_a: u64,
+    clone_b: u64,
+    land_a: u64,
+    land_b: u64,
+    nl_a: u64,
+    nl_b: u64,
+    pla: &[u64; 4],
+    plb: &[u64; 4],
+    ple: &[u64; 4],
+    us: *mut u32,
+    them: *mut u32,
+) {
+    use core::arch::x86_64::*;
+    const _: () = assert!(MAX_ACTIVE >= 64);
+    let blk = FULL & !(pa | pb | empty);
+    for hi in [false, true] {
+        let a = expand_bytes(pa, hi);
+        let b = expand_bytes(pb, hi);
+        let e = expand_bytes(empty, hi);
+        let k = expand_bytes(blk, hi);
+        let one = _mm256_set1_epi8(1);
+        let two = _mm256_set1_epi8(2);
+        let nine = _mm256_set1_epi8(9);
+        let ec = plane_count(ple, hi);
+        // stones: (enemy can land next to it) * 9 + empty neighbours; the opponent's perspective adds 18
+        let sa = _mm256_add_epi8(_mm256_and_si256(expand_bytes(nl_b, hi), nine), ec);
+        let sb = _mm256_add_epi8(_mm256_and_si256(expand_bytes(nl_a, hi), nine), ec);
+        let eighteen = _mm256_set1_epi8(18);
+        let ca_st = _mm256_or_si256(_mm256_and_si256(a, sa), _mm256_and_si256(b, _mm256_add_epi8(sb, eighteen)));
+        let cb_st = _mm256_or_si256(_mm256_and_si256(a, _mm256_add_epi8(sa, eighteen)), _mm256_and_si256(b, sb));
+        // empties: reach (0 none, 1 jump, 2 clone) of each side, capped contact counts
+        let ca_cl = expand_bytes(clone_a, hi);
+        let cb_cl = expand_bytes(clone_b, hi);
+        let ro = _mm256_max_epu8(_mm256_and_si256(expand_bytes(land_a, hi), one), _mm256_and_si256(ca_cl, two));
+        let re = _mm256_max_epu8(_mm256_and_si256(expand_bytes(land_b, hi), one), _mm256_and_si256(cb_cl, two));
+        let four = _mm256_set1_epi8(4);
+        let go = _mm256_min_epu8(plane_count(plb, hi), four);
+        let ge = _mm256_min_epu8(plane_count(pla, hi), four);
+        let qa = _mm256_add_epi8(mul5_u8(_mm256_add_epi8(mul5_u8(_mm256_add_epi8(mul3_u8(ro), re)), go)), ge);
+        let qb = _mm256_add_epi8(mul5_u8(_mm256_add_epi8(mul5_u8(_mm256_add_epi8(mul3_u8(re), ro)), ge)), go);
+        // the empty-square codes reach 224 (260 with the +36 offset), so the offset is added after widening to u32
+        let ca = _mm256_or_si256(ca_st, _mm256_and_si256(e, qa));
+        let cb = _mm256_or_si256(cb_st, _mm256_and_si256(e, qb));
+        // widen to u32, empties get +36, blockers take the fixed code, add the per-square table offset
+        let n = if hi { 4 } else { 0 };
+        let halves = |x: __m256i| {
+            let l = _mm256_castsi256_si128(x);
+            let h = _mm256_extracti128_si256(x, 1);
+            [l, _mm_srli_si128(l, 8), h, _mm_srli_si128(h, 8)]
+        };
+        let (ha, hb, he, hk) = (halves(ca), halves(cb), halves(e), halves(k));
+        for g in 0..4 {
+            let sq0 = (n + g) * 8;
+            let base = _mm256_add_epi32(
+                _mm256_set1_epi32((G1_OFF + sq0 * SQ_STATES) as i32),
+                _mm256_mullo_epi32(_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7), _mm256_set1_epi32(SQ_STATES as i32)),
+            );
+            let off = _mm256_add_epi32(base, _mm256_and_si256(_mm256_cvtepi8_epi32(he[g]), _mm256_set1_epi32(36)));
+            let km = _mm256_cvtepi8_epi32(hk[g]);
+            let blk_code = _mm256_set1_epi32(BLOCKER_CODE as i32);
+            for (codes, out) in [(&ha, us), (&hb, them)] {
+                let code = _mm256_blendv_epi8(_mm256_cvtepu8_epi32(codes[g]), blk_code, km);
+                _mm256_storeu_si256(out.add(sq0) as *mut __m256i, _mm256_add_epi32(code, off));
+            }
+        }
+    }
+}
+
+/// Both perspectives, side to move first: (us, n_us, them, n_them). One joint pass: the landing sets, the stone
+/// codes (they differ by 18 between the perspectives) and the G3 neighbour counts (perspective independent) are
+/// computed once; each output equals `features` for that side, in the same order.
+pub fn both(b: &Board, groups: u32) -> ([u32; MAX_ACTIVE], usize, [u32; MAX_ACTIVE], usize) {
+    let mut us = [0u32; MAX_ACTIVE];
+    let mut them = [0u32; MAX_ACTIVE];
+    let (nu, nt) = both_into(b, groups, &mut us, &mut them);
+    (us, nu, them, nt)
+}
+
+/// `both` writing into the caller's arrays and returning only the counts: returning the two 700-byte arrays by value
+/// cost two copies whose vector loads hit scalar stores that had just been written (store-forwarding stalls, ~1,900
+/// cycles per eval measured); entries past the returned counts are not touched and not meaningful.
+pub fn both_into(b: &Board, groups: u32, us: &mut [u32; MAX_ACTIVE], them: &mut [u32; MAX_ACTIVE]) -> (usize, usize) {
+    let stm = b.turn as usize;
+    let pa = b.occ[stm];
+    let pb = b.occ[1 - stm];
+    let empty = b.empty();
+    let clone_a = box1(pa) & empty;
+    let clone_b = box1(pb) & empty;
+    let land_a = landing(pa, empty);
+    let land_b = landing(pb, empty);
+    let nl_a = box1(land_a);
+    let nl_b = box1(land_b);
+    // neighbour-count planes of each side's stones: they drive both the anchors and the G5 base
+    let pla = victim_planes(pa);
+    let plb = victim_planes(pb);
+    let anc_a = anchor_of(land_a & box1(pb), &plb, clone_a);
+    let anc_b = anchor_of(land_b & box1(pa), &pla, clone_b);
+
+    let (mut nu, mut nt) = (0usize, 0usize);
+    if groups & G1 != 0 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                // SAFETY: AVX2 checked above; the arrays hold MAX_ACTIVE >= 64 entries.
+                unsafe {
+                    g1_avx2(pa, pb, empty, clone_a, clone_b, land_a, land_b, nl_a, nl_b, &pla, &plb, &victim_planes(empty), us.as_mut_ptr(), them.as_mut_ptr())
+                };
+            } else {
+                g1_scalar(pa, pb, empty, clone_a, clone_b, land_a, land_b, nl_a, nl_b, us, them);
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        g1_scalar(pa, pb, empty, clone_a, clone_b, land_a, land_b, nl_a, nl_b, us, them);
         nu = SQUARES;
         nt = SQUARES;
     }
@@ -689,6 +841,41 @@ mod tests {
                     let ny = features(&b, 1 - turn, g, &mut y);
                     assert_eq!(&us[..nu], &x[..nx], "us groups {g}");
                     assert_eq!(&them[..nt], &y[..ny], "them groups {g}");
+                }
+            }
+        }
+    }
+
+    /// Boards with blocker squares (the 4th square state): `both` must still equal the per-side reference.
+    #[test]
+    fn both_matches_features_blockers() {
+        let mut seed = 0x0b10_c4e5_7a11_0001u64;
+        let mut next = |seed: &mut u64| {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        };
+        for _ in 0..4000 {
+            let mut b = rand_board(&mut seed);
+            let free = b.empty();
+            let density = next(&mut seed) % 40;
+            let mut blk = 0u64;
+            for sq in 0..49u64 {
+                if free >> sq & 1 == 1 && next(&mut seed) % 100 < density {
+                    blk |= 1 << sq;
+                }
+            }
+            b.blockers = blk;
+            for turn in 0..2usize {
+                b.turn = turn as _;
+                for g in 0..64u32 {
+                    let (us, nu, them, nt) = both(&b, g);
+                    let (mut x, mut y) = ([0u32; MAX_ACTIVE], [0u32; MAX_ACTIVE]);
+                    let nx = features(&b, turn, g, &mut x);
+                    let ny = features(&b, 1 - turn, g, &mut y);
+                    assert_eq!(&us[..nu], &x[..nx], "us groups {g} blockers {blk:#x}");
+                    assert_eq!(&them[..nt], &y[..ny], "them groups {g} blockers {blk:#x}");
                 }
             }
         }
