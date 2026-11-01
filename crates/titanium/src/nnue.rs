@@ -24,6 +24,72 @@ pub const QA: i32 = 1024;
 const MAX_W: usize = 1024;
 const MAX_H: usize = 64;
 
+/// Immutable slice with a 64-byte aligned start (a plain Vec only guarantees the element alignment, so every 512 B
+/// feature row and 64 B L1 column straddled one extra cache line). Deref gives the same indexing as a Vec.
+struct Aligned<T: Copy> {
+    ptr: *mut T,
+    len: usize,
+}
+unsafe impl<T: Copy + Send> Send for Aligned<T> {}
+unsafe impl<T: Copy + Sync> Sync for Aligned<T> {}
+impl<T: Copy> Aligned<T> {
+    fn empty() -> Self {
+        Aligned { ptr: std::ptr::NonNull::dangling().as_ptr(), len: 0 }
+    }
+    fn from_vec(v: Vec<T>) -> Self {
+        if v.is_empty() {
+            return Self::empty();
+        }
+        let layout = std::alloc::Layout::from_size_align(v.len() * std::mem::size_of::<T>(), 64).unwrap();
+        // SAFETY: non-zero size; the copy fills the whole allocation
+        unsafe {
+            let ptr = std::alloc::alloc(layout) as *mut T;
+            assert!(!ptr.is_null(), "out of memory");
+            std::ptr::copy_nonoverlapping(v.as_ptr(), ptr, v.len());
+            Aligned { ptr, len: v.len() }
+        }
+    }
+}
+impl<T: Copy> std::ops::Deref for Aligned<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        // SAFETY: ptr/len describe the live allocation (or a dangling empty slice)
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+impl<T: Copy> Drop for Aligned<T> {
+    fn drop(&mut self) {
+        if self.len != 0 {
+            let layout = std::alloc::Layout::from_size_align(self.len * std::mem::size_of::<T>(), 64).unwrap();
+            // SAFETY: allocated in from_vec with this layout
+            unsafe { std::alloc::dealloc(self.ptr as *mut u8, layout) };
+        }
+    }
+}
+
+/// For each byte mask, the positions of its set bits in ascending order (rest 0): lets the activation scan store 8
+/// candidate indices at once and advance by the popcount instead of looping over bits with a mispredicted exit.
+#[cfg(target_feature = "avx2")]
+const fn bit_pos_table() -> [[u8; 8]; 256] {
+    let mut t = [[0u8; 8]; 256];
+    let mut b = 0;
+    while b < 256 {
+        let mut n = 0;
+        let mut j = 0;
+        while j < 8 {
+            if (b >> j) & 1 != 0 {
+                t[b][n] = j as u8;
+                n += 1;
+            }
+            j += 1;
+        }
+        b += 1;
+    }
+    t
+}
+#[cfg(target_feature = "avx2")]
+static BIT_POS: [[u8; 8]; 256] = bit_pos_table();
+
 pub struct Nnue {
     pub num_feats: usize,
     pub width: usize,
@@ -48,14 +114,14 @@ pub struct Nnue {
     s57w: Vec<f32>,
     dis_w: Vec<f32>,
     dis_b: Vec<f32>,
-    ftq: Vec<i16>,
+    ftq: Aligned<i16>,
     ftbq: Vec<i16>,
     /// l1 weights transposed per bucket: [bucket][din][l1] (one contiguous l1 column per input, for sparse L1)
-    l1_wt: Vec<f32>,
+    l1_wt: Aligned<f32>,
     /// l2 weights transposed per bucket: [bucket][l1 input][l2 output] (so 8 outputs can be summed side by side)
-    l2_wt: Vec<f32>,
+    l2_wt: Aligned<f32>,
     /// psqt transposed: [bucket][feature] (one bucket's column is contiguous: ~105 KB, stays in L2)
-    psqt_t: Vec<f32>,
+    psqt_t: Aligned<f32>,
 }
 
 impl Nnue {
@@ -116,11 +182,11 @@ impl Nnue {
             s57w: if v2 { take(buckets) } else { Vec::new() },
             dis_w: if has_dis { take(buckets * (l1 + l2)) } else { Vec::new() },
             dis_b: if has_dis { take(buckets) } else { Vec::new() },
-            ftq: Vec::new(),
+            ftq: Aligned::empty(),
             ftbq: Vec::new(),
-            l1_wt: Vec::new(),
-            l2_wt: Vec::new(),
-            psqt_t: Vec::new(),
+            l1_wt: Aligned::empty(),
+            l2_wt: Aligned::empty(),
+            psqt_t: Aligned::empty(),
             num_feats,
             width,
             l1,
@@ -146,12 +212,12 @@ impl Nnue {
                 None
             }
         };
-        net.ftq = net
+        net.ftq = Aligned::from_vec(net
             .ft
             .iter()
             .map(q)
             .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| bad("ft weight overflows int16 at QA"))?;
+            .ok_or_else(|| bad("ft weight overflows int16 at QA"))?);
         net.ftbq = net
             .ftb
             .iter()
@@ -171,7 +237,7 @@ impl Nnue {
                 }
             }
         }
-        net.l1_wt = t;
+        net.l1_wt = Aligned::from_vec(t);
         let mut t2 = vec![0f32; net.buckets * net.l1 * net.l2];
         for bk in 0..net.buckets {
             for j in 0..net.l2 {
@@ -180,14 +246,14 @@ impl Nnue {
                 }
             }
         }
-        net.l2_wt = t2;
+        net.l2_wt = Aligned::from_vec(t2);
         let mut pt = vec![0f32; net.buckets * net.num_feats];
         for f in 0..net.num_feats {
             for bk in 0..net.buckets {
                 pt[bk * net.num_feats + f] = net.psqt[f * net.buckets + bk];
             }
         }
-        net.psqt_t = pt;
+        net.psqt_t = Aligned::from_vec(pt);
         Ok(net)
     }
 
@@ -331,7 +397,7 @@ impl Nnue {
         let base = bucket * din * l1;
         // nonzero inputs collected branch-free (no mispredicts on the ~86% zeros), then summed in ascending input order:
         // exactly the terms and order of the plain sparse loop, so the result is bit-identical
-        let mut nz_buf = std::mem::MaybeUninit::<[u16; 2 * MAX_W]>::uninit();
+        let mut nz_buf = std::mem::MaybeUninit::<[u16; 2 * MAX_W + 8]>::uninit();
         let nzp = nz_buf.as_mut_ptr() as *mut u16;
         let mut cnt = 0usize;
         if self.pairwise {
@@ -350,7 +416,7 @@ impl Nnue {
                 let a = &acc[half * w..(half + 1) * w];
                 for base in (0..w).step_by(32) {
                     // SAFETY: AVX2 is enabled at compile time; base + 32 <= w <= MAX_W so both 16-lane loads are in bounds.
-                    let mut m = unsafe {
+                    let m = unsafe {
                         let z = _mm256_setzero_si256();
                         let p = a.as_ptr().add(base) as *const __m256i;
                         let c0 = _mm256_cmpgt_epi16(_mm256_loadu_si256(p), z);
@@ -359,10 +425,17 @@ impl Nnue {
                         let pk = _mm256_permute4x64_epi64::<0xD8>(_mm256_packs_epi16(c0, c1));
                         _mm256_movemask_epi8(pk) as u32
                     };
-                    while m != 0 {
-                        unsafe { *nzp.add(cnt) = (half * w + base + m.trailing_zeros() as usize) as u16 };
-                        cnt += 1;
-                        m &= m - 1;
+                    // four mask bytes: each byte's set-bit positions come from a table and are stored 8 at a time (entries
+                    // past the popcount are overwritten by the next store); no data-dependent branches, same indices, same order
+                    for k in 0..4 {
+                        let byte = ((m >> (8 * k)) & 0xFF) as usize;
+                        // SAFETY: the 8-entry store starts at cnt <= 2 * w - 1 and the buffer has 8 spare entries
+                        unsafe {
+                            let idx = _mm_cvtepu8_epi16(_mm_loadl_epi64(BIT_POS[byte].as_ptr() as *const __m128i));
+                            let off = _mm_set1_epi16((half * w + base + 8 * k) as i16);
+                            _mm_storeu_si128(nzp.add(cnt) as *mut __m128i, _mm_add_epi16(idx, off));
+                        }
+                        cnt += byte.count_ones() as usize;
                     }
                 }
             }
@@ -397,17 +470,39 @@ impl Nnue {
         let nz: &[u16] = unsafe { std::slice::from_raw_parts(nzp, cnt) };
         if !self.pairwise && l1 == 16 {
             // accumulator held in registers; no division per input; per-lane add order = ascending input order, as before
-            let mut h = [0f32; 16];
-            h.copy_from_slice(&h1[..16]);
-            for &i in nz {
-                let i = i as usize;
-                let v = acc[i].clamp(0, qa) as f32 * inv;
-                let col: &[f32; 16] = self.l1_wt[base + i * 16..base + i * 16 + 16].try_into().unwrap();
-                for j in 0..16 {
-                    h[j] += v * col[j];
+            #[cfg(target_feature = "avx2")]
+            {
+                use std::arch::x86_64::*;
+                // SAFETY: AVX2 is enabled at compile time; h1 has >= 16 lanes and every column slice is 16 floats.
+                // mul then add (no fused multiply-add): the per-lane result is the same sequential sum as the scalar loop
+                unsafe {
+                    let mut h0 = _mm256_loadu_ps(h1.as_ptr());
+                    let mut h8 = _mm256_loadu_ps(h1.as_ptr().add(8));
+                    for &i in nz {
+                        let i = i as usize;
+                        let v = _mm256_set1_ps(acc[i].clamp(0, qa) as f32 * inv);
+                        let col = self.l1_wt[base + i * 16..base + i * 16 + 16].as_ptr();
+                        h0 = _mm256_add_ps(h0, _mm256_mul_ps(v, _mm256_loadu_ps(col)));
+                        h8 = _mm256_add_ps(h8, _mm256_mul_ps(v, _mm256_loadu_ps(col.add(8))));
+                    }
+                    _mm256_storeu_ps(h1.as_mut_ptr(), h0);
+                    _mm256_storeu_ps(h1.as_mut_ptr().add(8), h8);
                 }
             }
-            h1[..16].copy_from_slice(&h);
+            #[cfg(not(target_feature = "avx2"))]
+            {
+                let mut h = [0f32; 16];
+                h.copy_from_slice(&h1[..16]);
+                for &i in nz {
+                    let i = i as usize;
+                    let v = acc[i].clamp(0, qa) as f32 * inv;
+                    let col: &[f32; 16] = self.l1_wt[base + i * 16..base + i * 16 + 16].try_into().unwrap();
+                    for j in 0..16 {
+                        h[j] += v * col[j];
+                    }
+                }
+                h1[..16].copy_from_slice(&h);
+            }
         } else {
             for &i in nz {
                 let i = i as usize;
