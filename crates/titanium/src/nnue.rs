@@ -478,12 +478,40 @@ impl Nnue {
                 unsafe {
                     let mut h0 = _mm256_loadu_ps(h1.as_ptr());
                     let mut h8 = _mm256_loadu_ps(h1.as_ptr().add(8));
-                    for &i in nz {
-                        let i = i as usize;
-                        let v = _mm256_set1_ps(acc[i].clamp(0, qa) as f32 * inv);
-                        let col = self.l1_wt[base + i * 16..base + i * 16 + 16].as_ptr();
-                        h0 = _mm256_add_ps(h0, _mm256_mul_ps(v, _mm256_loadu_ps(col)));
-                        h8 = _mm256_add_ps(h8, _mm256_mul_ps(v, _mm256_loadu_ps(col.add(8))));
+                    if w % 8 == 0 {
+                        // every lane's activation once, vectorised (clamp to [0, QA], exact int -> f32, times 1/QA: the same
+                        // three operations as the scalar form); the input loop then only broadcasts and multiply-adds
+                        let mut vals = std::mem::MaybeUninit::<[f32; 2 * MAX_W]>::uninit();
+                        let vp = vals.as_mut_ptr() as *mut f32;
+                        let zero = _mm256_setzero_si256();
+                        let top = _mm256_set1_epi16(qa);
+                        let invv = _mm256_set1_ps(inv);
+                        for c in (0..2 * w).step_by(16) {
+                            let x = _mm256_loadu_si256(acc.as_ptr().add(c) as *const __m256i);
+                            let x = _mm256_min_epi16(_mm256_max_epi16(x, zero), top);
+                            let lo = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(x)));
+                            let hi = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(x)));
+                            _mm256_storeu_ps(vp.add(c), _mm256_mul_ps(lo, invv));
+                            _mm256_storeu_ps(vp.add(c + 8), _mm256_mul_ps(hi, invv));
+                        }
+                        assert!(base + din * 16 <= self.l1_wt.len());
+                        let wt = self.l1_wt.as_ptr().add(base);
+                        for &i in nz {
+                            // i < 2 * w = din, so the 16-float column and the activation are in bounds
+                            let i = i as usize;
+                            let v = _mm256_broadcast_ss(&*vp.add(i));
+                            let col = wt.add(i * 16);
+                            h0 = _mm256_add_ps(h0, _mm256_mul_ps(v, _mm256_loadu_ps(col)));
+                            h8 = _mm256_add_ps(h8, _mm256_mul_ps(v, _mm256_loadu_ps(col.add(8))));
+                        }
+                    } else {
+                        for &i in nz {
+                            let i = i as usize;
+                            let v = _mm256_set1_ps(acc[i].clamp(0, qa) as f32 * inv);
+                            let col = self.l1_wt[base + i * 16..base + i * 16 + 16].as_ptr();
+                            h0 = _mm256_add_ps(h0, _mm256_mul_ps(v, _mm256_loadu_ps(col)));
+                            h8 = _mm256_add_ps(h8, _mm256_mul_ps(v, _mm256_loadu_ps(col.add(8))));
+                        }
                     }
                     _mm256_storeu_ps(h1.as_mut_ptr(), h0);
                     _mm256_storeu_ps(h1.as_mut_ptr().add(8), h8);

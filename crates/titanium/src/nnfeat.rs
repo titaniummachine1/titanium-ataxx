@@ -141,6 +141,28 @@ fn planes_max(cand: u64, p: &[u64; 4]) -> u32 {
     best
 }
 
+/// Anchor of one perspective without per-square branches: among the candidate squares (landable by us, next to an enemy
+/// stone) the ones with the most adjacent enemy stones (read off the victim planes), then clone landings before jumps,
+/// then the lowest square: exactly the winner of the ascending scan with a strict (victims, clone) comparison.
+#[inline(always)]
+fn anchor_of(cand: u64, enemy_planes: &[u64; 4], clone: u64) -> usize {
+    if cand == 0 {
+        return usize::MAX;
+    }
+    let mut m = cand;
+    for k in (0..4).rev() {
+        let x = m & enemy_planes[k];
+        if x != 0 {
+            m = x;
+        }
+    }
+    let c = m & clone;
+    if c != 0 {
+        m = c;
+    }
+    m.trailing_zeros() as usize
+}
+
 #[cfg(test)]
 #[inline]
 fn landing_ref(stones: u64, empty: u64) -> u64 {
@@ -164,8 +186,7 @@ fn best_capture_ref(attacker: u64, victims: u64, empty: u64) -> u32 {
 /// G5 for one perspective: per clone square the enemy's best reply capture, from base victim planes of `own` plus a
 /// bit-sliced increment per added stone (the clone and the converted stones); enemy landing reuses `land_e` when nothing converts.
 #[inline(always)]
-fn g5_block(own: u64, en: u64, empty: u64, clone_o: u64, land_e: u64, out: &mut [u32; MAX_ACTIVE], n: &mut usize) {
-    let base = victim_planes(own);
+fn g5_block(own: u64, en: u64, empty: u64, clone_o: u64, land_e: u64, base: [u64; 4], out: &mut [u32; MAX_ACTIVE], n: &mut usize) {
     let du_own = box1(own);
     let mut c = clone_o;
     while c != 0 {
@@ -279,7 +300,7 @@ pub fn features(b: &Board, side: usize, groups: u32, out: &mut [u32; MAX_ACTIVE]
         }
     }
     if groups & G5 != 0 {
-        g5_block(own, en, empty, clone_o, land_e, out, &mut n);
+        g5_block(own, en, empty, clone_o, land_e, victim_planes(own), out, &mut n);
     }
     if groups & G6 != 0 {
         let e = empty.count_ones() as usize;
@@ -408,12 +429,15 @@ pub fn both(b: &Board, groups: u32) -> ([u32; MAX_ACTIVE], usize, [u32; MAX_ACTI
     let land_b = landing(pb, empty);
     let nl_a = box1(land_a);
     let nl_b = box1(land_b);
+    // neighbour-count planes of each side's stones: they drive both the anchors and the G5 base
+    let pla = victim_planes(pa);
+    let plb = victim_planes(pb);
+    let anc_a = anchor_of(land_a & box1(pb), &plb, clone_a);
+    let anc_b = anchor_of(land_b & box1(pa), &pla, clone_b);
 
     let mut us = [0u32; MAX_ACTIVE];
     let mut them = [0u32; MAX_ACTIVE];
     let (mut nu, mut nt) = (0usize, 0usize);
-    let (mut anc_a, mut anc_b) = (usize::MAX, usize::MAX);
-    let (mut best_a, mut best_b) = ((0u32, 0u32), (0u32, 0u32));
     let mut ca = [0u16; SQUARES];
     let mut cb = [0u16; SQUARES];
     let mut m = pa;
@@ -447,20 +471,6 @@ pub fn both(b: &Board, groups: u32) -> ([u32; MAX_ACTIVE], usize, [u32; MAX_ACTI
         let ge = (ring & pa).count_ones();
         let ro = if (clone_a >> sq) & 1 != 0 { 2 } else { ((land_a >> sq) & 1) as usize };
         let re = if (clone_b >> sq) & 1 != 0 { 2 } else { ((land_b >> sq) & 1) as usize };
-        if ro > 0 && go > 0 {
-            let key = (go, (ro == 2) as u32);
-            if key > best_a {
-                best_a = key;
-                anc_a = sq;
-            }
-        }
-        if re > 0 && ge > 0 {
-            let key = (ge, (re == 2) as u32);
-            if key > best_b {
-                best_b = key;
-                anc_b = sq;
-            }
-        }
         ca[sq] = (36 + ((ro * 3 + re) * 5 + go.min(4) as usize) * 5 + ge.min(4) as usize) as u16;
         cb[sq] = (36 + ((re * 3 + ro) * 5 + ge.min(4) as usize) * 5 + go.min(4) as usize) as u16;
         m &= m - 1;
@@ -505,8 +515,8 @@ pub fn both(b: &Board, groups: u32) -> ([u32; MAX_ACTIVE], usize, [u32; MAX_ACTI
         }
     }
     if groups & G5 != 0 {
-        g5_block(pa, pb, empty, clone_a, land_b, &mut us, &mut nu);
-        g5_block(pb, pa, empty, clone_b, land_a, &mut them, &mut nt);
+        g5_block(pa, pb, empty, clone_a, land_b, pla, &mut us, &mut nu);
+        g5_block(pb, pa, empty, clone_b, land_a, plb, &mut them, &mut nt);
     }
     if groups & G6 != 0 {
         let e = empty.count_ones() as usize;

@@ -91,5 +91,11 @@ fn main() {
     }
     let full = t.elapsed().as_secs_f64() / n * 1e6;
     println!("full eval        {:.2} us/eval  ({})", full, s3);
+    // raw f32 eval bit patterns, order-sensitive: any rounding change anywhere in the head shows up here
+    let mut bits = 0u64;
+    for b in boards.iter().take(5000) {
+        bits = bits.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(net.forward(b, 0.0).to_bits() as u64);
+    }
+    println!("f32 eval bits checksum {bits:016x}");
     println!("=> features {:.2} | FT sum {:.2} | head {:.2} us", f, ft - f, full - ft);
 }
