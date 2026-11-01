@@ -116,6 +116,9 @@ pub struct Nnue {
     dis_b: Vec<f32>,
     ftq: Aligned<i16>,
     ftbq: Vec<i16>,
+    /// bias + the three always-active G6 rows pre-summed for every (phase, bucket, bucket, parity) key (1,600 rows):
+    /// wrapping i16 adds commute, so starting the accumulator from this row is bit-identical and saves two row loads
+    g6tab: Option<Aligned<i16>>,
     /// l1 weights transposed per bucket: [bucket][din][l1] (one contiguous l1 column per input, for sparse L1)
     l1_wt: Aligned<f32>,
     /// l2 weights transposed per bucket: [bucket][l1 input][l2 output] (so 8 outputs can be summed side by side)
@@ -184,6 +187,7 @@ impl Nnue {
             dis_b: if has_dis { take(buckets) } else { Vec::new() },
             ftq: Aligned::empty(),
             ftbq: Vec::new(),
+            g6tab: None,
             l1_wt: Aligned::empty(),
             l2_wt: Aligned::empty(),
             psqt_t: Aligned::empty(),
@@ -224,6 +228,28 @@ impl Nnue {
             .map(q)
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| bad("ft bias overflows int16 at QA"))?;
+        if net.groups & nnfeat::G6 != 0 && net.width % 128 == 0 && net.num_feats == nnfeat::NUM_FEATS {
+            let w = net.width;
+            let mut tab = vec![0i16; 1600 * w];
+            for f1 in 0..80usize {
+                let phase = f1 / 10;
+                for bb in 0..10usize {
+                    for par in 0..2usize {
+                        let key = (f1 * 10 + bb) * 2 + par;
+                        let r1 = nnfeat::G6_OFF + f1;
+                        let r2 = nnfeat::G6_OFF + 80 + phase * 10 + bb;
+                        let r3 = nnfeat::G6_PAR_OFF + phase * 2 + par;
+                        for j in 0..w {
+                            tab[key * w + j] = net.ftbq[j]
+                                .wrapping_add(net.ftq[r1 * w + j])
+                                .wrapping_add(net.ftq[r2 * w + j])
+                                .wrapping_add(net.ftq[r3 * w + j]);
+                        }
+                    }
+                }
+            }
+            net.g6tab = Some(Aligned::from_vec(tab));
+        }
         let din = if net.pairwise {
             net.width
         } else {
@@ -312,8 +338,20 @@ impl Nnue {
         let mut acc_buf = std::mem::MaybeUninit::<[i16; 2 * MAX_W]>::uninit();
         let accp = acc_buf.as_mut_ptr() as *mut i16;
         for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
+            let idx = &idx[..n];
+            // the last three entries are the G6 rows (G6 is the last group): replace them and the bias by one pre-summed row
+            let (init, rows) = match &self.g6tab {
+                Some(tab) if n >= 3 => {
+                    let f1 = idx[n - 3] as usize - nnfeat::G6_OFF;
+                    let bb = (idx[n - 2] as usize - nnfeat::G6_OFF) % 10;
+                    let par = (idx[n - 1] as usize - nnfeat::G6_PAR_OFF) & 1;
+                    let key = (f1 * 10 + bb) * 2 + par;
+                    (&tab[key * w..(key + 1) * w], &idx[..n - 3])
+                }
+                _ => (&self.ftbq[..w], idx),
+            };
             // SAFETY: half * w + w <= 2 * MAX_W; ft_sum initialises all w lanes of this half
-            unsafe { self.ft_sum(accp.add(half * w), w, &idx[..n]) };
+            unsafe { self.ft_sum(accp.add(half * w), w, rows, init) };
         }
         // SAFETY: both halves (2 * w lanes) were just fully written
         let acc: &[i16] = unsafe { std::slice::from_raw_parts(accp, 2 * w) };
@@ -338,10 +376,10 @@ impl Nnue {
     /// a = bias + sum of the active rows (wrapping i16, so any order is bit-identical). The accumulator is kept in
     /// registers one CH-lane block at a time: each row costs one load+add per vector instead of load/add/store.
     #[inline(always)]
-    unsafe fn ft_sum(&self, out: *mut i16, w: usize, idx: &[u32]) {
+    unsafe fn ft_sum(&self, out: *mut i16, w: usize, idx: &[u32], init: &[i16]) {
         const CH: usize = 128;
         if w % CH != 0 {
-            std::ptr::copy_nonoverlapping(self.ftbq.as_ptr(), out, w);
+            std::ptr::copy_nonoverlapping(init.as_ptr(), out, w);
             let a = std::slice::from_raw_parts_mut(out, w);
             for &f in idx {
                 let row = &self.ftq[f as usize * w..(f as usize + 1) * w];
@@ -354,7 +392,7 @@ impl Nnue {
         let n = idx.len();
         for c in (0..w).step_by(CH) {
             let mut r = [0i16; CH];
-            r.copy_from_slice(&self.ftbq[c..c + CH]);
+            r.copy_from_slice(&init[c..c + CH]);
             for k in 0..n {
                 let f = idx[k] as usize;
                 let row = &self.ftq[f * w + c..f * w + c + CH];
@@ -377,7 +415,7 @@ impl Nnue {
         for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
             let idx = &idx[..n];
             // SAFETY: w <= MAX_W
-            unsafe { self.ft_sum(acc[half].as_mut_ptr(), w, idx) };
+            unsafe { self.ft_sum(acc[half].as_mut_ptr(), w, idx, &self.ftbq[..w]) };
             for &f in idx {
                 ps[half] += pst[f as usize];
             }
