@@ -161,6 +161,37 @@ fn best_capture_ref(attacker: u64, victims: u64, empty: u64) -> u32 {
     best
 }
 
+/// G5 for one perspective: per clone square the enemy's best reply capture, from base victim planes of `own` plus a
+/// bit-sliced increment per added stone (the clone and the converted stones); enemy landing reuses `land_e` when nothing converts.
+#[inline(always)]
+fn g5_block(own: u64, en: u64, empty: u64, clone_o: u64, land_e: u64, out: &mut [u32; MAX_ACTIVE], n: &mut usize) {
+    let base = victim_planes(own);
+    let du_own = box1(own);
+    let mut c = clone_o;
+    while c != 0 {
+        let s = c.trailing_zeros() as usize;
+        let sbit = 1u64 << s;
+        let conv = en & RING1[s];
+        let mut p = base;
+        planes_add(&mut p, RING1[s]);
+        let mut near = du_own | RING1[s];
+        let mut cv = conv;
+        while cv != 0 {
+            let x = cv.trailing_zeros() as usize;
+            planes_add(&mut p, RING1[x]);
+            near |= RING1[x];
+            cv &= cv - 1;
+        }
+        let land2 = if conv == 0 { land_e & !sbit } else { box1(box1(en & !conv)) & (empty & !sbit) };
+        let cand = land2 & near;
+        let best_rep = if cand == 0 { 0 } else { planes_max(cand, &p) };
+        let v = 1 + conv.count_ones() as i32 - best_rep as i32;
+        out[*n] = (G5_OFF + s * 9 + (v.clamp(-3, 5) + 3) as usize) as u32;
+        *n += 1;
+        c &= c - 1;
+    }
+}
+
 /// Active feature indices for perspective `side` (0 black / 1 white), restricted to `groups`.
 /// Returns the count written into `out`.
 pub fn features(b: &Board, side: usize, groups: u32, out: &mut [u32; MAX_ACTIVE]) -> usize {
@@ -248,33 +279,7 @@ pub fn features(b: &Board, side: usize, groups: u32, out: &mut [u32; MAX_ACTIVE]
         }
     }
     if groups & G5 != 0 {
-        // per clone square the enemy's best reply capture, from base victim planes of `own` plus a bit-sliced
-        // increment per added stone (the clone and the converted stones); enemy landing reuses `land_e` when nothing converts
-        let base = victim_planes(own);
-        let du_own = box1(own);
-        let mut c = clone_o;
-        while c != 0 {
-            let s = c.trailing_zeros() as usize;
-            let sbit = 1u64 << s;
-            let conv = en & RING1[s];
-            let mut p = base;
-            planes_add(&mut p, RING1[s]);
-            let mut near = du_own | RING1[s];
-            let mut cv = conv;
-            while cv != 0 {
-                let x = cv.trailing_zeros() as usize;
-                planes_add(&mut p, RING1[x]);
-                near |= RING1[x];
-                cv &= cv - 1;
-            }
-            let land2 = if conv == 0 { land_e & !sbit } else { box1(box1(en & !conv)) & (empty & !sbit) };
-            let cand = land2 & near;
-            let best_rep = if cand == 0 { 0 } else { planes_max(cand, &p) };
-            let v = 1 + conv.count_ones() as i32 - best_rep as i32;
-            out[n] = (G5_OFF + s * 9 + (v.clamp(-3, 5) + 3) as usize) as u32;
-            n += 1;
-            c &= c - 1;
-        }
+        g5_block(own, en, empty, clone_o, land_e, out, &mut n);
     }
     if groups & G6 != 0 {
         let e = empty.count_ones() as usize;
@@ -389,13 +394,134 @@ pub fn features_ref(b: &Board, side: usize, groups: u32, out: &mut [u32; MAX_ACT
     n
 }
 
-/// Both perspectives, side to move first: (us, n_us, them, n_them).
+/// Both perspectives, side to move first: (us, n_us, them, n_them). One joint pass: the landing sets, the stone
+/// codes (they differ by 18 between the perspectives) and the G3 neighbour counts (perspective independent) are
+/// computed once; each output equals `features` for that side, in the same order.
 pub fn both(b: &Board, groups: u32) -> ([u32; MAX_ACTIVE], usize, [u32; MAX_ACTIVE], usize) {
     let stm = b.turn as usize;
+    let pa = b.occ[stm];
+    let pb = b.occ[1 - stm];
+    let empty = b.empty();
+    let clone_a = box1(pa) & empty;
+    let clone_b = box1(pb) & empty;
+    let land_a = landing(pa, empty);
+    let land_b = landing(pb, empty);
+    let nl_a = box1(land_a);
+    let nl_b = box1(land_b);
+
     let mut us = [0u32; MAX_ACTIVE];
     let mut them = [0u32; MAX_ACTIVE];
-    let nu = features(b, stm, groups, &mut us);
-    let nt = features(b, 1 - stm, groups, &mut them);
+    let (mut nu, mut nt) = (0usize, 0usize);
+    let (mut anc_a, mut anc_b) = (usize::MAX, usize::MAX);
+    let (mut best_a, mut best_b) = ((0u32, 0u32), (0u32, 0u32));
+    let mut ca = [0u16; SQUARES];
+    let mut cb = [0u16; SQUARES];
+    let mut m = pa;
+    while m != 0 {
+        let sq = m.trailing_zeros() as usize;
+        let c = (((nl_b >> sq) & 1) as usize) * 9 + (RING1[sq] & empty).count_ones() as usize;
+        ca[sq] = c as u16;
+        cb[sq] = (c + 18) as u16;
+        m &= m - 1;
+    }
+    let mut m = pb;
+    while m != 0 {
+        let sq = m.trailing_zeros() as usize;
+        let c = (((nl_a >> sq) & 1) as usize) * 9 + (RING1[sq] & empty).count_ones() as usize;
+        ca[sq] = (c + 18) as u16;
+        cb[sq] = c as u16;
+        m &= m - 1;
+    }
+    let mut m = FULL & !(pa | pb | empty);
+    while m != 0 {
+        let sq = m.trailing_zeros() as usize;
+        ca[sq] = BLOCKER_CODE as u16;
+        cb[sq] = BLOCKER_CODE as u16;
+        m &= m - 1;
+    }
+    let mut m = empty;
+    while m != 0 {
+        let sq = m.trailing_zeros() as usize;
+        let ring = RING1[sq];
+        let go = (ring & pb).count_ones();
+        let ge = (ring & pa).count_ones();
+        let ro = if (clone_a >> sq) & 1 != 0 { 2 } else { ((land_a >> sq) & 1) as usize };
+        let re = if (clone_b >> sq) & 1 != 0 { 2 } else { ((land_b >> sq) & 1) as usize };
+        if ro > 0 && go > 0 {
+            let key = (go, (ro == 2) as u32);
+            if key > best_a {
+                best_a = key;
+                anc_a = sq;
+            }
+        }
+        if re > 0 && ge > 0 {
+            let key = (ge, (re == 2) as u32);
+            if key > best_b {
+                best_b = key;
+                anc_b = sq;
+            }
+        }
+        ca[sq] = (36 + ((ro * 3 + re) * 5 + go.min(4) as usize) * 5 + ge.min(4) as usize) as u16;
+        cb[sq] = (36 + ((re * 3 + ro) * 5 + ge.min(4) as usize) * 5 + go.min(4) as usize) as u16;
+        m &= m - 1;
+    }
+    if groups & G1 != 0 {
+        for sq in 0..SQUARES {
+            us[sq] = (G1_OFF + sq * SQ_STATES + ca[sq] as usize) as u32;
+            them[sq] = (G1_OFF + sq * SQ_STATES + cb[sq] as usize) as u32;
+        }
+        nu = SQUARES;
+        nt = SQUARES;
+    }
+    if groups & G2 != 0 {
+        for (anchor, en, out, n) in [(anc_a, pb, &mut us, &mut nu), (anc_b, pa, &mut them, &mut nt)] {
+            if anchor == usize::MAX {
+                out[*n] = G2_NONE as u32;
+                *n += 1;
+            } else {
+                let mut stones = (pa | pb) & BOX2[anchor];
+                while stones != 0 {
+                    let t = stones.trailing_zeros() as usize;
+                    out[*n] = (G2_OFF + (anchor * SQUARES + t) * 2 + ((en >> t) & 1) as usize) as u32;
+                    *n += 1;
+                    stones &= stones - 1;
+                }
+            }
+        }
+    }
+    if groups & G3 != 0 {
+        let mut stones = pa | pb;
+        while stones != 0 {
+            let t = stones.trailing_zeros() as usize;
+            let col_a = ((pb >> t) & 1) as usize;
+            let (same, other) = if col_a == 0 { (pa, pb) } else { (pb, pa) };
+            let on = (RING1[t] & same).count_ones() as usize;
+            let ef = (RING1[t] & other).count_ones() as usize;
+            us[nu] = (G3_OFF + ((t * 2 + col_a) * 9 + on) * 9 + ef) as u32;
+            them[nt] = (G3_OFF + ((t * 2 + 1 - col_a) * 9 + on) * 9 + ef) as u32;
+            nu += 1;
+            nt += 1;
+            stones &= stones - 1;
+        }
+    }
+    if groups & G5 != 0 {
+        g5_block(pa, pb, empty, clone_a, land_b, &mut us, &mut nu);
+        g5_block(pb, pa, empty, clone_b, land_a, &mut them, &mut nt);
+    }
+    if groups & G6 != 0 {
+        let e = empty.count_ones() as usize;
+        let phase = (e / 7).min(7);
+        let ba = (land_a.count_ones() as usize / 3).min(9);
+        let bb = (land_b.count_ones() as usize / 3).min(9);
+        us[nu] = (G6_OFF + phase * 10 + ba) as u32;
+        us[nu + 1] = (G6_OFF + (8 + phase) * 10 + bb) as u32;
+        us[nu + 2] = (G6_PAR_OFF + phase * 2 + (e & 1)) as u32;
+        nu += 3;
+        them[nt] = (G6_OFF + phase * 10 + bb) as u32;
+        them[nt + 1] = (G6_OFF + (8 + phase) * 10 + ba) as u32;
+        them[nt + 2] = (G6_PAR_OFF + phase * 2 + (e & 1)) as u32;
+        nt += 3;
+    }
     (us, nu, them, nt)
 }
 
@@ -525,6 +651,26 @@ mod tests {
                     let nx = features(&b, side, g, &mut x);
                     let ny = features_ref(&b, side, g, &mut y);
                     assert_eq!(&x[..nx], &y[..ny], "groups {g}");
+                }
+            }
+        }
+    }
+
+    /// The joint `both` equals two independent `features` calls for every board, side to move and group mask.
+    #[test]
+    fn both_matches_features() {
+        let mut seed = 0x5eed_0001_9e37_79b9u64;
+        for _ in 0..4000 {
+            let mut b = rand_board(&mut seed);
+            for turn in 0..2usize {
+                b.turn = turn as _;
+                for g in 0..64u32 {
+                    let (us, nu, them, nt) = both(&b, g);
+                    let (mut x, mut y) = ([0u32; MAX_ACTIVE], [0u32; MAX_ACTIVE]);
+                    let nx = features(&b, turn, g, &mut x);
+                    let ny = features(&b, 1 - turn, g, &mut y);
+                    assert_eq!(&us[..nu], &x[..nx], "us groups {g}");
+                    assert_eq!(&them[..nt], &y[..ny], "them groups {g}");
                 }
             }
         }

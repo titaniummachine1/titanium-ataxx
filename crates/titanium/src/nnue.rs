@@ -239,12 +239,16 @@ impl Nnue {
         let empties = b.empty().count_ones() as usize;
         let bucket = (empties * self.buckets / 50).min(self.buckets - 1);
         let pst = &self.psqt_t[bucket * self.num_feats..(bucket + 1) * self.num_feats];
-        let mut acc = [[0i16; MAX_W]; 2];
+        // both halves live back to back in one uninitialised scratch (every lane is written by ft_sum before it is read):
+        // no 4 KB zero-fill per eval and half the stack lines touched
+        let mut acc_buf = std::mem::MaybeUninit::<[i16; 2 * MAX_W]>::uninit();
+        let accp = acc_buf.as_mut_ptr() as *mut i16;
         for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
-            let a = &mut acc[half][..w];
-            let idx = &idx[..n];
-            self.ft_sum(a, idx);
+            // SAFETY: half * w + w <= 2 * MAX_W; ft_sum initialises all w lanes of this half
+            unsafe { self.ft_sum(accp.add(half * w), w, &idx[..n]) };
         }
+        // SAFETY: both halves (2 * w lanes) were just fully written
+        let acc: &[i16] = unsafe { std::slice::from_raw_parts(accp, 2 * w) };
         // the two sides' position-weight sums are independent float chains: run them side by side (each keeps its order)
         let (iu, it) = (&us[..nu], &them[..nt]);
         let m = nu.min(nt);
@@ -260,17 +264,17 @@ impl Nnue {
             p1 += pst[f as usize];
         }
         let ps = [p0, p1];
-        self.head_with_dis(&acc, bucket, ps, s57)
+        self.head_with_dis(acc, bucket, ps, s57)
     }
 
     /// a = bias + sum of the active rows (wrapping i16, so any order is bit-identical). The accumulator is kept in
     /// registers one CH-lane block at a time: each row costs one load+add per vector instead of load/add/store.
     #[inline(always)]
-    fn ft_sum(&self, a: &mut [i16], idx: &[u32]) {
+    unsafe fn ft_sum(&self, out: *mut i16, w: usize, idx: &[u32]) {
         const CH: usize = 128;
-        let w = a.len();
         if w % CH != 0 {
-            a.copy_from_slice(&self.ftbq[..w]);
+            std::ptr::copy_nonoverlapping(self.ftbq.as_ptr(), out, w);
+            let a = std::slice::from_raw_parts_mut(out, w);
             for &f in idx {
                 let row = &self.ftq[f as usize * w..(f as usize + 1) * w];
                 for (x, r) in a.iter_mut().zip(row) {
@@ -290,7 +294,7 @@ impl Nnue {
                     r[j] = r[j].wrapping_add(row[j]);
                 }
             }
-            a[c..c + CH].copy_from_slice(&r);
+            std::ptr::copy_nonoverlapping(r.as_ptr(), out.add(c), CH);
         }
     }
 
@@ -303,9 +307,9 @@ impl Nnue {
         let mut acc = [[0i16; MAX_W]; 2];
         let mut ps = [0f32; 2];
         for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
-            let a = &mut acc[half][..w];
             let idx = &idx[..n];
-            self.ft_sum(a, idx);
+            // SAFETY: w <= MAX_W
+            unsafe { self.ft_sum(acc[half].as_mut_ptr(), w, idx) };
             for &f in idx {
                 ps[half] += pst[f as usize];
             }
@@ -316,7 +320,7 @@ impl Nnue {
     /// Everything after the feature transformer: int16 accumulators -> activations -> sparse L1 -> L2 -> output.
     /// Activations are computed on the fly (no zeroed scratch array); arithmetic and order are exactly as before.
     #[inline(always)]
-    fn head_with_dis(&self, acc: &[[i16; MAX_W]; 2], bucket: usize, ps: [f32; 2], s57: f32) -> (f32, i32) {
+    fn head_with_dis(&self, acc: &[i16], bucket: usize, ps: [f32; 2], s57: f32) -> (f32, i32) {
         let w = self.width;
         let inv = 1.0 / QA as f32;
         let qa = QA as i16;
@@ -327,14 +331,15 @@ impl Nnue {
         let base = bucket * din * l1;
         // nonzero inputs collected branch-free (no mispredicts on the ~86% zeros), then summed in ascending input order:
         // exactly the terms and order of the plain sparse loop, so the result is bit-identical
-        let mut nz = [0u16; 2 * MAX_W];
+        let mut nz_buf = std::mem::MaybeUninit::<[u16; 2 * MAX_W]>::uninit();
+        let nzp = nz_buf.as_mut_ptr() as *mut u16;
         let mut cnt = 0usize;
         if self.pairwise {
             let h = w / 2;
             for half in 0..2 {
-                let a = &acc[half];
+                let a = &acc[half * w..(half + 1) * w];
                 for j in 0..h {
-                    nz[cnt] = (half * h + j) as u16;
+                    unsafe { *nzp.add(cnt) = (half * h + j) as u16 };
                     cnt += (a[j] > 0 && a[h + j] > 0) as usize;
                 }
             }
@@ -342,7 +347,7 @@ impl Nnue {
             #[cfg(target_feature = "avx2")]
             for half in 0..2 {
                 use std::arch::x86_64::*;
-                let a = &acc[half];
+                let a = &acc[half * w..(half + 1) * w];
                 for base in (0..w).step_by(32) {
                     // SAFETY: AVX2 is enabled at compile time; base + 32 <= w <= MAX_W so both 16-lane loads are in bounds.
                     let mut m = unsafe {
@@ -355,7 +360,7 @@ impl Nnue {
                         _mm256_movemask_epi8(pk) as u32
                     };
                     while m != 0 {
-                        nz[cnt] = (half * w + base + m.trailing_zeros() as usize) as u16;
+                        unsafe { *nzp.add(cnt) = (half * w + base + m.trailing_zeros() as usize) as u16 };
                         cnt += 1;
                         m &= m - 1;
                     }
@@ -364,7 +369,7 @@ impl Nnue {
         } else if w % 64 == 0 {
             // 64-lane masks (compare + movemask), then walk the set bits ascending: same indices, same order
             for half in 0..2 {
-                let a = &acc[half];
+                let a = &acc[half * w..(half + 1) * w];
                 let mut base = 0;
                 while base < w {
                     let mut m = 0u64;
@@ -372,7 +377,7 @@ impl Nnue {
                         m |= ((a[base + k] > 0) as u64) << k;
                     }
                     while m != 0 {
-                        nz[cnt] = (half * w + base + m.trailing_zeros() as usize) as u16;
+                        unsafe { *nzp.add(cnt) = (half * w + base + m.trailing_zeros() as usize) as u16 };
                         cnt += 1;
                         m &= m - 1;
                     }
@@ -381,21 +386,22 @@ impl Nnue {
             }
         } else {
             for half in 0..2 {
-                let a = &acc[half];
+                let a = &acc[half * w..(half + 1) * w];
                 for j in 0..w {
-                    nz[cnt] = (half * w + j) as u16;
+                    unsafe { *nzp.add(cnt) = (half * w + j) as u16 };
                     cnt += (a[j] > 0) as usize;
                 }
             }
         }
+        // SAFETY: the first cnt entries were written above (cnt <= 2 * w <= 2 * MAX_W)
+        let nz: &[u16] = unsafe { std::slice::from_raw_parts(nzp, cnt) };
         if !self.pairwise && l1 == 16 {
             // accumulator held in registers; no division per input; per-lane add order = ascending input order, as before
             let mut h = [0f32; 16];
             h.copy_from_slice(&h1[..16]);
-            for k in 0..cnt {
-                let i = nz[k] as usize;
-                let half = (i >= w) as usize;
-                let v = acc[half][i - half * w].clamp(0, qa) as f32 * inv;
+            for &i in nz {
+                let i = i as usize;
+                let v = acc[i].clamp(0, qa) as f32 * inv;
                 let col: &[f32; 16] = self.l1_wt[base + i * 16..base + i * 16 + 16].try_into().unwrap();
                 for j in 0..16 {
                     h[j] += v * col[j];
@@ -403,16 +409,15 @@ impl Nnue {
             }
             h1[..16].copy_from_slice(&h);
         } else {
-            for &i in &nz[..cnt] {
+            for &i in nz {
                 let i = i as usize;
                 let v = if self.pairwise {
                     let h = w / 2;
                     let (half, j) = (i / h, i % h);
-                    let a = &acc[half];
+                    let a = &acc[half * w..(half + 1) * w];
                     (a[j].clamp(0, qa) as f32 * inv) * (a[h + j].clamp(0, qa) as f32 * inv)
                 } else {
-                    let half = (i >= w) as usize;
-                    acc[half][i - half * w].clamp(0, qa) as f32 * inv
+                    acc[i].clamp(0, qa) as f32 * inv
                 };
                 let col = &self.l1_wt[base + i * l1..base + (i + 1) * l1];
                 for (h, c) in h1[..l1].iter_mut().zip(col) {
