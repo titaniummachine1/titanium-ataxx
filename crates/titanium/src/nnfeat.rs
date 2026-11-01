@@ -419,6 +419,16 @@ pub fn features_ref(b: &Board, side: usize, groups: u32, out: &mut [u32; MAX_ACT
 /// codes (they differ by 18 between the perspectives) and the G3 neighbour counts (perspective independent) are
 /// computed once; each output equals `features` for that side, in the same order.
 pub fn both(b: &Board, groups: u32) -> ([u32; MAX_ACTIVE], usize, [u32; MAX_ACTIVE], usize) {
+    let mut us = [0u32; MAX_ACTIVE];
+    let mut them = [0u32; MAX_ACTIVE];
+    let (nu, nt) = both_into(b, groups, &mut us, &mut them);
+    (us, nu, them, nt)
+}
+
+/// `both` writing into the caller's arrays and returning only the counts: returning the two 700-byte arrays by value
+/// cost two copies whose vector loads hit scalar stores that had just been written (store-forwarding stalls, ~1,900
+/// cycles per eval measured); entries past the returned counts are not touched and not meaningful.
+pub fn both_into(b: &Board, groups: u32, us: &mut [u32; MAX_ACTIVE], them: &mut [u32; MAX_ACTIVE]) -> (usize, usize) {
     let stm = b.turn as usize;
     let pa = b.occ[stm];
     let pb = b.occ[1 - stm];
@@ -435,8 +445,6 @@ pub fn both(b: &Board, groups: u32) -> ([u32; MAX_ACTIVE], usize, [u32; MAX_ACTI
     let anc_a = anchor_of(land_a & box1(pb), &plb, clone_a);
     let anc_b = anchor_of(land_b & box1(pa), &pla, clone_b);
 
-    let mut us = [0u32; MAX_ACTIVE];
-    let mut them = [0u32; MAX_ACTIVE];
     let (mut nu, mut nt) = (0usize, 0usize);
     let mut ca = [0u16; SQUARES];
     let mut cb = [0u16; SQUARES];
@@ -484,7 +492,7 @@ pub fn both(b: &Board, groups: u32) -> ([u32; MAX_ACTIVE], usize, [u32; MAX_ACTI
         nt = SQUARES;
     }
     if groups & G2 != 0 {
-        for (anchor, en, out, n) in [(anc_a, pb, &mut us, &mut nu), (anc_b, pa, &mut them, &mut nt)] {
+        for (anchor, en, out, n) in [(anc_a, pb, &mut *us, &mut nu), (anc_b, pa, &mut *them, &mut nt)] {
             if anchor == usize::MAX {
                 out[*n] = G2_NONE as u32;
                 *n += 1;
@@ -515,8 +523,8 @@ pub fn both(b: &Board, groups: u32) -> ([u32; MAX_ACTIVE], usize, [u32; MAX_ACTI
         }
     }
     if groups & G5 != 0 {
-        g5_block(pa, pb, empty, clone_a, land_b, pla, &mut us, &mut nu);
-        g5_block(pb, pa, empty, clone_b, land_a, plb, &mut them, &mut nt);
+        g5_block(pa, pb, empty, clone_a, land_b, pla, &mut *us, &mut nu);
+        g5_block(pb, pa, empty, clone_b, land_a, plb, &mut *them, &mut nt);
     }
     if groups & G6 != 0 {
         let e = empty.count_ones() as usize;
@@ -532,7 +540,7 @@ pub fn both(b: &Board, groups: u32) -> ([u32; MAX_ACTIVE], usize, [u32; MAX_ACTI
         them[nt + 2] = (G6_PAR_OFF + phase * 2 + (e & 1)) as u32;
         nt += 3;
     }
-    (us, nu, them, nt)
+    (nu, nt)
 }
 
 #[cfg(test)]

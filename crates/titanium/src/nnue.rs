@@ -300,7 +300,9 @@ impl Nnue {
 
     #[inline(always)]
     fn forward_with_dis_inner(&self, b: &Board, s57: f32) -> (f32, i32) {
-        let (us, nu, them, nt) = nnfeat::both(b, self.groups);
+        let mut us = [0u32; nnfeat::MAX_ACTIVE];
+        let mut them = [0u32; nnfeat::MAX_ACTIVE];
+        let (nu, nt) = nnfeat::both_into(b, self.groups, &mut us, &mut them);
         let w = self.width;
         let empties = b.empty().count_ones() as usize;
         let bucket = (empties * self.buckets / 50).min(self.buckets - 1);
