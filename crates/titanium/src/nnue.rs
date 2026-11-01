@@ -23,8 +23,6 @@ pub const BUNDLED_NNUE: &[u8] = include_bytes!("../../../data/nnue/nnue_main.tnn
 pub const QA: i32 = 1024;
 const MAX_W: usize = 1024;
 const MAX_H: usize = 64;
-/// prefetch distance (features ahead) for the feature-transformer rows
-const PF: usize = 8;
 
 pub struct Nnue {
     pub num_feats: usize,
@@ -54,6 +52,8 @@ pub struct Nnue {
     ftbq: Vec<i16>,
     /// l1 weights transposed per bucket: [bucket][din][l1] (one contiguous l1 column per input, for sparse L1)
     l1_wt: Vec<f32>,
+    /// l2 weights transposed per bucket: [bucket][l1 input][l2 output] (so 8 outputs can be summed side by side)
+    l2_wt: Vec<f32>,
     /// psqt transposed: [bucket][feature] (one bucket's column is contiguous: ~105 KB, stays in L2)
     psqt_t: Vec<f32>,
 }
@@ -119,6 +119,7 @@ impl Nnue {
             ftq: Vec::new(),
             ftbq: Vec::new(),
             l1_wt: Vec::new(),
+            l2_wt: Vec::new(),
             psqt_t: Vec::new(),
             num_feats,
             width,
@@ -171,6 +172,15 @@ impl Nnue {
             }
         }
         net.l1_wt = t;
+        let mut t2 = vec![0f32; net.buckets * net.l1 * net.l2];
+        for bk in 0..net.buckets {
+            for j in 0..net.l2 {
+                for k in 0..net.l1 {
+                    t2[(bk * net.l1 + k) * net.l2 + j] = net.l2_w[(bk * net.l2 + j) * net.l1 + k];
+                }
+            }
+        }
+        net.l2_wt = t2;
         let mut pt = vec![0f32; net.buckets * net.num_feats];
         for f in 0..net.num_feats {
             for bk in 0..net.buckets {
@@ -230,15 +240,26 @@ impl Nnue {
         let bucket = (empties * self.buckets / 50).min(self.buckets - 1);
         let pst = &self.psqt_t[bucket * self.num_feats..(bucket + 1) * self.num_feats];
         let mut acc = [[0i16; MAX_W]; 2];
-        let mut ps = [0f32; 2];
         for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
             let a = &mut acc[half][..w];
             let idx = &idx[..n];
             self.ft_sum(a, idx);
-            for &f in idx {
-                ps[half] += pst[f as usize];
-            }
         }
+        // the two sides' position-weight sums are independent float chains: run them side by side (each keeps its order)
+        let (iu, it) = (&us[..nu], &them[..nt]);
+        let m = nu.min(nt);
+        let (mut p0, mut p1) = (0f32, 0f32);
+        for k in 0..m {
+            p0 += pst[iu[k] as usize];
+            p1 += pst[it[k] as usize];
+        }
+        for &f in &iu[m..] {
+            p0 += pst[f as usize];
+        }
+        for &f in &it[m..] {
+            p1 += pst[f as usize];
+        }
+        let ps = [p0, p1];
         self.head_with_dis(&acc, bucket, ps, s57)
     }
 
@@ -263,9 +284,6 @@ impl Nnue {
             let mut r = [0i16; CH];
             r.copy_from_slice(&self.ftbq[c..c + CH]);
             for k in 0..n {
-                if false && c == 0 && k + PF < n {
-                    self.prefetch_row(idx[k + PF] as usize);
-                }
                 let f = idx[k] as usize;
                 let row = &self.ftq[f * w + c..f * w + c + CH];
                 for j in 0..CH {
@@ -295,27 +313,6 @@ impl Nnue {
         std::hint::black_box(&acc);
         acc[0][3] as i32 + acc[1][5] as i32 + ps[0] as i32
     }
-    #[inline(always)]
-    fn prefetch_row(&self, f: usize) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            let base = self.ftq.as_ptr().wrapping_add(f * self.width) as *const i8;
-            let bytes = self.width * 2;
-            let mut o = 0;
-            while o < bytes {
-                // SAFETY: prefetch is a hint; it never faults, even on an out-of-range address.
-                unsafe {
-                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
-                        base.wrapping_add(o),
-                    )
-                };
-                o += 64;
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = f;
-    }
-
     /// Everything after the feature transformer: int16 accumulators -> activations -> sparse L1 -> L2 -> output.
     /// Activations are computed on the fly (no zeroed scratch array); arithmetic and order are exactly as before.
     #[inline(always)]
@@ -341,6 +338,47 @@ impl Nnue {
                     cnt += (a[j] > 0 && a[h + j] > 0) as usize;
                 }
             }
+        } else if cfg!(target_feature = "avx2") && w % 32 == 0 {
+            #[cfg(target_feature = "avx2")]
+            for half in 0..2 {
+                use std::arch::x86_64::*;
+                let a = &acc[half];
+                for base in (0..w).step_by(32) {
+                    // SAFETY: AVX2 is enabled at compile time; base + 32 <= w <= MAX_W so both 16-lane loads are in bounds.
+                    let mut m = unsafe {
+                        let z = _mm256_setzero_si256();
+                        let p = a.as_ptr().add(base) as *const __m256i;
+                        let c0 = _mm256_cmpgt_epi16(_mm256_loadu_si256(p), z);
+                        let c1 = _mm256_cmpgt_epi16(_mm256_loadu_si256(p.add(1)), z);
+                        // packs works per 128-bit lane: fix the lane order, then one bit per i16 lane
+                        let pk = _mm256_permute4x64_epi64::<0xD8>(_mm256_packs_epi16(c0, c1));
+                        _mm256_movemask_epi8(pk) as u32
+                    };
+                    while m != 0 {
+                        nz[cnt] = (half * w + base + m.trailing_zeros() as usize) as u16;
+                        cnt += 1;
+                        m &= m - 1;
+                    }
+                }
+            }
+        } else if w % 64 == 0 {
+            // 64-lane masks (compare + movemask), then walk the set bits ascending: same indices, same order
+            for half in 0..2 {
+                let a = &acc[half];
+                let mut base = 0;
+                while base < w {
+                    let mut m = 0u64;
+                    for k in 0..64 {
+                        m |= ((a[base + k] > 0) as u64) << k;
+                    }
+                    while m != 0 {
+                        nz[cnt] = (half * w + base + m.trailing_zeros() as usize) as u16;
+                        cnt += 1;
+                        m &= m - 1;
+                    }
+                    base += 64;
+                }
+            }
         } else {
             for half in 0..2 {
                 let a = &acc[half];
@@ -350,19 +388,36 @@ impl Nnue {
                 }
             }
         }
-        for &i in &nz[..cnt] {
-            let i = i as usize;
-            let v = if self.pairwise {
-                let h = w / 2;
-                let (half, j) = (i / h, i % h);
-                let a = &acc[half];
-                (a[j].clamp(0, qa) as f32 * inv) * (a[h + j].clamp(0, qa) as f32 * inv)
-            } else {
-                acc[i / w][i % w].clamp(0, qa) as f32 * inv
-            };
-            let col = &self.l1_wt[base + i * l1..base + (i + 1) * l1];
-            for (h, c) in h1[..l1].iter_mut().zip(col) {
-                *h += v * c;
+        if !self.pairwise && l1 == 16 {
+            // accumulator held in registers; no division per input; per-lane add order = ascending input order, as before
+            let mut h = [0f32; 16];
+            h.copy_from_slice(&h1[..16]);
+            for k in 0..cnt {
+                let i = nz[k] as usize;
+                let half = (i >= w) as usize;
+                let v = acc[half][i - half * w].clamp(0, qa) as f32 * inv;
+                let col: &[f32; 16] = self.l1_wt[base + i * 16..base + i * 16 + 16].try_into().unwrap();
+                for j in 0..16 {
+                    h[j] += v * col[j];
+                }
+            }
+            h1[..16].copy_from_slice(&h);
+        } else {
+            for &i in &nz[..cnt] {
+                let i = i as usize;
+                let v = if self.pairwise {
+                    let h = w / 2;
+                    let (half, j) = (i / h, i % h);
+                    let a = &acc[half];
+                    (a[j].clamp(0, qa) as f32 * inv) * (a[h + j].clamp(0, qa) as f32 * inv)
+                } else {
+                    let half = (i >= w) as usize;
+                    acc[half][i - half * w].clamp(0, qa) as f32 * inv
+                };
+                let col = &self.l1_wt[base + i * l1..base + (i + 1) * l1];
+                for (h, c) in h1[..l1].iter_mut().zip(col) {
+                    *h += v * c;
+                }
             }
         }
         for h in h1[..l1].iter_mut() {
@@ -370,11 +425,30 @@ impl Nnue {
         }
         let l2 = self.l2;
         let mut h2 = [0f32; MAX_H];
-        for (j, h) in h2[..l2].iter_mut().enumerate() {
-            let r = bucket * l2 + j;
-            let row = &self.l2_w[r * l1..(r + 1) * l1];
-            let s: f32 = row.iter().zip(&h1[..l1]).map(|(a, b)| a * b).sum();
-            *h = (s + self.l2_b[r]).clamp(0.0, 1.0);
+        if l2 % 8 == 0 {
+            // 8 outputs at a time: every lane is the same sequential sum over the l1 inputs (mul, then add, in input
+            // order) as the plain per-output dot product, so the result is bit-identical; only the latency chains overlap
+            let wt = &self.l2_wt[bucket * l1 * l2..(bucket + 1) * l1 * l2];
+            for j0 in (0..l2).step_by(8) {
+                let mut s = [-0.0f32; 8];
+                for k in 0..l1 {
+                    let hk = h1[k];
+                    let w8: &[f32; 8] = wt[k * l2 + j0..k * l2 + j0 + 8].try_into().unwrap();
+                    for l in 0..8 {
+                        s[l] += w8[l] * hk;
+                    }
+                }
+                for l in 0..8 {
+                    h2[j0 + l] = (s[l] + self.l2_b[bucket * l2 + j0 + l]).clamp(0.0, 1.0);
+                }
+            }
+        } else {
+            for (j, h) in h2[..l2].iter_mut().enumerate() {
+                let r = bucket * l2 + j;
+                let row = &self.l2_w[r * l1..(r + 1) * l1];
+                let s: f32 = row.iter().zip(&h1[..l1]).map(|(a, b)| a * b).sum();
+                *h = (s + self.l2_b[r]).clamp(0.0, 1.0);
+            }
         }
         let o = if self.v2 {
             let k = l1 + l2;

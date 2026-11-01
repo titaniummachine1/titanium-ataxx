@@ -24,7 +24,9 @@
 //!    G6_PAR_OFF + phase * 2 + (empties & 1). phase = empties / 7 (0..7).
 //! (G4 = 8-cell pattern pairs stays OUTSIDE the accumulator: the existing tuple net as a linear skip path.)
 
-use crate::board::{dist_union, jump_union, Board, FILE_A, FILE_G, FULL, RING1, SQUARES};
+#[cfg(test)]
+use crate::board::{dist_union, jump_union};
+use crate::board::{Board, FILE_A, FILE_G, FULL, RING1, SQUARES};
 
 pub const G1: u32 = 1;
 pub const G2: u32 = 2;
@@ -85,16 +87,10 @@ fn landing(stones: u64, empty: u64) -> u64 {
     box1(box1(stones)) & empty
 }
 
-/// Best number of `victims` stones converted by one landing of `attacker` (clone or jump) on `empty`.
-/// The victim count around every square is built at once with a carry-save adder over the 8 shifted masks
-/// (planes 1/2/4/8), then the maximum over the candidate squares is read off the planes: no per-candidate loop.
-#[inline]
-fn best_capture(attacker: u64, victims: u64, empty: u64) -> u32 {
-    let cand = landing(attacker, empty) & box1(victims);
-    if cand == 0 {
-        return 0;
-    }
-    let v = victims;
+/// Bit planes (ones, twos, fours, eights) of the number of `v` stones in the 8-neighbourhood of every square,
+/// built with a carry-save adder over the 8 shifted masks.
+#[inline(always)]
+fn victim_planes(v: u64) -> [u64; 4] {
     let s0 = (v >> 1) & !FILE_G;
     let s1 = (v << 1) & !FILE_A;
     let s2 = v >> 7;
@@ -115,12 +111,28 @@ fn best_capture(attacker: u64, victims: u64, empty: u64) -> u32 {
     let uc = (c0 & c1) | (c2 & (c0 ^ c1));
     let twos = u0 ^ k0;
     let tc = u0 & k0;
-    let fours = uc ^ tc;
-    let eights = uc & tc;
+    [ones, twos, uc ^ tc, uc & tc]
+}
+
+/// Add 1 to the count of every square in `m` (a new victim stone adds 1 to each of its 8 neighbours).
+#[inline(always)]
+fn planes_add(p: &mut [u64; 4], m: u64) {
+    let c0 = p[0] & m;
+    p[0] ^= m;
+    let c1 = p[1] & c0;
+    p[1] ^= c0;
+    let c2 = p[2] & c1;
+    p[2] ^= c1;
+    p[3] ^= c2;
+}
+
+/// Largest victim count over the candidate squares, read off the bit planes (no per-candidate loop).
+#[inline(always)]
+fn planes_max(cand: u64, p: &[u64; 4]) -> u32 {
     let mut m = cand;
     let mut best = 0u32;
-    for (k, plane) in [(3u32, eights), (2, fours), (1, twos), (0, ones)] {
-        let x = m & plane;
+    for k in (0..4).rev() {
+        let x = m & p[k];
         if x != 0 {
             best |= 1 << k;
             m = x;
@@ -236,14 +248,29 @@ pub fn features(b: &Board, side: usize, groups: u32, out: &mut [u32; MAX_ACTIVE]
         }
     }
     if groups & G5 != 0 {
+        // per clone square the enemy's best reply capture, from base victim planes of `own` plus a bit-sliced
+        // increment per added stone (the clone and the converted stones); enemy landing reuses `land_e` when nothing converts
+        let base = victim_planes(own);
+        let du_own = box1(own);
         let mut c = clone_o;
         while c != 0 {
             let s = c.trailing_zeros() as usize;
+            let sbit = 1u64 << s;
             let conv = en & RING1[s];
-            let own2 = own | (1u64 << s) | conv;
-            let en2 = en & !conv;
-            let empty2 = empty & !(1u64 << s);
-            let v = 1 + conv.count_ones() as i32 - best_capture(en2, own2, empty2) as i32;
+            let mut p = base;
+            planes_add(&mut p, RING1[s]);
+            let mut near = du_own | RING1[s];
+            let mut cv = conv;
+            while cv != 0 {
+                let x = cv.trailing_zeros() as usize;
+                planes_add(&mut p, RING1[x]);
+                near |= RING1[x];
+                cv &= cv - 1;
+            }
+            let land2 = if conv == 0 { land_e & !sbit } else { box1(box1(en & !conv)) & (empty & !sbit) };
+            let cand = land2 & near;
+            let best_rep = if cand == 0 { 0 } else { planes_max(cand, &p) };
+            let v = 1 + conv.count_ones() as i32 - best_rep as i32;
             out[n] = (G5_OFF + s * 9 + (v.clamp(-3, 5) + 3) as usize) as u32;
             n += 1;
             c &= c - 1;
