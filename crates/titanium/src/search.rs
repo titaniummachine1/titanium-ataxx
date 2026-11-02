@@ -619,6 +619,11 @@ pub struct Searcher<'a> {
     tuple: Option<&'a TupleTable>,
     /// Optional exp/nnue net (None = unchanged eval path). Takes precedence over sancta/tuple when set.
     nnue: Option<&'a Nnue>,
+    /// exp/policy: move-ordering policy head (None = unchanged), weight (ordering points per logit), min depth, scratch.
+    policy: Option<&'a crate::policy::Policy>,
+    pol_w: f32,
+    pol_min: u32,
+    pol_buf: Vec<(u16, f32)>,
     /// Tuple-native eval mode: skip E2/E4 scans, mat+PST+tempo+tuples only.
     /// False by default (full hand eval + optional additive tuples).
     tup_native: bool,
@@ -681,6 +686,10 @@ impl<'a> Searcher<'a> {
             sancta: None,
             tuple: None,
             nnue: None,
+            policy: crate::policy::global(),
+            pol_w: crate::policy::env_f32("TI_POLW", 100000.0),
+            pol_min: crate::policy::env_f32("TI_POLMIN", 1.0) as u32,
+            pol_buf: Vec::new(),
             tup_native: false,
             corr: None,
             stack: MoveStack::new(),
@@ -701,6 +710,12 @@ impl<'a> Searcher<'a> {
 
     /// Attach an n-tuple table (None = pure hand eval). Borrowed for the
     /// search duration; zero-cost OFF (None branch).
+    pub fn set_policy(&mut self, p: Option<&'a crate::policy::Policy>, w: f32, min_depth: u32) {
+        self.policy = p;
+        self.pol_w = w;
+        self.pol_min = min_depth;
+    }
+
     pub fn set_nnue(&mut self, n: Option<&'a Nnue>) {
         self.nnue = n;
         self.clear_ecache();
@@ -1001,6 +1016,26 @@ impl<'a> Searcher<'a> {
                     static_eval,
                 );
                 return static_eval;
+            }
+        }
+
+        if let (Some(pol), Some(nn)) = (self.policy, self.nnue) {
+            let n = self.stack.lists[ply as usize].len();
+            if n > 1 && depth >= self.pol_min {
+                let mut buf = std::mem::take(&mut self.pol_buf);
+                nn.policy_xin(b, &mut buf);
+                for i in 0..n {
+                    let (m, sc) = {
+                        let l = &self.stack.lists[ply as usize];
+                        (l.move_at(i), l.score_at(i))
+                    };
+                    if sc == ORD_TT {
+                        continue;
+                    }
+                    let add = (pol.logit(b, m, &buf) * self.pol_w) as i32;
+                    self.stack.lists[ply as usize].set_score(i, sc.saturating_add(add));
+                }
+                self.pol_buf = buf;
             }
         }
 

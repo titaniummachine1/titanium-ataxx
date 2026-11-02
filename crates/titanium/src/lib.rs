@@ -11,6 +11,7 @@
 pub mod board;
 pub mod nnfeat;
 pub mod nnue;
+pub mod policy;
 pub mod sancta;
 pub mod search;
 pub mod smallnet;

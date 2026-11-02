@@ -291,6 +291,46 @@ impl Nnue {
         self.forward_with_dis(b, s57).0
     }
 
+    /// Policy head input (exp/policy): the nonzero pairwise products `(index, value)` the L1 layer reads for this position
+    /// (empty for non-pairwise nets). Recomputes the accumulator; scalar code, experiment only.
+    pub fn policy_xin(&self, b: &Board, out: &mut Vec<(u16, f32)>) {
+        out.clear();
+        if !self.pairwise {
+            return;
+        }
+        let mut us = [0u32; nnfeat::MAX_ACTIVE];
+        let mut them = [0u32; nnfeat::MAX_ACTIVE];
+        let (nu, nt) = nnfeat::both_into(b, self.groups, &mut us, &mut them);
+        let w = self.width;
+        let mut acc = vec![0i16; 2 * w];
+        for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
+            let idx = &idx[..n];
+            let (init, rows) = match &self.g6tab {
+                Some(tab) if n >= 3 => {
+                    let f1 = idx[n - 3] as usize - nnfeat::G6_OFF;
+                    let bb = (idx[n - 2] as usize - nnfeat::G6_OFF) % 10;
+                    let par = (idx[n - 1] as usize - nnfeat::G6_PAR_OFF) & 1;
+                    let key = (f1 * 10 + bb) * 2 + par;
+                    (&tab[key * w..(key + 1) * w], &idx[..n - 3])
+                }
+                _ => (&self.ftbq[..w], idx),
+            };
+            // SAFETY: the half-slice has w lanes, fully written by ft_sum
+            unsafe { self.ft_sum(acc.as_mut_ptr().add(half * w), w, rows, init) };
+        }
+        let inv = 1.0 / QA as f32;
+        let qa = QA as i16;
+        let h = w / 2;
+        for half in 0..2 {
+            let a = &acc[half * w..(half + 1) * w];
+            for j in 0..h {
+                if a[j] > 0 && a[h + j] > 0 {
+                    out.push(((half * h + j) as u16, (a[j].min(qa) as f32 * inv) * (a[h + j].min(qa) as f32 * inv)));
+                }
+            }
+        }
+    }
+
     /// Fast path returning both `(eval_logit, dis_cp)` from a single shared accumulator + hidden pass.
     pub fn forward_with_dis(&self, b: &Board, s57: f32) -> (f32, i32) {
         #[cfg(target_arch = "x86_64")]

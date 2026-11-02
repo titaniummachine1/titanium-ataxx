@@ -477,6 +477,35 @@ fn bench_cmd(
         r.nodes,
         r.nodes as f64 / secs
     );
+    // exp/policy: BENCH_BOOK=<file of "<49 cells> <w|b>" lines> BENCH_N=<positions> BENCH_DEPTH=<fixed depth> [TI_POLICY=<TPOL1 file> TI_POLW TI_POLMIN]
+    if let Ok(path) = std::env::var("BENCH_BOOK") {
+        let n: usize = std::env::var("BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+        let d: u8 = std::env::var("BENCH_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let pol = std::env::var("TI_POLICY").ok().map(|p| titanium::policy::Policy::load(&p).expect("policy unreadable"));
+        let pw: f32 = std::env::var("TI_POLW").ok().and_then(|v| v.parse().ok()).unwrap_or(1000.0);
+        let pm: u32 = std::env::var("TI_POLMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let text = std::fs::read_to_string(&path).expect("BENCH_BOOK unreadable");
+        let step = (text.lines().count() / n.max(1)).max(1);
+        let (mut total, mut done, mut secs_tot) = (0u64, 0usize, 0f64);
+        let mut firsts = Vec::new();
+        for line in text.lines().step_by(step).take(n) {
+            let Some(pos) = Board::from_str(line) else { continue };
+            let mut s = Searcher::new_unconfigured();
+            s.set_sancta(net.as_ref());
+            s.set_tuple(tup.as_ref());
+            s.set_tuple_native(tup_native && tup.is_some());
+            s.set_nnue(nn.as_ref());
+            if pol.is_some() { s.set_policy(pol.as_ref(), pw, pm); }
+            let lim = SearchLimits { time: None, max_nodes: None, max_depth: d };
+            let rr = s.search(&pos, &lim);
+            total += rr.nodes;
+            secs_tot += rr.elapsed.as_secs_f64();
+            firsts.push(move_str(rr.best));
+            done += 1;
+        }
+        println!("--- policy bench: {done} positions at depth {d}: nodes {total} time {secs_tot:.2}s nps {:.0} policy {} w {pw} min {pm}", total as f64 / secs_tot, pol.is_some());
+        println!("bestmoves hash {:016x}", firsts.iter().fold(0xcbf29ce484222325u64, |h, s| s.bytes().fold(h, |h, c| (h ^ c as u64).wrapping_mul(0x100000001b3))));
+    }
     ExitCode::SUCCESS
 }
 
