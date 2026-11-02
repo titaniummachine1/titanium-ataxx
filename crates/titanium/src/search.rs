@@ -109,6 +109,18 @@ const FUT_SN_M: i32 = env_usize(option_env!("FUT_SN_M"), 0) as i32;
 /// search into the searcher, never per node.
 static FUT_SN_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+pub fn fut_sn_on() -> bool {
+    FUT_SN_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// (FUT_CHEAP_M, FUT_SN_M, EVORD_W, EVORD_MIN_DEPTH, EVORD_CACHE as 0/1): the cargo-build-time knobs, for `info` and the defaults test.
+pub fn build_knobs() -> (i32, i32, i32, u32, u32) {
+    (FUT_CHEAP_M, FUT_SN_M, EVORD_W, EVORD_MIN_DEPTH, EVORD_CACHE as u32)
+}
+
+/// The shipped (strongest, gated) values of the build-time knobs.
+pub const DEFAULT_BUILD_KNOBS: (i32, i32, i32, u32, u32) = (350, 0, 0, 1, 1);
+
 pub fn set_fut_sn(on: bool) {
     FUT_SN_ON.store(on, std::sync::atomic::Ordering::Relaxed);
 }
@@ -623,6 +635,8 @@ pub struct Searcher<'a> {
     policy: Option<&'a crate::policy::Policy>,
     pol_w: f32,
     pol_min: u32,
+    /// set_policy was called explicitly: set_nnue must not drop it
+    pol_explicit: bool,
     pol_buf: Vec<(u16, f32)>,
     /// Tuple-native eval mode: skip E2/E4 scans, mat+PST+tempo+tuples only.
     /// False by default (full hand eval + optional additive tuples).
@@ -689,6 +703,7 @@ impl<'a> Searcher<'a> {
             policy: crate::policy::global(),
             pol_w: crate::policy::env_f32("TI_POLW", 100000.0),
             pol_min: crate::policy::env_f32("TI_POLMIN", 1.0) as u32,
+            pol_explicit: false,
             pol_buf: Vec::new(),
             tup_native: false,
             corr: None,
@@ -714,10 +729,19 @@ impl<'a> Searcher<'a> {
         self.policy = p;
         self.pol_w = w;
         self.pol_min = min_depth;
+        self.pol_explicit = true;
     }
 
     pub fn set_nnue(&mut self, n: Option<&'a Nnue>) {
         self.nnue = n;
+        // The bundled policy head is fitted on the bundled big net (config.rs pins it): with any other net its
+        // ordering is meaningless, so it switches itself off unless the user chose a head (--policy FILE / TI_POLICY).
+        if !self.pol_explicit && !crate::policy::is_forced() {
+            self.policy = match n {
+                Some(x) if x.fingerprint != crate::nnue::Nnue::bundled_fingerprint() => None,
+                _ => crate::policy::global(),
+            };
+        }
         self.clear_ecache();
     }
 

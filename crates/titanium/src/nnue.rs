@@ -91,6 +91,8 @@ const fn bit_pos_table() -> [[u8; 8]; 256] {
 static BIT_POS: [[u8; 8]; 256] = bit_pos_table();
 
 pub struct Nnue {
+    /// cheap identity of the net file (config::fingerprint); the bundled policy head only applies to the bundled net
+    pub fingerprint: u64,
     pub num_feats: usize,
     pub width: usize,
     pub l1: usize,
@@ -138,6 +140,11 @@ impl Nnue {
         Self::parse(BUNDLED_NNUE).expect("the bundled main NNUE is malformed")
     }
 
+    pub fn bundled_fingerprint() -> u64 {
+        static F: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *F.get_or_init(|| crate::config::fingerprint(BUNDLED_NNUE))
+    }
+
     /// Shared production instance for one-shot engine APIs.
     pub fn bundled_static() -> &'static Nnue {
         static NET: std::sync::OnceLock<Nnue> = std::sync::OnceLock::new();
@@ -173,6 +180,7 @@ impl Nnue {
             v
         };
         let net = Nnue {
+            fingerprint: crate::config::fingerprint(d),
             ft: take(num_feats * width),
             ftb: take(width),
             psqt: take(num_feats * buckets),

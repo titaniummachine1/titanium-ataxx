@@ -63,6 +63,10 @@ const EXEMPT: &[&str] = &[
     // main's DEFAULT eval since 923dbea (user order 2026-10-25: the big NNUE must load without flags, so the net
     // ships with the repo like Stockfish's); 28 MB, tracked with `git add -f`
     "data/nnue/nnue_main.tnn",
+    // the bundled move-ordering policy head (201 KB, fitted on nnue_main.tnn by `ti policy`) and the pins that tie the three
+    // bundled files together (config.rs tests); tracked with `git add -f`
+    "data/nnue/policy_main.bin",
+    "data/nnue/bundle.txt", // lowercase: reason() compares against lowercased paths
 ];
 
 fn glob_match(pattern: &str, name: &str) -> bool {

@@ -30,7 +30,16 @@ fn main() -> ExitCode {
     {
         titanium::search::set_fut_sn(false);
     }
+    // --policy <bundled|FILE|none>: the move-ordering policy head (default: the bundled head, which applies to the bundled net only)
+    if let Some(p) = flag_str(&args, "--policy") {
+        titanium::policy::configure(&p);
+    }
     match cmd {
+        "info" => {
+            let nn = load_nnue_opt(&args);
+            print!("{}", titanium::config::report(nn.as_ref()));
+            ExitCode::SUCCESS
+        }
         "perft" => perft_cmd(first_int(&args).unwrap_or(4) as u32),
         "bench" => bench_cmd(
             depth_flag(&args, 8),
@@ -339,6 +348,18 @@ fn load_nnue_spec(spec: &Option<String>) -> Result<Option<titanium::nnue::Nnue>,
         Some(path) => titanium::nnue::Nnue::load(path)
             .map(Some)
             .map_err(|e| format!("network {path}: {e}")),
+    }
+}
+
+/// The big net selected by --network/--nnue (default: bundled); a bad file stops the program with a message.
+fn load_nnue_opt(args: &[String]) -> Option<titanium::nnue::Nnue> {
+    let spec = resolve_nnue_spec(&flag_str_alias(args, "--network", "--nnue"));
+    match load_nnue_spec(&spec) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
     }
 }
 

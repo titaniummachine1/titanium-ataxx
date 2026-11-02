@@ -15,6 +15,11 @@ const D2: usize = 2 * W;
 
 static BLOB: &[u8] = include_bytes!("../../../data/nnue/fut_small.tsn");
 
+/// The compiled-in blob (identity checks in config.rs).
+pub fn blob() -> &'static [u8] {
+    BLOB
+}
+
 pub struct SmallNet {
     /// fused rows [kind][sq][us W | them W]: own stone (us row sq, them row 49+sq), enemy stone (us 49+sq, them sq),
     /// blocker (98+sq both): one 2W add per piece

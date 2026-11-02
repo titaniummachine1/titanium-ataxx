@@ -10,6 +10,8 @@ node_modules/
 # Local scratch space (never pushed: gate .exes, moonbird, per-gate launchers, match logs)
 /data/*
 !/data/nnue/
+!/data/nnue/BUNDLE.txt
+!/data/nnue/policy_main.bin
 /data/nnue/*
 /logs
 /scripts

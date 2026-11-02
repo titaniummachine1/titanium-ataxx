@@ -65,12 +65,39 @@ impl Policy {
 /// minimum depth TI_POLMIN (default 1). None when TI_POLICY is unset or unreadable.
 pub fn global() -> Option<&'static Policy> {
     static P: std::sync::OnceLock<Option<Policy>> = std::sync::OnceLock::new();
-    P.get_or_init(|| match std::env::var("TI_POLICY") {
-        Ok(p) if p == "none" => None,
-        Ok(p) => Policy::load(&p).ok(),
-        Err(_) => Policy::from_bytes(BUNDLED).ok(),
+    P.get_or_init(|| match spec().as_deref() {
+        Some("none") => None,
+        Some("bundled") | None => Policy::from_bytes(BUNDLED).ok(),
+        Some(p) => Some(Policy::load(p).unwrap_or_else(|e| panic!("--policy / TI_POLICY {p}: {e}"))),
     })
     .as_ref()
+}
+
+static CONFIGURED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Command-line `--policy <bundled|FILE|none>` (call once, before the first search); beats env TI_POLICY.
+pub fn configure(spec: &str) {
+    let _ = CONFIGURED.set(spec.to_string());
+}
+
+fn spec() -> Option<String> {
+    CONFIGURED.get().cloned().or_else(|| std::env::var("TI_POLICY").ok())
+}
+
+/// True when the user chose a policy file explicitly (then it is used with any net); the default bundled head is
+/// fitted on the bundled net only and switches itself off for any other net (see Searcher::set_nnue).
+pub fn is_forced() -> bool {
+    !matches!(spec().as_deref(), None | Some("bundled"))
+}
+
+pub fn bundled_bytes() -> &'static [u8] {
+    BUNDLED
+}
+
+/// The compiled-in head, parsed (None only if the blob is corrupt).
+pub fn bundled() -> Option<&'static Policy> {
+    static B: std::sync::OnceLock<Option<Policy>> = std::sync::OnceLock::new();
+    B.get_or_init(|| Policy::from_bytes(BUNDLED).ok()).as_ref()
 }
 
 pub fn env_f32(name: &str, default: f32) -> f32 {
