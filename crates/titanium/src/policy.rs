@@ -3,6 +3,10 @@
 //! File: magic "TPOL1\0\0\0", u32 dim, f32 bias[98], f32 g[45], f32 u[98*dim], little endian.
 use crate::board::{Board, Move, RING1};
 
+
+/// Bundled head (fitted by `ti policy --feat x --out-bin` on the bundled net data/nnue/nnue_main.tnn). Env TI_POLICY=none disables, =path overrides.
+static BUNDLED: &[u8] = include_bytes!("../../../data/nnue/policy_main.bin");
+
 pub const SLOTS: usize = 98;
 pub const NSCAL: usize = 45;
 
@@ -15,7 +19,10 @@ pub struct Policy {
 
 impl Policy {
     pub fn load(path: &str) -> std::io::Result<Policy> {
-        let d = std::fs::read(path)?;
+        Self::from_bytes(&std::fs::read(path)?)
+    }
+
+    pub fn from_bytes(d: &[u8]) -> std::io::Result<Policy> {
         let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
         if d.len() < 12 || &d[..8] != b"TPOL1\0\0\0" {
             return Err(bad("bad policy magic"));
@@ -58,7 +65,12 @@ impl Policy {
 /// minimum depth TI_POLMIN (default 1). None when TI_POLICY is unset or unreadable.
 pub fn global() -> Option<&'static Policy> {
     static P: std::sync::OnceLock<Option<Policy>> = std::sync::OnceLock::new();
-    P.get_or_init(|| std::env::var("TI_POLICY").ok().and_then(|p| Policy::load(&p).ok())).as_ref()
+    P.get_or_init(|| match std::env::var("TI_POLICY") {
+        Ok(p) if p == "none" => None,
+        Ok(p) => Policy::load(&p).ok(),
+        Err(_) => Policy::from_bytes(BUNDLED).ok(),
+    })
+    .as_ref()
 }
 
 pub fn env_f32(name: &str, default: f32) -> f32 {
