@@ -23,6 +23,10 @@ use titanium::{Board, Move, SearchLimits, Searcher, RING1};
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("help");
+    // D444: i8 feature-transformer table (half the bytes, fits L3); must be set before any net is built
+    if args.iter().any(|x| x == "--ft-i8") {
+        titanium::nnue::set_ft_i8(true);
+    }
     // exact full-strength search without the lossy futility small net (D112); any command, `serve` included
     if args
         .iter()

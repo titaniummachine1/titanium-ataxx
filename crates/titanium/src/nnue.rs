@@ -118,6 +118,15 @@ pub struct Nnue {
     dis_b: Vec<f32>,
     ftq: Aligned<i16>,
     ftbq: Vec<i16>,
+    /// D444 i8 FT mode (off unless `set_ft_i8(true)` before the net is built): FT rows as i8 with one integer scale per
+    /// accumulator lane (s_j = floor(127 / max |column j|)), summed into the same i16 accumulator in each lane's own scale;
+    /// activation = clamp(a_j, 0, s_j) / s_j instead of clamp(a_j, 0, QA) / QA. Halves the FT table (6.7 MB at W256: fits L3).
+    ft_i8: bool,
+    ftq8: Aligned<i8>,
+    ftbq8: Vec<i16>,
+    g6tab8: Option<Aligned<i16>>,
+    lane_top: Vec<i16>,
+    lane_inv: Vec<f32>,
     /// bias + the three always-active G6 rows pre-summed for every (phase, bucket, bucket, parity) key (1,600 rows):
     /// wrapping i16 adds commute, so starting the accumulator from this row is bit-identical and saves two row loads
     g6tab: Option<Aligned<i16>>,
@@ -127,6 +136,13 @@ pub struct Nnue {
     l2_wt: Aligned<f32>,
     /// psqt transposed: [bucket][feature] (one bucket's column is contiguous: ~105 KB, stays in L2)
     psqt_t: Aligned<f32>,
+}
+
+/// D444: build every net loaded after this point with the i8 FT path (CLI `--ft-i8`); default off.
+static FT_I8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_ft_i8(on: bool) {
+    FT_I8.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 impl Nnue {
@@ -195,6 +211,12 @@ impl Nnue {
             dis_b: if has_dis { take(buckets) } else { Vec::new() },
             ftq: Aligned::empty(),
             ftbq: Vec::new(),
+            ft_i8: false,
+            ftq8: Aligned::empty(),
+            ftbq8: Vec::new(),
+            g6tab8: None,
+            lane_top: Vec::new(),
+            lane_inv: Vec::new(),
             g6tab: None,
             l1_wt: Aligned::empty(),
             l2_wt: Aligned::empty(),
@@ -236,7 +258,7 @@ impl Nnue {
             .map(q)
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| bad("ft bias overflows int16 at QA"))?;
-        if net.groups & nnfeat::G6 != 0 && net.width % 128 == 0 && net.num_feats == nnfeat::NUM_FEATS {
+        if net.groups & nnfeat::G6 != 0 && net.width % 64 == 0 && net.num_feats == nnfeat::NUM_FEATS {
             let w = net.width;
             let mut tab = vec![0i16; 1600 * w];
             for f1 in 0..80usize {
@@ -288,7 +310,69 @@ impl Nnue {
             }
         }
         net.psqt_t = Aligned::from_vec(pt);
+        if FT_I8.load(std::sync::atomic::Ordering::Relaxed) {
+            net.enable_ft_i8().map_err(|e| bad(&e))?;
+        }
         Ok(net)
+    }
+
+    /// Build the i8 FT tables (D444). Needs the f32 FT copy (call before `drop_f32_reference`); non-pairwise nets only.
+    pub fn enable_ft_i8(&mut self) -> Result<(), String> {
+        let w = self.width;
+        let nf = self.num_feats;
+        if self.pairwise {
+            return Err("i8 FT: pairwise nets are not supported".into());
+        }
+        if self.ft.len() != nf * w {
+            return Err("i8 FT: the f32 FT copy is missing".into());
+        }
+        let mut top = vec![0i16; w];
+        let mut inv = vec![0f32; w];
+        for j in 0..w {
+            let m = (0..nf).fold(0f32, |m, f| m.max(self.ft[f * w + j].abs())).max(1e-6);
+            let sc = (127.0 / m).floor().clamp(1.0, 16000.0);
+            top[j] = sc as i16;
+            inv[j] = 1.0 / sc;
+        }
+        let mut q8 = vec![0i8; nf * w];
+        for f in 0..nf {
+            for j in 0..w {
+                q8[f * w + j] = (self.ft[f * w + j] * top[j] as f32).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+        let bq: Vec<i16> = (0..w).map(|j| (self.ftb[j] * top[j] as f32).round().clamp(-32000.0, 32000.0) as i16).collect();
+        if self.g6tab.is_some() {
+            let mut tab = vec![0i16; 1600 * w];
+            for f1 in 0..80usize {
+                let phase = f1 / 10;
+                for bb in 0..10usize {
+                    for par in 0..2usize {
+                        let key = (f1 * 10 + bb) * 2 + par;
+                        let r1 = nnfeat::G6_OFF + f1;
+                        let r2 = nnfeat::G6_OFF + 80 + phase * 10 + bb;
+                        let r3 = nnfeat::G6_PAR_OFF + phase * 2 + par;
+                        for j in 0..w {
+                            tab[key * w + j] = bq[j]
+                                .wrapping_add(q8[r1 * w + j] as i16)
+                                .wrapping_add(q8[r2 * w + j] as i16)
+                                .wrapping_add(q8[r3 * w + j] as i16);
+                        }
+                    }
+                }
+            }
+            self.g6tab8 = Some(Aligned::from_vec(tab));
+        }
+        self.ftq8 = Aligned::from_vec(q8);
+        self.ftbq8 = bq;
+        self.lane_top = top;
+        self.lane_inv = inv;
+        self.ft_i8 = true;
+        Ok(())
+    }
+
+    /// True when the i8 FT path is active (reported by `titanium-cli info`).
+    pub fn ft_i8(&self) -> bool {
+        self.ft_i8
     }
 
     /// Fast path (int16 feature transformer, allocation-free, sparse L1); differs from `forward_f32` only by the
@@ -388,7 +472,8 @@ impl Nnue {
         for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
             let idx = &idx[..n];
             // the last three entries are the G6 rows (G6 is the last group): replace them and the bias by one pre-summed row
-            let (init, rows) = match &self.g6tab {
+            let (gtab, bias) = if self.ft_i8 { (&self.g6tab8, &self.ftbq8) } else { (&self.g6tab, &self.ftbq) };
+            let (init, rows) = match gtab {
                 Some(tab) if n >= 3 => {
                     let f1 = idx[n - 3] as usize - nnfeat::G6_OFF;
                     let bb = (idx[n - 2] as usize - nnfeat::G6_OFF) % 10;
@@ -396,7 +481,7 @@ impl Nnue {
                     let key = (f1 * 10 + bb) * 2 + par;
                     (&tab[key * w..(key + 1) * w], &idx[..n - 3])
                 }
-                _ => (&self.ftbq[..w], idx),
+                _ => (&bias[..w], idx),
             };
             // SAFETY: half * w + w <= 2 * MAX_W; ft_sum initialises all w lanes of this half
             unsafe { self.ft_sum(accp.add(half * w), w, rows, init) };
@@ -425,27 +510,52 @@ impl Nnue {
     /// registers one CH-lane block at a time: each row costs one load+add per vector instead of load/add/store.
     #[inline(always)]
     unsafe fn ft_sum(&self, out: *mut i16, w: usize, idx: &[u32], init: &[i16]) {
-        const CH: usize = 128;
-        if w % CH != 0 {
-            std::ptr::copy_nonoverlapping(init.as_ptr(), out, w);
-            let a = std::slice::from_raw_parts_mut(out, w);
-            for &f in idx {
-                let row = &self.ftq[f as usize * w..(f as usize + 1) * w];
-                for (x, r) in a.iter_mut().zip(row) {
+        // D446: register-blocked path for any width that is a multiple of 64 (was 128 only: W192/W224 ran the scalar loop)
+        if w % 128 == 0 {
+            return self.ft_sum_blk::<128>(out, w, idx, init);
+        }
+        if w % 64 == 0 {
+            return self.ft_sum_blk::<64>(out, w, idx, init);
+        }
+        std::ptr::copy_nonoverlapping(init.as_ptr(), out, w);
+        let a = std::slice::from_raw_parts_mut(out, w);
+        for &f in idx {
+            let f = f as usize;
+            if self.ft_i8 {
+                for (x, r) in a.iter_mut().zip(&self.ftq8[f * w..(f + 1) * w]) {
+                    *x = x.wrapping_add(*r as i16);
+                }
+            } else {
+                for (x, r) in a.iter_mut().zip(&self.ftq[f * w..(f + 1) * w]) {
                     *x = x.wrapping_add(*r);
                 }
             }
-            return;
         }
+    }
+
+    /// a = bias + sum of the active rows, one CH-lane block at a time held in registers (i16 or, in i8 mode, sign-extended
+    /// i8 rows: D444). Wrapping i16 adds, any order is bit-identical.
+    #[inline(always)]
+    unsafe fn ft_sum_blk<const CH: usize>(&self, out: *mut i16, w: usize, idx: &[u32], init: &[i16]) {
         let n = idx.len();
         for c in (0..w).step_by(CH) {
             let mut r = [0i16; CH];
             r.copy_from_slice(&init[c..c + CH]);
-            for k in 0..n {
-                let f = idx[k] as usize;
-                let row = &self.ftq[f * w + c..f * w + c + CH];
-                for j in 0..CH {
-                    r[j] = r[j].wrapping_add(row[j]);
+            if self.ft_i8 {
+                for k in 0..n {
+                    let f = idx[k] as usize;
+                    let row = &self.ftq8[f * w + c..f * w + c + CH];
+                    for j in 0..CH {
+                        r[j] = r[j].wrapping_add(row[j] as i16);
+                    }
+                }
+            } else {
+                for k in 0..n {
+                    let f = idx[k] as usize;
+                    let row = &self.ftq[f * w + c..f * w + c + CH];
+                    for j in 0..CH {
+                        r[j] = r[j].wrapping_add(row[j]);
+                    }
                 }
             }
             std::ptr::copy_nonoverlapping(r.as_ptr(), out.add(c), CH);
@@ -463,7 +573,8 @@ impl Nnue {
         for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
             let idx = &idx[..n];
             // SAFETY: w <= MAX_W
-            unsafe { self.ft_sum(acc[half].as_mut_ptr(), w, idx, &self.ftbq[..w]) };
+            let bias = if self.ft_i8 { &self.ftbq8 } else { &self.ftbq };
+            unsafe { self.ft_sum(acc[half].as_mut_ptr(), w, idx, &bias[..w]) };
             for &f in idx {
                 ps[half] += pst[f as usize];
             }
@@ -471,6 +582,17 @@ impl Nnue {
         std::hint::black_box(&acc);
         acc[0][3] as i32 + acc[1][5] as i32 + ps[0] as i32
     }
+    /// One accumulator lane's activation in the active FT mode (QA domain, or the lane's own i8 scale, D444).
+    #[inline(always)]
+    fn act(&self, acc: &[i16], i: usize, qa: i16, inv: f32) -> f32 {
+        if self.ft_i8 {
+            let j = i % self.width;
+            acc[i].clamp(0, self.lane_top[j]) as f32 * self.lane_inv[j]
+        } else {
+            acc[i].clamp(0, qa) as f32 * inv
+        }
+    }
+
     /// Everything after the feature transformer: int16 accumulators -> activations -> sparse L1 -> L2 -> output.
     /// Activations are computed on the fly (no zeroed scratch array); arithmetic and order are exactly as before.
     #[inline(always)]
@@ -576,11 +698,22 @@ impl Nnue {
                         let invv = _mm256_set1_ps(inv);
                         for c in (0..2 * w).step_by(16) {
                             let x = _mm256_loadu_si256(acc.as_ptr().add(c) as *const __m256i);
+                            // D444 i8 mode: per-lane top s_j and 1/s_j (lane j = c % w; w is a multiple of 16)
+                            let (top, ilo, ihi) = if self.ft_i8 {
+                                let j = c % w;
+                                (
+                                    _mm256_loadu_si256(self.lane_top.as_ptr().add(j) as *const __m256i),
+                                    _mm256_loadu_ps(self.lane_inv.as_ptr().add(j)),
+                                    _mm256_loadu_ps(self.lane_inv.as_ptr().add(j + 8)),
+                                )
+                            } else {
+                                (top, invv, invv)
+                            };
                             let x = _mm256_min_epi16(_mm256_max_epi16(x, zero), top);
                             let lo = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(x)));
                             let hi = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(x)));
-                            _mm256_storeu_ps(vp.add(c), _mm256_mul_ps(lo, invv));
-                            _mm256_storeu_ps(vp.add(c + 8), _mm256_mul_ps(hi, invv));
+                            _mm256_storeu_ps(vp.add(c), _mm256_mul_ps(lo, ilo));
+                            _mm256_storeu_ps(vp.add(c + 8), _mm256_mul_ps(hi, ihi));
                         }
                         assert!(base + din * 16 <= self.l1_wt.len());
                         let wt = self.l1_wt.as_ptr().add(base);
@@ -595,7 +728,7 @@ impl Nnue {
                     } else {
                         for &i in nz {
                             let i = i as usize;
-                            let v = _mm256_set1_ps(acc[i].clamp(0, qa) as f32 * inv);
+                            let v = _mm256_set1_ps(self.act(acc, i, qa, inv));
                             let col = self.l1_wt[base + i * 16..base + i * 16 + 16].as_ptr();
                             h0 = _mm256_add_ps(h0, _mm256_mul_ps(v, _mm256_loadu_ps(col)));
                             h8 = _mm256_add_ps(h8, _mm256_mul_ps(v, _mm256_loadu_ps(col.add(8))));
@@ -611,7 +744,7 @@ impl Nnue {
                 h.copy_from_slice(&h1[..16]);
                 for &i in nz {
                     let i = i as usize;
-                    let v = acc[i].clamp(0, qa) as f32 * inv;
+                    let v = self.act(acc, i, qa, inv);
                     let col: &[f32; 16] = self.l1_wt[base + i * 16..base + i * 16 + 16].try_into().unwrap();
                     for j in 0..16 {
                         h[j] += v * col[j];
@@ -628,7 +761,7 @@ impl Nnue {
                     let a = &acc[half * w..(half + 1) * w];
                     (a[j].clamp(0, qa) as f32 * inv) * (a[h + j].clamp(0, qa) as f32 * inv)
                 } else {
-                    acc[i].clamp(0, qa) as f32 * inv
+                    self.act(acc, i, qa, inv)
                 };
                 let col = &self.l1_wt[base + i * l1..base + (i + 1) * l1];
                 for (h, c) in h1[..l1].iter_mut().zip(col) {
