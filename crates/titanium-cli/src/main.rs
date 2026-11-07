@@ -40,6 +40,10 @@ fn main() -> ExitCode {
     if let Some(n) = flag_int(&args, "--ecache-bits") {
         titanium::search::set_ecache_bits(n as usize);
     }
+    // --ecache-mode 1: cache-line bucketed eval cache + prefetch (D585); 0 = old direct-mapped (default)
+    if let Some(n) = flag_int(&args, "--ecache-mode") {
+        titanium::search::set_ecache_mode(n as usize);
+    }
     // --knobs FILE: per-phase search knob table (exp/tree-shape D557; defaults = the old constants)
     if let Some(p) = flag_str(&args, "--knobs") {
         match std::fs::read_to_string(&p).map_err(|e| e.to_string()).and_then(|x| titanium::search::set_knobs_text(&x)) {

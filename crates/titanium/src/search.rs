@@ -8,6 +8,31 @@
 /// `set_ecache_bits` (titanium-cli --ecache-bits N) changes it for searchers created afterwards.
 static ECACHE_BITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
 
+/// D585: eval-cache layout. 0 = the old direct-mapped table of (u64 key, i32) entries (default, unchanged);
+/// 1 = cache-line buckets: 8 entries of 8 bytes per 64-byte line (32-bit check = 26 hash bits + 6 bits of empties,
+/// 32-bit packed eval), one memory fetch per probe, victim = empty > dead (more empties than the search root:
+/// fewer stones, unreachable) > least recently used (hits move to the front), plus a prefetch of the child's
+/// eval-cache line and TT slot as soon as the move is made.
+static ECACHE_MODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_ecache_mode(m: usize) {
+    ECACHE_MODE.store(m.min(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+const EC_EMPTY: u64 = 0x8000_0000; // low half = i32::MIN (never a packed eval), check 0
+
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct EcBucket([u64; 8]);
+
+/// 32-bit check = 25 hash bits | 1 importance bit | 6 bits of empties (the slot index already carries the low hash
+/// bits, so these 25 bits are new information: a false match needs 25 equal bits AND equal empties)
+#[inline(always)]
+fn ec_check(hash: u64, empties: u32, imp: u32) -> u32 {
+    (((hash >> 39) as u32) << 7) | ((imp & 1) << 6) | (empties & 63)
+}
+const EC_IMP_BIT: u32 = 1 << 6;
+
 pub fn set_ecache_bits(bits: usize) {
     ECACHE_BITS.store(bits.clamp(10, 26), std::sync::atomic::Ordering::Relaxed);
 }
@@ -618,6 +643,11 @@ impl Tt {
         self.age = 0;
     }
 
+    #[inline(always)]
+    fn slot_ptr(&self, key: u64) -> *const i8 {
+        &self.buf[(key as usize) & self.mask] as *const TtEntry as *const i8
+    }
+
     #[inline]
     pub fn step_age(&mut self) {
         self.age = self.age.wrapping_add(1);
@@ -803,6 +833,10 @@ pub struct Searcher<'a> {
     /// hit returns exactly what a recomputation would: search is bit-identical, only faster (iterative deepening
     /// re-evaluates ~42% of positions). Cleared on new game and whenever the eval source changes.
     ecache: Box<[(u64, i32)]>,
+    /// D585 bucketed eval cache (Some = ECACHE_MODE 1)
+    ec2: Option<Box<[EcBucket]>>,
+    /// D586: importance of the next eval-cache store (1 = a searched node or one of the first 3 moves, 0 = a late move)
+    ec_imp: u32,
     /// Two killer moves per ply (packed u32 moves), refreshed on cutoffs.
     killers: Box<[(u32, u32); MAX_PLY]>,
     /// History heuristic: [mover][to] cutoff counters, aged per search.
@@ -887,7 +921,13 @@ impl<'a> Searcher<'a> {
             time_src: native_now_ms,
             ext_stop: None,
             tt: Tt::new(bits),
-            ecache: vec![(0u64, i32::MIN); 1 << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)].into_boxed_slice(),
+            ecache: vec![(0u64, i32::MIN); if ECACHE_MODE.load(std::sync::atomic::Ordering::Relaxed) == 1 { 1 } else { 1 << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed) }].into_boxed_slice(),
+            ec2: if ECACHE_MODE.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+                Some(vec![EcBucket([EC_EMPTY; 8]); (1usize << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)) / 8].into_boxed_slice())
+            } else {
+                None
+            },
+            ec_imp: 1,
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[[0; 49]; 49]; 2]),
             sancta: None,
@@ -965,6 +1005,62 @@ impl<'a> Searcher<'a> {
     /// Every static eval goes through here (node entry AND the futility child eval) so pruning and leaves agree.
     fn clear_ecache(&mut self) {
         self.ecache.fill((0, i32::MIN));
+        if let Some(e) = self.ec2.as_mut() {
+            e.fill(EcBucket([EC_EMPTY; 8]));
+        }
+    }
+
+    /// D585: bucketed eval-cache probe; a hit moves the entry to the front of its line (LRU order)
+    #[inline]
+    fn ec2_get(&mut self, b: &Board) -> Option<i32> {
+        let e = self.ec2.as_mut()?;
+        let n = e.len();
+        let bk = &mut e[(b.hash as usize) & (n - 1)].0;
+        let chk = ec_check(b.hash, b.empty().count_ones(), 0);
+        for i in 0..8 {
+            let x = bk[i];
+            if ((x >> 32) as u32 & !EC_IMP_BIT) == chk && x as u32 != 0x8000_0000 {
+                if i > 0 {
+                    bk.copy_within(0..i, 1);
+                    bk[0] = x;
+                }
+                return Some(x as u32 as i32);
+            }
+        }
+        None
+    }
+
+    /// D585/D586 ranked eviction: insert at the front; victim = the first empty slot, else the first dead entry (fewer
+    /// stones than the root: unreachable), else the least recently used UNIMPORTANT entry, else the last (LRU)
+    #[inline]
+    fn ec2_put(&mut self, b: &Board, v: i32) {
+        let root_empties = self.tt.root_empties as u32;
+        let imp = self.ec_imp;
+        let Some(e) = self.ec2.as_mut() else { return };
+        let n = e.len();
+        let bk = &mut e[(b.hash as usize) & (n - 1)].0;
+        let chk = ec_check(b.hash, b.empty().count_ones(), imp);
+        let victim = (0..8)
+            .find(|&i| bk[i] as u32 == 0x8000_0000)
+            .or_else(|| (0..8).find(|&i| ((bk[i] >> 32) as u32 & 63) > root_empties))
+            .or_else(|| (0..8).rev().find(|&i| (bk[i] >> 32) as u32 & EC_IMP_BIT == 0))
+            .unwrap_or(7);
+        bk.copy_within(0..victim, 1);
+        bk[0] = ((chk as u64) << 32) | (v as u32 as u64);
+    }
+
+    /// D585: start loading the child's eval-cache line and TT slot while the parent still works on the move
+    #[inline(always)]
+    fn prefetch_child(&self, hash: u64) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(e) = self.ec2.as_ref() {
+            let pe = &e[(hash as usize) & (e.len() - 1)] as *const EcBucket as *const i8;
+            let pt = self.tt.slot_ptr(hash);
+            unsafe {
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(pe);
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(pt);
+            }
+        }
     }
 
     #[inline]
@@ -974,6 +1070,22 @@ impl<'a> Searcher<'a> {
 
     #[inline]
     fn leaf_eval_with_dis(&mut self, b: &Board) -> (i32, i32) {
+        if self.ec2.is_some() {
+            if let Some(v) = self.ec2_get(b) {
+                #[cfg(feature = "trace")]
+                {
+                    self.ec_stats.0 += 1;
+                }
+                return unpack_eval_dis(v);
+            }
+            #[cfg(feature = "trace")]
+            {
+                self.ec_stats.1 += 1;
+            }
+            let (eval, dis) = self.leaf_eval_raw_with_dis(b);
+            self.ec2_put(b, pack_eval_dis(eval, dis));
+            return (eval, dis);
+        }
         let slot = (b.hash as usize) & (self.ecache.len() - 1);
         let (k, v) = self.ecache[slot];
         if k == b.hash && v != i32::MIN {
@@ -1028,12 +1140,16 @@ impl<'a> Searcher<'a> {
     /// cross-game leakage in long matches (titanium binary_match lesson).
     /// D572: TT + eval-cache census for the position `b` (the next search root)
     pub fn cache_census(&self, b: &Board) -> String {
-        let filled = self.ecache.iter().filter(|e| e.1 != i32::MIN).count();
+        let filled = match self.ec2.as_ref() {
+            Some(e) => e.iter().map(|b| b.0.iter().filter(|&&x| x as u32 != 0x8000_0000).count()).sum::<usize>(),
+            None => self.ecache.iter().filter(|e| e.1 != i32::MIN).count(),
+        };
         #[cfg(feature = "trace")]
         let hits = format!(" hits {} misses {} hit rate {:.1}%", self.ec_stats.0, self.ec_stats.1, 100.0 * self.ec_stats.0 as f64 / (self.ec_stats.0 + self.ec_stats.1).max(1) as f64);
         #[cfg(not(feature = "trace"))]
         let hits = String::new();
-        format!("{} | ecache {} entries filled {:.1}%{hits}", self.tt.census(b.empty().count_ones() as u8), self.ecache.len(), 100.0 * filled as f64 / self.ecache.len() as f64)
+        let cap = self.ec2.as_ref().map(|e| e.len() * 8).unwrap_or(self.ecache.len());
+        format!("{} | ecache {} entries ({}) filled {:.1}%{hits}", self.tt.census(b.empty().count_ones() as u8), cap, if self.ec2.is_some() { "8-way 8 B" } else { "direct 16 B" }, 100.0 * filled as f64 / cap as f64)
     }
 
     pub fn reset_for_new_game(&mut self) {
@@ -1213,7 +1329,10 @@ impl<'a> Searcher<'a> {
         let (raw, node_dis) = match (self.nnue, self.sancta) {
             (None, Some(net)) => (net.forward_ready(&self.stack.acc[ply as usize], b.turn), 0),
             _ if pre != i32::MIN => unpack_eval_dis(pre),
-            _ => self.leaf_eval_with_dis(b),
+            _ => {
+                self.ec_imp = 1;
+                self.leaf_eval_with_dis(b)
+            }
         };
         let static_eval = self.corrected(b, raw);
         trc!(self, t => if let Some(r) = t.top() {
@@ -1407,6 +1526,8 @@ impl<'a> Searcher<'a> {
             // first is reduced by how far its child's STATIC eval falls short of alpha, and a move reduced to depth
             // <= 0 is not searched at all. First move: full window, full depth (always searched, so best is set).
             let child = b.make(m);
+            self.prefetch_child(child.hash);
+            self.ec_imp = (move_idx < 3) as u32;
             if m.is_clone() {
                 self.stack.path_hash[ply as usize + 1] = child.hash;
                 self.stack.rep_base[ply as usize + 1] = ply + 1;
@@ -1452,7 +1573,12 @@ impl<'a> Searcher<'a> {
                 // child eval is from the child's side to move = minus our static value of the move
                 if FUT_CHEAP_M > 0 && self.fut_sn && self.nnue.is_some() {
                     let slot = (child.hash as usize) & (self.ecache.len() - 1);
-                    if !(self.ecache[slot].0 == child.hash && self.ecache[slot].1 != i32::MIN) {
+                    let cached = if self.ec2.is_some() {
+                        self.ec2_get(&child).is_some()
+                    } else {
+                        self.ecache[slot].0 == child.hash && self.ecache[slot].1 != i32::MIN
+                    };
+                    if !cached {
                         let hand = evaluate(&child, None, false);
                         let (bt, ct) = (b.turn as usize, child.turn as usize);
                         let sn = small_net();
