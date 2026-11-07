@@ -1216,6 +1216,9 @@ impl<'a> Searcher<'a> {
             }
         }
 
+        trc!(self, t => if let Some(r) = t.top() {
+            r.nmoves = self.stack.lists[ply as usize].len().min(255) as u8;
+        });
         if let (Some(pol), Some(nn)) = (self.policy, self.nnue) {
             let n = self.stack.lists[ply as usize].len();
             if n > 1 && depth >= self.pol_min {

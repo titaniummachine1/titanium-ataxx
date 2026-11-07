@@ -65,6 +65,8 @@ pub struct Rec {
     /// knob slack: RFP = alpha - (static + margin); SKIP_* = how far below 0 the reduced depth went (plies x 100) or
     /// the fut shortfall in cp; NMP/PROBCUT = score - beta
     pub slack: i32,
+    /// number of legal moves of this node (0 = the move loop never ran)
+    pub nmoves: u8,
 }
 
 pub struct Tracer {
@@ -126,6 +128,7 @@ impl Tracer {
             dis: 0,
             score: i32::MIN,
             slack: 0,
+            nmoves: 0,
         });
         self.stack.push(id);
         id
@@ -176,6 +179,7 @@ impl Tracer {
             dis: 0,
             score: i32::MIN,
             slack,
+            nmoves: 0,
         });
     }
 }

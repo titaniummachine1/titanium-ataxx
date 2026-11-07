@@ -354,6 +354,28 @@ pub fn run(args: &[String]) -> ExitCode {
                     let a = agg.entry((pph, format!("knob_idx {} skipped", ibucket(r.idx)))).or_default();
                     a.n += 1;
                 }
+                // D563 (user): jumps vs clones, side to move behind (parent static < -100) or not
+                if r.via == via::SCOUT && r.depth >= 0 && r.score != i32::MIN && r.mv != 0xFFFF && p.stat != i32::MIN {
+                    let cj = if Move::from_u32(r.mv as u32).is_clone() { "clone" } else { "jump" };
+                    let st = if p.stat < -100 { "behind" } else if p.stat > 100 { "ahead" } else { "level" };
+                    let a = agg.entry((pph, format!("knob_cj {st} {cj} {}", ibucket(r.idx)))).or_default();
+                    a.n += 1;
+                    a.sub += sub[i];
+                    a.hit += (r.score <= r.alpha) as u64;
+                }
+                // D562 (user): relative move index = idx / number of legal moves, in tenths; and the move count itself
+                if r.via == via::SCOUT && r.depth >= 0 && r.score != i32::MIN && p.nmoves > 0 {
+                    let rel = (r.idx as usize * 10 / p.nmoves as usize).min(9);
+                    let a = agg.entry((pph, format!("knob_rel {rel}/10 scout"))).or_default();
+                    a.n += 1;
+                    a.sub += sub[i];
+                    a.hit += (r.score <= r.alpha) as u64;
+                }
+            }
+            if r.kind == kind::FULL && r.nmoves > 0 {
+                let a = agg.entry((ph_n, "knob_nmoves".to_string())).or_default();
+                a.n += 1;
+                a.sub += r.nmoves as u64; // sum of move counts (mean = sub / n)
             }
         }
         // deep PV through the shallow tree
