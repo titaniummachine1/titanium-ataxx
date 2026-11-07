@@ -81,6 +81,8 @@ struct MoveStack {
     /// Lowest ply index since the most recent irreversible (clone) move; positions before this index
     /// have strictly fewer total stones on the board and can never be repeated.
     rep_base: Box<[u32; MAX_PLY]>,
+    /// D590: how the node at this ply was reached (3 first move, 2 top-12, 1 later, 0 null-move probe): TT worth
+    imp: Box<[u8; MAX_PLY]>,
 }
 
 impl MoveStack {
@@ -91,6 +93,7 @@ impl MoveStack {
             pre_eval: Box::new([i32::MIN; MAX_PLY]),
             path_hash: Box::new([0u64; MAX_PLY]),
             rep_base: Box::new([0u32; MAX_PLY]),
+            imp: Box::new([3u8; MAX_PLY]),
         }
     }
 }
@@ -601,10 +604,39 @@ impl CorrHist {
     }
 }
 
+/// D590: ranked TT (TT_MODE 1): 16-byte entries, 4 per 64-byte line.
+static TT_MODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_tt_mode(m: usize) {
+    TT_MODE.store(m.min(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct TtE2 {
+    chk: u32,
+    score: i32,
+    mv: u16,
+    depth: u8,
+    /// flag (2 bits) | importance << 2 (2 bits)
+    meta: u8,
+    age: u8,
+    empties: u8,
+    _pad: u16,
+}
+const _: () = assert!(std::mem::size_of::<TtE2>() == 16);
+const TTE2_EMPTY: TtE2 = TtE2 { chk: 0, score: 0, mv: 0, depth: 0, meta: 0, age: 0, empties: 0, _pad: 0 };
+
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct TtBucket([TtE2; 4]);
+
 /// Fixed-size transposition table, power-of-two entry count. Depth-0 EXACT
 /// entries double as the eval cache (Ataxx transpositions repeat a lot).
 pub struct Tt {
     buf: Vec<TtEntry>,
+    /// D590 ranked buckets (Some = TT_MODE 1; then `buf` is a 1-entry dummy)
+    v2: Option<Box<[TtBucket]>>,
     mask: usize,
     pub age: u8,
     /// D571: empties of the current search root (255 = nothing is dead) and the knob mode (0 off, 1, 2)
@@ -615,6 +647,17 @@ pub struct Tt {
 impl Tt {
     /// 2^bits entries (bits=20 -> 1M entries, 24 MB).
     pub fn new(bits: usize) -> Tt {
+        if TT_MODE.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+            let nb = (1usize << bits.min(25)) / 4;
+            let mut t = Tt::new_v1(0);
+            t.v2 = Some(vec![TtBucket([TTE2_EMPTY; 4]); nb].into_boxed_slice());
+            t.mask = nb - 1;
+            return t;
+        }
+        Tt::new_v1(bits)
+    }
+
+    fn new_v1(bits: usize) -> Tt {
         let size = 1usize << bits.min(24);
         Tt {
             buf: vec![
@@ -630,6 +673,7 @@ impl Tt {
                 size
             ],
             mask: size - 1,
+            v2: None,
             root_empties: 255,
             dead_mode: 0,
             age: 0,
@@ -640,11 +684,17 @@ impl Tt {
         for e in self.buf.iter_mut() {
             e.flag = FLAG_EMPTY;
         }
+        if let Some(v) = self.v2.as_mut() {
+            v.fill(TtBucket([TTE2_EMPTY; 4]));
+        }
         self.age = 0;
     }
 
     #[inline(always)]
     fn slot_ptr(&self, key: u64) -> *const i8 {
+        if let Some(v) = self.v2.as_ref() {
+            return &v[(key as usize) & self.mask] as *const TtBucket as *const i8;
+        }
         &self.buf[(key as usize) & self.mask] as *const TtEntry as *const i8
     }
 
@@ -655,6 +705,17 @@ impl Tt {
 
     #[inline]
     fn probe(&mut self, key: u64) -> Option<TtEntry> {
+        if let Some(v) = self.v2.as_mut() {
+            let age = self.age;
+            let chk = (key >> 32) as u32;
+            for e in v[(key as usize) & self.mask].0.iter_mut() {
+                if e.meta & 3 != 0 && e.chk == chk {
+                    e.age = age;
+                    return Some(TtEntry { key, mv: e.mv as u32, score: e.score, depth: e.depth, flag: e.meta & 3, age, empties: e.empties });
+                }
+            }
+            return None;
+        }
         let e = &mut self.buf[(key as usize) & self.mask];
         if e.flag != FLAG_EMPTY && e.key == key {
             e.age = self.age;
@@ -666,6 +727,27 @@ impl Tt {
 
     /// D572: what the table holds relative to a root with `root_empties` empty squares (TT review)
     pub fn census(&self, root_empties: u8) -> String {
+        if let Some(v) = self.v2.as_ref() {
+            let (mut empty, mut dead, mut live, mut imp) = (0u64, 0u64, 0u64, [0u64; 4]);
+            for b in v.iter() {
+                for e in b.0.iter() {
+                    if e.meta & 3 == 0 {
+                        empty += 1;
+                    } else if e.empties > root_empties {
+                        dead += 1;
+                    } else {
+                        live += 1;
+                        imp[((e.meta >> 2) & 3) as usize] += 1;
+                    }
+                }
+            }
+            let n = (v.len() * 4) as f64;
+            return format!(
+                "tt ranked {} entries (16 B): empty {:.1}% dead {:.1}% live {:.1}% (importance 3:{:.1}% 2:{:.1}% 1:{:.1}% 0:{:.1}%)",
+                v.len() * 4, 100.0 * empty as f64 / n, 100.0 * dead as f64 / n, 100.0 * live as f64 / n,
+                100.0 * imp[3] as f64 / n, 100.0 * imp[2] as f64 / n, 100.0 * imp[1] as f64 / n, 100.0 * imp[0] as f64 / n
+            );
+        }
         let (mut empty, mut dead, mut proven) = (0u64, 0u64, 0u64);
         let mut ahead = [0u64; 6]; // live entries by stones above the root: 0, 1, 2, 3-5, 6-10, 11+
         let mut depth = [0u64; 4]; // live entries by depth: 0-2, 3-5, 6-9, 10+
@@ -698,11 +780,46 @@ impl Tt {
 
     #[inline]
     fn store(&mut self, key: u64, mv: u32, score: i32, depth: u8, flag: u8) {
-        self.store_e(key, mv, score, depth, flag, 0);
+        self.store_e(key, mv, score, depth, flag, 0, 1);
+    }
+
+    /// D590 ranked store: same position -> update (refutation move kept on fail-low); else the victim is an empty
+    /// slot, else a dead entry (more empties than the root), else the lowest worth = depth + 4 x importance
+    /// + 16 if proven - 3 x age (searches since last touched, capped at 4)
+    #[inline]
+    fn store_v2(&mut self, key: u64, mut mv: u32, score: i32, depth: u8, flag: u8, empties: u8, imp: u8) {
+        let (age, root_empties, mask) = (self.age, self.root_empties, self.mask);
+        let Some(v) = self.v2.as_mut() else { return };
+        let bk = &mut v[(key as usize) & mask].0;
+        let chk = (key >> 32) as u32;
+        let new = |mv: u32| TtE2 { chk, score, mv: mv as u16, depth, meta: (flag & 3) | ((imp & 3) << 2), age, empties, _pad: 0 };
+        if let Some(i) = (0..4).find(|&i| bk[i].meta & 3 != 0 && bk[i].chk == chk) {
+            if flag == FLAG_UPPER && bk[i].mv != 0 && bk[i].mv != 0xFFFF {
+                mv = bk[i].mv as u32;
+            }
+            bk[i] = new(mv);
+            return;
+        }
+        let worth = |e: &TtE2| -> i32 {
+            if e.meta & 3 == 0 {
+                return i32::MIN;
+            }
+            if e.empties > root_empties {
+                return i32::MIN + 1;
+            }
+            let a = age.wrapping_sub(e.age).min(4) as i32;
+            e.depth as i32 + 4 * ((e.meta >> 2) & 3) as i32 + if e.score.abs() >= MATE_BOUND { 16 } else { 0 } - 3 * a
+        };
+        let victim = (0..4).min_by_key(|&i| worth(&bk[i])).unwrap_or(0);
+        bk[victim] = new(mv);
     }
 
     #[inline]
-    fn store_e(&mut self, key: u64, mut mv: u32, score: i32, depth: u8, flag: u8, empties: u8) {
+    fn store_e(&mut self, key: u64, mut mv: u32, score: i32, depth: u8, flag: u8, empties: u8, imp: u8) {
+        if self.v2.is_some() {
+            self.store_v2(key, mv, score, depth, flag, empties, imp);
+            return;
+        }
         let (root_empties, dead_mode) = (self.root_empties, self.dead_mode);
         let e = &mut self.buf[(key as usize) & self.mask];
         let same_pos = e.flag != FLAG_EMPTY && e.key == key;
@@ -1370,6 +1487,7 @@ impl<'a> Searcher<'a> {
                 && static_eval >= beta + self.knobs.v[bk][K_NMP_MARGIN]
             {
                 let child = b.make_pass();
+                self.stack.imp[ply as usize + 1] = 0;
                 self.stack.path_hash[ply as usize + 1] = child.hash;
                 self.stack.rep_base[ply as usize + 1] = self.stack.rep_base[ply as usize];
                 // NMP pass flips stm: sancta acc is color-relative so it
@@ -1527,7 +1645,9 @@ impl<'a> Searcher<'a> {
             // <= 0 is not searched at all. First move: full window, full depth (always searched, so best is set).
             let child = b.make(m);
             self.prefetch_child(child.hash);
-            self.ec_imp = (move_idx < 3) as u32;
+            // D590 (user): the top ~10-15 moves are real candidates the search often keeps unreduced
+            self.ec_imp = (move_idx < 12) as u32;
+            self.stack.imp[ply as usize + 1] = if move_idx == 0 { 3 } else if move_idx < 12 { 2 } else { 1 };
             if m.is_clone() {
                 self.stack.path_hash[ply as usize + 1] = child.hash;
                 self.stack.rep_base[ply as usize + 1] = ply + 1;
@@ -1745,7 +1865,7 @@ impl<'a> Searcher<'a> {
             FLAG_EXACT
         };
         self.tt
-            .store_e(b.hash, best_mv, score_to_tt(best, ply), depth as u8, flag, b.empty().count_ones() as u8);
+            .store_e(b.hash, best_mv, score_to_tt(best, ply), depth as u8, flag, b.empty().count_ones() as u8, self.stack.imp[ply as usize]);
     }
     /// Iterative deepening root search. Falls back to any legal move.
     /// Whichever limit hits first (nodes / time / depth) stops the search;
@@ -1916,6 +2036,7 @@ impl<'a> Searcher<'a> {
             for i in 0..n_root {
                 let m = root_moves[i];
                 let child = b.make(m);
+                self.stack.imp[1] = 3;
                 self.stack.path_hash[1] = child.hash;
                 self.stack.rep_base[1] = if m.is_clone() { 1 } else { 0 };
                 // Root children: acc[1] = acc[0] + diffs (sancta lazy path).
