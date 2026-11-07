@@ -1048,6 +1048,7 @@ impl<'a> Searcher<'a> {
             if n > 1 && depth >= self.pol_min {
                 let mut buf = std::mem::take(&mut self.pol_buf);
                 nn.policy_xin(b, &mut buf);
+                let mut kc = crate::policy::KCache::new();
                 for i in 0..n {
                     let (m, sc) = {
                         let l = &self.stack.lists[ply as usize];
@@ -1056,7 +1057,7 @@ impl<'a> Searcher<'a> {
                     if sc == ORD_TT {
                         continue;
                     }
-                    let add = (pol.logit(b, m, &buf) * self.pol_w) as i32;
+                    let add = (pol.logit_k(b, m, &buf, &mut kc) * self.pol_w) as i32;
                     self.stack.lists[ply as usize].set_score(i, sc.saturating_add(add));
                 }
                 self.pol_buf = buf;

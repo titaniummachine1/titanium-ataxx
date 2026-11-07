@@ -18,11 +18,29 @@ pub struct Policy {
     g: [f32; NSCAL],
     u: Vec<f32>,
     /// D486 pattern tables (empty for TPOL1)
-    td: Vec<f32>,
-    tor: Vec<f32>,
+    /// D502: stored as i16 at TQ (1/2048 logit steps, |table| <= 16): half the cache footprint of f32 (the nps cost)
+    td: Vec<i16>,
+    tor: Vec<i16>,
+    /// D502 TPOL3: tables shared by the 9 edge classes (row/col in {0, 1..5, 6}) instead of per square
+    cls: bool,
 }
 
+/// edge class of a square: (row class) * 3 + (col class), class 0 = first line, 1 = inner, 2 = last line
+static CLS: [u8; 49] = {
+    let mut t = [0u8; 49];
+    let mut a = 0;
+    while a < 49 {
+        let (r, c) = (a / 7, a % 7);
+        let fr: u8 = if r == 0 { 0 } else if r == 6 { 2 } else { 1 };
+        let fc: u8 = if c == 0 { 0 } else if c == 6 { 2 } else { 1 };
+        t[a] = fr * 3 + fc;
+        a += 1;
+    }
+    t
+};
+
 const P3: usize = 6561;
+const TQ: f32 = 2048.0;
 
 /// D493 speed: per square, the 8 neighbour squares in the fixed order NW N NE W E SW S SE; off-board = bit 63 (never set
 /// on a 49-square board, so it reads as empty = digit 0, exactly like the trainer's bounds check).
@@ -62,6 +80,31 @@ static T3: [u16; 256] = {
     t
 };
 
+/// D502: on-board neighbour mask per square
+static NBM: [u64; 49] = {
+    let mut t = [0u64; 49];
+    let mut a = 0;
+    while a < 49 {
+        let mut j = 0;
+        while j < 8 {
+            if NB[a][j] != 63 {
+                t[a] |= 1u64 << NB[a][j];
+            }
+            j += 1;
+        }
+        a += 1;
+    }
+    t
+};
+
+/// the 8 neighbour bits of `s` (bit j = NB order) with 4 shifts: mask off-board/wrapped cells, shift up by 8 so s-8 >= 0
+#[inline(always)]
+fn bits8f(x: u64, s: usize) -> usize {
+    let y = (x & NBM[s]) << 8;
+    (((y >> s) & 7) | (((y >> (s + 7)) & 1) << 3) | (((y >> (s + 9)) & 1) << 4) | (((y >> (s + 14)) & 7) << 5)) as usize
+}
+
+#[allow(dead_code)]
 #[inline(always)]
 fn bits8(x: u64, nb: &[u8; 8]) -> usize {
     let mut v = 0usize;
@@ -77,8 +120,35 @@ fn bits8(x: u64, nb: &[u8; 8]) -> usize {
 /// significant; must match titaniumtest src/policy.rs k3code exactly (test k3code_matches_reference).
 #[inline]
 fn k3code(me: u64, opp: u64, sq: u8) -> usize {
-    let nb = &NB[sq as usize];
-    T3[bits8(me, nb)] as usize + 2 * T3[bits8(opp, nb)] as usize
+    let s = sq as usize;
+    T3[bits8f(me, s)] as usize + 2 * T3[bits8f(opp, s)] as usize
+}
+
+/// D502: per-node memo of the 3x3 codes (many moves share a destination or an origin square); new() per node
+pub struct KCache {
+    valid: u64,
+    code: [u16; 49],
+}
+
+impl KCache {
+    #[inline]
+    pub fn new() -> KCache {
+        KCache { valid: 0, code: [0; 49] }
+    }
+    #[inline(always)]
+    fn get(&mut self, me: u64, opp: u64, sq: u8) -> usize {
+        if self.valid >> sq & 1 == 0 {
+            self.code[sq as usize] = k3code(me, opp, sq) as u16;
+            self.valid |= 1u64 << sq;
+        }
+        self.code[sq as usize] as usize
+    }
+}
+
+impl Default for KCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -121,13 +191,15 @@ impl Policy {
 
     pub fn from_bytes(d: &[u8]) -> std::io::Result<Policy> {
         let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
-        let v2 = d.len() >= 12 && &d[..8] == b"TPOL2\0\0\0";
+        let v3 = d.len() >= 12 && &d[..8] == b"TPOL3\0\0\0";
+        let v2 = (d.len() >= 12 && &d[..8] == b"TPOL2\0\0\0") || v3;
         if d.len() < 12 || (&d[..8] != b"TPOL1\0\0\0" && !v2) {
             return Err(bad("bad policy magic"));
         }
         let dim = u32::from_le_bytes(d[8..12].try_into().unwrap()) as usize;
         let n1 = SLOTS + NSCAL + SLOTS * dim;
-        let n = n1 + if v2 { (SLOTS + 49) * P3 } else { 0 };
+        let (nds, nos) = if v3 { (18, 9) } else { (SLOTS, 49) };
+        let n = n1 + if v2 { (nds + nos) * P3 } else { 0 };
         if d.len() != 12 + 4 * n {
             return Err(bad("bad policy size"));
         }
@@ -136,13 +208,20 @@ impl Policy {
         bias.copy_from_slice(&f[..SLOTS]);
         let mut g = [0f32; NSCAL];
         g.copy_from_slice(&f[SLOTS..SLOTS + NSCAL]);
-        let (td, tor) = if v2 { (f[n1..n1 + SLOTS * P3].to_vec(), f[n1 + SLOTS * P3..].to_vec()) } else { (Vec::new(), Vec::new()) };
-        Ok(Policy { dim, bias, g, u: f[SLOTS + NSCAL..n1].to_vec(), td, tor })
+        let q = |x: &[f32]| -> Vec<i16> { x.iter().map(|v| (v * TQ).round().clamp(-32767.0, 32767.0) as i16).collect() };
+        let (td, tor) = if v2 { (q(&f[n1..n1 + nds * P3]), q(&f[n1 + nds * P3..])) } else { (Vec::new(), Vec::new()) };
+        Ok(Policy { dim, bias, g, u: f[SLOTS + NSCAL..n1].to_vec(), td, tor, cls: v3 })
     }
 
     /// Logit of move `m` in `b` given the sparse accumulator product `xin` (index, value).
     #[inline]
     pub fn logit(&self, b: &Board, m: Move, xin: &[(u16, f32)]) -> f32 {
+        self.logit_k(b, m, xin, &mut KCache::new())
+    }
+
+    /// `logit` with a per-node code cache (search ordering loop: one KCache per node, same board for every move)
+    #[inline]
+    pub fn logit_k(&self, b: &Board, m: Move, xin: &[(u16, f32)], kc: &mut KCache) -> f32 {
         let clone = m.is_clone();
         let c = clone as usize;
         let empty = b.empty();
@@ -159,10 +238,16 @@ impl Policy {
         }
         if !self.td.is_empty() {
             let (me, opp) = (b.me(), b.opp());
-            z += self.td[slot * P3 + k3code(me, opp, m.to)];
+            let (ds, os) = if self.cls {
+                (CLS[m.to as usize] as usize * 2 + (!clone) as usize, CLS[m.from as usize] as usize)
+            } else {
+                (slot, m.from as usize)
+            };
+            let mut t = self.td[ds * P3 + kc.get(me, opp, m.to)] as i32;
             if !clone {
-                z += self.tor[m.from as usize * P3 + k3code(me, opp, m.from)];
+                t += self.tor[os * P3 + kc.get(me, opp, m.from)] as i32;
             }
+            z += t as f32 * (1.0 / TQ);
         }
         z
     }
