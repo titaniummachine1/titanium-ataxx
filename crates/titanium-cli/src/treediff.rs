@@ -67,9 +67,46 @@ const DIS_RFP_NUM: i32 = 32;
 struct Agg {
     n: u64,
     sub: u64,
+    /// knob buckets: cuts (nmp/pc), fail-lows (rfp gap), alpha raised (move index)
+    hit: u64,
+}
+
+fn sbucket(d: i32) -> &'static str {
+    if d < -200 {
+        "a<-200"
+    } else if d < -100 {
+        "b-200..-100"
+    } else if d < 0 {
+        "c-100..0"
+    } else if d < 100 {
+        "d0..100"
+    } else if d < 200 {
+        "e100..200"
+    } else if d < 300 {
+        "f200..300"
+    } else {
+        "g>=300"
+    }
+}
+
+fn ibucket(i: u8) -> &'static str {
+    match i {
+        0 => "00",
+        1 => "01",
+        2 => "02",
+        3 => "03",
+        4..=5 => "04-05",
+        6..=8 => "06-08",
+        9..=12 => "09-12",
+        13..=20 => "13-20",
+        _ => "21+",
+    }
 }
 
 pub fn run(args: &[String]) -> ExitCode {
+    if let Some(p) = arg(args, "--report") {
+        return report(&p);
+    }
     let Some(games) = arg(args, "--games") else {
         eprintln!("treediff --games G.jsonl [--max-games 40] [--every 4] [--snodes 50000] [--dnodes 500000] [--out PREFIX] [--dump N] [--per-phase 12]");
         return ExitCode::from(2);
@@ -183,6 +220,63 @@ pub fn run(args: &[String]) -> ExitCode {
                 let a = agg.entry((ph_n, format!("{bucket}_d{}", r.sdepth))).or_default();
                 a.n += 1;
                 a.sub += sub[i];
+            }
+            let par = recs.get(r.parent as usize);
+            // KNOB BUCKETS (D556): null move by parent static - beta (hit = cut)
+            if r.via == via::NULL {
+                if let Some(p) = par {
+                    let a = agg.entry((phase_of(p.empties as u32), format!("knob_nmp_try {}", sbucket(p.stat - p.beta)))).or_default();
+                    a.n += 1;
+                    a.sub += sub[i];
+                    a.hit += (p.kind == kind::NMP) as u64;
+                }
+            }
+            // ProbCut by parent static - pc_beta (the probcut search window is pc_beta-1, pc_beta)
+            if r.via == via::PROBCUT {
+                if let Some(p) = par {
+                    let a = agg.entry((phase_of(p.empties as u32), format!("knob_pc_try {}", sbucket(p.stat - r.beta)))).or_default();
+                    a.n += 1;
+                    a.sub += sub[i];
+                    a.hit += (p.kind == kind::PROBCUT) as u64;
+                }
+            }
+            // RFP gap (alpha - (static + margin)) for non-PV depth 1..4 nodes that ran the move loop or were RFP-cut
+            // (hit = failed low anyway; gap > 0 = RFP fired)
+            if (r.kind == kind::FULL || r.kind == kind::RFP)
+                && r.ply > 0
+                && r.sdepth >= 1
+                && r.sdepth <= 4
+                && r.beta - r.alpha == 1
+                && r.score != i32::MIN
+                && r.alpha.abs() < 90_000
+                && r.stat != i32::MIN
+            {
+                let gap = r.alpha - (r.stat + RFP_MARGINS[(r.sdepth - 1) as usize] + ((r.dis * DIS_RFP_NUM) >> 7));
+                let a = agg.entry((ph_n, format!("knob_rfp_d{} gap {}", r.sdepth, sbucket(gap)))).or_default();
+                a.n += 1;
+                a.sub += sub[i];
+                a.hit += (r.kind == kind::RFP || r.score <= r.alpha) as u64;
+            }
+            // move index (LMR start, D556): scouts at index k (hit = the scout failed high = the move raised alpha), by
+            // the PARENT's phase; reduced ones separately; skipped children counted
+            if let Some(p) = par {
+                let pph = phase_of(p.empties as u32);
+                if r.via == via::SCOUT && r.depth >= 0 && r.score != i32::MIN {
+                    let a = agg.entry((pph, format!("knob_idx {} scout", ibucket(r.idx)))).or_default();
+                    a.n += 1;
+                    a.sub += sub[i];
+                    a.hit += (r.score <= r.alpha) as u64;
+                    if r.full_depth > r.depth {
+                        let a = agg.entry((pph, format!("knob_idx {} reduced", ibucket(r.idx)))).or_default();
+                        a.n += 1;
+                        a.sub += sub[i];
+                        a.hit += (r.score <= r.alpha) as u64;
+                    }
+                }
+                if r.kind == kind::SKIP_FUT || r.kind == kind::SKIP_SN {
+                    let a = agg.entry((pph, format!("knob_idx {} skipped", ibucket(r.idx)))).or_default();
+                    a.n += 1;
+                }
             }
         }
         // deep PV through the shallow tree
@@ -307,10 +401,10 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut keys: Vec<_> = agg.keys().cloned().collect();
     keys.sort();
     let mut fn_ = fs::File::create(format!("{prefix}.nodes.tsv")).unwrap();
-    writeln!(fn_, "phase\tkind\tcount\tsubtree_nodes").unwrap();
+    writeln!(fn_, "phase\tkind\tcount\tsubtree_nodes\thit").unwrap();
     for k in keys {
         let a = &agg[&k];
-        writeln!(fn_, "{}\t{}\t{}\t{}", k.0, k.1, a.n, a.sub).unwrap();
+        writeln!(fn_, "{}\t{}\t{}\t{}\t{}", k.0, k.1, a.n, a.sub, a.hit).unwrap();
     }
     eprintln!("wrote {prefix}.pos.tsv, {prefix}.pv.tsv, {prefix}.nodes.tsv");
     ExitCode::SUCCESS
@@ -417,6 +511,22 @@ fn report(prefix: &str) -> ExitCode {
         ks.sort();
         for (k, (n, sub)) in ks {
             out += &format!("    {k:24} {n:9} ({:5.1}% of nodes)  subtree nodes {sub:10} ({:5.1}%)\n", 100.0 * n as f64 / total.max(1) as f64, 100.0 * sub as f64 / total.max(1) as f64);
+        }
+    }
+    // knob tables: every knob_* key, per phase -> count, hit %, subtree nodes
+    let mut kk: Vec<String> = nodes.iter().map(|r| g(r, "kind")).filter(|k| k.starts_with("knob_")).collect();
+    kk.sort();
+    kk.dedup();
+    out += "\nKnob buckets per phase: count / hit% (nmp, pc: cut; rfp: failed low; idx: raised alpha) / subtree nodes\n";
+    for k in kk {
+        out += &format!("  {k}\n");
+        for ph in 0..16 {
+            let rs: Vec<_> = nodes.iter().filter(|r| g(r, "kind") == k && gi(r, "phase") == ph).collect();
+            if rs.is_empty() {
+                continue;
+            }
+            let (n, h, sb) = rs.iter().fold((0i64, 0i64, 0i64), |a, r| (a.0 + gi(r, "count"), a.1 + gi(r, "hit"), a.2 + gi(r, "subtree_nodes")));
+            out += &format!("    phase {ph:2}: {n:8}  {:5.1}%  {sb:9}\n", 100.0 * h as f64 / n.max(1) as f64);
         }
     }
     print!("{out}");
