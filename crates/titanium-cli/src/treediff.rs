@@ -80,7 +80,17 @@ pub fn run(args: &[String]) -> ExitCode {
     let dnodes: u64 = arg(args, "--dnodes").and_then(|v| v.parse().ok()).unwrap_or(500_000);
     let per_phase: usize = arg(args, "--per-phase").and_then(|v| v.parse().ok()).unwrap_or(12);
     let dump: usize = arg(args, "--dump").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let prefix = arg(args, "--out").unwrap_or_else(|| "treediff".into());
+    if let Some(p) = arg(args, "--report") {
+        return report(&p);
+    }
+    // --shard K/N: this process takes positions with index % N == K (run N processes in parallel), files PREFIX.sK.*
+    let (shard_k, shard_n) = arg(args, "--shard")
+        .and_then(|v| v.split_once('/').and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))))
+        .unwrap_or((0, 1));
+    let mut prefix = arg(args, "--out").unwrap_or_else(|| "treediff".into());
+    if shard_n > 1 {
+        prefix = format!("{prefix}.s{shard_k}");
+    }
     let nn = Some(titanium::nnue::Nnue::bundled());
 
     // positions, at most per_phase per phase, spread over the games
@@ -88,10 +98,12 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut cnt = [0usize; 16];
     for (start, mv) in read_games(&games, max_games) {
         let Some(mut b) = Board::from_ataxx_fen(&start) else { continue };
+        let mut taken = [false; 16]; // at most one position per phase per game: spread over games
         for (k, m) in mv.iter().enumerate() {
             if k > 0 && k % every == 0 && !b.game_over() {
                 let ph = phase_of(b.empty().count_ones());
-                if cnt[ph] < per_phase {
+                if cnt[ph] < per_phase && !taken[ph] {
+                    taken[ph] = true;
                     cnt[ph] += 1;
                     pos.push((b, k));
                 }
@@ -110,6 +122,9 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut agg: HashMap<(usize, String), Agg> = HashMap::new();
 
     for (pi, (b, gply)) in pos.iter().enumerate() {
+        if pi % shard_n != shard_k {
+            continue;
+        }
         let ph = phase_of(b.empty().count_ones());
         // deep reference
         let mut sd = Searcher::new_unconfigured();
@@ -298,5 +313,113 @@ pub fn run(args: &[String]) -> ExitCode {
         writeln!(fn_, "{}\t{}\t{}\t{}", k.0, k.1, a.n, a.sub).unwrap();
     }
     eprintln!("wrote {prefix}.pos.tsv, {prefix}.pv.tsv, {prefix}.nodes.tsv");
+    ExitCode::SUCCESS
+}
+
+fn read_tsv(path: &std::path::Path) -> Vec<HashMap<String, String>> {
+    let Ok(t) = fs::read_to_string(path) else { return Vec::new() };
+    let mut it = t.lines();
+    let Some(h) = it.next() else { return Vec::new() };
+    let hs: Vec<&str> = h.split('\t').collect();
+    it.map(|l| hs.iter().zip(l.split('\t')).map(|(a, b)| (a.to_string(), b.to_string())).collect()).collect()
+}
+
+fn files(prefix: &str, suffix: &str) -> Vec<std::path::PathBuf> {
+    let p = std::path::Path::new(prefix);
+    let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let stem = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let mut v: Vec<_> = fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|f| {
+                    let n = f.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    n.starts_with(&stem) && n.ends_with(suffix) && (n == format!("{stem}{suffix}") || n[stem.len()..].starts_with(".s"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// `treediff --report PREFIX`: summary over PREFIX[.sK].{pos,pv,nodes}.tsv, printed and written to PREFIX.report.txt
+fn report(prefix: &str) -> ExitCode {
+    let mut out = String::new();
+    let pos: Vec<_> = files(prefix, ".pos.tsv").iter().flat_map(|f| read_tsv(f)).collect();
+    let pv: Vec<_> = files(prefix, ".pv.tsv").iter().flat_map(|f| read_tsv(f)).collect();
+    let nodes: Vec<_> = files(prefix, ".nodes.tsv").iter().flat_map(|f| read_tsv(f)).collect();
+    let g = |r: &HashMap<String, String>, k: &str| r.get(k).cloned().unwrap_or_default();
+    let gi = |r: &HashMap<String, String>, k: &str| r.get(k).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    out += &format!("treediff report {prefix}: {} positions, {} PV rows\n\n", pos.len(), pv.len());
+    out += "phase empties  n  agree%  sdepth ddepth  |deep-shallow score|  first event when they disagree\n";
+    for ph in 0..16 {
+        let rs: Vec<_> = pos.iter().filter(|r| gi(r, "phase") == ph).collect();
+        if rs.is_empty() {
+            continue;
+        }
+        let n = rs.len() as f64;
+        let ag = rs.iter().filter(|r| g(r, "agree") == "1").count() as f64;
+        let sd = rs.iter().map(|r| gi(r, "sdepth")).sum::<i64>() as f64 / n;
+        let dd = rs.iter().map(|r| gi(r, "ddepth")).sum::<i64>() as f64 / n;
+        let ds = rs.iter().map(|r| (gi(r, "deep_score") - gi(r, "shallow_score")).abs().min(2000)).sum::<i64>() as f64 / n;
+        let mut fe: HashMap<String, usize> = HashMap::new();
+        for r in rs.iter().filter(|r| g(r, "agree") == "0") {
+            *fe.entry(g(r, "first_event")).or_default() += 1;
+        }
+        let mut fev: Vec<_> = fe.into_iter().collect();
+        fev.sort_by(|a, b| b.1.cmp(&a.1));
+        let fes: Vec<String> = fev.iter().map(|(k, v)| format!("{k} {v}")).collect();
+        out += &format!(
+            "{ph:5} {:>2}-{:<2} {:3} {:6.1}  {sd:6.1} {dd:6.1}  {ds:8.0}              {}\n",
+            45 - 3 * ph as i64 - 2,
+            45 - 3 * ph as i64,
+            rs.len(),
+            100.0 * ag / n,
+            fes.join(", ")
+        );
+    }
+    // PV events: what the shallow tree did to the deep PV move, by side (even ply = the root side) and agreement
+    out += "\nPV events (deep PV move in the shallow tree), share of PV plies: root side (even ply) | other side (odd ply)\n";
+    for agree in ["0", "1"] {
+        let mut c: HashMap<(String, bool), usize> = HashMap::new();
+        let mut tot = [0usize; 2];
+        for r in pv.iter().filter(|r| g(r, "agree") == agree) {
+            let odd = gi(r, "pv_ply") % 2 == 1;
+            *c.entry((g(r, "event"), odd)).or_default() += 1;
+            tot[odd as usize] += 1;
+        }
+        let mut evs: Vec<String> = c.keys().map(|k| k.0.clone()).collect();
+        evs.sort();
+        evs.dedup();
+        out += &format!("  {} positions ({} / {} plies):\n", if agree == "1" { "AGREE" } else { "DISAGREE" }, tot[0], tot[1]);
+        for e in evs {
+            let a = *c.get(&(e.clone(), false)).unwrap_or(&0);
+            let b = *c.get(&(e.clone(), true)).unwrap_or(&0);
+            out += &format!("    {e:16} {:5.1}% | {:5.1}%\n", 100.0 * a as f64 / tot[0].max(1) as f64, 100.0 * b as f64 / tot[1].max(1) as f64);
+        }
+    }
+    // tree composition per phase group (4 phases each)
+    out += "\nTree composition (shallow trees): count and share of tree nodes per node kind, by phase group\n";
+    for grp in 0..4 {
+        let rs: Vec<_> = nodes.iter().filter(|r| gi(r, "phase") / 4 == grp).collect();
+        if rs.is_empty() {
+            continue;
+        }
+        let mut c: HashMap<String, (i64, i64)> = HashMap::new();
+        for r in &rs {
+            let e = c.entry(g(r, "kind")).or_default();
+            e.0 += gi(r, "count");
+            e.1 += gi(r, "subtree_nodes");
+        }
+        let total: i64 = c.iter().filter(|(k, _)| !k.starts_with("rfp_miss") && !k.starts_with("skip") && !k.contains("_search_")).map(|(_, v)| v.0).sum();
+        out += &format!("  phases {}-{} (empties {}..{}), {} nodes:\n", grp * 4, grp * 4 + 3, 45 - 12 * grp as i64 - 11, 45 - 12 * grp as i64, total);
+        let mut ks: Vec<_> = c.into_iter().collect();
+        ks.sort();
+        for (k, (n, sub)) in ks {
+            out += &format!("    {k:24} {n:9} ({:5.1}% of nodes)  subtree nodes {sub:10} ({:5.1}%)\n", 100.0 * n as f64 / total.max(1) as f64, 100.0 * sub as f64 / total.max(1) as f64);
+        }
+    }
+    print!("{out}");
+    let _ = fs::write(format!("{prefix}.report.txt"), &out);
     ExitCode::SUCCESS
 }
