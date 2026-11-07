@@ -4,7 +4,13 @@
 //! (TT move > killers > captures*W + history) -> lazy selection -> alpha-beta.
 
 /// exp/nnue-speed: static-eval cache entries (2^16 x 16 B = 1 MiB per searcher).
-const ECACHE_BITS: usize = 16;
+/// eval cache size, log2 entries (16 B each). D575: 2^16 is 100% full and thrashing at 500k nodes per move;
+/// `set_ecache_bits` (titanium-cli --ecache-bits N) changes it for searchers created afterwards.
+static ECACHE_BITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
+
+pub fn set_ecache_bits(bits: usize) {
+    ECACHE_BITS.store(bits.clamp(10, 26), std::sync::atomic::Ordering::Relaxed);
+}
 
 /// exp/tree-shape: trace hook, expands to nothing unless built with `--features trace`.
 macro_rules! trc {
@@ -829,6 +835,9 @@ pub struct Searcher<'a> {
     pub trace: Option<Box<crate::trace::Tracer>>,
     /// per-phase knobs, copied from the global table at every search start (D557)
     knobs: Knobs,
+    /// D575: eval-cache hits / misses (trace build only)
+    #[cfg(feature = "trace")]
+    pub ec_stats: (u64, u64),
 }
 
 /// Monotonic milliseconds since process start (native default time source).
@@ -876,7 +885,7 @@ impl<'a> Searcher<'a> {
             time_src: native_now_ms,
             ext_stop: None,
             tt: Tt::new(bits),
-            ecache: vec![(0u64, i32::MIN); 1 << ECACHE_BITS].into_boxed_slice(),
+            ecache: vec![(0u64, i32::MIN); 1 << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)].into_boxed_slice(),
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[[0; 49]; 49]; 2]),
             sancta: None,
@@ -893,6 +902,8 @@ impl<'a> Searcher<'a> {
             #[cfg(feature = "trace")]
             trace: None,
             knobs: DEFAULT_KNOBS,
+            #[cfg(feature = "trace")]
+            ec_stats: (0, 0),
         }
     }
 
@@ -961,10 +972,18 @@ impl<'a> Searcher<'a> {
 
     #[inline]
     fn leaf_eval_with_dis(&mut self, b: &Board) -> (i32, i32) {
-        let slot = (b.hash as usize) & ((1 << ECACHE_BITS) - 1);
+        let slot = (b.hash as usize) & (self.ecache.len() - 1);
         let (k, v) = self.ecache[slot];
         if k == b.hash && v != i32::MIN {
+            #[cfg(feature = "trace")]
+            {
+                self.ec_stats.0 += 1;
+            }
             return unpack_eval_dis(v);
+        }
+        #[cfg(feature = "trace")]
+        {
+            self.ec_stats.1 += 1;
         }
         let (eval, dis) = self.leaf_eval_raw_with_dis(b);
         self.ecache[slot] = (b.hash, pack_eval_dis(eval, dis));
@@ -1008,7 +1027,11 @@ impl<'a> Searcher<'a> {
     /// D572: TT + eval-cache census for the position `b` (the next search root)
     pub fn cache_census(&self, b: &Board) -> String {
         let filled = self.ecache.iter().filter(|e| e.1 != i32::MIN).count();
-        format!("{} | ecache {} entries filled {:.1}%", self.tt.census(b.empty().count_ones() as u8), self.ecache.len(), 100.0 * filled as f64 / self.ecache.len() as f64)
+        #[cfg(feature = "trace")]
+        let hits = format!(" hits {} misses {} hit rate {:.1}%", self.ec_stats.0, self.ec_stats.1, 100.0 * self.ec_stats.0 as f64 / (self.ec_stats.0 + self.ec_stats.1).max(1) as f64);
+        #[cfg(not(feature = "trace"))]
+        let hits = String::new();
+        format!("{} | ecache {} entries filled {:.1}%{hits}", self.tt.census(b.empty().count_ones() as u8), self.ecache.len(), 100.0 * filled as f64 / self.ecache.len() as f64)
     }
 
     pub fn reset_for_new_game(&mut self) {
@@ -1343,7 +1366,7 @@ impl<'a> Searcher<'a> {
                     }
                     let child = b.make(m);
                     let add = if EVORD_CACHE {
-                        let (k, v) = self.ecache[(child.hash as usize) & ((1 << ECACHE_BITS) - 1)];
+                        let (k, v) = self.ecache[(child.hash as usize) & (self.ecache.len() - 1)];
                         if k == child.hash && v != i32::MIN {
                             let (ce, _) = unpack_eval_dis(v);
                             (-ce).saturating_sub(static_eval)
@@ -1426,7 +1449,7 @@ impl<'a> Searcher<'a> {
             {
                 // child eval is from the child's side to move = minus our static value of the move
                 if FUT_CHEAP_M > 0 && self.fut_sn && self.nnue.is_some() {
-                    let slot = (child.hash as usize) & ((1 << ECACHE_BITS) - 1);
+                    let slot = (child.hash as usize) & (self.ecache.len() - 1);
                     if !(self.ecache[slot].0 == child.hash && self.ecache[slot].1 != i32::MIN) {
                         let hand = evaluate(&child, None, false);
                         let (bt, ct) = (b.turn as usize, child.turn as usize);
