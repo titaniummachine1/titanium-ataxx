@@ -1,6 +1,8 @@
 //! Move-ordering policy head (exp/policy, docs/POLICY_PLAN.md). logit(m) = bias[slot] + scalar move features
 //! + U[slot] . xin, where xin is the sparse pairwise accumulator product the value net's L1 reads. Fitted by `ti policy`.
 //! File: magic "TPOL1\0\0\0", u32 dim, f32 bias[98], f32 g[45], f32 u[98*dim], little endian.
+//! TPOL2 (D486): the same, then f32 dest[98][6561] + f32 orig[49][6561]: one lookup per move on the base-3 code of the
+//! 8 cells around the destination (and, for jumps, around the origin), mover-relative, as `ti policy --pat k3` fits it.
 use crate::board::{Board, Move, RING1};
 
 
@@ -15,6 +17,30 @@ pub struct Policy {
     bias: [f32; SLOTS],
     g: [f32; NSCAL],
     u: Vec<f32>,
+    /// D486 pattern tables (empty for TPOL1)
+    td: Vec<f32>,
+    tor: Vec<f32>,
+}
+
+const P3: usize = 6561;
+
+/// Base-3 code of the 8 neighbours of `sq` (0 empty/off-board, 1 `me`, 2 `opp`), order NW N NE W E SW S SE;
+/// must match titaniumtest src/policy.rs k3code exactly.
+#[inline]
+fn k3code(me: u64, opp: u64, sq: u8) -> usize {
+    let (r, c) = ((sq / 7) as i32, (sq % 7) as i32);
+    let mut code = 0usize;
+    for (dr, dc) in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)] {
+        let (rr, cc) = (r + dr, c + dc);
+        let d = if (0..7).contains(&rr) && (0..7).contains(&cc) {
+            let bit = 1u64 << (rr * 7 + cc);
+            ((me & bit != 0) as usize) | (((opp & bit != 0) as usize) << 1)
+        } else {
+            0
+        };
+        code = code * 3 + d;
+    }
+    code
 }
 
 impl Policy {
@@ -24,11 +50,13 @@ impl Policy {
 
     pub fn from_bytes(d: &[u8]) -> std::io::Result<Policy> {
         let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
-        if d.len() < 12 || &d[..8] != b"TPOL1\0\0\0" {
+        let v2 = d.len() >= 12 && &d[..8] == b"TPOL2\0\0\0";
+        if d.len() < 12 || (&d[..8] != b"TPOL1\0\0\0" && !v2) {
             return Err(bad("bad policy magic"));
         }
         let dim = u32::from_le_bytes(d[8..12].try_into().unwrap()) as usize;
-        let n = SLOTS + NSCAL + SLOTS * dim;
+        let n1 = SLOTS + NSCAL + SLOTS * dim;
+        let n = n1 + if v2 { (SLOTS + 49) * P3 } else { 0 };
         if d.len() != 12 + 4 * n {
             return Err(bad("bad policy size"));
         }
@@ -37,7 +65,8 @@ impl Policy {
         bias.copy_from_slice(&f[..SLOTS]);
         let mut g = [0f32; NSCAL];
         g.copy_from_slice(&f[SLOTS..SLOTS + NSCAL]);
-        Ok(Policy { dim, bias, g, u: f[SLOTS + NSCAL..].to_vec() })
+        let (td, tor) = if v2 { (f[n1..n1 + SLOTS * P3].to_vec(), f[n1 + SLOTS * P3..].to_vec()) } else { (Vec::new(), Vec::new()) };
+        Ok(Policy { dim, bias, g, u: f[SLOTS + NSCAL..n1].to_vec(), td, tor })
     }
 
     /// Logit of move `m` in `b` given the sparse accumulator product `xin` (index, value).
@@ -56,6 +85,13 @@ impl Policy {
         let row = &self.u[slot * self.dim..(slot + 1) * self.dim];
         for &(i, v) in xin {
             z += row[i as usize] * v;
+        }
+        if !self.td.is_empty() {
+            let (me, opp) = (b.me(), b.opp());
+            z += self.td[slot * P3 + k3code(me, opp, m.to)];
+            if !clone {
+                z += self.tor[m.from as usize * P3 + k3code(me, opp, m.from)];
+            }
         }
         z
     }
