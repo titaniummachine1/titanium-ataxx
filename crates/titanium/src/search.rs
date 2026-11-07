@@ -69,24 +69,24 @@ const MATERIAL: i32 = 100;
 /// Tempo: flat bonus for the side to move. autaxx uses 1.5-2 stones worth.
 const TEMPO: i32 = 150;
 /// Reverse futility pruning margins, index = depth-1 (autaxx, stone = 100).
-const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774];
+// (const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774]; -> KNOB_DEFAULT, per NNUE bucket)
 /// exp/search-moonbird A: Moonbird 1.1.0 reduction scheme (searchParams.nim) in place of the universal LMR.
 /// LMR from the 7th move: new_depth = depth * HALF / (HALF + n_reduced_so_far).
 /// (now per phase: Knobs::lmr_min_idx / lmr_half, defaults 6 / 47)
 /// Futility reduction from the 2nd move: one ply per FUT_DIV cp the child's static eval falls short of alpha
 /// (Moonbird futilityReductionDiv 35 in its units; x1.62 to Titanium cp: 568/ln10 vs 400 per logit). Reduce only.
-const MB_FUT_MIN_IDX: usize = 1;
-const MB_FUT_DIV: i32 = 57;
+// (const MB_FUT_MIN_IDX: usize = 1; -> KNOB_DEFAULT, per NNUE bucket)
+// (const MB_FUT_DIV: i32 = 57; -> KNOB_DEFAULT, per NNUE bucket)
 /// Volatility scaling numerator (scaled by 128) for Reverse Futility Pruning: +25% of predicted disagreement.
-const DIS_RFP_NUM: i32 = 32;
+// (const DIS_RFP_NUM: i32 = 32; -> KNOB_DEFAULT, per NNUE bucket)
 /// Volatility credit numerator (scaled by 128) for Child Futility Pruning: 37.5% credit.
-const DIS_FUT_NUM: i32 = 24;
+// (const DIS_FUT_NUM: i32 = 24; -> KNOB_DEFAULT, per NNUE bucket)
 /// ProbCut (gated +20 Elo @100 ms vs main, user-approved 2026-10-31): min depth, depth reduction, margin cp,
 /// disagreement-head credit (/128). A shallow null-window search at pc_beta; if it clears pc_beta the node cuts.
-const PC_D: u32 = 6;
-const PC_R: u32 = 3;
-const PC_T: i32 = 140;
-const PC_K: i32 = 32;
+// (const PC_D: u32 = 6; -> KNOB_DEFAULT, per NNUE bucket)
+// (const PC_R: u32 = 3; -> KNOB_DEFAULT, per NNUE bucket)
+// (const PC_T: i32 = 140; -> KNOB_DEFAULT, per NNUE bucket)
+// (const PC_K: i32 = 32; -> KNOB_DEFAULT, per NNUE bucket)
 
 #[inline(always)]
 pub fn pack_eval_dis(eval: i32, dis: i32) -> i32 {
@@ -132,29 +132,72 @@ pub fn build_knobs() -> (i32, i32, i32, u32, u32) {
 /// The shipped (strongest, gated) values of the build-time knobs.
 pub const DEFAULT_BUILD_KNOBS: (i32, i32, i32, u32, u32) = (350, 0, 0, 1, 1);
 
-/// exp/tree-shape (D556/D557): per-phase search knobs, phase = clamp((45 - empties) / 3, 0, 15) (16 phases).
-/// The defaults are the old constants, so the default build is bit-identical. `titanium-cli --knobs FILE` overrides
-/// (text lines `name = v` or `name = v0 v1 ... v15`); the searcher copies the table at every search start.
+/// exp/tree-shape (D557/D558, user order): EVERY search knob is a 16-entry table indexed by the NNUE bucket of the
+/// node, bucket = (empties * 16 / 50).min(15) (exactly nnue.rs: 14 at the start position, 0 on a full board), so the
+/// search is shaped separately for each of the 16 game phases the net uses. Defaults = the old constants (the default
+/// build is bit-identical). `titanium-cli --knobs FILE` overrides: lines `name = v` (all buckets) or
+/// `name = v0 v1 ... v15` (bucket 0 = full board ... 15); `#` comments. The searcher copies the table per search.
+pub const NK: usize = 19;
+pub const K_RFP1: usize = 0; // reverse futility margin depth 1..4 (257 347 478 774)
+pub const K_RFP2: usize = 1;
+pub const K_RFP3: usize = 2;
+pub const K_RFP4: usize = 3;
+pub const K_RFP_DIS: usize = 4; // RFP disagreement credit /128 (32)
+pub const K_NMP_MARGIN: usize = 5; // null move only when static >= beta + m (-1000000 = no condition)
+pub const K_NMP_R: usize = 6; // null move reduction (3)
+pub const K_NMP_CLONES: usize = 7; // min clone targets for the null move (11)
+pub const K_PC_D: usize = 8; // ProbCut min depth (6)
+pub const K_PC_R: usize = 9; // ProbCut reduction (3)
+pub const K_PC_T: usize = 10; // ProbCut margin cp (140)
+pub const K_PC_K: usize = 11; // ProbCut disagreement credit /128 (32)
+pub const K_LMR_MIN: usize = 12; // first move index with LMR (6)
+pub const K_LMR_HALF: usize = 13; // LMR half-life (47)
+pub const K_FUT_MIN: usize = 14; // first move index with futility reduction (1)
+pub const K_FUT_DIV: usize = 15; // cp per ply of futility reduction (57)
+pub const K_FUT_DIS: usize = 16; // futility disagreement credit /128 (24)
+pub const K_SN_M: usize = 17; // extra cp under the small-net lower bound before a skip (0)
+pub const K_IIR: usize = 18; // min depth for IIR without a TT entry (4)
+pub const KNOB_NAMES: [&str; NK] = [
+    "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "nmp_margin", "nmp_r", "nmp_clones", "pc_d", "pc_r", "pc_t", "pc_k",
+    "lmr_min", "lmr_half", "fut_min", "fut_div", "fut_dis", "sn_m", "iir",
+];
+pub const KNOB_DEFAULT: [i32; NK] = [257, 347, 478, 774, 32, -1_000_000, 3, 11, 6, 3, 140, 32, 6, 47, 1, 57, 24, 0, 4];
+pub const KNOB_RANGE: [(i32, i32); NK] = [
+    (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (-1_000_000, 1_000_000), (1, 8), (0, 49), (2, 64), (1, 8),
+    (0, 2000), (0, 512), (1, 255), (1, 10_000), (1, 255), (1, 10_000), (0, 512), (-2000, 2000), (1, 255),
+];
+
+/// knob table: v[bucket][knob]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Knobs {
-    /// first move index that gets the Moonbird LMR (old MB_LMR_MIN_IDX = 6)
-    pub lmr_min_idx: [u8; 16],
-    /// LMR half-life (old MB_LMR_HALFLIFE = 47)
-    pub lmr_half: [i32; 16],
-    /// null move only when static eval >= beta + nmp_margin (old: no condition = -1000000)
-    pub nmp_margin: [i32; 16],
+    pub v: [[i32; NK]; 16],
 }
 
-pub const DEFAULT_KNOBS: Knobs = Knobs { lmr_min_idx: [6; 16], lmr_half: [47; 16], nmp_margin: [-1_000_000; 16] };
+pub const DEFAULT_KNOBS: Knobs = Knobs { v: [KNOB_DEFAULT; 16] };
 static KNOBS: std::sync::Mutex<Knobs> = std::sync::Mutex::new(DEFAULT_KNOBS);
 
+/// the NNUE bucket of a position with `empties` empty squares (MUST match nnue.rs forward: empties * 16 / 50)
 #[inline(always)]
-pub fn phase_of_empties(empties: u32) -> usize {
-    (45i32 - empties as i32).clamp(0, 47) as usize / 3
+pub fn knob_bucket(empties: u32) -> usize {
+    ((empties as usize) * 16 / 50).min(15)
 }
 
 pub fn knobs() -> Knobs {
     *KNOBS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Knobs {
+    /// the table as a knob file (only knobs that differ from the default)
+    pub fn to_text(&self) -> String {
+        let mut o = String::new();
+        for k in 0..NK {
+            if (0..16).any(|b| self.v[b][k] != KNOB_DEFAULT[k]) {
+                let vals: Vec<String> = (0..16).map(|b| self.v[b][k].to_string()).collect();
+                o += &format!("{} = {}\n", KNOB_NAMES[k], vals.join(" "));
+            }
+        }
+        o
+    }
 }
 
 /// parse and install a knob file; returns the installed table
@@ -168,14 +211,12 @@ pub fn set_knobs_text(text: &str) -> Result<Knobs, String> {
         let (name, vals) = line.split_once('=').ok_or(format!("knobs line {}: expected name = values", ln + 1))?;
         let v: Vec<i64> = vals.split_whitespace().map(|x| x.parse::<i64>().map_err(|e| format!("knobs line {}: {e}", ln + 1))).collect::<Result<_, _>>()?;
         if v.len() != 1 && v.len() != 16 {
-            return Err(format!("knobs line {}: give 1 value or 16 (one per phase), got {}", ln + 1, v.len()));
+            return Err(format!("knobs line {}: give 1 value or 16 (one per NNUE bucket 0..15), got {}", ln + 1, v.len()));
         }
-        let at = |i: usize| if v.len() == 1 { v[0] } else { v[i] };
-        match name.trim() {
-            "lmr_min_idx" => (0..16).for_each(|i| k.lmr_min_idx[i] = at(i).clamp(1, 255) as u8),
-            "lmr_half" => (0..16).for_each(|i| k.lmr_half[i] = at(i).clamp(1, 10_000) as i32),
-            "nmp_margin" => (0..16).for_each(|i| k.nmp_margin[i] = at(i).clamp(-1_000_000, 1_000_000) as i32),
-            other => return Err(format!("knobs line {}: unknown knob {other} (lmr_min_idx, lmr_half, nmp_margin)", ln + 1)),
+        let ki = KNOB_NAMES.iter().position(|n| *n == name.trim()).ok_or(format!("knobs line {}: unknown knob {} (known: {})", ln + 1, name.trim(), KNOB_NAMES.join(" ")))?;
+        let (lo, hi) = KNOB_RANGE[ki];
+        for b in 0..16 {
+            k.v[b][ki] = (if v.len() == 1 { v[0] } else { v[b] }).clamp(lo as i64, hi as i64) as i32;
         }
     }
     *KNOBS.lock().unwrap_or_else(|e| e.into_inner()) = k;
@@ -1021,6 +1062,7 @@ impl<'a> Searcher<'a> {
         let alpha_orig = alpha;
         let mut tt_mv: u32 = 0;
         let mut depth = depth;
+        let bk = knob_bucket(b.empty().count_ones());
         if let Some(e) = self.tt.probe(b.hash) {
             tt_mv = e.mv;
             if e.depth as u32 >= depth {
@@ -1053,7 +1095,7 @@ impl<'a> Searcher<'a> {
                     return s;
                 }
             }
-        } else if depth >= 4 {
+        } else if depth >= self.knobs.v[bk][K_IIR] as u32 {
             depth -= 1;
         }
 
@@ -1083,10 +1125,10 @@ impl<'a> Searcher<'a> {
             && depth <= 4
             && alpha.abs() < MATE_BOUND
             && beta.abs() < MATE_BOUND
-            && static_eval + RFP_MARGINS[(depth.max(1) - 1) as usize] + ((node_dis * DIS_RFP_NUM) >> 7) < alpha
+            && static_eval + self.knobs.v[bk][K_RFP1 + (depth.max(1) - 1) as usize] + ((node_dis * self.knobs.v[bk][K_RFP_DIS]) >> 7) < alpha
         {
             self.heuristic_used = true;
-            trc!(self, t => t.end(crate::trace::kind::RFP, alpha - (static_eval + RFP_MARGINS[(depth.max(1) - 1) as usize] + ((node_dis * DIS_RFP_NUM) >> 7))));
+            trc!(self, t => t.end(crate::trace::kind::RFP, alpha - (static_eval + self.knobs.v[bk][K_RFP1 + (depth.max(1) - 1) as usize] + ((node_dis * self.knobs.v[bk][K_RFP_DIS]) >> 7))));
             return alpha;
         }
 
@@ -1098,9 +1140,9 @@ impl<'a> Searcher<'a> {
         if null_allowed && !BZ && depth > 2 && beta.abs() < MATE_BOUND {
             let clone_targets = (dist_union(b.occ[b.turn as usize], 1) & b.empty()).count_ones();
             // fill < 0.54 as integer: pieces*50 < 26*49 (no per-node float div).
-            if clone_targets >= 11
+            if clone_targets >= self.knobs.v[bk][K_NMP_CLONES] as u32
                 && (b.piece_cnt[0] as u32 + b.piece_cnt[1] as u32) * 50 < 26 * SQUARES as u32
-                && static_eval >= beta + self.knobs.nmp_margin[phase_of_empties(b.empty().count_ones())]
+                && static_eval >= beta + self.knobs.v[bk][K_NMP_MARGIN]
             {
                 let child = b.make_pass();
                 self.stack.path_hash[ply as usize + 1] = child.hash;
@@ -1110,7 +1152,7 @@ impl<'a> Searcher<'a> {
                 // (pass: no stones change, no diff update needed.)
                 trc!(self, t => t.pending(0xFFFF, crate::trace::via::NULL, 255, (depth - 1) as i8));
                 let score =
-                    -self.negamax::<BZ>(&child, -beta, -beta + 1, depth - 3, ply + 1, false);
+                    -self.negamax::<BZ>(&child, -beta, -beta + 1, depth.saturating_sub(self.knobs.v[bk][K_NMP_R] as u32), ply + 1, false);
                 if self.stop {
                     return 0;
                 }
@@ -1123,11 +1165,12 @@ impl<'a> Searcher<'a> {
         }
 
         // ProbCut: non-PV, not right after a null, margin widens with the net's disagreement output.
-        if null_allowed && ply > 0 && depth >= PC_D && beta - alpha == 1 && beta.abs() < MATE_BOUND {
-            let pc_beta = beta + PC_T + ((node_dis * PC_K) >> 7);
-            if pc_beta < MATE_BOUND && static_eval + 50 >= pc_beta - 2 * PC_T {
+        let (pc_d, pc_r, pc_t, pc_k) = (self.knobs.v[bk][K_PC_D] as u32, self.knobs.v[bk][K_PC_R] as u32, self.knobs.v[bk][K_PC_T], self.knobs.v[bk][K_PC_K]);
+        if null_allowed && ply > 0 && depth >= pc_d && beta - alpha == 1 && beta.abs() < MATE_BOUND {
+            let pc_beta = beta + pc_t + ((node_dis * pc_k) >> 7);
+            if pc_beta < MATE_BOUND && static_eval + 50 >= pc_beta - 2 * pc_t {
                 trc!(self, t => t.pending(0xFFFF, crate::trace::via::PROBCUT, 255, depth as i8));
-                let score = self.negamax::<BZ>(b, pc_beta - 1, pc_beta, depth - PC_R, ply, false);
+                let score = self.negamax::<BZ>(b, pc_beta - 1, pc_beta, depth.saturating_sub(pc_r), ply, false);
                 if self.stop {
                     return 0;
                 }
@@ -1230,8 +1273,9 @@ impl<'a> Searcher<'a> {
         // futility small net: the parent's accumulator, built at the first child that needs it (D110)
         let mut sn_parent: Option<[f32; 64]> = None;
         let mut lmr_cnt = 0i32;
-        let kph = phase_of_empties(b.empty().count_ones());
-        let (lmr_min, lmr_half) = (self.knobs.lmr_min_idx[kph] as usize, self.knobs.lmr_half[kph]);
+        let kn = self.knobs.v[bk];
+        let (lmr_min, lmr_half) = (kn[K_LMR_MIN] as usize, kn[K_LMR_HALF]);
+        let (fut_min, fut_div, fut_dis, sn_m) = (kn[K_FUT_MIN] as usize, kn[K_FUT_DIV], kn[K_FUT_DIS], kn[K_SN_M]);
         loop {
             let m = {
                 let list = &mut self.stack.lists[ply as usize];
@@ -1282,7 +1326,7 @@ impl<'a> Searcher<'a> {
                 lmr_cnt += 1;
             }
             let mut child_eval = i32::MIN;
-            if move_idx >= MB_FUT_MIN_IDX
+            if move_idx >= fut_min
                 && new_depth > 0
                 && self.sancta.is_none()
                 && alpha.abs() < MATE_BOUND
@@ -1304,8 +1348,9 @@ impl<'a> Searcher<'a> {
                             child.occ[1 - ct],
                         );
                         let lo = sn.bound_acc(&ca, child.empty().count_ones(), static_eval, hand)
-                            - FUT_SN_M;
-                        if new_depth - (alpha.saturating_add(lo) / MB_FUT_DIV).clamp(0, 64) <= 0
+                            - FUT_SN_M
+                            - sn_m;
+                        if new_depth - (alpha.saturating_add(lo) / fut_div).clamp(0, 64) <= 0
                             && best > -MATE_BOUND
                         {
                             self.heuristic_used = true;
@@ -1317,9 +1362,9 @@ impl<'a> Searcher<'a> {
                 }
                 let (ce, child_dis) = self.leaf_eval_with_dis(&child);
                 child_eval = pack_eval_dis(ce, child_dis);
-                let vol_credit = (child_dis * DIS_FUT_NUM) >> 7;
+                let vol_credit = (child_dis * fut_dis) >> 7;
                 let shortfall = alpha.saturating_add(ce) - vol_credit;
-                new_depth -= (shortfall / MB_FUT_DIV).clamp(0, 64);
+                new_depth -= (shortfall / fut_div).clamp(0, 64);
                 if child_dis > 300 && new_depth < depth as i32 {
                     new_depth += 1;
                 }

@@ -18,8 +18,9 @@ use std::process::ExitCode;
 use titanium::trace::{kind, via, Rec, Tracer};
 use titanium::{Board, Move, SearchLimits, Searcher};
 
+/// D558: phase = the NNUE bucket (empties * 16 / 50, 14 at the start, 0 on a full board), the index of the knob tables
 pub fn phase_of(empties: u32) -> usize {
-    (45i32 - empties as i32).clamp(0, 47) as usize / 3
+    titanium::search::knob_bucket(empties)
 }
 
 fn json_str<'a>(s: &'a str, key: &str, from: usize) -> Option<(&'a str, usize)> {
@@ -60,8 +61,6 @@ fn arg(args: &[String], k: &str) -> Option<String> {
     args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
 }
 
-const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774]; // MUST match search.rs
-const DIS_RFP_NUM: i32 = 32;
 
 #[derive(Default, Clone)]
 struct Agg {
@@ -215,7 +214,8 @@ pub fn run(args: &[String]) -> ExitCode {
             a.sub += if r.depth >= 0 { sub[i] } else { 0 };
             // RFP near misses: non-PV, depth 1..4, failed low, not a null/probcut search itself
             if r.kind == kind::FULL && r.ply > 0 && r.sdepth >= 1 && r.sdepth <= 4 && r.beta - r.alpha == 1 && r.score != i32::MIN && r.score <= r.alpha && r.alpha.abs() < 90_000 {
-                let gap = r.alpha - (r.stat + RFP_MARGINS[(r.sdepth - 1) as usize] + ((r.dis * DIS_RFP_NUM) >> 7));
+                let kb = titanium::search::knobs().v[phase_of(r.empties as u32)];
+                let gap = r.alpha - (r.stat + kb[titanium::search::K_RFP1 + (r.sdepth - 1) as usize] + ((r.dis * kb[titanium::search::K_RFP_DIS]) >> 7));
                 let bucket = if gap > -50 { "rfp_miss_0_50" } else if gap > -100 { "rfp_miss_50_100" } else if gap > -200 { "rfp_miss_100_200" } else { "rfp_miss_200plus" };
                 let a = agg.entry((ph_n, format!("{bucket}_d{}", r.sdepth))).or_default();
                 a.n += 1;
@@ -251,7 +251,8 @@ pub fn run(args: &[String]) -> ExitCode {
                 && r.alpha.abs() < 90_000
                 && r.stat != i32::MIN
             {
-                let gap = r.alpha - (r.stat + RFP_MARGINS[(r.sdepth - 1) as usize] + ((r.dis * DIS_RFP_NUM) >> 7));
+                let kb = titanium::search::knobs().v[phase_of(r.empties as u32)];
+                let gap = r.alpha - (r.stat + kb[titanium::search::K_RFP1 + (r.sdepth - 1) as usize] + ((r.dis * kb[titanium::search::K_RFP_DIS]) >> 7));
                 let a = agg.entry((ph_n, format!("knob_rfp_d{} gap {}", r.sdepth, sbucket(gap)))).or_default();
                 a.n += 1;
                 a.sub += sub[i];
@@ -465,8 +466,8 @@ fn report(prefix: &str) -> ExitCode {
         let fes: Vec<String> = fev.iter().map(|(k, v)| format!("{k} {v}")).collect();
         out += &format!(
             "{ph:5} {:>2}-{:<2} {:3} {:6.1}  {sd:6.1} {dd:6.1}  {ds:8.0}              {}\n",
-            45 - 3 * ph as i64 - 2,
-            45 - 3 * ph as i64,
+            (ph as i64 * 50 + 15) / 16,
+            ((ph as i64 + 1) * 50 + 15) / 16 - 1,
             rs.len(),
             100.0 * ag / n,
             fes.join(", ")
