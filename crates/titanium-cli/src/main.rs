@@ -81,6 +81,7 @@ fn main() -> ExitCode {
             flag_int(&args, "--threads").unwrap_or(1).max(1) as usize,
             max_depth_flag(&args),
             flag_int_alias(&args, "--time-limit-ms", "--time").map(|ms| ms as u64),
+            flag_int(&args, "--rec").unwrap_or(25) as usize,
         ),
         "snparity" => snparity_cmd(flag_str(&args, "--ref")),
         "nnbench" => nnbench_cmd(
@@ -1104,6 +1105,7 @@ fn labelbin_cmd(
     threads: usize,
     max_depth: u8,
     time_ms: Option<u64>,
+    rec_len: usize,
 ) -> ExitCode {
     let Some(bin) = bin else {
         eprintln!("labelbin: --bin FILE required");
@@ -1131,13 +1133,28 @@ fn labelbin_cmd(
         network_description(&nnue), max_depth, max_nodes, time_ms
     );
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    let data = fs::read(&bin).expect("bin");
-    let total = data.len() / 25;
+    // D498: --rec 25 (packed positions: occ0, occ1, blockers, turn) or --rec 48 (train_v9.tdat rows: occ0 @0, occ1 @8,
+    // turn @40, no blockers). Only the [lo, hi) slice is read, never the whole multi-GB file.
+    if rec_len != 25 && rec_len != 48 {
+        eprintln!("labelbin: --rec must be 25 or 48");
+        return ExitCode::FAILURE;
+    }
+    let total = fs::metadata(&bin).map(|m| m.len() as usize / rec_len).unwrap_or(0);
     let hi = hi.unwrap_or(total).min(total);
     let n = hi.saturating_sub(lo);
+    let data = {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut f = fs::File::open(&bin).expect("bin");
+        f.seek(SeekFrom::Start((lo * rec_len) as u64)).expect("seek");
+        let mut v = vec![0u8; n * rec_len];
+        f.read_exact(&mut v).expect("read slice");
+        v
+    };
     // ONE shared read-only net for all threads (one copy in the CPU cache), one Searcher per thread, rows handed out in
     // small chunks from an atomic counter (load balanced). Result per row packed in a u64: score(i32) | depth<<32 | nodes<<40.
     let res: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
+    // D498: the searched best move per row (from << 8 | to, 0xFFFF = none); the old output dropped it (policy data lost)
+    let mvs: Vec<std::sync::atomic::AtomicU32> = (0..n).map(|_| std::sync::atomic::AtomicU32::new(0xFFFF)).collect();
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     const CHUNK: usize = 32;
@@ -1158,9 +1175,9 @@ fn labelbin_cmd(
                         break;
                     }
                     for i in c..(c + CHUNK).min(n) {
-                        let rec = &data[(lo + i) * 25..(lo + i) * 25 + 25];
+                        let rec = &data[i * rec_len..(i + 1) * rec_len];
                         let u = |k: usize| u64::from_le_bytes(rec[k..k + 8].try_into().unwrap());
-                        let b = Board::from_occ(u(0), u(8), u(16), rec[24]);
+                        let b = if rec_len == 48 { Board::from_occ(u(0), u(8), 0, rec[40]) } else { Board::from_occ(u(0), u(8), u(16), rec[24]) };
                         searcher.reset_for_new_game();
                         let r = searcher.search(&b, &limits);
                         res[i].store(
@@ -1169,6 +1186,9 @@ fn labelbin_cmd(
                                 | ((r.nodes & 0xff_ffff) << 40),
                             Ordering::Relaxed,
                         );
+                        if let Some(m) = r.best {
+                            mvs[i].store(((m.from as u32) << 8) | m.to as u32, Ordering::Relaxed);
+                        }
                     }
                     let d = done.fetch_add((c + CHUNK).min(n) - c, Ordering::Relaxed)
                         + ((c + CHUNK).min(n) - c);
@@ -1180,10 +1200,17 @@ fn labelbin_cmd(
         }
     });
     let mut out = io::BufWriter::new(io::stdout().lock());
-    for v in &res {
+    for (v, mv) in res.iter().zip(&mvs) {
         let v = v.load(Ordering::Relaxed);
+        let mv = mv.load(Ordering::Relaxed);
+        let ms = if mv == 0xFFFF {
+            "0000".to_string()
+        } else {
+            let m = Move { from: (mv >> 8) as u8, to: (mv & 0xff) as u8 };
+            if m.is_clone() { Board::sq_name(m.to) } else { format!("{}{}", Board::sq_name(m.from), Board::sq_name(m.to)) }
+        };
         use std::io::Write as _;
-        let _ = writeln!(out, "{} {} {}", v as u32 as i32, (v >> 32) & 0xff, v >> 40);
+        let _ = writeln!(out, "{} {} {} {}", v as u32 as i32, (v >> 32) & 0xff, v >> 40, ms);
     }
     ExitCode::SUCCESS
 }
