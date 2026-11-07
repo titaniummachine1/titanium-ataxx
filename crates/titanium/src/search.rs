@@ -137,7 +137,7 @@ pub const DEFAULT_BUILD_KNOBS: (i32, i32, i32, u32, u32) = (350, 0, 0, 1, 1);
 /// search is shaped separately for each of the 16 game phases the net uses. Defaults = the old constants (the default
 /// build is bit-identical). `titanium-cli --knobs FILE` overrides: lines `name = v` (all buckets) or
 /// `name = v0 v1 ... v15` (bucket 0 = full board ... 15); `#` comments. The searcher copies the table per search.
-pub const NK: usize = 19;
+pub const NK: usize = 20;
 pub const K_RFP1: usize = 0; // reverse futility margin depth 1..4 (257 347 478 774)
 pub const K_RFP2: usize = 1;
 pub const K_RFP3: usize = 2;
@@ -157,14 +157,15 @@ pub const K_FUT_DIV: usize = 15; // cp per ply of futility reduction (57)
 pub const K_FUT_DIS: usize = 16; // futility disagreement credit /128 (24)
 pub const K_SN_M: usize = 17; // extra cp under the small-net lower bound before a skip (0)
 pub const K_IIR: usize = 18; // min depth for IIR without a TT entry (4)
+pub const K_KILL_CANON: usize = 19; // 1 = a clone killer matches any clone to the same square (D564; 0 = exact from-to)
 pub const KNOB_NAMES: [&str; NK] = [
     "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "nmp_margin", "nmp_r", "nmp_clones", "pc_d", "pc_r", "pc_t", "pc_k",
-    "lmr_min", "lmr_half", "fut_min", "fut_div", "fut_dis", "sn_m", "iir",
+    "lmr_min", "lmr_half", "fut_min", "fut_div", "fut_dis", "sn_m", "iir", "kill_canon",
 ];
-pub const KNOB_DEFAULT: [i32; NK] = [257, 347, 478, 774, 32, -1_000_000, 3, 11, 6, 3, 140, 32, 6, 47, 1, 57, 24, 0, 4];
+pub const KNOB_DEFAULT: [i32; NK] = [257, 347, 478, 774, 32, -1_000_000, 3, 11, 6, 3, 140, 32, 6, 47, 1, 57, 24, 0, 4, 0];
 pub const KNOB_RANGE: [(i32, i32); NK] = [
     (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (-1_000_000, 1_000_000), (1, 8), (0, 49), (2, 64), (1, 8),
-    (0, 2000), (0, 512), (1, 255), (1, 10_000), (1, 255), (1, 10_000), (0, 512), (-2000, 2000), (1, 255),
+    (0, 2000), (0, 512), (1, 255), (1, 10_000), (1, 255), (1, 10_000), (0, 512), (-2000, 2000), (1, 255), (0, 1),
 ];
 
 /// knob table: v[bucket][knob]
@@ -388,6 +389,7 @@ fn score_into(
     ply: u32,
     killers: &[(u32, u32); MAX_PLY],
     history: &History,
+    kill_canon: bool,
 ) {
     b.legal_moves_dedup_into(list);
     let opp = b.opp();
@@ -415,7 +417,17 @@ fn score_into(
             let conn = (b.occ[b.turn as usize] & RING1[m.from as usize]).count_ones() as i32;
             score -= ORD_JUMP_PEN + conn * ORD_JUMP_CONN;
         }
-        if packed == k1 || packed == k2 {
+        // D564: a clone is generated from the LOWEST adjacent own stone, so a killer clone from a sibling may carry
+        // another origin; kill_canon matches clones by destination (as hist_key already does)
+        let is_killer = packed == k1
+            || packed == k2
+            || (kill_canon
+                && m.is_clone()
+                && [k1, k2].iter().any(|&k| {
+                    let km = Move::from_u32(k);
+                    km.from < 49 && km.to == m.to && km.from != km.to && (RING1[km.from as usize] >> km.to) & 1 != 0
+                }));
+        if is_killer {
             score += ORD_KILLER;
         }
         let (hf, ht) = hist_key(m);
@@ -1190,7 +1202,7 @@ impl<'a> Searcher<'a> {
 
         {
             let list = &mut self.stack.lists[ply as usize];
-            score_into(b, list, tt_mv, ply, &self.killers, &self.history);
+            score_into(b, list, tt_mv, ply, &self.killers, &self.history, self.knobs.v[bk][K_KILL_CANON] != 0);
             // Fallthrough terminal: legal_moves_dedup_into tracks dedup
             // multiplicities, so len>0 always — but double-pass positions
             // have no children to search: score the pass-through.
@@ -1585,7 +1597,7 @@ impl<'a> Searcher<'a> {
             // array (best-first). Each iteration reorders the array.
             let (kill, hist) = (&self.killers, &self.history);
             let root = &mut self.stack.lists[0];
-            score_into(b, root, tt_mv, 0, kill, hist);
+            score_into(b, root, tt_mv, 0, kill, hist, self.knobs.v[knob_bucket(b.empty().count_ones())][K_KILL_CANON] != 0);
         }
         let n_root = self.stack.lists[0].len();
         if n_root == 0 {
