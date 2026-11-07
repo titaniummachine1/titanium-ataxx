@@ -1477,6 +1477,11 @@ fn serve_cmd(
             out_line("readyok");
         } else if t == "uainewgame" {
             searcher.reset_for_new_game();
+        } else if t == "ttstats" {
+            // D572: transposition table / eval cache census for the current position (debug)
+            if let Some(b) = current.as_ref() {
+                out_line(&format!("info string {}", searcher.cache_census(b)));
+            }
         } else if let Some(args) = t.strip_prefix("position ") {
             current = Board::from_uai_position(args);
             if current.is_none() {

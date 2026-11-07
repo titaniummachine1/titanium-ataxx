@@ -626,6 +626,38 @@ impl Tt {
         }
     }
 
+    /// D572: what the table holds relative to a root with `root_empties` empty squares (TT review)
+    pub fn census(&self, root_empties: u8) -> String {
+        let (mut empty, mut dead, mut proven) = (0u64, 0u64, 0u64);
+        let mut ahead = [0u64; 6]; // live entries by stones above the root: 0, 1, 2, 3-5, 6-10, 11+
+        let mut depth = [0u64; 4]; // live entries by depth: 0-2, 3-5, 6-9, 10+
+        let mut age = [0u64; 3]; // live entries by age: this search, previous, older
+        for e in self.buf.iter() {
+            if e.flag == FLAG_EMPTY {
+                empty += 1;
+                continue;
+            }
+            if e.empties > root_empties {
+                dead += 1;
+                continue;
+            }
+            let d = (root_empties - e.empties) as usize;
+            ahead[match d { 0 => 0, 1 => 1, 2 => 2, 3..=5 => 3, 6..=10 => 4, _ => 5 }] += 1;
+            depth[match e.depth { 0..=2 => 0, 3..=5 => 1, 6..=9 => 2, _ => 3 }] += 1;
+            age[(self.age.wrapping_sub(e.age) as usize).min(2)] += 1;
+            if e.score.abs() >= MATE_BOUND {
+                proven += 1;
+            }
+        }
+        let n = self.buf.len() as f64;
+        let pc = |x: u64| 100.0 * x as f64 / n;
+        format!(
+            "tt {} entries: empty {:.1}% DEAD(fewer stones than root) {:.1}% live by stones above root 0:{:.1}% 1:{:.1}% 2:{:.1}% 3-5:{:.1}% 6-10:{:.1}% 11+:{:.1}% | live depth 0-2:{:.1}% 3-5:{:.1}% 6-9:{:.1}% 10+:{:.1}% | live age now:{:.1}% prev:{:.1}% older:{:.1}% | proven {:.2}%",
+            self.buf.len(), pc(empty), pc(dead), pc(ahead[0]), pc(ahead[1]), pc(ahead[2]), pc(ahead[3]), pc(ahead[4]), pc(ahead[5]),
+            pc(depth[0]), pc(depth[1]), pc(depth[2]), pc(depth[3]), pc(age[0]), pc(age[1]), pc(age[2]), pc(proven)
+        )
+    }
+
     #[inline]
     fn store(&mut self, key: u64, mv: u32, score: i32, depth: u8, flag: u8) {
         self.store_e(key, mv, score, depth, flag, 0);
@@ -973,6 +1005,12 @@ impl<'a> Searcher<'a> {
 
     /// Full state reset between games (TT, killers, history) — prevents
     /// cross-game leakage in long matches (titanium binary_match lesson).
+    /// D572: TT + eval-cache census for the position `b` (the next search root)
+    pub fn cache_census(&self, b: &Board) -> String {
+        let filled = self.ecache.iter().filter(|e| e.1 != i32::MIN).count();
+        format!("{} | ecache {} entries filled {:.1}%", self.tt.census(b.empty().count_ones() as u8), self.ecache.len(), 100.0 * filled as f64 / self.ecache.len() as f64)
+    }
+
     pub fn reset_for_new_game(&mut self) {
         self.tt.clear();
         self.clear_ecache();
