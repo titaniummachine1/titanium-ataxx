@@ -6,14 +6,14 @@
 /// exp/nnue-speed: static-eval cache entries (2^16 x 16 B = 1 MiB per searcher).
 /// eval cache size, log2 entries (16 B each). D575: 2^16 is 100% full and thrashing at 500k nodes per move;
 /// `set_ecache_bits` (titanium-cli --ecache-bits N) changes it for searchers created afterwards.
-static ECACHE_BITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
+static ECACHE_BITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(22); // D606: 2^22 x 8 B = 32 MB ranked cache by default
 
 /// D585: eval-cache layout. 0 = the old direct-mapped table of (u64 key, i32) entries (default, unchanged);
 /// 1 = cache-line buckets: 8 entries of 8 bytes per 64-byte line (32-bit check = 26 hash bits + 6 bits of empties,
 /// 32-bit packed eval), one memory fetch per probe, victim = empty > dead (more empties than the search root:
 /// fewer stones, unreachable) > least recently used (hits move to the front), plus a prefetch of the child's
 /// eval-cache line and TT slot as soon as the move is made.
-static ECACHE_MODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ECACHE_MODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1); // D606: ranked 8-way cache is the default; --ecache-mode 0 = old
 
 pub fn set_ecache_mode(m: usize) {
     ECACHE_MODE.store(m.min(1), std::sync::atomic::Ordering::Relaxed);
@@ -605,7 +605,7 @@ impl CorrHist {
 }
 
 /// D590: ranked TT (TT_MODE 1): 16-byte entries, 4 per 64-byte line.
-static TT_MODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TT_MODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1); // D606: ranked TT is the default; --tt-mode 0 = old
 
 pub fn set_tt_mode(m: usize) {
     TT_MODE.store(m.min(1), std::sync::atomic::Ordering::Relaxed);
