@@ -36,6 +36,16 @@ fn main() -> ExitCode {
     if let Some(p) = flag_str(&args, "--policy") {
         titanium::policy::configure(&p);
     }
+    // --knobs FILE: per-phase search knob table (exp/tree-shape D557; defaults = the old constants)
+    if let Some(p) = flag_str(&args, "--knobs") {
+        match std::fs::read_to_string(&p).map_err(|e| e.to_string()).and_then(|x| titanium::search::set_knobs_text(&x)) {
+            Ok(k) => eprintln!("knobs {p}: {k:?}"),
+            Err(e) => {
+                eprintln!("--knobs {p}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     match cmd {
         "info" => {
             let nn = load_nnue_opt(&args);

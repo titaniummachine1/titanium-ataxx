@@ -72,8 +72,7 @@ const TEMPO: i32 = 150;
 const RFP_MARGINS: [i32; 4] = [257, 347, 478, 774];
 /// exp/search-moonbird A: Moonbird 1.1.0 reduction scheme (searchParams.nim) in place of the universal LMR.
 /// LMR from the 7th move: new_depth = depth * HALF / (HALF + n_reduced_so_far).
-const MB_LMR_MIN_IDX: usize = 6;
-const MB_LMR_HALFLIFE: i32 = 47;
+/// (now per phase: Knobs::lmr_min_idx / lmr_half, defaults 6 / 47)
 /// Futility reduction from the 2nd move: one ply per FUT_DIV cp the child's static eval falls short of alpha
 /// (Moonbird futilityReductionDiv 35 in its units; x1.62 to Titanium cp: 568/ln10 vs 400 per logit). Reduce only.
 const MB_FUT_MIN_IDX: usize = 1;
@@ -132,6 +131,56 @@ pub fn build_knobs() -> (i32, i32, i32, u32, u32) {
 
 /// The shipped (strongest, gated) values of the build-time knobs.
 pub const DEFAULT_BUILD_KNOBS: (i32, i32, i32, u32, u32) = (350, 0, 0, 1, 1);
+
+/// exp/tree-shape (D556/D557): per-phase search knobs, phase = clamp((45 - empties) / 3, 0, 15) (16 phases).
+/// The defaults are the old constants, so the default build is bit-identical. `titanium-cli --knobs FILE` overrides
+/// (text lines `name = v` or `name = v0 v1 ... v15`); the searcher copies the table at every search start.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Knobs {
+    /// first move index that gets the Moonbird LMR (old MB_LMR_MIN_IDX = 6)
+    pub lmr_min_idx: [u8; 16],
+    /// LMR half-life (old MB_LMR_HALFLIFE = 47)
+    pub lmr_half: [i32; 16],
+    /// null move only when static eval >= beta + nmp_margin (old: no condition = -1000000)
+    pub nmp_margin: [i32; 16],
+}
+
+pub const DEFAULT_KNOBS: Knobs = Knobs { lmr_min_idx: [6; 16], lmr_half: [47; 16], nmp_margin: [-1_000_000; 16] };
+static KNOBS: std::sync::Mutex<Knobs> = std::sync::Mutex::new(DEFAULT_KNOBS);
+
+#[inline(always)]
+pub fn phase_of_empties(empties: u32) -> usize {
+    (45i32 - empties as i32).clamp(0, 47) as usize / 3
+}
+
+pub fn knobs() -> Knobs {
+    *KNOBS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// parse and install a knob file; returns the installed table
+pub fn set_knobs_text(text: &str) -> Result<Knobs, String> {
+    let mut k = DEFAULT_KNOBS;
+    for (ln, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (name, vals) = line.split_once('=').ok_or(format!("knobs line {}: expected name = values", ln + 1))?;
+        let v: Vec<i64> = vals.split_whitespace().map(|x| x.parse::<i64>().map_err(|e| format!("knobs line {}: {e}", ln + 1))).collect::<Result<_, _>>()?;
+        if v.len() != 1 && v.len() != 16 {
+            return Err(format!("knobs line {}: give 1 value or 16 (one per phase), got {}", ln + 1, v.len()));
+        }
+        let at = |i: usize| if v.len() == 1 { v[0] } else { v[i] };
+        match name.trim() {
+            "lmr_min_idx" => (0..16).for_each(|i| k.lmr_min_idx[i] = at(i).clamp(1, 255) as u8),
+            "lmr_half" => (0..16).for_each(|i| k.lmr_half[i] = at(i).clamp(1, 10_000) as i32),
+            "nmp_margin" => (0..16).for_each(|i| k.nmp_margin[i] = at(i).clamp(-1_000_000, 1_000_000) as i32),
+            other => return Err(format!("knobs line {}: unknown knob {other} (lmr_min_idx, lmr_half, nmp_margin)", ln + 1)),
+        }
+    }
+    *KNOBS.lock().unwrap_or_else(|e| e.into_inner()) = k;
+    Ok(k)
+}
 
 pub fn set_fut_sn(on: bool) {
     FUT_SN_ON.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -662,6 +711,8 @@ pub struct Searcher<'a> {
     /// exp/tree-shape: search-tree trace (only with --features trace)
     #[cfg(feature = "trace")]
     pub trace: Option<Box<crate::trace::Tracer>>,
+    /// per-phase knobs, copied from the global table at every search start (D557)
+    knobs: Knobs,
 }
 
 /// Monotonic milliseconds since process start (native default time source).
@@ -725,6 +776,7 @@ impl<'a> Searcher<'a> {
             stack: MoveStack::new(),
             #[cfg(feature = "trace")]
             trace: None,
+            knobs: DEFAULT_KNOBS,
         }
     }
 
@@ -1048,6 +1100,7 @@ impl<'a> Searcher<'a> {
             // fill < 0.54 as integer: pieces*50 < 26*49 (no per-node float div).
             if clone_targets >= 11
                 && (b.piece_cnt[0] as u32 + b.piece_cnt[1] as u32) * 50 < 26 * SQUARES as u32
+                && static_eval >= beta + self.knobs.nmp_margin[phase_of_empties(b.empty().count_ones())]
             {
                 let child = b.make_pass();
                 self.stack.path_hash[ply as usize + 1] = child.hash;
@@ -1177,6 +1230,8 @@ impl<'a> Searcher<'a> {
         // futility small net: the parent's accumulator, built at the first child that needs it (D110)
         let mut sn_parent: Option<[f32; 64]> = None;
         let mut lmr_cnt = 0i32;
+        let kph = phase_of_empties(b.empty().count_ones());
+        let (lmr_min, lmr_half) = (self.knobs.lmr_min_idx[kph] as usize, self.knobs.lmr_half[kph]);
         loop {
             let m = {
                 let list = &mut self.stack.lists[ply as usize];
@@ -1222,8 +1277,8 @@ impl<'a> Searcher<'a> {
                 net.update_child(&a[ply as usize], &mut z[0], b, &child);
             }
             let mut new_depth = depth as i32;
-            if move_idx >= MB_LMR_MIN_IDX {
-                new_depth = depth as i32 * MB_LMR_HALFLIFE / (MB_LMR_HALFLIFE + lmr_cnt);
+            if move_idx >= lmr_min {
+                new_depth = depth as i32 * lmr_half / (lmr_half + lmr_cnt);
                 lmr_cnt += 1;
             }
             let mut child_eval = i32::MIN;
@@ -1449,6 +1504,7 @@ impl<'a> Searcher<'a> {
         self.stop_reason = StopReason::Completed;
         self.node_limit = limits.max_nodes;
         self.fut_sn = FUT_SN_ON.load(std::sync::atomic::Ordering::Relaxed);
+        self.knobs = knobs();
         let safety_margin_ms = 10.0;
         self.deadline_ms = limits
             .time
