@@ -47,6 +47,65 @@ fn read_games(path: &str, max: usize) -> Vec<(String, Vec<String>)> {
     out
 }
 
+/// --games: a games.jsonl file, a comma list, or a directory (every *.games.jsonl below it, sorted)
+fn game_files(spec: &str) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        let p = std::path::PathBuf::from(part);
+        if p.is_dir() {
+            let mut stack = vec![p];
+            while let Some(d) = stack.pop() {
+                if let Ok(rd) = fs::read_dir(&d) {
+                    for e in rd.flatten() {
+                        let f = e.path();
+                        if f.is_dir() {
+                            stack.push(f);
+                        } else if f.to_string_lossy().ends_with(".games.jsonl") {
+                            out.push(f);
+                        }
+                    }
+                }
+            }
+        } else {
+            out.push(p);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// --openings K: K distinct positions from random 1..6-ply playouts of the start position (buckets 13/14 are not
+/// in the gate games, which start from book lines at ~38 empties)
+fn opening_positions(k: usize) -> Vec<(Board, usize)> {
+    let mut x: u64 = 0x9E3779B97F4A7C15;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut tries = 0;
+    while out.len() < k && tries < k * 50 {
+        tries += 1;
+        let mut b = Board::start();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let plies = 1 + (x % 6) as usize;
+        for _ in 0..plies {
+            let mut ml = titanium::MoveList::new();
+            b.legal_moves_dedup_into(&mut ml);
+            if ml.len() == 0 {
+                break;
+            }
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            b = b.make(ml.move_at((x % ml.len() as u64) as usize));
+        }
+        if !b.game_over() && seen.insert(b.hash) {
+            out.push((b, plies));
+        }
+    }
+    out
+}
+
 fn mname(m: Move) -> String {
     if m.is_pass() {
         "pass".into()
@@ -132,7 +191,24 @@ pub fn run(args: &[String]) -> ExitCode {
     // positions, at most per_phase per phase, spread over the games
     let mut pos: Vec<(Board, usize)> = Vec::new();
     let mut cnt = [0usize; 16];
-    for (start, mv) in read_games(&games, max_games) {
+    let stride: usize = arg(args, "--game-stride").and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+    if let Some(k) = arg(args, "--openings").and_then(|v| v.parse::<usize>().ok()) {
+        for (b, pl) in opening_positions(k) {
+            let ph = phase_of(b.empty().count_ones());
+            if cnt[ph] < per_phase {
+                cnt[ph] += 1;
+                pos.push((b, pl));
+            }
+        }
+    }
+    let files = game_files(&games);
+    eprintln!("treediff: {} game files, stride {stride}", files.len());
+    let mut gi = 0usize;
+    for (start, mv) in files.iter().flat_map(|f| read_games(&f.to_string_lossy(), max_games)) {
+        gi += 1;
+        if gi % stride != 0 {
+            continue;
+        }
         let Some(mut b) = Board::from_ataxx_fen(&start) else { continue };
         let mut taken = [false; 16]; // at most one position per phase per game: spread over games
         for (k, m) in mv.iter().enumerate() {
