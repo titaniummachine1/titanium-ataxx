@@ -24,23 +24,94 @@ pub struct Policy {
 
 const P3: usize = 6561;
 
-/// Base-3 code of the 8 neighbours of `sq` (0 empty/off-board, 1 `me`, 2 `opp`), order NW N NE W E SW S SE;
-/// must match titaniumtest src/policy.rs k3code exactly.
+/// D493 speed: per square, the 8 neighbour squares in the fixed order NW N NE W E SW S SE; off-board = bit 63 (never set
+/// on a 49-square board, so it reads as empty = digit 0, exactly like the trainer's bounds check).
+static NB: [[u8; 8]; 49] = {
+    let mut t = [[63u8; 8]; 49];
+    let d: [(i32, i32); 8] = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)];
+    let mut a = 0;
+    while a < 49 {
+        let (r, c) = ((a / 7) as i32, (a % 7) as i32);
+        let mut j = 0;
+        while j < 8 {
+            let (rr, cc) = (r + d[j].0, c + d[j].1);
+            if rr >= 0 && rr < 7 && cc >= 0 && cc < 7 {
+                t[a][j] = (rr * 7 + cc) as u8;
+            }
+            j += 1;
+        }
+        a += 1;
+    }
+    t
+};
+
+/// T3[bits] = base-3 value of 8 binary digits, bit j = digit j, digit 0 most significant (weight 3^7)
+static T3: [u16; 256] = {
+    let mut t = [0u16; 256];
+    let mut c = 0;
+    while c < 256 {
+        let mut v = 0u16;
+        let mut j = 0;
+        while j < 8 {
+            v = v * 3 + ((c >> j) & 1) as u16;
+            j += 1;
+        }
+        t[c] = v;
+        c += 1;
+    }
+    t
+};
+
+#[inline(always)]
+fn bits8(x: u64, nb: &[u8; 8]) -> usize {
+    let mut v = 0usize;
+    let mut j = 0;
+    while j < 8 {
+        v |= (((x >> nb[j]) & 1) as usize) << j;
+        j += 1;
+    }
+    v
+}
+
+/// Base-3 code of the 8 neighbours of `sq` (0 empty/off-board, 1 `me`, 2 `opp`), order NW N NE W E SW S SE, digit 0 most
+/// significant; must match titaniumtest src/policy.rs k3code exactly (test k3code_matches_reference).
 #[inline]
 fn k3code(me: u64, opp: u64, sq: u8) -> usize {
-    let (r, c) = ((sq / 7) as i32, (sq % 7) as i32);
-    let mut code = 0usize;
-    for (dr, dc) in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)] {
-        let (rr, cc) = (r + dr, c + dc);
-        let d = if (0..7).contains(&rr) && (0..7).contains(&cc) {
-            let bit = 1u64 << (rr * 7 + cc);
-            ((me & bit != 0) as usize) | (((opp & bit != 0) as usize) << 1)
-        } else {
-            0
-        };
-        code = code * 3 + d;
+    let nb = &NB[sq as usize];
+    T3[bits8(me, nb)] as usize + 2 * T3[bits8(opp, nb)] as usize
+}
+
+#[cfg(test)]
+mod tests {
+    fn k3ref(me: u64, opp: u64, sq: u8) -> usize {
+        let (r, c) = ((sq / 7) as i32, (sq % 7) as i32);
+        let mut code = 0usize;
+        for (dr, dc) in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)] {
+            let (rr, cc) = (r + dr, c + dc);
+            let d = if (0..7).contains(&rr) && (0..7).contains(&cc) {
+                let bit = 1u64 << (rr * 7 + cc);
+                if me & bit != 0 { 1 } else if opp & bit != 0 { 2 } else { 0 }
+            } else {
+                0
+            };
+            code = code * 3 + d;
+        }
+        code
     }
-    code
+    #[test]
+    fn k3code_matches_reference() {
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        for _ in 0..20000 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let a = x & ((1u64 << 49) - 1);
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let me = a & x;
+            let opp = a & !x;
+            for sq in 0..49u8 {
+                assert_eq!(super::k3code(me, opp, sq), k3ref(me, opp, sq));
+            }
+        }
+    }
 }
 
 impl Policy {
