@@ -458,12 +458,12 @@ pub fn run(args: &[String]) -> ExitCode {
         .unwrap();
         if pi < dump {
             let mut f = fs::File::create(format!("{prefix}.tree{pi}.tsv")).unwrap();
-            writeln!(f, "id\tparent\tmove\tply\tempties\tdepth\tsdepth\tfull_depth\tkind\tvia\tidx\talpha\tbeta\tstat\tdis\tscore\tslack\tsubtree").unwrap();
+            writeln!(f, "id\tparent\tmove\tply\tempties\tdepth\tsdepth\tfull_depth\tkind\tvia\tidx\talpha\tbeta\tstat\tdis\tscore\tslack\tsubtree\thash").unwrap();
             for (i, r) in recs.iter().enumerate() {
                 let m = if r.mv == 0xFFFF { "-".to_string() } else { mname(Move::from_u32(r.mv as u32)) };
                 writeln!(
                     f,
-                    "{i}\t{}\t{m}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{i}\t{}\t{m}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:016x}",
                     r.parent as i64,
                     r.ply,
                     r.empties,
@@ -479,7 +479,8 @@ pub fn run(args: &[String]) -> ExitCode {
                     r.dis,
                     r.score,
                     r.slack,
-                    if r.depth >= 0 { sub[i] } else { 0 }
+                    if r.depth >= 0 { sub[i] } else { 0 },
+                    r.hash
                 )
                 .unwrap();
             }
