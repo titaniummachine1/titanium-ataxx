@@ -251,6 +251,66 @@ class Reader:
         return got
 
 
+def _read(path, limit=65536):
+    try:
+        with open(path) as f:
+            return f.read(limit)
+    except Exception:
+        return ""
+
+
+def sysinfo():
+    """D583 (user): what the Botzone instance offers, once per game in the first debug line: CPU model and flags that
+    matter to the engine, cores usable, RAM total/available, the cgroup memory limit, glibc, kernel, Python. Cheap
+    (a few /proc reads), every part guarded: a failure only shortens the line."""
+    out = []
+    try:
+        cpu = _read("/proc/cpuinfo", 1 << 20)
+        model = next((l.split(":", 1)[1].strip() for l in cpu.splitlines() if l.startswith("model name")), "?")
+        flags = next((l.split(":", 1)[1].split() for l in cpu.splitlines() if l.startswith("flags")), [])
+        want = ("avx2", "bmi2", "popcnt", "avx512f", "avx512bw", "avx512vl", "avx512_vnni", "avx512vbmi")
+        mhz = next((l.split(":", 1)[1].strip().split(".")[0] for l in cpu.splitlines() if l.startswith("cpu MHz")), "?")
+        out.append("cpu=%s@%sMHz flags=%s" % (model.replace(" ", "_")[:48], mhz, "+".join(f for f in want if f in flags) or "none"))
+    except Exception as ex:
+        out.append("cpu_err=%s" % type(ex).__name__)
+    try:
+        aff = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else -1
+        out.append("cores=%s/%s" % (aff, os.cpu_count()))
+    except Exception:
+        pass
+    try:
+        mi = {}
+        for l in _read("/proc/meminfo").splitlines():
+            k, _, v = l.partition(":")
+            mi[k] = v.strip().split(" ")[0]
+        out.append("mem=%dM avail=%dM" % (int(mi.get("MemTotal", 0)) // 1024, int(mi.get("MemAvailable", 0)) // 1024))
+    except Exception:
+        pass
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        v = _read(path).strip()
+        if v:
+            out.append("cg_limit=%s" % (v if not v.isdigit() else "%dM" % (int(v) // (1 << 20))))
+            break
+    try:
+        out.append("glibc=%s" % os.confstr("CS_GNU_LIBC_VERSION").replace("glibc ", ""))
+    except Exception:
+        pass
+    try:
+        out.append("kernel=%s py=%d.%d" % (os.uname().release, sys.version_info[0], sys.version_info[1]))
+    except Exception:
+        pass
+    return " ".join(out)[:420]
+
+
+def rss_mb():
+    """peak resident memory of this process in MB (Linux ru_maxrss is in KB); -1 if unknown"""
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+    except Exception:
+        return -1
+
+
 def play_turn(eng, history, limit_ms, t0):
     """The engine's move, resuscitating it up to twice. Returns (move or None, debug line)."""
     deadline = limit_ms - SAFETY_MS * min(1.0, SCALE * 4) - OUT_RESERVE_MS
@@ -299,6 +359,12 @@ def main():
     history = [tuple(flat[i:i + 4]) for i in range(0, len(flat), 4) if flat[i] >= 0]
     eng = Engine()
     first = turns == 1
+    sys_line = ""
+    if first:
+        try:
+            sys_line = sysinfo()
+        except Exception as ex:
+            sys_line = "sys_err=%s" % type(ex).__name__
     oneshot = MODE != "long"
     while True:
         limit_ms = (FIRST_LIMIT_MS if first else TURN_LIMIT_MS) * SCALE
@@ -307,6 +373,10 @@ def main():
         if mv is not None:
             history.append(mv)
         line1 = "%d %d %d %d" % (mv if mv is not None else (-1, -1, -1, -1))
+        dbg += " rss%dM" % rss_mb()
+        if sys_line:
+            dbg += " | sys " + sys_line
+            sys_line = ""
         if EVENTS:
             dbg += " | ev " + ",".join(EVENTS)
             del EVENTS[:]
