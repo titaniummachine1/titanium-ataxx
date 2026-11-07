@@ -23,8 +23,6 @@ pub struct Policy {
     tor: Vec<i16>,
     /// D502 TPOL3: tables shared by the 9 edge classes (row/col in {0, 1..5, 6}) instead of per square
     cls: bool,
-    /// D543 TPOL4 jump-ring table [49][clone/jump][4 sides][81], i16 at TQ (empty otherwise)
-    ring: Vec<i16>,
 }
 
 /// edge class of a square: (row class) * 3 + (col class), class 0 = first line, 1 = inner, 2 = last line
@@ -130,59 +128,12 @@ fn k3code(me: u64, opp: u64, sq: u8) -> usize {
 pub struct KCache {
     valid: u64,
     code: [u16; 49],
-    /// D543 ring codes per destination square (4 sides, base 3, 0..80)
-    rvalid: u64,
-    rcode: [[u8; 4]; 49],
-}
-
-/// D543 jump ring: the 16 cells at distance 2 as 4 sides of 4 cells (N E S W, clockwise), first cell most significant;
-/// off-board = bit 63 (reads as empty). MUST match titaniumtest src/policy2.rs RING_SIDES / ring_idx.
-static RINGSQ: [[[u8; 4]; 4]; 49] = {
-    let sides: [[(i32, i32); 4]; 4] = [
-        [(-2, -2), (-2, -1), (-2, 0), (-2, 1)],
-        [(-2, 2), (-1, 2), (0, 2), (1, 2)],
-        [(2, 2), (2, 1), (2, 0), (2, -1)],
-        [(2, -2), (1, -2), (0, -2), (-1, -2)],
-    ];
-    let mut t = [[[63u8; 4]; 4]; 49];
-    let mut a = 0;
-    while a < 49 {
-        let (r, c) = ((a / 7) as i32, (a % 7) as i32);
-        let mut k = 0;
-        while k < 4 {
-            let mut j = 0;
-            while j < 4 {
-                let (rr, cc) = (r + sides[k][j].0, c + sides[k][j].1);
-                if rr >= 0 && rr < 7 && cc >= 0 && cc < 7 {
-                    t[a][k][j] = (rr * 7 + cc) as u8;
-                }
-                j += 1;
-            }
-            k += 1;
-        }
-        a += 1;
-    }
-    t
-};
-const RING_N: usize = 49 * 2 * 4 * 81;
-
-#[inline(always)]
-fn ring_codes(me: u64, opp: u64, sq: u8) -> [u8; 4] {
-    let mut out = [0u8; 4];
-    for (k, side) in RINGSQ[sq as usize].iter().enumerate() {
-        let mut v = 0u8;
-        for &c in side {
-            v = v * 3 + ((me >> c) & 1) as u8 + 2 * ((opp >> c) & 1) as u8;
-        }
-        out[k] = v;
-    }
-    out
 }
 
 impl KCache {
     #[inline]
     pub fn new() -> KCache {
-        KCache { valid: 0, code: [0; 49], rvalid: 0, rcode: [[0; 4]; 49] }
+        KCache { valid: 0, code: [0; 49] }
     }
     #[inline(always)]
     fn get(&mut self, me: u64, opp: u64, sq: u8) -> usize {
@@ -191,14 +142,6 @@ impl KCache {
             self.valid |= 1u64 << sq;
         }
         self.code[sq as usize] as usize
-    }
-    #[inline(always)]
-    fn ring(&mut self, me: u64, opp: u64, sq: u8) -> [u8; 4] {
-        if self.rvalid >> sq & 1 == 0 {
-            self.rcode[sq as usize] = ring_codes(me, opp, sq);
-            self.rvalid |= 1u64 << sq;
-        }
-        self.rcode[sq as usize]
     }
 }
 
@@ -226,41 +169,6 @@ mod tests {
         code
     }
     #[test]
-    fn ring_matches_reference() {
-        // reference = the hub trainer's definition (titaniumtest src/policy2.rs ring_idx)
-        let sides: [[(i32, i32); 4]; 4] = [
-            [(-2, -2), (-2, -1), (-2, 0), (-2, 1)],
-            [(-2, 2), (-1, 2), (0, 2), (1, 2)],
-            [(2, 2), (2, 1), (2, 0), (2, -1)],
-            [(2, -2), (1, -2), (0, -2), (-1, -2)],
-        ];
-        let mut x: u64 = 0x2545F4914F6CDD1D;
-        for _ in 0..5000 {
-            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-            let a = x & ((1u64 << 49) - 1);
-            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-            let (me, opp) = (a & x, a & !x);
-            for sq in 0..49u8 {
-                let got = super::ring_codes(me, opp, sq);
-                let (r, c) = ((sq / 7) as i32, (sq % 7) as i32);
-                for k in 0..4 {
-                    let mut code = 0u8;
-                    for &(dr, dc) in &sides[k] {
-                        let (rr, cc) = (r + dr, c + dc);
-                        let d = if (0..7).contains(&rr) && (0..7).contains(&cc) {
-                            let bit = 1u64 << (rr * 7 + cc);
-                            if me & bit != 0 { 1 } else if opp & bit != 0 { 2 } else { 0 }
-                        } else {
-                            0
-                        };
-                        code = code * 3 + d;
-                    }
-                    assert_eq!(got[k], code);
-                }
-            }
-        }
-    }
-    #[test]
     fn k3code_matches_reference() {
         let mut x: u64 = 0x9E3779B97F4A7C15;
         for _ in 0..20000 {
@@ -283,8 +191,7 @@ impl Policy {
 
     pub fn from_bytes(d: &[u8]) -> std::io::Result<Policy> {
         let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
-        let v4 = d.len() >= 12 && &d[..8] == b"TPOL4\0\0\0";
-        let v3 = (d.len() >= 12 && &d[..8] == b"TPOL3\0\0\0") || v4;
+        let v3 = d.len() >= 12 && &d[..8] == b"TPOL3\0\0\0";
         let v2 = (d.len() >= 12 && &d[..8] == b"TPOL2\0\0\0") || v3;
         if d.len() < 12 || (&d[..8] != b"TPOL1\0\0\0" && !v2) {
             return Err(bad("bad policy magic"));
@@ -292,7 +199,7 @@ impl Policy {
         let dim = u32::from_le_bytes(d[8..12].try_into().unwrap()) as usize;
         let n1 = SLOTS + NSCAL + SLOTS * dim;
         let (nds, nos) = if v3 { (18, 9) } else { (SLOTS, 49) };
-        let n = n1 + if v2 { (nds + nos) * P3 } else { 0 } + if v4 { RING_N } else { 0 };
+        let n = n1 + if v2 { (nds + nos) * P3 } else { 0 };
         if d.len() != 12 + 4 * n {
             return Err(bad("bad policy size"));
         }
@@ -302,10 +209,8 @@ impl Policy {
         let mut g = [0f32; NSCAL];
         g.copy_from_slice(&f[SLOTS..SLOTS + NSCAL]);
         let q = |x: &[f32]| -> Vec<i16> { x.iter().map(|v| (v * TQ).round().clamp(-32767.0, 32767.0) as i16).collect() };
-        let n2 = n1 + (nds + nos) * P3;
-        let (td, tor) = if v2 { (q(&f[n1..n1 + nds * P3]), q(&f[n1 + nds * P3..n2])) } else { (Vec::new(), Vec::new()) };
-        let ring = if v4 { q(&f[n2..]) } else { Vec::new() };
-        Ok(Policy { dim, bias, g, u: f[SLOTS + NSCAL..n1].to_vec(), td, tor, cls: v3, ring })
+        let (td, tor) = if v2 { (q(&f[n1..n1 + nds * P3]), q(&f[n1 + nds * P3..])) } else { (Vec::new(), Vec::new()) };
+        Ok(Policy { dim, bias, g, u: f[SLOTS + NSCAL..n1].to_vec(), td, tor, cls: v3 })
     }
 
     /// Logit of move `m` in `b` given the sparse accumulator product `xin` (index, value).
@@ -341,13 +246,6 @@ impl Policy {
             let mut t = self.td[ds * P3 + kc.get(me, opp, m.to)] as i32;
             if !clone {
                 t += self.tor[os * P3 + kc.get(me, opp, m.from)] as i32;
-            }
-            if !self.ring.is_empty() {
-                let rc = kc.ring(me, opp, m.to);
-                let base = (m.to as usize * 2 + (!clone) as usize) * 4;
-                for (k, &code) in rc.iter().enumerate() {
-                    t += self.ring[(base + k) * 81 + code as usize] as i32;
-                }
             }
             z += t as f32 * (1.0 / TQ);
         }
