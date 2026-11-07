@@ -9,5 +9,9 @@ license = "MIT"
 name = "titanium-cli"
 path = "src/main.rs"
 
+[features]
+# exp/tree-shape: titanium-cli treediff (search-tree trace); never in a normal build
+trace = ["titanium/trace"]
+
 [dependencies]
 titanium = { path = "../titanium" }

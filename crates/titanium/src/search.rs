@@ -6,6 +6,18 @@
 /// exp/nnue-speed: static-eval cache entries (2^16 x 16 B = 1 MiB per searcher).
 const ECACHE_BITS: usize = 16;
 
+/// exp/tree-shape: trace hook, expands to nothing unless built with `--features trace`.
+macro_rules! trc {
+    ($s:ident, $t:ident => $e:expr) => {
+        #[cfg(feature = "trace")]
+        {
+            if let Some($t) = $s.trace.as_mut() {
+                $e;
+            }
+        }
+    };
+}
+
 use crate::board::{dist_union, jump_union, Board, Move, MoveList, RING1, SQUARES};
 use crate::nnue::Nnue;
 use crate::sancta::{S1Acc, S1Net};
@@ -647,6 +659,9 @@ pub struct Searcher<'a> {
     /// Per-ply move/acc buffers, reused across searches (no per-search
     /// alloc: MoveStack is ~72KB of lists + acc, was rebuilt per search).
     stack: MoveStack,
+    /// exp/tree-shape: search-tree trace (only with --features trace)
+    #[cfg(feature = "trace")]
+    pub trace: Option<Box<crate::trace::Tracer>>,
 }
 
 /// Monotonic milliseconds since process start (native default time source).
@@ -708,6 +723,8 @@ impl<'a> Searcher<'a> {
             tup_native: false,
             corr: None,
             stack: MoveStack::new(),
+            #[cfg(feature = "trace")]
+            trace: None,
         }
     }
 
@@ -856,8 +873,50 @@ impl<'a> Searcher<'a> {
         }
     }
 
+    #[cfg(not(feature = "trace"))]
+    #[inline(always)]
+    fn negamax<const BZ: bool>(&mut self, b: &Board, alpha: i32, beta: i32, depth: u32, ply: u32, null_allowed: bool) -> i32 {
+        self.negamax_body::<BZ>(b, alpha, beta, depth, ply, null_allowed)
+    }
+
+    /// trace build: one record per call (crate::trace)
+    #[cfg(feature = "trace")]
+    fn negamax<const BZ: bool>(&mut self, b: &Board, alpha: i32, beta: i32, depth: u32, ply: u32, null_allowed: bool) -> i32 {
+        let e = b.empty().count_ones() as u8;
+        trc!(self, t => t.enter(b.hash, e, alpha, beta, depth, ply));
+        let s = self.negamax_body::<BZ>(b, alpha, beta, depth, ply, null_allowed);
+        trc!(self, t => t.exit(s));
+        s
+    }
+
+    /// exp/tree-shape: walk the principal variation through the TT (legal, exact-or-bound entries, no repeats)
+    pub fn pv_from_tt(&mut self, b: &Board, max: usize) -> Vec<Move> {
+        let mut pv = Vec::new();
+        let mut cur = *b;
+        let mut seen = Vec::new();
+        while pv.len() < max {
+            let Some(e) = self.tt.probe(cur.hash) else { break };
+            if e.mv == 0xFFFF {
+                break;
+            }
+            let m = Move::from_u32(e.mv);
+            let mut ml = MoveList::new();
+            cur.legal_moves_dedup_into(&mut ml);
+            if !(0..ml.len()).any(|i| ml.move_at(i) == m) {
+                break;
+            }
+            cur = cur.make(m);
+            if seen.contains(&cur.hash) {
+                break;
+            }
+            seen.push(cur.hash);
+            pv.push(m);
+        }
+        pv
+    }
+
     #[inline]
-    fn negamax<const BZ: bool>(
+    fn negamax_body<const BZ: bool>(
         &mut self,
         b: &Board,
         mut alpha: i32,
@@ -870,6 +929,7 @@ impl<'a> Searcher<'a> {
         // Hard stack guard (release builds too): never index past the MAX_PLY-sized stacks.
         if ply as usize >= MAX_PLY - 1 {
             self.heuristic_used = true;
+            trc!(self, t => t.end(crate::trace::kind::STACK, 0));
             return self.leaf_eval(b);
         }
         // consume a parent-computed static eval first, so a TT return below can never leave it stale
@@ -885,9 +945,11 @@ impl<'a> Searcher<'a> {
             // Botzone judge checks both sides after every move (!blackHasMove || !whiteHasMove):
             // if either side has no legal moves, or wipeout/full, the game ends immediately.
             if b.bz_over() {
+                trc!(self, t => t.end(crate::trace::kind::TERMINAL, 0));
                 return bz_terminal_score(b, ply);
             }
         } else if b.game_over() {
+            trc!(self, t => t.end(crate::trace::kind::TERMINAL, 0));
             return terminal_score(b, ply);
         }
 
@@ -897,6 +959,7 @@ impl<'a> Searcher<'a> {
         alpha = alpha.max(-MATE + ply as i32);
         beta = beta.min(MATE - (ply as i32 + 1));
         if alpha >= beta {
+            trc!(self, t => t.end(crate::trace::kind::MATE_DIST, 0));
             return alpha;
         }
 
@@ -915,6 +978,7 @@ impl<'a> Searcher<'a> {
                         if s.abs() < MATE_BOUND || (MATE - s.abs()) as u32 >= depth {
                             self.heuristic_used = true;
                         }
+                        trc!(self, t => t.end(crate::trace::kind::TT_CUT, 0));
                         return s;
                     }
                     FLAG_LOWER => {
@@ -933,6 +997,7 @@ impl<'a> Searcher<'a> {
                     if s.abs() < MATE_BOUND || (MATE - s.abs()) as u32 >= depth {
                         self.heuristic_used = true;
                     }
+                    trc!(self, t => t.end(crate::trace::kind::TT_CUT, 1));
                     return s;
                 }
             }
@@ -951,6 +1016,11 @@ impl<'a> Searcher<'a> {
             _ => self.leaf_eval_with_dis(b),
         };
         let static_eval = self.corrected(b, raw);
+        trc!(self, t => if let Some(r) = t.top() {
+            r.sdepth = depth.min(127) as i8;
+            r.stat = static_eval;
+            r.dis = node_dis;
+        });
 
         // Reverse futility pruning (autaxx, exact form): standing pat is so
         // far below alpha that even a generous error margin cannot recover
@@ -964,6 +1034,7 @@ impl<'a> Searcher<'a> {
             && static_eval + RFP_MARGINS[(depth.max(1) - 1) as usize] + ((node_dis * DIS_RFP_NUM) >> 7) < alpha
         {
             self.heuristic_used = true;
+            trc!(self, t => t.end(crate::trace::kind::RFP, alpha - (static_eval + RFP_MARGINS[(depth.max(1) - 1) as usize] + ((node_dis * DIS_RFP_NUM) >> 7))));
             return alpha;
         }
 
@@ -984,6 +1055,7 @@ impl<'a> Searcher<'a> {
                 // NMP pass flips stm: sancta acc is color-relative so it
                 // stays valid — just forward the other perspective.
                 // (pass: no stones change, no diff update needed.)
+                trc!(self, t => t.pending(0xFFFF, crate::trace::via::NULL, 255, (depth - 1) as i8));
                 let score =
                     -self.negamax::<BZ>(&child, -beta, -beta + 1, depth - 3, ply + 1, false);
                 if self.stop {
@@ -991,6 +1063,7 @@ impl<'a> Searcher<'a> {
                 }
                 if score >= beta {
                     self.heuristic_used = true;
+                    trc!(self, t => t.end(crate::trace::kind::NMP, score - beta));
                     return if score >= MATE_BOUND { beta } else { score };
                 }
             }
@@ -1000,12 +1073,14 @@ impl<'a> Searcher<'a> {
         if null_allowed && ply > 0 && depth >= PC_D && beta - alpha == 1 && beta.abs() < MATE_BOUND {
             let pc_beta = beta + PC_T + ((node_dis * PC_K) >> 7);
             if pc_beta < MATE_BOUND && static_eval + 50 >= pc_beta - 2 * PC_T {
+                trc!(self, t => t.pending(0xFFFF, crate::trace::via::PROBCUT, 255, depth as i8));
                 let score = self.negamax::<BZ>(b, pc_beta - 1, pc_beta, depth - PC_R, ply, false);
                 if self.stop {
                     return 0;
                 }
                 if score >= pc_beta && score < MATE_BOUND {
                     self.heuristic_used = true;
+                    trc!(self, t => t.end(crate::trace::kind::PROBCUT, score - pc_beta));
                     return score - (pc_beta - beta);
                 }
             }
@@ -1013,6 +1088,7 @@ impl<'a> Searcher<'a> {
 
         if depth == 0 {
             self.heuristic_used = true;
+            trc!(self, t => t.end(crate::trace::kind::LEAF, 0));
             return static_eval;
         }
 
@@ -1039,6 +1115,7 @@ impl<'a> Searcher<'a> {
                     ply,
                     static_eval,
                 );
+                trc!(self, t => t.end(crate::trace::kind::NO_MOVES, 0));
                 return static_eval;
             }
         }
@@ -1134,6 +1211,7 @@ impl<'a> Searcher<'a> {
                 }
                 if is_rep {
                     rep_skipped = true;
+                    trc!(self, t => t.skip(child.hash, child.empty().count_ones() as u8, m.to_u32() as u16, ply, move_idx, depth as i32 - 1, crate::trace::kind::SKIP_REP, i32::MIN, 0, alpha));
                     continue;
                 }
                 self.stack.path_hash[ply as usize + 1] = child.hash;
@@ -1176,6 +1254,7 @@ impl<'a> Searcher<'a> {
                             && best > -MATE_BOUND
                         {
                             self.heuristic_used = true;
+                            trc!(self, t => t.skip(child.hash, child.empty().count_ones() as u8, m.to_u32() as u16, ply, move_idx, depth as i32 - 1, crate::trace::kind::SKIP_SN, lo, alpha.saturating_add(lo), alpha));
                             move_idx += 1;
                             continue;
                         }
@@ -1197,17 +1276,20 @@ impl<'a> Searcher<'a> {
             }
             if new_depth <= 0 {
                 self.heuristic_used = true;
+                trc!(self, t => t.skip(child.hash, child.empty().count_ones() as u8, m.to_u32() as u16, ply, move_idx, depth as i32 - 1, crate::trace::kind::SKIP_FUT, if child_eval == i32::MIN { i32::MIN } else { unpack_eval_dis(child_eval).0 }, new_depth, alpha));
                 move_idx += 1;
                 continue;
             }
             let mut score;
             if move_idx == 0 {
+                trc!(self, t => t.pending(m.to_u32() as u16, crate::trace::via::FIRST, 0, depth as i8 - 1));
                 score = -self.negamax::<BZ>(&child, -beta, -alpha, depth - 1, ply + 1, true);
                 if self.stop {
                     return 0;
                 }
             } else {
                 self.stack.pre_eval[ply as usize + 1] = child_eval;
+                trc!(self, t => t.pending(m.to_u32() as u16, crate::trace::via::SCOUT, move_idx.min(255) as u8, depth as i8 - 1));
                 score = -self.negamax::<BZ>(
                     &child,
                     -alpha - 1,
@@ -1222,6 +1304,7 @@ impl<'a> Searcher<'a> {
                 if score > alpha {
                     // re-search: full window, full depth
                     self.stack.pre_eval[ply as usize + 1] = child_eval;
+                    trc!(self, t => t.pending(m.to_u32() as u16, crate::trace::via::RESEARCH, move_idx.min(255) as u8, depth as i8 - 1));
                     score = -self.negamax::<BZ>(&child, -beta, -alpha, depth - 1, ply + 1, true);
                     if self.stop {
                         return 0;
@@ -1247,8 +1330,10 @@ impl<'a> Searcher<'a> {
         }
         if best == i32::MIN {
             // Every legal move from this node repeated an ancestor position (CIRCULAR_MOVE forfeit).
+            trc!(self, t => t.end(crate::trace::kind::CIRCULAR, 0));
             return -MATE + ply as i32;
         }
+        trc!(self, t => t.end(crate::trace::kind::FULL, 0));
         if best > alpha_orig && best_mv != 0xFFFF {
             self.hist_add(
                 b.turn as usize,
@@ -1477,6 +1562,10 @@ impl<'a> Searcher<'a> {
             // fixed node budgets -> bench d8 9.4k=>17k, QB5k 45-53-2.-28.)
             self.stack.path_hash[0] = b.hash;
             self.stack.rep_base[0] = 0;
+            trc!(self, t => {
+                t.clear();
+                t.enter(b.hash, b.empty().count_ones() as u8, -INF, INF, u32::from(depth), 0);
+            });
             for i in 0..n_root {
                 let m = root_moves[i];
                 let child = b.make(m);
@@ -1487,6 +1576,7 @@ impl<'a> Searcher<'a> {
                     let (a, z) = self.stack.acc.split_at_mut(1);
                     net.update_child(&a[0], &mut z[0], b, &child);
                 }
+                trc!(self, t => t.pending(m.to_u32() as u16, crate::trace::via::FIRST, i.min(255) as u8, depth as i8 - 1));
                 let score =
                     -self.negamax::<BZ>(&child, -INF, -alpha, u32::from(depth - 1), 1, true);
                 if self.stop {
@@ -1500,6 +1590,10 @@ impl<'a> Searcher<'a> {
                     }
                 }
             }
+            trc!(self, t => {
+                t.end(crate::trace::kind::FULL, 0);
+                t.exit(best_score);
+            });
             // Partial-iteration adoption (Stockfish / Reckless):
             // - A completed iteration is adopted unless it forgot a shorter proven winning mate
             //   from a previous completed iteration (`forgotten_mate`).

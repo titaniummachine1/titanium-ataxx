@@ -19,6 +19,8 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use titanium::{Board, Move, SearchLimits, Searcher, RING1};
+#[cfg(feature = "trace")]
+mod treediff;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -149,6 +151,8 @@ fn main() -> ExitCode {
             args.iter().any(|x| x == "--tuple-native"),
             network_flag(&args),
         ),
+        #[cfg(feature = "trace")]
+        "treediff" => treediff::run(&args),
         "treebook" => treebook_cmd(
             flag_int(&args, "--target").unwrap_or(50_000) as usize,
             flag_int(&args, "--max-ply").unwrap_or(10) as usize,
@@ -1703,7 +1707,7 @@ fn match_cmd(
         network_description(&opp_nnue_spec),
         max_depth
     );
-    // Eval presets, explicit per side — no env vars anywhere:
+    // Eval presets, explicit per side â€” no env vars anywhere:
     // --net = OUR side (in-process), --opp-net = child side (appended to the
     // opp serve command). --opp self = both in-process (opp side gets opp-net).
     let net = match load_net_preset(&net_spec) {
@@ -1780,7 +1784,7 @@ fn match_cmd(
         Some(o) => o.name.clone(),
         None => "titanium".to_string(),
     };
-    println!("titanium vs {opp_name} — {games} games");
+    println!("titanium vs {opp_name} â€” {games} games");
 
     let mut tally = (0u32, 0u32, 0u32); // titanium wins, opp wins, draws
     let limits_desc = format!(
@@ -1794,14 +1798,14 @@ fn match_cmd(
     );
     let mut report = String::new();
     report.push_str(&format!(
-        "Match: titanium vs {opp_name} — games {start_game}..{} — {limits_desc}, opp {}\n===\n",
+        "Match: titanium vs {opp_name} â€” games {start_game}..{} â€” {limits_desc}, opp {}\n===\n",
         start_game + games - 1,
         opp_depth
             .map(|d| format!("depth {d}"))
             .unwrap_or_else(|| format!("movetime {} ms", if opp_time == 0 { 1000 } else { opp_time }))
     ));
 
-    // Incremental log: header first, then append per game — played games
+    // Incremental log: header first, then append per game â€” played games
     // are never lost, even if the run is killed.
     let path: PathBuf = out.map(PathBuf::from).unwrap_or_else(default_log_path);
     if let Some(parent) = path.parent() {
@@ -1847,7 +1851,7 @@ fn match_cmd(
 
     for game in start_game..start_game + games {
         // Book position (paired: two consecutive games share a line), or
-        // startpos when no book. Bad lines fail fast — never silently skip.
+        // startpos when no book. Bad lines fail fast â€” never silently skip.
         let mut b = match &book {
             None => Board::start(),
             Some(lines) => {
@@ -2000,7 +2004,7 @@ fn match_cmd(
     ));
     let _ = fs::write(&path, &report);
     println!(
-        "total: titanium {} - {opp_name} {}, draws {} — log: {}",
+        "total: titanium {} - {opp_name} {}, draws {} â€” log: {}",
         tally.0,
         tally.1,
         tally.2,

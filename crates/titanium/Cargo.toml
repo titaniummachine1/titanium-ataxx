@@ -5,4 +5,8 @@ edition = "2021"
 description = "Titanium Ataxx engine core: rules, movegen, alpha-beta search"
 license = "MIT"
 
+[features]
+# exp/tree-shape: search-tree trace for titanium-cli treediff (never in a normal build)
+trace = []
+
 [dependencies]
