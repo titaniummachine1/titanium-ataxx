@@ -137,7 +137,7 @@ pub const DEFAULT_BUILD_KNOBS: (i32, i32, i32, u32, u32) = (350, 0, 0, 1, 1);
 /// search is shaped separately for each of the 16 game phases the net uses. Defaults = the old constants (the default
 /// build is bit-identical). `titanium-cli --knobs FILE` overrides: lines `name = v` (all buckets) or
 /// `name = v0 v1 ... v15` (bucket 0 = full board ... 15); `#` comments. The searcher copies the table per search.
-pub const NK: usize = 23;
+pub const NK: usize = 24;
 pub const K_RFP1: usize = 0; // reverse futility margin depth 1..4 (257 347 478 774)
 pub const K_RFP2: usize = 1;
 pub const K_RFP3: usize = 2;
@@ -161,16 +161,17 @@ pub const K_KILL_CANON: usize = 19; // 1 = a clone killer matches any clone to t
 pub const K_ORD_AHEAD_CLONE: usize = 20; // ordering points added to clones when static > ord_state_cp (D567; 0)
 pub const K_ORD_BEHIND_JUMP: usize = 21; // ordering points added to jumps when static < -ord_state_cp (D567; 0)
 pub const K_ORD_STATE_CP: usize = 22; // ahead/behind threshold in cp (100)
+pub const K_TT_DEAD: usize = 23; // D571 (user): 1 = TT entries with more empties than the root are dead and replaced first; 2 = also no age eviction of live entries (0)
 pub const KNOB_NAMES: [&str; NK] = [
     "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "nmp_margin", "nmp_r", "nmp_clones", "pc_d", "pc_r", "pc_t", "pc_k",
     "lmr_min", "lmr_half", "fut_min", "fut_div", "fut_dis", "sn_m", "iir", "kill_canon",
-    "ord_ahead_clone", "ord_behind_jump", "ord_state_cp",
+    "ord_ahead_clone", "ord_behind_jump", "ord_state_cp", "tt_dead",
 ];
-pub const KNOB_DEFAULT: [i32; NK] = [257, 347, 478, 774, 32, -1_000_000, 3, 11, 6, 3, 140, 32, 6, 47, 1, 57, 24, 0, 4, 0, 0, 0, 100];
+pub const KNOB_DEFAULT: [i32; NK] = [257, 347, 478, 774, 32, -1_000_000, 3, 11, 6, 3, 140, 32, 6, 47, 1, 57, 24, 0, 4, 0, 0, 0, 100, 0];
 pub const KNOB_RANGE: [(i32, i32); NK] = [
     (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (-1_000_000, 1_000_000), (1, 8), (0, 49), (2, 64), (1, 8),
     (0, 2000), (0, 512), (1, 255), (1, 10_000), (1, 255), (1, 10_000), (0, 512), (-2000, 2000), (1, 255), (0, 1),
-    (-1_000_000, 1_000_000), (-1_000_000, 1_000_000), (0, 5000),
+    (-1_000_000, 1_000_000), (-1_000_000, 1_000_000), (0, 5000), (0, 2),
 ];
 
 /// knob table: v[bucket][knob]
@@ -489,6 +490,9 @@ struct TtEntry {
     depth: u8,
     flag: u8, // 0 empty, 1 exact, 2 lower, 3 upper
     age: u8,  // Generation age for FIFO/LRU eviction without RAM increase (fits in compiler padding)
+    /// D571: empty squares of the stored position (padding byte; empties never increase in Ataxx, so an entry with
+    /// more empties than the root can never be reached again). 0 = unknown (never dead).
+    empties: u8,
 }
 
 const _: () = assert!(std::mem::size_of::<TtEntry>() == 24);
@@ -570,6 +574,9 @@ pub struct Tt {
     buf: Vec<TtEntry>,
     mask: usize,
     pub age: u8,
+    /// D571: empties of the current search root (255 = nothing is dead) and the knob mode (0 off, 1, 2)
+    pub root_empties: u8,
+    pub dead_mode: u8,
 }
 
 impl Tt {
@@ -583,12 +590,15 @@ impl Tt {
                     mv: 0,
                     score: 0,
                     depth: 0,
+                    empties: 0,
                     flag: FLAG_EMPTY,
                     age: 0,
                 };
                 size
             ],
             mask: size - 1,
+            root_empties: 255,
+            dead_mode: 0,
             age: 0,
         }
     }
@@ -617,9 +627,17 @@ impl Tt {
     }
 
     #[inline]
-    fn store(&mut self, key: u64, mut mv: u32, score: i32, depth: u8, flag: u8) {
+    fn store(&mut self, key: u64, mv: u32, score: i32, depth: u8, flag: u8) {
+        self.store_e(key, mv, score, depth, flag, 0);
+    }
+
+    #[inline]
+    fn store_e(&mut self, key: u64, mut mv: u32, score: i32, depth: u8, flag: u8, empties: u8) {
+        let (root_empties, dead_mode) = (self.root_empties, self.dead_mode);
         let e = &mut self.buf[(key as usize) & self.mask];
         let same_pos = e.flag != FLAG_EMPTY && e.key == key;
+        // D571: an entry with more empties than the root is unreachable for the rest of the game
+        let dead = dead_mode > 0 && e.flag != FLAG_EMPTY && e.empties > root_empties;
 
         // Preserve refutation move on fail-low (FLAG_UPPER):
         if same_pos && flag == FLAG_UPPER && e.mv != 0 && e.mv != 0xFFFF {
@@ -632,10 +650,15 @@ impl Tt {
         // 3. Stale generation/age (older turns aged out from dead subtrees)
         // 4. Deeper or equal depth
         let age_diff = self.age.wrapping_sub(e.age);
-        let replace = e.flag == FLAG_EMPTY
-            || same_pos
-            || (!same_pos && (age_diff >= 2 || (age_diff == 1 && depth.saturating_add(4) >= e.depth)))
-            || e.depth <= depth;
+        let replace = if dead_mode == 2 {
+            e.flag == FLAG_EMPTY || same_pos || dead || e.depth <= depth
+        } else {
+            e.flag == FLAG_EMPTY
+                || same_pos
+                || dead
+                || (!same_pos && (age_diff >= 2 || (age_diff == 1 && depth.saturating_add(4) >= e.depth)))
+                || e.depth <= depth
+        };
 
         if replace {
             *e = TtEntry {
@@ -645,6 +668,7 @@ impl Tt {
                 depth,
                 flag,
                 age: self.age,
+                empties,
             };
         }
     }
@@ -1532,7 +1556,7 @@ impl<'a> Searcher<'a> {
             FLAG_EXACT
         };
         self.tt
-            .store(b.hash, best_mv, score_to_tt(best, ply), depth as u8, flag);
+            .store_e(b.hash, best_mv, score_to_tt(best, ply), depth as u8, flag, b.empty().count_ones() as u8);
     }
     /// Iterative deepening root search. Falls back to any legal move.
     /// Whichever limit hits first (nodes / time / depth) stops the search;
@@ -1581,6 +1605,8 @@ impl<'a> Searcher<'a> {
         self.node_limit = limits.max_nodes;
         self.fut_sn = FUT_SN_ON.load(std::sync::atomic::Ordering::Relaxed);
         self.knobs = knobs();
+        self.tt.root_empties = b.empty().count_ones() as u8;
+        self.tt.dead_mode = self.knobs.v[knob_bucket(b.empty().count_ones())][K_TT_DEAD] as u8;
         let safety_margin_ms = 10.0;
         self.deadline_ms = limits
             .time
