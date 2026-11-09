@@ -1,0 +1,10 @@
+sha8	file	family	trained	data	sibling_agreement	regret_cp	rows_per_eval	status	decision
+7FA02CBA	data/nnue/pattern_store/ray_7FA02CBA.rnn	k3s	PC ray_nnue 2026-11-06 (1+3 epochs, lr 0.02, 8 threads)	3.09M children + 0.95M train_v9 rows, champion-labelled	64.7% (engine 65.5%)	29.0	58	GATING 100 ms vs main (D480)	D473/D480
+(not local)	(Modal /vol/runs/ray_nnue_full/ray_k3s.rnn, 368,292,063 B; local downloads truncated over the user's hotspot)	k3s	Modal ray_nnue 2026-11-06 (2+8 epochs)	18.55M children + 26.55M train_v9 rows	69.0%	24.8	57	NOT DOWNLOADED (hotspot)	D480
+pol_F45D57D3.bin	TPOL2	4059156	ti policy --pat k3 --init policy_main.bin, 900k pos from 91 gate files (logs/tstg_verify/d486_policy_files.txt), 4 ep, lr 0.003, pat-lr 0.01, net 46FCB5A4	D488	GATING
+pol_E61F5DD4.bin	TPOL2 dim0	3858452	ti policy --feat none --pat k3 --init policy_main.bin, 2.09M pos (91 gate files), 4 ep, lr 0.003, pat-lr 0.01; engine-consistent (D490)	D495	GATING
+pol_1582E4F9.bin	TPOL3 dim0	709172	ti policy --feat none --pat k3c --init policy_main.bin, 2.09M pos (91 gate files), 4 ep, lr 0.003, pat-lr 0.01; class-shared tables	D505	GATING
+pol_5D0F22E4.bin	TPOL3 dim0	709172	ti policy --feat none --pat k3c --init pol_1582E4F9 --kata data/kata_raw/s3413 + 91 gate files, 4 ep, lr 0.003, pat-lr 0.01	D522	GATING
+pol_EE96825B.bin	TPOL3 dim0	709172	ti policy2 full Kata 3 shards (1,415 files) + 3.84M game positions, stop-on kata, init 1582E4F9 (D529 A)	D534	GATING 5k
+pol_96EFC958.bin	TPOL4 dim0	836180	ti policy2 --ring, init pol_EE96825B, full Kata + 3.84M games, stop-on kata, best epoch 3 of 4	D543	ENGINE PENDING
+pol_96EFC958.bin	TPOL4 dim0	836180	ti policy2 --ring, init pol_EE96825B, full Kata + 3.84M games, stop-on kata, best epoch 3 of 4; 5k block 1 +18.0 +-27.6 LOS 90%	D547	PARKED: 5k pooled ~+12 P~89%, 100 ms -13 +-32 (D554)
