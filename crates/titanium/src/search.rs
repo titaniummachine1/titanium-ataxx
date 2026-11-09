@@ -174,6 +174,19 @@ const HIST_MAX: i32 = 107_000 * HIST_SCALE;
 const ORD_HIST_FULL: i32 = 2 * ORD_CAPTURE_UNIT;
 type History = [[[i32; 49]; 49]; 2];
 
+/// Killer key. A clone's child position depends only on its DESTINATION: the `from` that `legal_moves_dedup_into`
+/// reports is just the lowest-index neighbouring stone, which differs between sibling positions. A killer clone must
+/// therefore be keyed by destination only (same rule as `hist_key`), otherwise it rarely matches (measured on 8 positions to
+/// depth 11: 2.7% of clone moves matched the stored killer exactly, 4.0% by destination). Jumps keep their `(from, to)`.
+#[inline]
+fn kill_key(m: Move) -> u32 {
+    if m.is_clone() {
+        ((m.to as u32) << 8) | m.to as u32
+    } else {
+        m.to_u32()
+    }
+}
+
 #[inline]
 fn hist_key(m: Move) -> (usize, usize) {
     if m.is_clone() {
@@ -313,7 +326,8 @@ fn score_into(
             let conn = (b.occ[b.turn as usize] & RING1[m.from as usize]).count_ones() as i32;
             score -= ORD_JUMP_PEN + conn * ORD_JUMP_CONN;
         }
-        if packed == k1 || packed == k2 {
+        let kk = kill_key(m);
+        if kk == k1 || kk == k2 {
             score += ORD_KILLER;
         }
         let (hf, ht) = hist_key(m);
@@ -1280,7 +1294,7 @@ impl<'a> Searcher<'a> {
     /// Killer bookkeeping on a beta cutoff (history: hist_add at the node's end, exp/search-histmb).
     #[inline]
     fn on_cutoff(&mut self, _b: &Board, m: Move, _depth: u32, ply: u32) {
-        let packed = m.to_u32();
+        let packed = kill_key(m);
         let k = &mut self.killers[ply as usize];
         if k.0 != packed {
             k.1 = k.0;
@@ -1630,6 +1644,20 @@ mod tests {
             b = b.make(list.move_at(i));
         }
         assert!(checked >= 60);
+    }
+
+    /// A killer clone depends on its destination only; a jump keeps its origin (the child differs per origin).
+    #[test]
+    fn killer_key_clone_ignores_source_jump_does_not() {
+        use crate::board::Move;
+        // destination 16 = (row 2, col 2): sources 8 and 9 are both adjacent (clones), 0 and 2 are two away (jumps)
+        let (c1, c2) = (Move { from: 8, to: 16 }, Move { from: 15, to: 16 });
+        assert!(c1.is_clone() && c2.is_clone());
+        assert_eq!(kill_key(c1), kill_key(c2));
+        let (j1, j2) = (Move { from: 0, to: 16 }, Move { from: 2, to: 16 });
+        assert!(!j1.is_clone() && !j2.is_clone());
+        assert_ne!(kill_key(j1), kill_key(j2));
+        assert_ne!(kill_key(c1), kill_key(j1));
     }
 
     #[test]
