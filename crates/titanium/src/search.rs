@@ -3,8 +3,248 @@
 //! Search order: TT probe -> eval cache (depth 0) -> move scoring
 //! (TT move > killers > captures*W + history) -> lazy selection -> alpha-beta.
 
-/// exp/nnue-speed: static-eval cache entries (2^16 x 16 B = 1 MiB per searcher).
-const ECACHE_BITS: usize = 16;
+/// Eval cache size, log2 entries. D606: 2^22 x 8 B = 32 MB in the ranked layout (the old direct-mapped table was
+/// 2^16 x 16 B = 1 MiB and thrashed at 500k nodes per move, D575). `set_ecache_bits` (CLI --ecache-bits) applies to
+/// searchers created afterwards.
+static ECACHE_BITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(22);
+
+pub fn set_ecache_bits(bits: usize) {
+    ECACHE_BITS.store(bits.clamp(10, 26), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// D585: eval-cache layout. 1 (default) = cache-line buckets: 8 entries of 8 bytes per 64-byte line (32-bit check =
+/// 25 hash bits + importance bit + 6 bits of empties, 32-bit packed eval), one memory fetch per probe, victim =
+/// empty > dead (fewer stones than the search root: unreachable) > least recently used unimportant entry, plus a
+/// prefetch of the child's eval-cache line and TT slot as soon as the move is made. 0 = the old direct-mapped table
+/// of (u64 key, i32) entries.
+static ECACHE_MODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+pub fn set_ecache_mode(m: usize) {
+    ECACHE_MODE.store(m.min(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+const EC_EMPTY: u64 = 0x8000_0000; // low half = i32::MIN (never a packed eval), check 0
+
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct EcBucket([u64; 8]);
+
+/// 32-bit check = 25 hash bits | 1 importance bit | 6 bits of empties (the slot index already carries the low hash
+/// bits, so these 25 bits are new information: a false match needs 25 equal bits AND equal empties)
+#[inline(always)]
+fn ec_check(hash: u64, empties: u32, imp: u32) -> u32 {
+    (((hash >> 39) as u32) << 7) | ((imp & 1) << 6) | (empties & 63)
+}
+const EC_IMP_BIT: u32 = 1 << 6;
+
+/// D590: ranked TT (TT_MODE 1, default): 16-byte entries, 4 per 64-byte line. 0 = the old 24-byte single-slot table.
+static TT_MODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+pub fn set_tt_mode(m: usize) {
+    TT_MODE.store(m.min(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// D643/D652 (user): STAGED SIZE. The ranked tables do not start at their full size: they start at an L1-sized table and
+/// JUMP to an L2-sized, then an L3-sized, then the full table (--tt-bits / --ecache-bits, 22 bits by default) when the
+/// current stage overflows (more than half of its slots filled). NEVER by doubling or one more bit (user rule D652, it never
+/// worked; my doubling version lost at 1000 / 3300 ms, D649). A search that touches only a few thousand positions stays
+/// inside the CPU cache; a long search ends at the full size. The stage sizes come from the TARGET CPU's cache sizes read at
+/// engine start (crate::cacheinfo, CPUID, never compile-time constants): L1d, L2, L3 / 2 (the L3 is shared), the TT taking
+/// 2/3 and the eval cache 1/3 of each budget (the same 2:1 split as the full 64 MB + 32 MB). Growth never rehashes: the index
+/// mask widens, the newly exposed buckets are cleared at that moment, entries whose new index bits differ are stranded and
+/// evicted like any stale entry. A new game resets to stage 1. The flags below: 0 = automatic stages; N = a 2-stage
+/// table starting at 2^N entries (N >= the full size = fixed size, for experiments and parity checks).
+static TT_MIN_BITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ECACHE_MIN_BITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_tt_min_bits(b: usize) {
+    TT_MIN_BITS.store(if b == 0 { 0 } else { b.clamp(4, 30) }, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_ecache_min_bits(b: usize) {
+    ECACHE_MIN_BITS.store(if b == 0 { 0 } else { b.clamp(4, 30) }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// which cache levels are used as stages: bit 0 = L1d, bit 1 = L2, bit 2 = L3 / 2 (default 0 = NO staging: the full size from the first search. The L3-first start gained +17..25% nodes in cold-table tests but nothing in real games, D664; 4 = L3 then full).
+/// Fewer stages are allowed (user D652) but a stage is always a cache-level size, never something in between.
+static STAGE_MASK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// intermediate RAM stages between the L3 stage and the full size (default 0 = jump L3 -> full)
+static RAM_STAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_ram_stages(n: usize) {
+    RAM_STAGES.store(n.min(6), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_cache_stages(mask: u32) {
+    STAGE_MASK.store(mask & 7, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn floor_pow2(n: usize) -> usize {
+    if n == 0 {
+        1
+    } else {
+        1usize << (usize::BITS - 1 - n.leading_zeros())
+    }
+}
+
+/// Bucket counts (64-byte buckets, powers of two, strictly increasing, the last = `nb_max`) of the stages.
+/// `explicit_bits` != 0: [2^bits entries' worth of buckets, nb_max]; 0: the cache-sized stages, `share` = this table's
+/// fraction (numerator, denominator) of each cache budget, `per_bucket` = entries per bucket of the flag's bit convention.
+fn stage_list(nb_max: usize, explicit_bits: usize, per_bucket: usize, share: (usize, usize), c: crate::cacheinfo::CacheSizes, mask: u32, ram: usize) -> Vec<usize> {
+    if explicit_bits != 0 {
+        let nb = (1usize << explicit_bits).div_ceil(per_bucket).clamp(1, nb_max);
+        return if nb >= nb_max { vec![nb_max] } else { vec![nb, nb_max] };
+    }
+    let mut st: Vec<usize> = Vec::new();
+    for (i, budget) in [c.l1d, c.l2, c.l3 / 2].into_iter().enumerate() {
+        if mask & (1 << i) == 0 {
+            continue; // this cache level is not used as a stage (D652: fewer jumps are fine, but only at cache-level sizes)
+        }
+        let nb = floor_pow2(budget * share.0 / share.1 / 64).clamp(1, nb_max);
+        if nb < nb_max && st.last().map_or(true, |&l| nb > l) {
+            st.push(nb);
+        }
+    }
+    // extra jumps are allowed beyond the L3 stage, because that part lives in RAM (user D652): `ram` intermediate stages,
+    // geometrically spaced between the last cache stage and the full size (cache levels themselves never get in-between sizes)
+    if ram > 0 {
+        if let Some(&lo) = st.last() {
+            let ratio = nb_max as f64 / lo as f64;
+            for j in 1..=ram {
+                let nb = floor_pow2((lo as f64 * ratio.powf(j as f64 / (ram + 1) as f64)) as usize);
+                if nb > *st.last().unwrap() && nb < nb_max {
+                    st.push(nb);
+                }
+            }
+        }
+    }
+    st.push(nb_max);
+    st
+}
+
+fn tt_stage_list(nb_max: usize) -> Vec<usize> {
+    stage_list(nb_max, TT_MIN_BITS.load(std::sync::atomic::Ordering::Relaxed), 4, (2, 3), crate::cacheinfo::sizes(), STAGE_MASK.load(std::sync::atomic::Ordering::Relaxed), RAM_STAGES.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn ec_stage_list(nb_max: usize) -> Vec<usize> {
+    stage_list(nb_max, ECACHE_MIN_BITS.load(std::sync::atomic::Ordering::Relaxed), 8, (1, 3), crate::cacheinfo::sizes(), STAGE_MASK.load(std::sync::atomic::Ordering::Relaxed), RAM_STAGES.load(std::sync::atomic::Ordering::Relaxed))
+}
+/// D650 (user idea): BIT-PACKED TT entry, 10 bytes = 80 bits, 6 per 64-byte bucket (60 bytes + 4 spare) instead of
+/// 4 x 16 bytes: +50% entries in the same memory, still one cache line per probe. Layout (little endian):
+///   bytes 0-3 check (high 32 hash bits) | 4-5 score (16-bit code, ttcodec::enc_score) | 6 depth |
+///   7 empties (6 bits) + age bits 0-1 | 8 move code bits 0-7 (ttcodec: 10-bit code, any pseudo-legal move) |
+///   9 move code bits 8-9, flag (2 bits, 0 = empty slot), importance (2 bits), age bits 2-3.
+/// The 4 spare bytes of the bucket (60-63) hold 6 x 5 extra check bits (hash bits 27-31) so every bit of the line is used:
+/// the index takes hash bits 0-22 at most, the check bits 32-63, the extension bits 27-31 (59 of the 64 hash bits filter).
+/// An all-zero bucket is an empty bucket.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct TtBucket([u8; 64]);
+
+const TT_EBYTES: usize = 10;
+/// entries per bucket in the packed layout (--tt-ways N: 4 reproduces the old 16-byte table's replacement behaviour)
+const TT_MAX_WAYS: usize = 6;
+
+static TT_WAYS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(TT_MAX_WAYS);
+
+pub fn set_tt_ways(w: usize) {
+    TT_WAYS.store(w.clamp(1, TT_MAX_WAYS), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// unpacked view of one TT slot
+#[derive(Clone, Copy)]
+struct TtE2 {
+    chk: u32,
+    score: i32,
+    code: u16,
+    depth: u8,
+    flag: u8,
+    imp: u8,
+    /// 4-bit generation
+    age: u8,
+    empties: u8,
+    /// 5 extra check bits (hash bits 27-31)
+    ext: u8,
+}
+
+impl TtBucket {
+    const EMPTY: TtBucket = TtBucket([0u8; 64]);
+
+    #[inline(always)]
+    fn ext(&self, i: usize) -> u8 {
+        let w = u32::from_le_bytes([self.0[60], self.0[61], self.0[62], self.0[63]]);
+        ((w >> (5 * i)) & 31) as u8
+    }
+
+    #[inline(always)]
+    fn set_ext(&mut self, i: usize, v: u8) {
+        let mut w = u32::from_le_bytes([self.0[60], self.0[61], self.0[62], self.0[63]]);
+        w = (w & !(31u32 << (5 * i))) | (((v & 31) as u32) << (5 * i));
+        self.0[60..64].copy_from_slice(&w.to_le_bytes());
+    }
+
+    #[inline(always)]
+    fn flag(&self, i: usize) -> u8 {
+        (self.0[i * TT_EBYTES + 9] >> 2) & 3
+    }
+
+    #[inline(always)]
+    fn chk(&self, i: usize) -> u32 {
+        let o = i * TT_EBYTES;
+        u32::from_le_bytes([self.0[o], self.0[o + 1], self.0[o + 2], self.0[o + 3]])
+    }
+
+    #[inline(always)]
+    fn empties(&self, i: usize) -> u8 {
+        self.0[i * TT_EBYTES + 7] & 63
+    }
+
+    #[inline(always)]
+    fn age(&self, i: usize) -> u8 {
+        let o = i * TT_EBYTES;
+        (self.0[o + 7] >> 6) | ((self.0[o + 9] >> 6) << 2)
+    }
+
+    #[inline(always)]
+    fn set_age(&mut self, i: usize, age: u8) {
+        let o = i * TT_EBYTES;
+        self.0[o + 7] = (self.0[o + 7] & 63) | ((age & 3) << 6);
+        self.0[o + 9] = (self.0[o + 9] & 0x3F) | (((age >> 2) & 3) << 6);
+    }
+
+    #[inline(always)]
+    fn get(&self, i: usize) -> TtE2 {
+        let o = i * TT_EBYTES;
+        let b = &self.0;
+        TtE2 {
+            chk: self.chk(i),
+            score: crate::ttcodec::dec_score(i16::from_le_bytes([b[o + 4], b[o + 5]])),
+            code: b[o + 8] as u16 | (((b[o + 9] & 3) as u16) << 8),
+            depth: b[o + 6],
+            flag: (b[o + 9] >> 2) & 3,
+            imp: (b[o + 9] >> 4) & 3,
+            age: self.age(i),
+            empties: b[o + 7] & 63,
+            ext: self.ext(i),
+        }
+    }
+
+    #[inline(always)]
+    fn set(&mut self, i: usize, e: &TtE2) {
+        let o = i * TT_EBYTES;
+        let c = e.chk.to_le_bytes();
+        let s = crate::ttcodec::enc_score(e.score).to_le_bytes();
+        let b = &mut self.0;
+        b[o..o + 4].copy_from_slice(&c);
+        b[o + 4] = s[0];
+        b[o + 5] = s[1];
+        b[o + 6] = e.depth;
+        b[o + 7] = (e.empties & 63) | ((e.age & 3) << 6);
+        b[o + 8] = e.code as u8;
+        b[o + 9] = ((e.code >> 8) & 3) as u8 | ((e.flag & 3) << 2) | ((e.imp & 3) << 4) | (((e.age >> 2) & 3) << 6);
+        self.set_ext(i, e.ext);
+    }
+}
 
 use crate::board::{dist_union, jump_union, Board, Move, MoveList, RING1, SQUARES};
 use crate::nnue::Nnue;
@@ -38,6 +278,8 @@ struct MoveStack {
     /// Lowest ply index since the most recent irreversible (clone) move; positions before this index
     /// have strictly fewer total stones on the board and can never be repeated.
     rep_base: Box<[u32; MAX_PLY]>,
+    /// D590: how the node at this ply was reached (3 first move, 2 top-12, 1 later, 0 null-move probe): TT worth
+    imp: Box<[u8; MAX_PLY]>,
 }
 
 impl MoveStack {
@@ -48,6 +290,7 @@ impl MoveStack {
             pre_eval: Box::new([i32::MIN; MAX_PLY]),
             path_hash: Box::new([0u64; MAX_PLY]),
             rep_base: Box::new([0u32; MAX_PLY]),
+            imp: Box::new([3u8; MAX_PLY]),
         }
     }
 }
@@ -207,7 +450,7 @@ const CONTACT_PEN: i32 = 15;
 /// landing would convert costs this much. Restored S13: +330 standalone.
 const MULTICAP_PEN: i32 = 20;
 
-/// Empty landing squares `them` can reach right now (shared E2+E4 input —
+/// Empty landing squares `them` can reach right now (shared E2+E4 input â€”
 /// computed once per side, not once per term).
 #[inline]
 fn enemy_landings(b: &Board, them: u8) -> u64 {
@@ -215,7 +458,7 @@ fn enemy_landings(b: &Board, them: u8) -> u64 {
     b.empty() & (dist_union(tp, 1) | jump_union(tp))
 }
 
-/// E2: stones of `side` the enemy can currently convert — own stones ring-1
+/// E2: stones of `side` the enemy can currently convert â€” own stones ring-1
 /// of an enemy-reachable landing square.
 #[inline]
 fn endangered_count(b: &Board, side: u8, landings_them: u64) -> u32 {
@@ -241,7 +484,7 @@ fn multicapture_penalty(b: &Board, side: u8, landings_them: u64) -> i32 {
 
 /// Static eval from the side-to-move's perspective. Material + PST + tempo
 /// are O(1) incremental; E2/E4 regional terms (contact + multicap exposure)
-/// scan enemy reachability per node — the knowledge that won +190/+330.
+/// scan enemy reachability per node â€” the knowledge that won +190/+330.
 /// The n-tuple term (`tup`, S20) adds learned local-shape knowledge on top;
 /// None = pure hand eval (zero-cost OFF).
 pub fn evaluate(b: &Board, tup: Option<&TupleTable>, native_tup: bool) -> i32 {
@@ -278,7 +521,7 @@ pub fn evaluate(b: &Board, tup: Option<&TupleTable>, native_tup: bool) -> i32 {
     // Tuple term is stm-relative by construction: add after the flip.
     // None branch = zero-cost OFF (single predictable branch).
     // forward_fast reuses this eval's landing sets (bit-identical scores,
-    // zero recompute — capconv's land_u/land_t ARE land_w/land_b per side).
+    // zero recompute â€” capconv's land_u/land_t ARE land_w/land_b per side).
     if let Some(t) = tup {
         let land_me = if b.turn == 0 { land_w } else { land_b };
         let land_opp = if b.turn == 0 { land_b } else { land_w };
@@ -289,7 +532,7 @@ pub fn evaluate(b: &Board, tup: Option<&TupleTable>, native_tup: bool) -> i32 {
 
 /// Score moves in place: TT move > killers > captures*W + history.
 /// Free function (not a method) so negamax can borrow the move stack
-/// mutably while reading killers/history immutably — no split-borrow
+/// mutably while reading killers/history immutably â€” no split-borrow
 /// fight, no unsafe, no clone.
 #[inline]
 fn score_into(
@@ -307,8 +550,8 @@ fn score_into(
     let mut tt_index = usize::MAX;
     for i in 0..list.len() {
         let m = list.move_at(i);
-        let packed = m.to_u32();
-        if packed == tt_mv {
+        // the TT move is a ttcodec move code: a clone matches by destination, a jump by (from, to)
+        if crate::ttcodec::move_code(m) as u32 == tt_mv {
             tt_index = i;
             list.set_score(i, i32::MAX / 2);
             continue;
@@ -320,7 +563,7 @@ fn score_into(
         if m.is_clone() {
             score += ORD_CLONE_BONUS;
         } else {
-            // exp/ab O1 (hole-aware jumps): a jump vacates its origin —
+            // exp/ab O1 (hole-aware jumps): a jump vacates its origin â€”
             // leaving a connected origin breaks formation, so penalty
             // scales with own stones adjacent to the origin square.
             let conn = (b.occ[b.turn as usize] & RING1[m.from as usize]).count_ones() as i32;
@@ -371,7 +614,7 @@ fn bz_terminal_score(b: &Board, ply: u32) -> i32 {
 }
 
 /// Move scoring is fixed: TT move > killers > captures*W + history, consumed
-/// lazily (repeated argmax — only pays for moves examined before a cutoff).
+/// lazily (repeated argmax â€” only pays for moves examined before a cutoff).
 
 /// Transposition table entry (24 bytes with padding).
 #[derive(Clone, Copy)]
@@ -382,6 +625,9 @@ struct TtEntry {
     depth: u8,
     flag: u8, // 0 empty, 1 exact, 2 lower, 3 upper
     age: u8,  // Generation age for FIFO/LRU eviction without RAM increase (fits in compiler padding)
+    /// empties of the stored position (padding byte). Empties never increase in Ataxx, so an entry with more
+    /// empties than the search root can never be reached again (D571). 0 = unknown.
+    empties: u8,
 }
 
 const _: () = assert!(std::mem::size_of::<TtEntry>() == 24);
@@ -461,13 +707,41 @@ impl CorrHist {
 /// entries double as the eval cache (Ataxx transpositions repeat a lot).
 pub struct Tt {
     buf: Vec<TtEntry>,
+    /// D590 ranked buckets (Some = TT_MODE 1; then `buf` is a 1-entry dummy)
+    v2: Option<Box<[TtBucket]>>,
+    /// active bucket mask (adaptive size: grows towards nb_max, see TT_MIN_BITS)
     mask: usize,
+    /// full bucket count, minimum bucket count, slots filled since the last reset (ranked mode)
+    nb_max: usize,
+    /// bucket counts of the stages (L1, L2, L3, full: D652) and the current stage
+    stages: Vec<usize>,
+    stage: usize,
+    filled: usize,
+    /// entries per bucket in use (packed layout, <= TT_MAX_WAYS)
+    ways: usize,
     pub age: u8,
+    /// empties of the current search root (255 = nothing is dead): entries/cache lines with more empties are unreachable
+    pub root_empties: u8,
 }
 
 impl Tt {
-    /// 2^bits entries (bits=20 -> 1M entries, 24 MB).
+    /// 2^bits entries (bits=20 -> 1M entries, 24 MB; ranked mode: 16 B entries, 4 per line).
     pub fn new(bits: usize) -> Tt {
+        if TT_MODE.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+            let nb = (1usize << bits.min(25)) / 4;
+            let mut t = Tt::new_v1(0);
+            t.v2 = Some(vec![TtBucket::EMPTY; nb].into_boxed_slice());
+            t.nb_max = nb;
+            t.stages = tt_stage_list(nb);
+            t.stage = 0;
+            t.mask = t.stages[0] - 1;
+            t.ways = TT_WAYS.load(std::sync::atomic::Ordering::Relaxed);
+            return t;
+        }
+        Tt::new_v1(bits)
+    }
+
+    fn new_v1(bits: usize) -> Tt {
         let size = 1usize << bits.min(24);
         Tt {
             buf: vec![
@@ -478,10 +752,18 @@ impl Tt {
                     depth: 0,
                     flag: FLAG_EMPTY,
                     age: 0,
+                    empties: 0,
                 };
                 size
             ],
             mask: size - 1,
+            nb_max: 0,
+            stages: Vec::new(),
+            stage: 0,
+            filled: 0,
+            ways: TT_MAX_WAYS,
+            v2: None,
+            root_empties: 255,
             age: 0,
         }
     }
@@ -490,7 +772,61 @@ impl Tt {
         for e in self.buf.iter_mut() {
             e.flag = FLAG_EMPTY;
         }
+        if let Some(v) = self.v2.as_mut() {
+            // back to stage 1; only that part is cleared now, the rest is cleared when it is exposed (grow)
+            self.stage = 0;
+            let nb0 = self.stages[0];
+            self.mask = nb0 - 1;
+            self.filled = 0;
+            v[..nb0].fill(TtBucket::EMPTY);
+        }
         self.age = 0;
+    }
+
+    /// Staged size (D652): JUMP to the next stage (L1 -> L2 -> L3 -> full), never by doubling. Never rehash: the mask
+    /// widens, the newly exposed buckets are cleared now, stranded entries age out.
+    #[cold]
+    fn grow(&mut self) {
+        if self.stage + 1 < self.stages.len() {
+            self.jump_to(self.stage + 1);
+        }
+    }
+
+    /// Jump to `stage` (never backwards): widen the mask, clear the newly exposed buckets, keep the stranded entries.
+    fn jump_to(&mut self, stage: usize) {
+        let cur = self.mask + 1;
+        if stage <= self.stage || stage >= self.stages.len() || cur >= self.nb_max {
+            return;
+        }
+        self.stage = stage;
+        let new = self.stages[stage].max(cur);
+        if let Some(v) = self.v2.as_mut() {
+            v[cur..new].fill(TtBucket::EMPTY);
+        }
+        self.mask = new - 1;
+        self.filled = self.filled * cur / new;
+    }
+
+    /// First search of a game (fresh table): start at the smallest stage whose capacity holds 4x the expected nodes of
+    /// the search, so a short search stays in a cache-sized table and a long one starts at the full size and never
+    /// jumps in the middle of a search (D657: L3-first +25% nodes at 100 ms, -7% at 1000 ms because of the late jump).
+    fn start_stage(&mut self, expected_nodes: usize) {
+        if self.v2.is_none() || self.filled != 0 {
+            return;
+        }
+        let mut s = 0;
+        while s + 1 < self.stages.len() && self.stages[s] * self.ways < 4usize.saturating_mul(expected_nodes) {
+            s += 1;
+        }
+        self.jump_to(s);
+    }
+
+    #[inline(always)]
+    fn slot_ptr(&self, key: u64) -> *const i8 {
+        if let Some(v) = self.v2.as_ref() {
+            return &v[(key as usize) & self.mask] as *const TtBucket as *const i8;
+        }
+        &self.buf[(key as usize) & self.mask] as *const TtEntry as *const i8
     }
 
     #[inline]
@@ -500,17 +836,95 @@ impl Tt {
 
     #[inline]
     fn probe(&mut self, key: u64) -> Option<TtEntry> {
+        self.probe_e(key, 255)
+    }
+
+    /// Probe with the position's empty-square count (D641/D647, user): stones never disappear in Ataxx, so a position
+    /// has exactly one stone count, and a hash match whose stored empties differ is a false positive. 255 = unchecked.
+    #[inline]
+    fn probe_e(&mut self, key: u64, empties: u8) -> Option<TtEntry> {
+        // NOTE: the returned `mv` is a ttcodec MOVE CODE (not a packed from/to) in both table modes.
+        if let Some(v) = self.v2.as_mut() {
+            let age = self.age & 15;
+            let chk = (key >> 32) as u32;
+            let ext = ((key >> 27) & 31) as u8;
+            let ways = self.ways;
+            let bk = &mut v[(key as usize) & self.mask];
+            for i in 0..ways {
+                if bk.flag(i) != 0 && bk.chk(i) == chk && bk.ext(i) == ext && (empties == 255 || bk.empties(i) == empties) {
+                    bk.set_age(i, age);
+                    let e = bk.get(i);
+                    return Some(TtEntry { key, mv: e.code as u32, score: e.score, depth: e.depth, flag: e.flag, age: self.age, empties: e.empties });
+                }
+            }
+            return None;
+        }
         let e = &mut self.buf[(key as usize) & self.mask];
         if e.flag != FLAG_EMPTY && e.key == key {
             e.age = self.age;
-            Some(*e)
+            let mut r = *e;
+            r.mv = crate::ttcodec::code_of_u32(r.mv) as u32;
+            Some(r)
         } else {
             None
         }
     }
 
     #[inline]
-    fn store(&mut self, key: u64, mut mv: u32, score: i32, depth: u8, flag: u8) {
+    fn store(&mut self, key: u64, mv: u32, score: i32, depth: u8, flag: u8) {
+        self.store_e(key, mv, score, depth, flag, 0, 1);
+    }
+
+    /// D590 ranked store: same position -> update (refutation move kept on fail-low); else the victim is an empty
+    /// slot, else a dead entry (more empties than the root), else the lowest worth = depth + 4 x importance
+    /// + 16 if proven - 3 x age (searches since last touched, capped at 4)
+    #[inline]
+    fn store_v2(&mut self, key: u64, mv: u32, score: i32, depth: u8, flag: u8, empties: u8, imp: u8) {
+        let (age, root_empties, mask, ways) = (self.age & 15, self.root_empties, self.mask, self.ways);
+        let Some(v) = self.v2.as_mut() else { return };
+        let bk = &mut v[(key as usize) & mask];
+        let chk = (key >> 32) as u32;
+        let ext = ((key >> 27) & 31) as u8;
+        let mut code = crate::ttcodec::code_of_u32(mv);
+        // same position: update in place (a position has exactly one stone count, so a different count is another position)
+        if let Some(i) = (0..ways).find(|&i| bk.flag(i) != 0 && bk.chk(i) == chk && bk.ext(i) == ext && bk.empties(i) == (empties & 63)) {
+            if flag == FLAG_UPPER {
+                let old = bk.get(i).code;
+                if old != 0 && old != crate::ttcodec::PASS_CODE {
+                    code = old; // keep the refutation move on a fail-low
+                }
+            }
+            bk.set(i, &TtE2 { chk, score, code, depth, flag, imp, age, empties, ext });
+            return;
+        }
+        let worth = |i: usize| -> i32 {
+            if bk.flag(i) == 0 {
+                return i32::MIN;
+            }
+            if bk.empties(i) > root_empties {
+                return i32::MIN + 1;
+            }
+            let e = bk.get(i);
+            let a = (age.wrapping_sub(e.age) & 15).min(4) as i32;
+            e.depth as i32 + 4 * e.imp as i32 + if e.score.abs() >= MATE_BOUND { 16 } else { 0 } - 3 * a
+        };
+        let victim = (0..ways).min_by_key(|&i| worth(i)).unwrap_or(0);
+        let was_empty = bk.flag(victim) == 0;
+        bk.set(victim, &TtE2 { chk, score, code, depth, flag, imp, age, empties, ext });
+        if was_empty {
+            self.filled += 1;
+            if self.filled * 2 > (self.mask + 1) * self.ways && self.mask + 1 < self.nb_max {
+                self.grow();
+            }
+        }
+    }
+
+    #[inline]
+    fn store_e(&mut self, key: u64, mut mv: u32, score: i32, depth: u8, flag: u8, empties: u8, imp: u8) {
+        if self.v2.is_some() {
+            self.store_v2(key, mv, score, depth, flag, empties, imp);
+            return;
+        }
         let e = &mut self.buf[(key as usize) & self.mask];
         let same_pos = e.flag != FLAG_EMPTY && e.key == key;
 
@@ -538,6 +952,7 @@ impl Tt {
                 depth,
                 flag,
                 age: self.age,
+                empties,
             };
         }
     }
@@ -638,13 +1053,24 @@ pub struct Searcher<'a> {
     /// hit returns exactly what a recomputation would: search is bit-identical, only faster (iterative deepening
     /// re-evaluates ~42% of positions). Cleared on new game and whenever the eval source changes.
     ecache: Box<[(u64, i32)]>,
+    /// D585 bucketed eval cache (Some = ECACHE_MODE 1; then `ecache` is a 1-entry dummy)
+    ec2: Option<Box<[EcBucket]>>,
+    /// D586/D590: importance of the next eval-cache store (1 = a searched node or one of the top-12 moves, 0 = a late move)
+    ec_imp: u32,
+    /// D643 adaptive size of the ranked eval cache: active bucket count (power of two, grows by doubling when more than
+    /// half of the active slots were filled), minimum bucket count, slots filled since the last reset
+    ec_act: usize,
+    /// bucket counts of the stages (L1, L2, L3, full: D652) and the current stage
+    ec_stages: Vec<usize>,
+    ec_stage: usize,
+    ec_filled: usize,
     /// Two killer moves per ply (packed u32 moves), refreshed on cutoffs.
     killers: Box<[(u32, u32); MAX_PLY]>,
     /// History heuristic: [mover][to] cutoff counters, aged per search.
     history: Box<History>,
     /// Optional sancta net (None = classical slim eval). Borrowed weights,
     /// set once via set_sancta, read-only in the tree. Zero refcount,
-    /// zero unsafe — the borrow checker proves the net outlives the search.
+    /// zero unsafe â€” the borrow checker proves the net outlives the search.
     sancta: Option<&'a S1Net>,
     /// Optional n-tuple table (None = pure hand eval). Borrowed, read-only
     /// in the tree, same zero-cost-OFF pattern as sancta.
@@ -716,7 +1142,28 @@ impl<'a> Searcher<'a> {
             best_sink: None,
             safety_ms: 10.0,
             tt: Tt::new(bits),
-            ecache: vec![(0u64, i32::MIN); 1 << ECACHE_BITS].into_boxed_slice(),
+            ecache: vec![
+                (0u64, i32::MIN);
+                if ECACHE_MODE.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+                    1
+                } else {
+                    1 << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)
+                }
+            ]
+            .into_boxed_slice(),
+            ec2: if ECACHE_MODE.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+                Some(
+                    vec![EcBucket([EC_EMPTY; 8]); (1usize << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)) / 8]
+                        .into_boxed_slice(),
+                )
+            } else {
+                None
+            },
+            ec_imp: 1,
+            ec_act: ec_stage_list((1usize << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)) / 8)[0],
+            ec_stages: ec_stage_list((1usize << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)) / 8),
+            ec_stage: 0,
+            ec_filled: 0,
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[[0; 49]; 49]; 2]),
             sancta: None,
@@ -789,6 +1236,109 @@ impl<'a> Searcher<'a> {
     /// Every static eval goes through here (node entry AND the futility child eval) so pruning and leaves agree.
     fn clear_ecache(&mut self) {
         self.ecache.fill((0, i32::MIN));
+        if let Some(e) = self.ec2.as_mut() {
+            // back to stage 1; only that part is cleared now, the rest is cleared when it is exposed (ec_grow)
+            self.ec_stage = 0;
+            self.ec_act = self.ec_stages[0];
+            self.ec_filled = 0;
+            e[..self.ec_act].fill(EcBucket([EC_EMPTY; 8]));
+        }
+    }
+
+    /// Staged size (D652): JUMP to the next eval-cache stage (L1 -> L2 -> L3 -> full), never by doubling. Never rehash.
+    #[cold]
+    fn ec_grow(&mut self) {
+        if self.ec_stage + 1 < self.ec_stages.len() {
+            self.ec_jump_to(self.ec_stage + 1);
+        }
+    }
+
+    fn ec_jump_to(&mut self, stage: usize) {
+        let cur = self.ec_act;
+        if stage <= self.ec_stage || stage >= self.ec_stages.len() {
+            return;
+        }
+        self.ec_stage = stage;
+        let new = self.ec_stages[stage].max(cur);
+        let Some(e) = self.ec2.as_mut() else { return };
+        e[cur..new].fill(EcBucket([EC_EMPTY; 8]));
+        self.ec_act = new;
+        self.ec_filled = self.ec_filled * cur / new;
+    }
+
+    /// Same rule as `Tt::start_stage` for the eval cache (8 entries per bucket).
+    fn ec_start_stage(&mut self, expected_nodes: usize) {
+        if self.ec2.is_none() || self.ec_filled != 0 {
+            return;
+        }
+        let mut s = 0;
+        while s + 1 < self.ec_stages.len() && self.ec_stages[s] * 8 < 4usize.saturating_mul(expected_nodes) {
+            s += 1;
+        }
+        self.ec_jump_to(s);
+    }
+
+    /// D585: bucketed eval-cache probe; a hit moves the entry to the front of its line (LRU order)
+    #[inline]
+    fn ec2_get(&mut self, b: &Board) -> Option<i32> {
+        let n = self.ec_act;
+        let e = self.ec2.as_mut()?;
+        let bk = &mut e[(b.hash as usize) & (n - 1)].0;
+        let chk = ec_check(b.hash, b.empty().count_ones(), 0);
+        // 2 more check bits (hash bits 37-38) live in the unused top bits 29-30 of the packed value (it needs 29 bits)
+        let ext = (((b.hash >> 37) & 3) as u32) << 29;
+        for i in 0..8 {
+            let x = bk[i];
+            if ((x >> 32) as u32 & !EC_IMP_BIT) == chk && x as u32 != 0x8000_0000 && (x as u32 & 0x6000_0000) == ext {
+                if i > 0 {
+                    bk.copy_within(0..i, 1);
+                    bk[0] = x;
+                }
+                return Some((x as u32 & 0x1FFF_FFFF) as i32);
+            }
+        }
+        None
+    }
+
+    /// D585/D586 ranked eviction: insert at the front; victim = the first empty slot, else the first dead entry (fewer
+    /// stones than the root: unreachable), else the least recently used UNIMPORTANT entry, else the last (LRU)
+    #[inline]
+    fn ec2_put(&mut self, b: &Board, v: i32) {
+        let root_empties = self.tt.root_empties as u32;
+        let imp = self.ec_imp;
+        let n = self.ec_act;
+        let Some(e) = self.ec2.as_mut() else { return };
+        let bk = &mut e[(b.hash as usize) & (n - 1)].0;
+        let chk = ec_check(b.hash, b.empty().count_ones(), imp);
+        let victim = (0..8)
+            .find(|&i| bk[i] as u32 == 0x8000_0000)
+            .or_else(|| (0..8).find(|&i| ((bk[i] >> 32) as u32 & 63) > root_empties))
+            .or_else(|| (0..8).rev().find(|&i| (bk[i] >> 32) as u32 & EC_IMP_BIT == 0))
+            .unwrap_or(7);
+        let was_empty = bk[victim] as u32 == 0x8000_0000;
+        bk.copy_within(0..victim, 1);
+        let ext = (((b.hash >> 37) & 3) as u64) << 29;
+        bk[0] = ((chk as u64) << 32) | (v as u32 as u64 & 0x1FFF_FFFF) | ext;
+        if was_empty {
+            self.ec_filled += 1;
+            if self.ec_filled * 2 > self.ec_act * 8 && self.ec_stage + 1 < self.ec_stages.len() {
+                self.ec_grow();
+            }
+        }
+    }
+
+    /// D585: start loading the child's eval-cache line and TT slot while the parent still works on the move
+    #[inline(always)]
+    fn prefetch_child(&self, hash: u64) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(e) = self.ec2.as_ref() {
+            let pe = &e[(hash as usize) & (self.ec_act - 1)] as *const EcBucket as *const i8;
+            let pt = self.tt.slot_ptr(hash);
+            unsafe {
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(pe);
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(pt);
+            }
+        }
     }
 
     #[inline]
@@ -798,7 +1348,15 @@ impl<'a> Searcher<'a> {
 
     #[inline]
     fn leaf_eval_with_dis(&mut self, b: &Board) -> (i32, i32) {
-        let slot = (b.hash as usize) & ((1 << ECACHE_BITS) - 1);
+        if self.ec2.is_some() {
+            if let Some(v) = self.ec2_get(b) {
+                return unpack_eval_dis(v);
+            }
+            let (eval, dis) = self.leaf_eval_raw_with_dis(b);
+            self.ec2_put(b, pack_eval_dis(eval, dis));
+            return (eval, dis);
+        }
+        let slot = (b.hash as usize) & (self.ecache.len() - 1);
         let (k, v) = self.ecache[slot];
         if k == b.hash && v != i32::MIN {
             return unpack_eval_dis(v);
@@ -856,7 +1414,7 @@ impl<'a> Searcher<'a> {
         self.time_src = f;
     }
 
-    /// Full state reset between games (TT, killers, history) — prevents
+    /// Full state reset between games (TT, killers, history) â€” prevents
     /// cross-game leakage in long matches (titanium binary_match lesson).
     pub fn reset_for_new_game(&mut self) {
         self.tt.clear();
@@ -944,7 +1502,7 @@ impl<'a> Searcher<'a> {
         let alpha_orig = alpha;
         let mut tt_mv: u32 = 0;
         let mut depth = depth;
-        if let Some(e) = self.tt.probe(b.hash) {
+        if let Some(e) = self.tt.probe_e(b.hash, b.empty().count_ones() as u8) {
             tt_mv = e.mv;
             if e.depth as u32 >= depth {
                 let s = score_from_tt(e.score, ply);
@@ -981,12 +1539,15 @@ impl<'a> Searcher<'a> {
         // Lazy incremental sancta: root refreshed once in search(); every
         // child acc = parent acc + bitboard diffs at make() time (below).
         // OFF = single branch to classical, zero-cost.
-        // forward_ready(acc, stm) is ALREADY stm-relative (like evaluate) —
+        // forward_ready(acc, stm) is ALREADY stm-relative (like evaluate) â€”
         // no negation (that was the 0-50 bug: double-negated white nodes).
         let (raw, node_dis) = match (self.nnue, self.sancta) {
             (None, Some(net)) => (net.forward_ready(&self.stack.acc[ply as usize], b.turn), 0),
             _ if pre != i32::MIN => unpack_eval_dis(pre),
-            _ => self.leaf_eval_with_dis(b),
+            _ => {
+                self.ec_imp = 1;
+                self.leaf_eval_with_dis(b)
+            }
         };
         let static_eval = self.corrected(b, raw);
 
@@ -1017,10 +1578,11 @@ impl<'a> Searcher<'a> {
                 && (b.piece_cnt[0] as u32 + b.piece_cnt[1] as u32) * 50 < 26 * SQUARES as u32
             {
                 let child = b.make_pass();
+                self.stack.imp[ply as usize + 1] = 0;
                 self.stack.path_hash[ply as usize + 1] = child.hash;
                 self.stack.rep_base[ply as usize + 1] = self.stack.rep_base[ply as usize];
                 // NMP pass flips stm: sancta acc is color-relative so it
-                // stays valid — just forward the other perspective.
+                // stays valid â€” just forward the other perspective.
                 // (pass: no stones change, no diff update needed.)
                 let score =
                     -self.negamax::<BZ>(&child, -beta, -beta + 1, depth - 3, ply + 1, false);
@@ -1058,7 +1620,7 @@ impl<'a> Searcher<'a> {
             let list = &mut self.stack.lists[ply as usize];
             score_into(b, list, tt_mv, ply, &self.killers, &self.history);
             // Fallthrough terminal: legal_moves_dedup_into tracks dedup
-            // multiplicities, so len>0 always — but double-pass positions
+            // multiplicities, so len>0 always â€” but double-pass positions
             // have no children to search: score the pass-through.
             if list.is_empty() {
                 self.heuristic_used = true;
@@ -1115,7 +1677,7 @@ impl<'a> Searcher<'a> {
                     }
                     let child = b.make(m);
                     let add = if EVORD_CACHE {
-                        let (k, v) = self.ecache[(child.hash as usize) & ((1 << ECACHE_BITS) - 1)];
+                        let (k, v) = self.ecache[(child.hash as usize) & (self.ecache.len() - 1)];
                         if k == child.hash && v != i32::MIN {
                             let (ce, _) = unpack_eval_dis(v);
                             (-ce).saturating_sub(static_eval)
@@ -1151,6 +1713,10 @@ impl<'a> Searcher<'a> {
             // first is reduced by how far its child's STATIC eval falls short of alpha, and a move reduced to depth
             // <= 0 is not searched at all. First move: full window, full depth (always searched, so best is set).
             let child = b.make(m);
+            self.prefetch_child(child.hash);
+            // D590 (user): the top ~10-15 moves are real candidates the search often keeps unreduced
+            self.ec_imp = (move_idx < 12) as u32;
+            self.stack.imp[ply as usize + 1] = if move_idx == 0 { 3 } else if move_idx < 12 { 2 } else { 1 };
             if m.is_clone() {
                 self.stack.path_hash[ply as usize + 1] = child.hash;
                 self.stack.rep_base[ply as usize + 1] = ply + 1;
@@ -1194,8 +1760,13 @@ impl<'a> Searcher<'a> {
             {
                 // child eval is from the child's side to move = minus our static value of the move
                 if FUT_CHEAP_M > 0 && self.fut_sn && self.nnue.is_some() {
-                    let slot = (child.hash as usize) & ((1 << ECACHE_BITS) - 1);
-                    if !(self.ecache[slot].0 == child.hash && self.ecache[slot].1 != i32::MIN) {
+                    let slot = (child.hash as usize) & (self.ecache.len() - 1);
+                    let cached = if self.ec2.is_some() {
+                        self.ec2_get(&child).is_some()
+                    } else {
+                        self.ecache[slot].0 == child.hash && self.ecache[slot].1 != i32::MIN
+                    };
+                    if !cached {
                         let hand = evaluate(&child, None, false);
                         let (bt, ct) = (b.turn as usize, child.turn as usize);
                         let sn = small_net();
@@ -1354,7 +1925,7 @@ impl<'a> Searcher<'a> {
             FLAG_EXACT
         };
         self.tt
-            .store(b.hash, best_mv, score_to_tt(best, ply), depth as u8, flag);
+            .store_e(b.hash, best_mv, score_to_tt(best, ply), depth as u8, flag, b.empty().count_ones() as u8, self.stack.imp[ply as usize]);
     }
     /// Iterative deepening root search. Falls back to any legal move.
     /// Whichever limit hits first (nodes / time / depth) stops the search;
@@ -1402,6 +1973,7 @@ impl<'a> Searcher<'a> {
         self.stop_reason = StopReason::Completed;
         self.node_limit = limits.max_nodes;
         self.fut_sn = FUT_SN_ON.load(std::sync::atomic::Ordering::Relaxed);
+        self.tt.root_empties = b.empty().count_ones() as u8;
         let safety_margin_ms = self.safety_ms;
         self.deadline_ms = limits
             .time
@@ -1419,6 +1991,16 @@ impl<'a> Searcher<'a> {
             return result;
         }
         self.tt.step_age();
+        if self.tt.age == 1 {
+            // first search of a game (a new game resets the age to 0): pick the starting table stage from the budget
+            let expected = match (limits.max_nodes, limits.time) {
+                (Some(n), _) => n as usize,
+                (None, Some(t)) => (t.as_millis() as usize).saturating_mul(120), // ~120 nodes per ms on a typical core
+                _ => usize::MAX, // unknown budget: the full size
+            };
+            self.tt.start_stage(expected);
+            self.ec_start_stage(expected);
+        }
         // Age the history table so old cutoffs don't dominate forever.
         for side in self.history.iter_mut() {
             for row in side.iter_mut() {
@@ -1427,7 +2009,7 @@ impl<'a> Searcher<'a> {
                 }
             }
         }
-        let root_tt = self.tt.probe(b.hash);
+        let root_tt = self.tt.probe_e(b.hash, b.empty().count_ones() as u8);
         let tt_mv = root_tt.map(|e| e.mv).unwrap_or(0);
         {
             // Root ordering: score once, drain by pop_best into a fixed
@@ -1477,7 +2059,7 @@ impl<'a> Searcher<'a> {
         // Initial fallback move: prioritize the proven TT move if legal, else first root move.
         let tt_legal_mv = if tt_mv != 0 {
             (0..n_root)
-                .find(|&i| root_moves[i].to_u32() == tt_mv)
+                .find(|&i| crate::ttcodec::move_code(root_moves[i]) as u32 == tt_mv)
                 .map(|i| root_moves[i])
         } else {
             None
@@ -1513,6 +2095,7 @@ impl<'a> Searcher<'a> {
             for i in 0..n_root {
                 let m = root_moves[i];
                 let child = b.make(m);
+                self.stack.imp[1] = 3;
                 self.stack.path_hash[1] = child.hash;
                 self.stack.rep_base[1] = if m.is_clone() { 1 } else { 0 };
                 // Root children: acc[1] = acc[0] + diffs (sancta lazy path).
@@ -1928,17 +2511,20 @@ xxx....
     fn tt_aging_and_fail_low_preservation() {
         let mut tt = Tt::new(10);
         let key = 123456789u64;
-        let mv_good = 42u32;
+        // a real jump (a1 -> c1): the TT hands back its ttcodec move code
+        let mv_good = Move { from: 0, to: 2 }.to_u32();
+        let code_good = crate::ttcodec::code_of_u32(mv_good) as u32;
+        assert!(code_good >= 50);
 
         // 1. Store an exact bound with a good move
         tt.store(key, mv_good, 150, 6, FLAG_EXACT);
-        assert_eq!(tt.probe(key).unwrap().mv, mv_good);
+        assert_eq!(tt.probe(key).unwrap().mv, code_good);
         assert_eq!(tt.probe(key).unwrap().score, 150);
 
         // 2. A deeper search on the same position fails low (FLAG_UPPER)
         tt.store(key, 0xFFFF, 50, 8, FLAG_UPPER);
         // The good move must be preserved!
-        assert_eq!(tt.probe(key).unwrap().mv, mv_good, "refutation move must be preserved on fail-low");
+        assert_eq!(tt.probe(key).unwrap().mv, code_good, "refutation move must be preserved on fail-low");
         assert_eq!(tt.probe(key).unwrap().score, 50);
 
         // 3. Test age replacement: position from old turn gets evicted by fresh search
@@ -1947,6 +2533,104 @@ xxx....
         let other_key = key ^ (1 << 10); // same hash slot, different key
         tt.store(other_key, 99, 200, 3, FLAG_EXACT);
         assert_eq!(tt.probe(other_key).unwrap().key, other_key);
+    }
+
+    #[test]
+    fn size_stages_jump_l1_l2_l3_then_full_never_by_doubling() {
+        let c = crate::cacheinfo::FALLBACK; // 32 KB L1d, 256 KB L2, 8 MB L3
+        let tt = stage_list(1 << 20, 0, 4, (2, 3), c, 7, 0);
+        let ec = stage_list(1 << 19, 0, 8, (1, 3), c, 7, 0);
+        assert_eq!(tt, vec![256, 2048, 32768, 1 << 20]);
+        assert_eq!(ec, vec![128, 1024, 16384, 1 << 19]);
+        for st in [&tt, &ec] {
+            for w in st.windows(2) {
+                assert!(w[1] >= 8 * w[0], "a stage jump is at least 8x, not a doubling: {st:?}");
+            }
+            assert!(st.iter().all(|n| n.is_power_of_two()));
+        }
+        // a big cache never makes a stage larger than the full table; a tiny table collapses the stages
+        assert_eq!(stage_list(64, 0, 4, (2, 3), c, 7, 0), vec![64]);
+        // explicit start size: two stages, or fixed when it is not smaller than the full size
+        assert_eq!(stage_list(1 << 20, 14, 4, (2, 3), c, 7, 0), vec![1 << 12, 1 << 20]);
+        assert_eq!(stage_list(1 << 20, 22, 4, (2, 3), c, 7, 0), vec![1 << 20]);
+        // fewer stages: only the chosen cache levels, e.g. L2 + L3, L3 only, or none (= the fixed full size)
+        assert_eq!(stage_list(1 << 20, 0, 4, (2, 3), c, 6, 0), vec![2048, 32768, 1 << 20]);
+        assert_eq!(stage_list(1 << 20, 0, 4, (2, 3), c, 4, 0), vec![32768, 1 << 20]);
+        assert_eq!(stage_list(1 << 20, 0, 4, (2, 3), c, 0, 0), vec![1 << 20]);
+        // extra jumps are allowed only in RAM (beyond the L3 stage), geometrically spaced
+        assert_eq!(stage_list(1 << 20, 0, 4, (2, 3), c, 7, 1), vec![256, 2048, 32768, 131072, 1 << 20]);
+        assert_eq!(stage_list(1 << 20, 0, 4, (2, 3), c, 7, 2), vec![256, 2048, 32768, 65536, 262144, 1 << 20]);
+    }
+
+    #[test]
+    fn start_stage_follows_the_budget_and_never_goes_back() {
+        let fresh = || {
+            let mut t = Tt::new(22);
+            t.stages = vec![256, 2048, 32768, 1 << 20];
+            t.stage = 0;
+            t.mask = 255;
+            t.filled = 0;
+            t
+        };
+        // 6 entries per bucket, the table must hold 4x the expected nodes
+        let mut t = fresh();
+        t.start_stage(300); // 1,200 <= 256 x 6
+        assert_eq!((t.stage, t.mask + 1), (0, 256));
+        let mut t = fresh();
+        t.start_stage(9_000); // a 100 ms search: 36,000 -> the 32768-bucket (L3-sized) stage
+        assert_eq!((t.stage, t.mask + 1), (2, 32768));
+        let mut t = fresh();
+        t.start_stage(500_000); // the Botzone clock: the full table at once
+        assert_eq!((t.stage, t.mask + 1), (3, 1 << 20));
+        let mut t = fresh();
+        t.start_stage(usize::MAX); // unknown budget: full
+        assert_eq!(t.stage, 3);
+        // a table that already holds entries keeps its stage; jump_to never goes backwards
+        let mut t = fresh();
+        t.filled = 1;
+        t.start_stage(500_000);
+        assert_eq!(t.stage, 0);
+        let mut t = fresh();
+        t.jump_to(2);
+        t.jump_to(1);
+        assert_eq!(t.stage, 2);
+    }
+
+    #[test]
+    fn packed_tt_bucket_round_trips_every_field() {
+        let mk = |i: usize| TtE2 {
+            chk: 0xDEAD_BEEFu32 ^ (i as u32).wrapping_mul(0x0101_0101),
+            score: if i == 3 { MATE - 17 } else if i == 4 { -MATE + 250 } else { -12345 + i as i32 * 7000 },
+            code: 529 - i as u16 * 77,
+            depth: 250 - i as u8,
+            flag: (i % 3) as u8 + 1,
+            imp: (i % 4) as u8,
+            age: (i * 3 % 16) as u8,
+            empties: 49 - i as u8 * 8,
+            ext: ((i * 5 + 1) & 31) as u8,
+        };
+        let mut bk = TtBucket::EMPTY;
+        for i in 0..TT_MAX_WAYS {
+            assert_eq!(bk.flag(i), 0, "an all-zero slot is empty");
+            bk.set(i, &mk(i));
+        }
+        let check = |bk: &TtBucket| {
+            for i in 0..TT_MAX_WAYS {
+                let (g, w) = (bk.get(i), mk(i));
+                assert_eq!((g.chk, g.score, g.code, g.depth), (w.chk, w.score, w.code, w.depth), "slot {i}");
+                assert_eq!((g.flag, g.imp, g.age, g.empties, g.ext), (w.flag, w.imp, w.age, w.empties, w.ext), "slot {i}");
+            }
+        };
+        check(&bk);
+        // rewriting the age of one slot and the whole of another leaves the neighbours alone
+        bk.set_age(2, 13);
+        assert_eq!(bk.age(2), 13);
+        let mut e = bk.get(2);
+        e.age = mk(2).age;
+        bk.set(2, &e);
+        check(&bk);
+        bk.set(5, &mk(5));
+        check(&bk);
     }
 
     #[test]

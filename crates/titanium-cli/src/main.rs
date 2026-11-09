@@ -34,6 +34,38 @@ fn main() -> ExitCode {
     if let Some(p) = flag_str(&args, "--policy") {
         titanium::policy::configure(&p);
     }
+    // --ecache-bits N: eval cache size (log2 entries, default 22 = 32 MB ranked layout; D575/D606)
+    if let Some(n) = flag_int(&args, "--ecache-bits") {
+        titanium::search::set_ecache_bits(n as usize);
+    }
+    // --ecache-mode 0: old direct-mapped eval cache instead of the ranked 8-way default (D585); use with --ecache-bits 16
+    if let Some(n) = flag_int(&args, "--ecache-mode") {
+        titanium::search::set_ecache_mode(n as usize);
+    }
+    // --cache-stages MASK: which cache levels are size stages (1 = L1d, 2 = L2, 4 = L3/2; default 0 = no staging, the full size), D652
+    if let Some(n) = flag_int(&args, "--cache-stages") {
+        titanium::search::set_cache_stages(n as u32);
+    }
+    // --ram-stages N: extra jump stages between the L3 stage and the full size (they live in RAM; default 0), D652
+    if let Some(n) = flag_int(&args, "--ram-stages") {
+        titanium::search::set_ram_stages(n as usize);
+    }
+    // --tt-ways N: entries used per 64-byte TT bucket (packed 10-byte entries, default 6 = all of them; 4 = the old width)
+    if let Some(n) = flag_int(&args, "--tt-ways") {
+        titanium::search::set_tt_ways(n as usize);
+    }
+    // --tt-min-bits N / --ecache-min-bits N: adaptive size (D643): the ranked tables start at 2^N entries and double
+    // when more than half full, up to --tt-bits / --ecache-bits; N >= the full size = fixed size
+    if let Some(n) = flag_int(&args, "--tt-min-bits") {
+        titanium::search::set_tt_min_bits(n as usize);
+    }
+    if let Some(n) = flag_int(&args, "--ecache-min-bits") {
+        titanium::search::set_ecache_min_bits(n as usize);
+    }
+    // --tt-mode 0: old 24-byte single-slot TT instead of the ranked 4-way default (D590)
+    if let Some(n) = flag_int(&args, "--tt-mode") {
+        titanium::search::set_tt_mode(n as usize);
+    }
     match cmd {
         "info" => {
             let nn = load_nnue_opt(&args);

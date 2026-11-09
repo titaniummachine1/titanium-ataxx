@@ -9,6 +9,7 @@
 //!   board is full, the game ends and the majority wins.
 
 pub mod board;
+pub mod cacheinfo;
 pub mod config;
 pub mod nnfeat;
 pub mod nnue;
@@ -16,6 +17,7 @@ pub mod policy;
 pub mod sancta;
 pub mod search;
 pub mod smallnet;
+pub mod ttcodec;
 pub mod tuple;
 
 pub use board::{
