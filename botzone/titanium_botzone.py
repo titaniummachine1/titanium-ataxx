@@ -26,6 +26,7 @@ because Botzone's sandbox may forbid or kill on process creation, which cannot b
 """
 import os
 import sys
+import threading
 import time
 
 T_START = time.perf_counter()
@@ -37,11 +38,13 @@ if MODE == "long":
 else:
     FIRST_LIMIT_MS = int(os.environ.get("TI_FIRST_MS", "12000"))
     TURN_LIMIT_MS = 6000
-SAFETY_MS = 10
+SAFETY_MS = 10                # TOTAL padding before the limit: the engine stops its own clock here and the answer is written (D662)
+ENGINE_SAFETY_MS = 0         # the engine's own extra margin: none, the driver owns the clock (ti_stop + hard-deadline backup answer)
 STARTUP_MS = 120            # assumed interpreter start-up when the process age cannot be measured
 MAX_SANE_AGE_MS = 3000      # a measured process age above this (or below 0) is a measurement error
-OUT_RESERVE_MS = 2
-WATCHDOG_GRACE_MS = 12
+OUT_RESERVE_MS = 0
+HARD_RESERVE_MS = 4          # backup answer (the engine's best move so far) is sent at limit - this if the engine has not answered (D661/D662)
+WATCHDOG_GRACE_MS = 1             # ti_stop is sent this long after the budget, a net under the engine's own exact deadline
 RETRY_RESERVE_MS = 400      # a resuscitated search needs at least this much time left
 SCALE = float(os.environ.get("TI_TIME_SCALE", "1.0"))
 DEBUG = os.environ.get("TI_DEBUG") == "1"
@@ -114,6 +117,8 @@ class Engine:
         self.e = None
         self.net = "-"
         self.injected = 0
+        self.has_best = False
+        self.has_serve = False
 
     def load(self):
         import ctypes
@@ -145,6 +150,19 @@ class Engine:
                 lib.ti_search_with_limits.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
                                                       ctypes.c_uint8, ctypes.POINTER(ctypes.c_int)]
                 lib.ti_stats.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                try:                      # best move so far for the hard-deadline backup (older libraries lack it: no backup then)
+                    lib.ti_set_safety_ms.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+                    lib.ti_best_so_far.restype = ctypes.c_int
+                    lib.ti_best_so_far.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+                    self.has_best = True
+                except AttributeError:
+                    self.has_best = False
+                try:                      # the whole session inside the library (Python = middleman only, D662)
+                    lib.ti_botzone_serve.restype = ctypes.c_int
+                    lib.ti_botzone_serve.argtypes = [ctypes.c_void_p] + [ctypes.c_uint32] * 5
+                    self.has_serve = True
+                except AttributeError:
+                    self.has_serve = False
                 if lib.ti_abi_version() != 2:
                     raise RuntimeError("abi_%d" % lib.ti_abi_version())
                 self.lib = lib
@@ -172,6 +190,11 @@ class Engine:
             if e:
                 label = "custom:%s" % os.path.basename(net) if net else "bundled-main"
                 self.e, self.net = e, "%s/%d" % (label, tt_bits)
+                if self.has_best:
+                    try:
+                        self.lib.ti_set_safety_ms(e, int(ENGINE_SAFETY_MS))
+                    except Exception:
+                        pass
                 if attempt:
                     event("engine_ok_after_%d_retries" % attempt, t0)
                 return
@@ -184,6 +207,18 @@ class Engine:
         for m in history:
             if self.lib.ti_apply(self.e, *m) != 1:
                 raise RuntimeError("history_move_rejected_%d_%d_%d_%d" % m)
+
+    def best_so_far(self):
+        """The engine's best move so far (callable from another thread while a search runs), or None."""
+        if not self.has_best or self.e is None:
+            return None
+        out = (self.ct.c_int * 4)()
+        try:
+            if self.lib.ti_best_so_far(self.e, out) == 1:
+                return (out[0], out[1], out[2], out[3])
+        except Exception:
+            pass
+        return None
 
     def search(self, budget):
         import threading
@@ -251,6 +286,22 @@ class Reader:
         return got
 
 
+ANS_LOCK = threading.Lock()
+TURN = {"answered": False, "move": None}   # one answer per request, whoever is first (main thread or the hard-deadline watchdog)
+
+
+def answer(mv, dbg, oneshot):
+    """Send the answer of this turn unless it was already sent. Returns True if THIS call sent it."""
+    with ANS_LOCK:
+        if TURN["answered"]:
+            return False
+        TURN["answered"] = True
+        TURN["move"] = mv
+        line1 = "%d %d %d %d" % (mv if mv is not None else (-1, -1, -1, -1))
+        write_out("%s\n%s%s\n" % (line1, dbg, "" if oneshot else "\n\n\n" + MARKER))
+        return True
+
+
 def play_turn(eng, history, limit_ms, t0):
     """The engine's move, resuscitating it up to twice. Returns (move or None, debug line)."""
     deadline = limit_ms - SAFETY_MS * min(1.0, SCALE * 4) - OUT_RESERVE_MS
@@ -303,16 +354,35 @@ def main():
     while True:
         limit_ms = (FIRST_LIMIT_MS if first else TURN_LIMIT_MS) * SCALE
         t0 = t_origin if (first or oneshot) else rd.t_req
+        TURN["answered"] = False
+        TURN["move"] = None
+
+        def hard_watchdog(eng=eng, oneshot=oneshot, t0=t0):
+            """Hard deadline (limit - HARD_RESERVE_MS): the engine has not answered, play its best move so far (D661/D662)."""
+            mv_b = eng.best_so_far()
+            if mv_b is None:
+                return
+            if answer(mv_b, "FALLBACK best-so-far t%.0f" % ((time.perf_counter() - t0) * 1000.0), oneshot) and oneshot:
+                os._exit(0)
+        hard_s = (limit_ms - HARD_RESERVE_MS * min(1.0, SCALE * 4) - (time.perf_counter() - t0) * 1000.0) / 1000.0
+        timer = threading.Timer(max(0.001, hard_s), hard_watchdog)
+        timer.daemon = True
+        timer.start()
         mv, dbg = play_turn(eng, history, limit_ms, t0)
-        if mv is not None:
-            history.append(mv)
-        line1 = "%d %d %d %d" % (mv if mv is not None else (-1, -1, -1, -1))
+        timer.cancel()
         if EVENTS:
             dbg += " | ev " + ",".join(EVENTS)
             del EVENTS[:]
+        if not answer(mv, dbg, oneshot):
+            # the watchdog sent the best-so-far move first: THAT move is played. The engine's internal board already holds its own
+            # (later) move, so it is rebuilt from the history on the next turn.
+            mv = TURN["move"]
+            eng.e = None
+            event("late_engine_replaced_by_fallback")
+        if mv is not None:
+            history.append(mv)
         if DEBUG:
             log(dbg)
-        write_out("%s\n%s%s\n" % (line1, dbg, "" if oneshot else "\n\n\n" + MARKER))
         if oneshot:
             return
         first = False
@@ -328,9 +398,35 @@ def main():
             eng.e = None
 
 
+def serve_in_engine():
+    """Run the whole Botzone long session INSIDE the engine library (D662): Python only creates the engine and makes one call, the engine reads
+    the requests, keeps the clock, writes the answers and has its own watchdog thread. Returns False if that path is not available (older
+    library, TI_PYLOOP=1, fault injection, load / create failure): the hardened Python loop then runs and reports the failure visibly."""
+    if MODE != "long" or os.environ.get("TI_PYLOOP") == "1" or FAULT:
+        return False
+    a0 = process_age_ms()                 # process age NOW (before the engine is created), measured once like main() does
+    if a0 is None or a0 < 0 or a0 > MAX_SANE_AGE_MS:
+        a0 = STARTUP_MS
+    t_a0 = time.perf_counter()
+    eng = Engine()
+    try:
+        eng.load()
+        if not eng.has_serve:
+            return False
+        eng.create()
+        eng.lib.ti_new_game(eng.e)
+    except Exception:
+        return False
+    age = a0 + (time.perf_counter() - t_a0) * 1000.0   # the first-turn clock runs from the process start: add what creation took
+    k = min(1.0, SCALE * 4)
+    eng.lib.ti_botzone_serve(eng.e, int(FIRST_LIMIT_MS * SCALE), int(TURN_LIMIT_MS * SCALE), int(SAFETY_MS * k), int(HARD_RESERVE_MS * k), int(age))
+    return True
+
+
 if __name__ == "__main__":
     try:
-        main()
+        if not serve_in_engine():
+            main()
     except BaseException as ex:          # never die silently: say why in the debug line (the move is then -1s)
         write_out("-1 -1 -1 -1\nFATAL %s:%s | ev %s\n" % (type(ex).__name__, str(ex)[:80].replace("\n", " "), ",".join(EVENTS)))
     # leave without interpreter shutdown: a broken stream at exit must not turn a sent move into a runtime error

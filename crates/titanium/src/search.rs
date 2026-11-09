@@ -626,6 +626,12 @@ pub struct Searcher<'a> {
     /// Optional external stop request (set from another thread, e.g. a driver
     /// watchdog). Polled on the same 2048-node cadence as the clock.
     ext_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Best move so far, published for another thread (the Botzone driver watchdog, D661/D662): 0 = none, else 1 + (from << 8 | to).
+    /// Set to a legal fallback at the start of a search and after every adopted iteration.
+    best_sink: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    /// Engine-side time safety margin in ms (deadline = budget - this): 10 for the CLI / gates (the harness gets its answer in time), the
+    /// Botzone driver sets it to ~0 because the driver owns the clock (ti_stop + hard-deadline backup answer, D662).
+    safety_ms: f64,
     /// Transposition table (persists across searches in the same Searcher).
     tt: Tt,
     /// exp/nnue-speed: static-eval cache (position hash -> raw eval). The eval is a pure function of the position, so a
@@ -707,6 +713,8 @@ impl<'a> Searcher<'a> {
             fut_sn: true,
             time_src: native_now_ms,
             ext_stop: None,
+            best_sink: None,
+            safety_ms: 10.0,
             tt: Tt::new(bits),
             ecache: vec![(0u64, i32::MIN); 1 << ECACHE_BITS].into_boxed_slice(),
             killers: Box::new([(0, 0); MAX_PLY]),
@@ -823,6 +831,22 @@ impl<'a> Searcher<'a> {
     /// Attach an external stop flag: when it reads `true` the running search
     /// stops at the next poll (<= 2048 nodes) and returns its best completed
     /// depth. The flag is never cleared by the engine.
+    /// Publish the best move so far into `sink` during searches (see `best_sink`).
+    pub fn set_safety_ms(&mut self, ms: f64) {
+        self.safety_ms = ms.clamp(0.0, 1000.0);
+    }
+
+    pub fn set_best_sink(&mut self, sink: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>) {
+        self.best_sink = sink;
+    }
+
+    #[inline]
+    fn publish_best(&self, m: Move) {
+        if let Some(s) = &self.best_sink {
+            s.store(1 + m.to_u32(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub fn set_stop_flag(&mut self, f: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
         self.ext_stop = f;
     }
@@ -1378,7 +1402,7 @@ impl<'a> Searcher<'a> {
         self.stop_reason = StopReason::Completed;
         self.node_limit = limits.max_nodes;
         self.fut_sn = FUT_SN_ON.load(std::sync::atomic::Ordering::Relaxed);
-        let safety_margin_ms = 10.0;
+        let safety_margin_ms = self.safety_ms;
         self.deadline_ms = limits
             .time
             .map(|t| self.start_ms + (t.as_secs_f64() * 1000.0 - safety_margin_ms).max(1.0));
@@ -1459,19 +1483,15 @@ impl<'a> Searcher<'a> {
             None
         };
         result.best = tt_legal_mv.or(Some(root_moves[0]));
+        if let Some(m) = result.best {
+            self.publish_best(m);
+        }
         if let Some(entry) = root_tt {
             if entry.score.abs() < MATE_BOUND {
                 result.score = entry.score;
             }
         }
 
-        let budget_ms = limits
-            .time
-            .map(|t| t.as_secs_f64() * 1000.0)
-            .unwrap_or(f64::INFINITY);
-        // Iteration cost prediction: project the next iteration as the max
-        // of the last two completed iterations.
-        let mut it_ms: [f64; 2] = [0.0, 0.0];
         let mut has_completed_iter = false;
 
         // Iterative deepening MUST always start at depth 1.
@@ -1481,7 +1501,6 @@ impl<'a> Searcher<'a> {
         // unverified move. Shallow iterations take <0.1% of search time and guarantee that a
         // verified completed iteration always exists.
         for depth in 1..=limits.max_depth.max(1) {
-            let iter_start = self.elapsed_ms();
             self.heuristic_used = false;
             let mut alpha = -INF;
             let mut best_this = None;
@@ -1528,6 +1547,7 @@ impl<'a> Searcher<'a> {
                 let adopt = !forgotten_mate;
                 if adopt {
                     result.best = Some(m);
+                    self.publish_best(m);
                     if best_score != i32::MIN {
                         result.score = best_score;
                     }
@@ -1557,19 +1577,9 @@ impl<'a> Searcher<'a> {
                 self.stop_reason = StopReason::Completed;
                 break;
             }
-            // exp/full-time: no "next iteration would overrun" early stop any more. A partial iteration is adopted
-            // (above), so searching on to the deadline is never wasted; the deadline check stops it.
-            it_ms[1] = it_ms[0];
-            it_ms[0] = self.elapsed_ms() - iter_start;
-            let proj_ms = it_ms[0].max(it_ms[1]);
-            // Iteration cost prediction: project if the next iteration would overrun the budget.
-            // On Botzone, overrunning by even 1 ms deducts time from future moves and risks time forfeit.
-            // We stop cleanly at the completed depth. Only when defending a forced loss do we use all
-            // remaining time to find delay paths.
-            if result.score > -MATE_BOUND && self.elapsed_ms() + proj_ms > budget_ms {
-                self.stop_reason = StopReason::Time;
-                break;
-            }
+            // Search on to the deadline (user D662): NO "next iteration would overrun" early stop. A partial iteration is adopted
+            // (above, Stockfish rule), so the time up to the deadline is never wasted; check_stop (every 64 nodes) ends the search
+            // at deadline_ms = budget - safety_margin_ms.
         }
 
         if self.stop {

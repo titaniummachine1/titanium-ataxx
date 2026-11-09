@@ -5,7 +5,7 @@
 //! called from any thread while `ti_search` runs.
 use std::ffi::CStr;
 use std::os::raw::c_char;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +13,8 @@ use titanium::board::{Board, Move};
 use titanium::nnue::Nnue;
 use titanium::search::{SearchLimits, Searcher, StopReason};
 use titanium::tuple::TupleTable;
+
+mod bz;
 
 pub const ABI_VERSION: u32 = 2;
 const DEFAULT_TT_BITS: u32 = 22;
@@ -24,6 +26,8 @@ pub struct TiEngine {
     snaps: Vec<(u64, u64)>,
     searcher: Searcher<'static>,
     stop: Arc<AtomicBool>,
+    /// best move so far of the running search for another thread (ti_best_so_far): 0 none, else 1 + (from << 8 | to)
+    best: Arc<AtomicU32>,
     stats: TiStats,
 }
 
@@ -121,12 +125,15 @@ pub extern "C" fn ti_new(net_path: *const c_char, tt_bits: u32) -> *mut TiEngine
     }
     let stop = Arc::new(AtomicBool::new(false));
     searcher.set_stop_flag(Some(stop.clone()));
+    let best = Arc::new(AtomicU32::new(0));
+    searcher.set_best_sink(Some(best.clone()));
     let board = Board::botzone_start();
     Box::into_raw(Box::new(TiEngine {
         snaps: vec![(board.occ[0], board.occ[1])],
         board,
         searcher,
         stop,
+        best,
         stats: TiStats::default(),
     }))
 }
@@ -161,7 +168,11 @@ pub extern "C" fn ti_apply(e: *mut TiEngine, x0: i32, y0: i32, x1: i32, y1: i32)
     if e.is_null() {
         return -1;
     }
-    let e = unsafe { &mut *e };
+    apply_raw(unsafe { &mut *e }, x0, y0, x1, y1)
+}
+
+/// `ti_apply` on a borrowed engine (also used by the in-library Botzone session, `bz`).
+pub(crate) fn apply_raw(e: &mut TiEngine, x0: i32, y0: i32, x1: i32, y1: i32) -> i32 {
     if x0 < 0 && y0 < 0 && x1 < 0 && y1 < 0 {
         return 0;
     }
@@ -214,6 +225,14 @@ pub extern "C" fn ti_legal_count(e: *mut TiEngine) -> i32 {
     unsafe { &*e }.board.legal_moves().len() as i32
 }
 
+/// Engine-side time safety margin in ms (deadline = budget - ms; default 10). The Botzone driver sets ~0 and keeps the clock itself.
+#[no_mangle]
+pub extern "C" fn ti_set_safety_ms(e: *mut TiEngine, ms: u32) {
+    if !e.is_null() {
+        unsafe { &mut *e }.searcher.set_safety_ms(ms as f64);
+    }
+}
+
 /// Ask a running `ti_search` to stop at its next poll (<= 2048 nodes, ~2 ms). Safe from any thread.
 #[no_mangle]
 pub extern "C" fn ti_stop(e: *mut TiEngine) {
@@ -247,14 +266,41 @@ pub extern "C" fn ti_search_with_limits(
         return -1;
     }
     let e = unsafe { &mut *e };
+    match search_core(e, budget_ms, max_nodes, max_depth) {
+        None => {
+            unsafe {
+                for i in 0..4 {
+                    *out.add(i) = -1;
+                }
+            }
+            0
+        }
+        Some((mv, stats)) => {
+            unsafe {
+                *out.add(0) = (mv.from % 7) as i32;
+                *out.add(1) = (mv.from / 7) as i32;
+                *out.add(2) = (mv.to % 7) as i32;
+                *out.add(3) = (mv.to / 7) as i32;
+            }
+            e.push_move(mv);
+            e.stats = stats;
+            1
+        }
+    }
+}
+
+/// The search of `ti_search_with_limits` WITHOUT playing the move: returns the move to play (repetition rule applied) and its stats,
+/// or None if there is no legal move. The caller pushes the move it actually plays (the in-library Botzone session may play the
+/// watchdog's fallback instead).
+pub(crate) fn search_core(
+    e: &mut TiEngine,
+    budget_ms: u64,
+    max_nodes: u64,
+    max_depth: u8,
+) -> Option<(Move, TiStats)> {
     let list = e.board.legal_moves();
     if list.is_empty() || e.board.bz_over() {
-        unsafe {
-            for i in 0..4 {
-                *out.add(i) = -1;
-            }
-        }
-        return 0;
+        return None;
     }
     e.stop.store(false, Ordering::Relaxed);
     let limits = SearchLimits {
@@ -271,6 +317,9 @@ pub extern "C" fn ti_search_with_limits(
             n_banned += 1;
         }
     }
+    // D661/D662: publish a legal, allowed fallback move BEFORE the search, so a watchdog thread always has a move to play
+    let fallback = (0..list.len()).map(|i| list.move_at(i)).find(|m| !e.banned(*m)).unwrap_or_else(|| list.move_at(0));
+    e.best.store(1 + fallback.to_u32(), Ordering::Relaxed);
     let r = e
         .searcher
         .search_bz_excluding(&e.board, &limits, &banned[..n_banned]);
@@ -297,14 +346,7 @@ pub extern "C" fn ti_search_with_limits(
             overridden = 1;
         }
     }
-    unsafe {
-        *out.add(0) = (mv.from % 7) as i32;
-        *out.add(1) = (mv.from / 7) as i32;
-        *out.add(2) = (mv.to % 7) as i32;
-        *out.add(3) = (mv.to / 7) as i32;
-    }
-    e.push_move(mv);
-    e.stats = TiStats {
+    let stats = TiStats {
         nodes: r.nodes,
         elapsed_us: r.elapsed.as_micros() as u64,
         score: r.score,
@@ -318,6 +360,28 @@ pub extern "C" fn ti_search_with_limits(
         },
         repetition_override: overridden,
     };
+    Some((mv, stats))
+}
+
+/// Best move so far of the running (or last) search, in Botzone coordinates: out[0..4] = x0,y0,x1,y1. Safe from any thread while
+/// `ti_search` runs (D661/D662: the driver's watchdog plays it if the search has not returned by the hard deadline).
+/// Returns 1 = move written, 0 = none yet, -1 = bad arguments. A legal fallback is published before the search starts.
+#[no_mangle]
+pub extern "C" fn ti_best_so_far(e: *mut TiEngine, out: *mut i32) -> i32 {
+    if e.is_null() || out.is_null() {
+        return -1;
+    }
+    let v = unsafe { &*e }.best.load(Ordering::Relaxed);
+    if v == 0 {
+        return 0;
+    }
+    let m = Move::from_u32(v - 1);
+    unsafe {
+        *out.add(0) = (m.from % 7) as i32;
+        *out.add(1) = (m.from / 7) as i32;
+        *out.add(2) = (m.to % 7) as i32;
+        *out.add(3) = (m.to / 7) as i32;
+    }
     1
 }
 
