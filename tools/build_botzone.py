@@ -34,7 +34,8 @@ GLIBC_BUILD = "2.14"
 GLIBC_MAX = (2, 17)
 SO = os.path.join(ROOT, "target", TARGET, "release", "libtitanium_ffi.so")
 EXPORTS = [b"ti_abi_version", b"ti_new", b"ti_free", b"ti_new_game", b"ti_apply", b"ti_legal_count", b"ti_search",
-           b"ti_search_with_limits", b"ti_stop", b"ti_stats"]
+           b"ti_search_with_limits", b"ti_stop", b"ti_stats",
+           b"ti_best_so_far", b"ti_set_safety_ms", b"ti_botzone_serve"]
 ZIG_DIRS = ["C:/gitProjects/toolchains/zig-0.13.0/zig-windows-x86_64-0.13.0"]
 FILES = {  # upload-folder path -> source path in the repo
     "titanium_botzone.py": "botzone/titanium_botzone.py",
