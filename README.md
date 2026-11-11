@@ -23,7 +23,7 @@ Titanium powers both native high-throughput testing harnesses, a browser-based W
 ### 2. Dual-Perspective NNUE Neural Evaluation
 - **Quantized Feature Transformer:** Int16 SIMD accumulators evaluated from the perspective of both sides, quantized (`QA`) for sub-microsecond inference directly on the CPU.
 - **Sparse Accumulation:** Each evaluation sums only the active feature rows (AVX2, with an AVX-512 kernel selected at run time), so the cost scales with the pieces on the board, not with the network width.
-- **Trained on 34M+ Positions:** Distilled from deep alpha-beta teacher labels, with the game result blended into the target more strongly near the end of the game (weights 0.55 / 0.55 / 0.25 by stones left), inspired by milestones from [Moonbird](https://github.com/the-spill/moonbird). Current net: `46FCB5A4`.
+- **Trained on 34M+ Positions:** Distilled from deep alpha-beta teacher labels, with the game result blended into the target more strongly near the end of the game (weights 0.55 / 0.55 / 0.25 by stones left), inspired by milestones from [Moonbird](https://github.com/tsoj/Moonbird). Current net: `46FCB5A4`.
 
 ### 3. Auxiliary Small Net (Futility Pre-Filter)
 - **Lower-Bound Pruning:** A lightweight secondary neural network bounds child node evaluations before invoking the primary NNUE network.
@@ -152,5 +152,7 @@ Titanium includes automated deployment tooling for [Botzone](https://www.botzone
 
 ## Acknowledgments & Related Work
 
-- **[Moonbird](https://github.com/the-spill/moonbird)** by the-spill — An exceptional Ataxx engine whose search selectivity, evaluation insights, and public milestones inspired Titanium's training and pruning architecture.
-- **Stockfish & Reckless** — For foundational principles in mate distance pruning, iterative deepening bounds, and robust engine design.
+- **[Moonbird](https://github.com/tsoj/Moonbird)** by [tsoj](https://github.com/tsoj) — An exceptional Ataxx engine that served as Titanium's primary sparring partner and benchmark, whose search selectivity, evaluation insights, and public milestones inspired Titanium's training and pruning architecture.
+- **[Zataxx](https://github.com/zzzzz151/Zataxx)** by [zzzzz151](https://github.com/zzzzz151) — Open-source Rust Ataxx engine that served as a key sparring partner and benchmark for Titanium, and provided `libataxx` perft/move-generation test suites and NNUE/search insights.
+- **[Sanctaphraxx](https://github.com/Ciekce/sanctaphraxx)** by [Ciekce](https://github.com/Ciekce) — Open-source Rust neural Ataxx engine used as an early sparring partner and speed/NNUE reference whose compact incremental NNUE architecture informed Titanium's earliest neural experiments.
+- **[Stockfish](https://github.com/official-stockfish/Stockfish) & [Reckless](https://github.com/codedeliveryservice/Reckless)** — For foundational principles in mate distance pruning, iterative deepening bounds, and robust engine design.
