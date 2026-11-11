@@ -1755,7 +1755,7 @@ impl<'a> Searcher<'a> {
                 }
             }
         }
-        let mut tainted = BZ && (n_banned > 0 || at_bz_horizon);
+        let mut tainted = BZ && at_bz_horizon;
 
         // Transposition table probe. Missing entry at depth >= 4 -> IIR
         // (internal iterative reduction, Moonbird): the node has no cached
@@ -1765,7 +1765,7 @@ impl<'a> Searcher<'a> {
         let mut depth = depth;
         if let Some(e) = self.tt.probe_e(b.hash, b.empty().count_ones() as u8) {
             tt_mv = e.mv;
-            if !(BZ && tainted) && e.depth as u32 >= depth {
+            if !(BZ && (n_banned > 0 || at_bz_horizon)) && e.depth as u32 >= depth {
                 let s = score_from_tt(e.score, ply);
                 match e.flag {
                     FLAG_EXACT => {
@@ -1800,7 +1800,7 @@ impl<'a> Searcher<'a> {
         // Lazy incremental sancta: root refreshed once in search(); every
         // child acc = parent acc + bitboard diffs at make() time (below).
         // OFF = single branch to classical, zero-cost.
-        // forward_ready(acc, stm) is ALREADY stm-relative (like evaluate) â€”
+        // forward_ready(acc, stm) is ALREADY stm-relative (like evaluate) —
         // no negation (that was the 0-50 bug: double-negated white nodes).
         let (raw, node_dis) = match (self.nnue, self.sancta) {
             (None, Some(net)) => (net.forward_ready(&self.stack.acc[ply as usize], b.turn), 0),
@@ -1817,7 +1817,7 @@ impl<'a> Searcher<'a> {
         // -> fail low. Safe in Ataxx because the eval is capture-risk-aware.
         // Disabled when alpha/beta are mate scores so centipawn evals never prune mate lines.
         if null_allowed
-            && !(BZ && tainted)
+            && !(BZ && (n_banned > 0 || at_bz_horizon))
             && ply > 0
             && depth <= 4
             && alpha.abs() < MATE_BOUND
@@ -1844,7 +1844,7 @@ impl<'a> Searcher<'a> {
                 self.stack.path_hash[ply as usize + 1] = child.hash;
                 self.stack.rep_base[ply as usize + 1] = self.stack.rep_base[ply as usize];
                 // NMP pass flips stm: sancta acc is color-relative so it
-                // stays valid â€” just forward the other perspective.
+                // stays valid — just forward the other perspective.
                 // (pass: no stones change, no diff update needed.)
                 let score =
                     -self.negamax::<BZ>(&child, -beta, -beta + 1, depth - 3, ply + 1, false);
@@ -1859,17 +1859,19 @@ impl<'a> Searcher<'a> {
         }
 
         // ProbCut: non-PV, not right after a null, margin widens with the net's disagreement output.
-        if null_allowed && !(BZ && tainted) && ply > 0 && depth >= PC_D && beta - alpha == 1 && beta.abs() < MATE_BOUND {
+        if null_allowed && !(BZ && (n_banned > 0 || at_bz_horizon)) && ply > 0 && depth >= PC_D && beta - alpha == 1 && beta.abs() < MATE_BOUND {
             let pc_beta = beta + PC_T + ((node_dis * PC_K) >> 7);
             if pc_beta < MATE_BOUND && static_eval + 50 >= pc_beta - 2 * PC_T {
                 let score = self.negamax::<BZ>(b, pc_beta - 1, pc_beta, depth - PC_R, ply, false);
                 if self.stop {
                     return 0;
                 }
-                if BZ && self.bz_ply[ply as usize].tainted {
-                    tainted = true;
+                let pc_tainted = BZ && self.bz_ply[ply as usize].tainted;
+                if BZ {
+                    // Failed ProbCut shares `bz_ply[ply]`; clear so its skipped subtree cannot leak taint here.
+                    self.bz_ply[ply as usize].tainted = false;
                 }
-                if score >= pc_beta && score < MATE_BOUND && !(BZ && tainted) {
+                if score >= pc_beta && score < MATE_BOUND && !pc_tainted && !at_bz_horizon {
                     self.heuristic_used = true;
                     return score - (pc_beta - beta);
                 }
@@ -1883,9 +1885,7 @@ impl<'a> Searcher<'a> {
                 self.bz_ply[ply as usize].tainted = true;
                 return -MATE + ply as i32;
             }
-            if BZ {
-                self.bz_ply[ply as usize].tainted = tainted;
-            }
+            // Note: `static_eval` depends only on `b`, so depth-0 leaves with legal unbanned moves remain untainted (`false` from entry).
             self.heuristic_used = true;
             return static_eval;
         }
@@ -2333,6 +2333,10 @@ impl<'a> Searcher<'a> {
                 if score > alpha {
                     alpha = score;
                     if alpha >= beta {
+                        if BZ && !at_bz_horizon && !self.bz_ply[ply as usize + 1].tainted {
+                            tainted = false;
+                            rep_skipped = false;
+                        }
                         self.on_cutoff(b, m, depth, ply);
                         break;
                     }
@@ -3316,6 +3320,64 @@ xxx....
             );
         }
         assert!(!se.is_bz_snap_banned(cur_v, 0, 1, n, overflow, (0x100u64 + 99, 0x200u64)));
+    }
+
+    #[test]
+    fn bz_step1c_depth0_unbanned_and_clean_cutoff_stay_untainted() {
+        let mut se = Searcher::with_tt_bits(12);
+        let b = Board::botzone_start();
+        let root_snap = (b.occ[0], b.occ[1]);
+        let moves = b.legal_moves();
+        let banned_jump = moves
+            .iter()
+            .find(|m| !m.is_clone())
+            .expect("startpos has legal jumps");
+        let banned_snap = placement_snap(&b, banned_jump);
+
+        // Set up history at ply=1 (`cur_v = 4`, `rbase = 0`, `bz_start_ply = 4`) where `banned_jump`
+        // repeats `bz_snaps[0] -> bz_snaps[1]`, while clones & other jumps remain unbanned.
+        se.bz_base_offset = 3;
+        se.bz_start_ply = 4;
+        se.bz_max_plies = 400;
+        se.bz_snaps.clear();
+        se.bz_snaps.push(root_snap);
+        se.bz_snaps.push(banned_snap);
+        se.bz_snaps.push((0xAA, 0xBB));
+        se.bz_snaps.push((0xCC, 0xDD));
+        se.bz_snaps.push(root_snap); // index 4 == cur_v for ply 1
+        se.bz_snaps.resize(4 + MAX_PLY + 2, (0, 0));
+        se.bz_ply[1] = BzPly {
+            rep_base: 0,
+            ban_start: 0,
+            tainted: false,
+        };
+
+        // 1. Depth-0 leaf with unbanned legal moves must NOT set `tainted = true`.
+        let d0_score = se.negamax::<true>(&b, -MATE, MATE, 0, 1, true);
+        assert!(d0_score > -MATE_BOUND, "unbanned depth-0 leaf returns static_eval");
+        assert!(
+            !se.bz_ply[1].tainted,
+            "depth-0 static_eval with unbanned moves must not taint parent"
+        );
+
+        // 2. Depth-1 search with a clean beta cutoff on an unbanned move must clear taint and store FLAG_LOWER in TT.
+        se.tt.clear();
+        se.bz_ply[1] = BzPly {
+            rep_base: 0,
+            ban_start: 0,
+            tainted: false,
+        };
+        let d1_cut = se.negamax::<true>(&b, -25000, -24999, 1, 1, true);
+        assert!(d1_cut >= -24999, "must fail high against -24999 beta");
+        assert!(
+            !se.bz_ply[1].tainted,
+            "clean beta cutoff on unbanned move must leave node untainted"
+        );
+        let tt_hit = se
+            .tt
+            .probe_e(b.hash, b.empty().count_ones() as u8)
+            .expect("clean beta cutoff under n_banned > 0 must store into TT");
+        assert_eq!(tt_hit.flag, FLAG_LOWER);
     }
 
     #[test]
