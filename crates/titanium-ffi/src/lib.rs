@@ -322,8 +322,8 @@ pub(crate) fn search_core(
     e.best.store(1 + fallback.to_u32(), Ordering::Relaxed);
     let r = e
         .searcher
-        .search_bz_excluding(&e.board, &limits, &banned[..n_banned]);
-    let mut mv = r.best.unwrap_or_else(|| list.move_at(0));
+        .search_bz_game(&e.board, &limits, &banned[..n_banned], &e.snaps, true);
+    let mut mv = r.best.unwrap_or(fallback);
     let mut overridden = u32::from(n_banned > 0);
     // Judge rule: a move that repeats an earlier transition is rejected as illegal input. If the
     // engine's move is such a move, play the allowed move that wins the most discs instead.
@@ -467,6 +467,35 @@ mod tests {
             );
         }
         ti_free(e);
+    }
+
+    #[test]
+    fn ffi_respects_ply_400_endgame_horizon() {
+        let e_ptr = ti_new(std::ptr::null(), 14);
+        assert!(!e_ptr.is_null());
+        ti_new_game(e_ptr);
+        {
+            let e = unsafe { &mut *e_ptr };
+            let b = Board::from_str(
+                ".....oo
+                 ....o..
+                 ..x....
+                 .......
+                 .......
+                 x....o.
+                 xx...o. b",
+            )
+            .unwrap();
+            e.board = b;
+            e.snaps = vec![(b.occ[0], b.occ[1]); 401];
+        }
+        let mut out = [0i32; 4];
+        assert_eq!(ti_search_with_limits(e_ptr, 2000, 0, 6, out.as_mut_ptr()), 1);
+        let mut st = TiStats::default();
+        ti_stats(e_ptr, &mut st);
+        assert_eq!(st.depth, 1, "ply-400 search should solve the 401 cutoff at depth 1");
+        assert!(st.score > 90_000, "ply-401 winning flip should score +MATE - 1, got {}", st.score);
+        ti_free(e_ptr);
     }
 
     #[test]

@@ -246,7 +246,7 @@ impl TtBucket {
     }
 }
 
-use crate::board::{box1, reach_union, Board, Move, MoveList, RING1, RING2, SQUARES};
+use crate::board::{box1, jump_union, reach_union, Board, Move, MoveList, RING1, RING2, SQUARES};
 use crate::nnue::Nnue;
 use crate::sancta::{S1Acc, S1Net};
 use crate::tuple::TupleTable;
@@ -708,6 +708,19 @@ fn bz_terminal_score(b: &Board, ply: u32) -> i32 {
     } else {
         0
     }
+}
+
+/// Pre-capture occupancy `(black, white)` right after `m` is placed, matching
+/// the Botzone judge's `savehistory()` snapshot for repetition detection.
+#[inline(always)]
+fn placement_snap(b: &Board, m: Move) -> (u64, u64) {
+    let me = b.turn as usize;
+    let mut occ = b.occ;
+    if !m.is_clone() {
+        occ[me] &= !(1u64 << m.from);
+    }
+    occ[me] |= 1u64 << m.to;
+    (occ[0], occ[1])
 }
 
 /// Move scoring is fixed: TT move > killers > captures*W + history, consumed
@@ -1190,6 +1203,21 @@ pub struct Searcher<'a> {
     /// Per-ply move/acc buffers, reused across searches (no per-search
     /// alloc: MoveStack is ~72KB of lists + acc, was rebuilt per search).
     stack: MoveStack,
+    /// Botzone (`BZ = true`) game placement snapshots `(black_occ, white_occ)` covering
+    /// the current stone-count epoch from pre-root history plus in-tree plies at `bz_base_offset + ply`.
+    bz_snaps: Vec<(u64, u64)>,
+    /// Index of the search root (`ply = 0`) within `bz_snaps`.
+    bz_base_offset: usize,
+    /// Real game ply at search root (`snaps.len().saturating_sub(1)`).
+    bz_start_ply: u32,
+    /// Relative ply horizon from root where Botzone judge terminates at ply 401
+    /// (`401 - bz_start_ply`, or `u32::MAX` when disabled).
+    bz_max_plies: u32,
+    /// Index in `bz_snaps` of the most recent clone move on the active path (or `0` for the pre-root tail).
+    bz_rep_base: Box<[u32; MAX_PLY]>,
+    /// True if the node score depended on Botzone history-specific repetition bans or the ply-401 horizon
+    /// and therefore must not be cached in TT / CorrHist.
+    bz_tainted: Box<[bool; MAX_PLY]>,
 }
 
 /// Monotonic milliseconds since process start (native default time source).
@@ -1274,6 +1302,12 @@ impl<'a> Searcher<'a> {
             tup_native: false,
             corr: None,
             stack: MoveStack::new(),
+            bz_snaps: Vec::with_capacity(MAX_PLY + 64),
+            bz_base_offset: 0,
+            bz_start_ply: 0,
+            bz_max_plies: u32::MAX,
+            bz_rep_base: Box::new([0u32; MAX_PLY]),
+            bz_tainted: Box::new([false; MAX_PLY]),
         }
     }
 
@@ -1560,6 +1594,9 @@ impl<'a> Searcher<'a> {
         null_allowed: bool,
     ) -> i32 {
         self.nodes += 1;
+        if BZ {
+            self.bz_tainted[ply as usize] = false;
+        }
         // Hard stack guard (release builds too): never index past the MAX_PLY-sized stacks.
         if ply as usize >= MAX_PLY - 1 {
             self.heuristic_used = true;
@@ -1580,6 +1617,11 @@ impl<'a> Searcher<'a> {
             if b.bz_over() {
                 return bz_terminal_score(b, ply);
             }
+            // Judge also ends the game unconditionally after ply 401 (Black's 201st half-move).
+            if ply >= self.bz_max_plies {
+                self.bz_tainted[ply as usize] = true;
+                return bz_terminal_score(b, ply);
+            }
         } else if b.game_over() {
             return terminal_score(b, ply);
         }
@@ -1593,6 +1635,36 @@ impl<'a> Searcher<'a> {
             return alpha;
         }
 
+        // Botzone (`BZ = true`) exact placement-snapshot repetition table & horizon check:
+        // collect all jump transitions banned by `repeat(nowgame)` at this node before probing TT or pruning.
+        let at_bz_horizon = BZ && ply.saturating_add(depth) >= self.bz_max_plies;
+        let mut cur_v = 0usize;
+        let mut rbase = 0usize;
+        let mut banned_snaps = [(0u64, 0u64); 32];
+        let mut n_banned = 0usize;
+        let mut banned_overflow = false;
+        if BZ {
+            cur_v = self.bz_base_offset + ply as usize;
+            rbase = self.bz_rep_base[ply as usize] as usize;
+            if self.bz_start_ply + ply >= 3 && cur_v >= rbase + 2 {
+                let last = self.bz_snaps[cur_v];
+                for i in rbase..=(cur_v - 2) {
+                    if self.bz_snaps[i] == last {
+                        let ban = self.bz_snaps[i + 1];
+                        if !banned_snaps[..n_banned].contains(&ban) {
+                            if n_banned < banned_snaps.len() {
+                                banned_snaps[n_banned] = ban;
+                                n_banned += 1;
+                            } else {
+                                banned_overflow = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut tainted = BZ && (n_banned > 0 || at_bz_horizon);
+
         // Transposition table probe. Missing entry at depth >= 4 -> IIR
         // (internal iterative reduction, Moonbird): the node has no cached
         // best move to order by, so search one ply less.
@@ -1601,7 +1673,7 @@ impl<'a> Searcher<'a> {
         let mut depth = depth;
         if let Some(e) = self.tt.probe_e(b.hash, b.empty().count_ones() as u8) {
             tt_mv = e.mv;
-            if e.depth as u32 >= depth {
+            if !(BZ && tainted) && e.depth as u32 >= depth {
                 let s = score_from_tt(e.score, ply);
                 match e.flag {
                     FLAG_EXACT => {
@@ -1629,7 +1701,7 @@ impl<'a> Searcher<'a> {
                     return s;
                 }
             }
-        } else if depth >= 4 {
+        } else if depth >= 4 && !at_bz_horizon {
             depth -= 1;
         }
 
@@ -1653,6 +1725,7 @@ impl<'a> Searcher<'a> {
         // -> fail low. Safe in Ataxx because the eval is capture-risk-aware.
         // Disabled when alpha/beta are mate scores so centipawn evals never prune mate lines.
         if null_allowed
+            && !(BZ && tainted)
             && ply > 0
             && depth <= 4
             && alpha.abs() < MATE_BOUND
@@ -1694,14 +1767,17 @@ impl<'a> Searcher<'a> {
         }
 
         // ProbCut: non-PV, not right after a null, margin widens with the net's disagreement output.
-        if null_allowed && ply > 0 && depth >= PC_D && beta - alpha == 1 && beta.abs() < MATE_BOUND {
+        if null_allowed && !(BZ && tainted) && ply > 0 && depth >= PC_D && beta - alpha == 1 && beta.abs() < MATE_BOUND {
             let pc_beta = beta + PC_T + ((node_dis * PC_K) >> 7);
             if pc_beta < MATE_BOUND && static_eval + 50 >= pc_beta - 2 * PC_T {
                 let score = self.negamax::<BZ>(b, pc_beta - 1, pc_beta, depth - PC_R, ply, false);
                 if self.stop {
                     return 0;
                 }
-                if score >= pc_beta && score < MATE_BOUND {
+                if BZ && self.bz_tainted[ply as usize] {
+                    tainted = true;
+                }
+                if score >= pc_beta && score < MATE_BOUND && !(BZ && tainted) {
                     self.heuristic_used = true;
                     return score - (pc_beta - beta);
                 }
@@ -1709,6 +1785,43 @@ impl<'a> Searcher<'a> {
         }
 
         if depth == 0 {
+            if BZ && n_banned > 0 {
+                let me = b.me();
+                let empty = b.empty();
+                // Clone moves strictly increase piece count and can never repeat an earlier snapshot.
+                if (box1(me) & empty) == 0 {
+                    let mut has_unbanned = false;
+                    let mut js_targets = jump_union(me) & empty;
+                    'chk: while js_targets != 0 {
+                        let to = js_targets.trailing_zeros() as u8;
+                        js_targets &= js_targets - 1;
+                        let mut froms = me & RING2[to as usize];
+                        while froms != 0 {
+                            let from = froms.trailing_zeros() as u8;
+                            froms &= froms - 1;
+                            let snap = placement_snap(b, Move { from, to });
+                            let banned = banned_snaps[..n_banned].contains(&snap)
+                                || (banned_overflow && {
+                                    let last = self.bz_snaps[cur_v];
+                                    self.bz_snaps[rbase..=cur_v - 1]
+                                        .windows(2)
+                                        .any(|w| w[0] == last && w[1] == snap)
+                                });
+                            if !banned {
+                                has_unbanned = true;
+                                break 'chk;
+                            }
+                        }
+                    }
+                    if !has_unbanned {
+                        self.bz_tainted[ply as usize] = true;
+                        return -MATE + ply as i32;
+                    }
+                }
+            }
+            if BZ {
+                self.bz_tainted[ply as usize] = tainted;
+            }
             self.heuristic_used = true;
             return static_eval;
         }
@@ -1724,64 +1837,100 @@ impl<'a> Searcher<'a> {
         if tt_mv != 0 {
             if let Some(m) = crate::ttcodec::decode_move(b, tt_mv as u16) {
                 skip_tt_mv = tt_mv;
-                let child = b.make(m);
                 let mut is_rep = false;
-                if !m.is_clone() {
-                    let base = self.stack.rep_base[ply as usize] as usize;
-                    if (ply as usize) >= base + 1 {
-                        let mut i = ply as usize - 1;
-                        loop {
-                            if self.stack.path_hash[i] == child.hash {
-                                is_rep = true;
-                                break;
-                            }
-                            if i < base + 2 {
-                                break;
-                            }
-                            i -= 2;
-                        }
+                let mut c_snap = (0u64, 0u64);
+                if BZ {
+                    c_snap = placement_snap(b, m);
+                    if !m.is_clone() && n_banned > 0 {
+                        is_rep = banned_snaps[..n_banned].contains(&c_snap)
+                            || (banned_overflow && {
+                                let last = self.bz_snaps[cur_v];
+                                self.bz_snaps[rbase..=cur_v - 1]
+                                    .windows(2)
+                                    .any(|w| w[0] == last && w[1] == c_snap)
+                            });
+                    }
+                    if is_rep {
+                        rep_skipped = true;
+                        tainted = true;
                     }
                 }
-                if is_rep {
-                    rep_skipped = true;
-                } else {
-                    self.prefetch_child(child.hash);
-                    self.ec_imp = 1;
-                    self.stack.imp[ply as usize + 1] = 3;
-                    self.stack.path_hash[ply as usize + 1] = child.hash;
-                    self.stack.rep_base[ply as usize + 1] = if m.is_clone() {
-                        ply + 1
-                    } else {
-                        self.stack.rep_base[ply as usize]
-                    };
-                    if let Some(net) = self.sancta {
-                        let (a, z) = self.stack.acc.split_at_mut(ply as usize + 1);
-                        net.update_child(&a[ply as usize], &mut z[0], b, &child);
-                    }
-                    let score =
-                        -self.negamax::<BZ>(&child, -beta, -alpha, depth - 1, ply + 1, true);
-                    if self.stop {
-                        return 0;
-                    }
-                    move_idx = 1;
-                    if score <= alpha {
-                        self.hist_add(b.turn as usize, m, -((depth * depth) as i32));
-                    }
-                    best = score;
-                    best_mv = m.to_u32();
-                    if score > alpha {
-                        alpha = score;
-                        if alpha >= beta {
-                            self.on_cutoff(b, m, depth, ply);
-                            if best > alpha_orig && best_mv != 0xFFFF {
-                                self.hist_add(
-                                    b.turn as usize,
-                                    m,
-                                    HIST_SCALE * (depth * depth) as i32,
-                                );
+                if !is_rep {
+                    let child = b.make(m);
+                    if !BZ && !m.is_clone() {
+                        let base = self.stack.rep_base[ply as usize] as usize;
+                        if (ply as usize) >= base + 1 {
+                            let mut i = ply as usize - 1;
+                            loop {
+                                if self.stack.path_hash[i] == child.hash {
+                                    is_rep = true;
+                                    break;
+                                }
+                                if i < base + 2 {
+                                    break;
+                                }
+                                i -= 2;
                             }
-                            self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply, raw);
-                            return best;
+                        }
+                    }
+                    if is_rep {
+                        rep_skipped = true;
+                    } else {
+                        self.prefetch_child(child.hash);
+                        self.ec_imp = 1;
+                        self.stack.imp[ply as usize + 1] = 3;
+                        if BZ {
+                            self.bz_snaps[cur_v + 1] = c_snap;
+                            self.bz_rep_base[ply as usize + 1] = if m.is_clone() {
+                                (cur_v + 1) as u32
+                            } else {
+                                rbase as u32
+                            };
+                        } else {
+                            self.stack.path_hash[ply as usize + 1] = child.hash;
+                            self.stack.rep_base[ply as usize + 1] = if m.is_clone() {
+                                ply + 1
+                            } else {
+                                self.stack.rep_base[ply as usize]
+                            };
+                        }
+                        if let Some(net) = self.sancta {
+                            let (a, z) = self.stack.acc.split_at_mut(ply as usize + 1);
+                            net.update_child(&a[ply as usize], &mut z[0], b, &child);
+                        }
+                        let score =
+                            -self.negamax::<BZ>(&child, -beta, -alpha, depth - 1, ply + 1, true);
+                        if self.stop {
+                            return 0;
+                        }
+                        if BZ && self.bz_tainted[ply as usize + 1] {
+                            tainted = true;
+                        }
+                        move_idx = 1;
+                        if score <= alpha {
+                            self.hist_add(b.turn as usize, m, -((depth * depth) as i32));
+                        }
+                        best = score;
+                        best_mv = m.to_u32();
+                        if score > alpha {
+                            alpha = score;
+                            if alpha >= beta {
+                                self.on_cutoff(b, m, depth, ply);
+                                if best > alpha_orig && best_mv != 0xFFFF {
+                                    self.hist_add(
+                                        b.turn as usize,
+                                        m,
+                                        HIST_SCALE * (depth * depth) as i32,
+                                    );
+                                }
+                                if BZ {
+                                    self.bz_tainted[ply as usize] = tainted;
+                                }
+                                if !(BZ && tainted) {
+                                    self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply, raw);
+                                }
+                                return best;
+                            }
                         }
                     }
                 }
@@ -1899,15 +2048,26 @@ impl<'a> Searcher<'a> {
             // Moonbird-style selectivity (exp/search-moonbird A): late moves get a gentle LMR, every move after the
             // first is reduced by how far its child's STATIC eval falls short of alpha, and a move reduced to depth
             // <= 0 is not searched at all. First move: full window, full depth (always searched, so best is set).
+            let mut c_snap = (0u64, 0u64);
+            if BZ {
+                c_snap = placement_snap(b, m);
+                if !m.is_clone() && n_banned > 0 {
+                    let is_rep = banned_snaps[..n_banned].contains(&c_snap)
+                        || (banned_overflow && {
+                            let last = self.bz_snaps[cur_v];
+                            self.bz_snaps[rbase..=cur_v - 1]
+                                .windows(2)
+                                .any(|w| w[0] == last && w[1] == c_snap)
+                        });
+                    if is_rep {
+                        rep_skipped = true;
+                        tainted = true;
+                        continue;
+                    }
+                }
+            }
             let child = b.make(m);
-            self.prefetch_child(child.hash);
-            // D590 (user): the top ~10-15 moves are real candidates the search often keeps unreduced
-            self.ec_imp = (move_idx < 12) as u32;
-            self.stack.imp[ply as usize + 1] = if move_idx == 0 { 3 } else if move_idx < 12 { 2 } else { 1 };
-            if m.is_clone() {
-                self.stack.path_hash[ply as usize + 1] = child.hash;
-                self.stack.rep_base[ply as usize + 1] = ply + 1;
-            } else {
+            if !BZ && !m.is_clone() {
                 let base = self.stack.rep_base[ply as usize] as usize;
                 let mut is_rep = false;
                 if (ply as usize) >= base + 1 {
@@ -1927,20 +2087,38 @@ impl<'a> Searcher<'a> {
                     rep_skipped = true;
                     continue;
                 }
+            }
+            self.prefetch_child(child.hash);
+            // D590 (user): the top ~10-15 moves are real candidates the search often keeps unreduced
+            self.ec_imp = (move_idx < 12) as u32;
+            self.stack.imp[ply as usize + 1] = if move_idx == 0 { 3 } else if move_idx < 12 { 2 } else { 1 };
+            if BZ {
+                self.bz_snaps[cur_v + 1] = c_snap;
+                self.bz_rep_base[ply as usize + 1] = if m.is_clone() {
+                    (cur_v + 1) as u32
+                } else {
+                    rbase as u32
+                };
+            } else {
                 self.stack.path_hash[ply as usize + 1] = child.hash;
-                self.stack.rep_base[ply as usize + 1] = base as u32;
+                self.stack.rep_base[ply as usize + 1] = if m.is_clone() {
+                    ply + 1
+                } else {
+                    self.stack.rep_base[ply as usize]
+                };
             }
             if let Some(net) = self.sancta {
                 let (a, z) = self.stack.acc.split_at_mut(ply as usize + 1);
                 net.update_child(&a[ply as usize], &mut z[0], b, &child);
             }
             let mut new_depth = depth as i32;
-            if move_idx >= MB_LMR_MIN_IDX {
+            if move_idx >= MB_LMR_MIN_IDX && !at_bz_horizon {
                 new_depth = depth as i32 * MB_LMR_HALFLIFE / (MB_LMR_HALFLIFE + lmr_cnt);
                 lmr_cnt += 1;
             }
             let mut child_eval = i32::MIN;
             if move_idx >= MB_FUT_MIN_IDX
+                && !at_bz_horizon
                 && new_depth > 0
                 && self.sancta.is_none()
                 && alpha.abs() < MATE_BOUND
@@ -2036,6 +2214,9 @@ impl<'a> Searcher<'a> {
                 if self.stop {
                     return 0;
                 }
+                if BZ && self.bz_tainted[ply as usize + 1] {
+                    tainted = true;
+                }
             } else {
                 self.stack.pre_eval[ply as usize + 1] = child_eval;
                 score = -self.negamax::<BZ>(
@@ -2049,12 +2230,18 @@ impl<'a> Searcher<'a> {
                 if self.stop {
                     return 0;
                 }
+                if BZ && self.bz_tainted[ply as usize + 1] {
+                    tainted = true;
+                }
                 if score > alpha {
                     // re-search: full window, full depth
                     self.stack.pre_eval[ply as usize + 1] = child_eval;
                     score = -self.negamax::<BZ>(&child, -beta, -alpha, depth - 1, ply + 1, true);
                     if self.stop {
                         return 0;
+                    }
+                    if BZ && self.bz_tainted[ply as usize + 1] {
+                        tainted = true;
                     }
                 }
             }
@@ -2077,6 +2264,9 @@ impl<'a> Searcher<'a> {
         }
         if best == i32::MIN {
             // Every legal move from this node repeated an ancestor position (CIRCULAR_MOVE forfeit).
+            if BZ {
+                self.bz_tainted[ply as usize] = true;
+            }
             return -MATE + ply as i32;
         }
         if best > alpha_orig && best_mv != 0xFFFF {
@@ -2086,7 +2276,10 @@ impl<'a> Searcher<'a> {
                 HIST_SCALE * (depth * depth) as i32,
             );
         }
-        if !rep_skipped {
+        if BZ {
+            self.bz_tainted[ply as usize] = tainted;
+        }
+        if !rep_skipped && !(BZ && tainted) {
             self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply, raw);
         }
         best
@@ -2152,13 +2345,13 @@ impl<'a> Searcher<'a> {
     /// Whichever limit hits first (nodes / time / depth) stops the search;
     /// an aborted iteration is adopted by the Stockfish rule (see the adoption block in `search_gen`).
     pub fn search(&mut self, b: &Board, limits: &SearchLimits) -> SearchResult {
-        self.search_gen::<false>(b, limits, &[])
+        self.search_gen::<false>(b, limits, &[], &[], false)
     }
 
     /// Same search under the Botzone judge's rules (no passes; either side
     /// stuck ends the game, mobile side absorbs the empties; NMP off).
     pub fn search_bz(&mut self, b: &Board, limits: &SearchLimits) -> SearchResult {
-        self.search_gen::<true>(b, limits, &[])
+        self.search_gen::<true>(b, limits, &[], &[], false)
     }
 
     /// Standard search excluding specified root moves (Multi-PV tree generation).
@@ -2168,7 +2361,7 @@ impl<'a> Searcher<'a> {
         limits: &SearchLimits,
         banned_root: &[Move],
     ) -> SearchResult {
-        self.search_gen::<false>(b, limits, banned_root)
+        self.search_gen::<false>(b, limits, banned_root, &[], false)
     }
 
     /// Botzone search excluding repetition-banned root moves up front so the full
@@ -2179,7 +2372,20 @@ impl<'a> Searcher<'a> {
         limits: &SearchLimits,
         banned_root: &[Move],
     ) -> SearchResult {
-        self.search_gen::<true>(b, limits, banned_root)
+        self.search_gen::<true>(b, limits, banned_root, &[], false)
+    }
+
+    /// Botzone search with full game placement-snapshot history and optional 401-ply
+    /// game-end horizon (`input.size() > 800`), matching the Botzone judge exactly.
+    pub fn search_bz_game(
+        &mut self,
+        b: &Board,
+        limits: &SearchLimits,
+        banned_root: &[Move],
+        snaps: &[(u64, u64)],
+        respect_401: bool,
+    ) -> SearchResult {
+        self.search_gen::<true>(b, limits, banned_root, snaps, respect_401)
     }
 
     fn search_gen<const BZ: bool>(
@@ -2187,6 +2393,8 @@ impl<'a> Searcher<'a> {
         b: &Board,
         limits: &SearchLimits,
         banned_root: &[Move],
+        snaps: &[(u64, u64)],
+        respect_401: bool,
     ) -> SearchResult {
         self.start_ms = (self.time_src)();
         self.nodes = 0;
@@ -2200,11 +2408,36 @@ impl<'a> Searcher<'a> {
             .time
             .map(|t| self.start_ms + (t.as_secs_f64() * 1000.0 - safety_margin_ms).max(1.0));
 
+        if BZ {
+            let game_ply = snaps.len().saturating_sub(1);
+            self.bz_start_ply = game_ply as u32;
+            self.bz_max_plies = if respect_401 {
+                401usize.saturating_sub(game_ply) as u32
+            } else {
+                u32::MAX
+            };
+            let root_stones = (b.occ[0] | b.occ[1]).count_ones();
+            let tail_start = snaps
+                .iter()
+                .position(|&(x, y)| (x | y).count_ones() == root_stones)
+                .unwrap_or(snaps.len());
+            let tail = &snaps[tail_start..];
+            self.bz_snaps.clear();
+            if tail.is_empty() {
+                self.bz_snaps.push((b.occ[0], b.occ[1]));
+            } else {
+                self.bz_snaps.extend_from_slice(tail);
+            }
+            let base_len = self.bz_snaps.len();
+            self.bz_base_offset = base_len - 1;
+            self.bz_snaps.resize(base_len + MAX_PLY + 2, (0, 0));
+        }
+
         let mut result = SearchResult::default();
-        // Instant terminal fast path (Botzone rules): a full board or a stuck
-        // side (including a stuck OPPONENT, which movegen alone would miss)
-        // ends the game on the spot: zero nodes searched.
-        if BZ && b.bz_over() {
+        // Instant terminal fast path (Botzone rules): a full board, a stuck
+        // side (including a stuck OPPONENT, which movegen alone would miss),
+        // or already past ply 401 ends the game on the spot: zero nodes searched.
+        if BZ && (b.bz_over() || self.bz_max_plies == 0) {
             result.score = bz_terminal_score(b, 0);
             result.elapsed = self.elapsed();
             result.nodes = self.nodes;
@@ -2255,6 +2488,25 @@ impl<'a> Searcher<'a> {
         // Root best-so-far: drained best-first into a fixed array.
         // Root acc refreshed once (sancta lazy path: children diff from it).
         let mut root_moves = [Move::PASS; 256];
+        let mut root_banned_snaps = [(0u64, 0u64); 32];
+        let mut n_root_banned = 0usize;
+        let mut root_banned_overflow = false;
+        if BZ && self.bz_start_ply >= 3 && self.bz_base_offset >= 2 {
+            let last = self.bz_snaps[self.bz_base_offset];
+            for i in 0..=(self.bz_base_offset - 2) {
+                if self.bz_snaps[i] == last {
+                    let ban = self.bz_snaps[i + 1];
+                    if !root_banned_snaps[..n_root_banned].contains(&ban) {
+                        if n_root_banned < root_banned_snaps.len() {
+                            root_banned_snaps[n_root_banned] = ban;
+                            n_root_banned += 1;
+                        } else {
+                            root_banned_overflow = true;
+                        }
+                    }
+                }
+            }
+        }
         let n_root = {
             let root = &mut self.stack.lists[0];
             let mut all_moves = [Move::PASS; 256];
@@ -2262,7 +2514,18 @@ impl<'a> Searcher<'a> {
             for slot in all_moves.iter_mut().take(n_root) {
                 let m = root.pop_best();
                 *slot = m;
-                if !banned_root.contains(&m) {
+                let mut is_banned = banned_root.contains(&m);
+                if BZ && !is_banned && !m.is_clone() && n_root_banned > 0 {
+                    let c = placement_snap(b, m);
+                    is_banned = root_banned_snaps[..n_root_banned].contains(&c)
+                        || (root_banned_overflow && {
+                            let last = self.bz_snaps[self.bz_base_offset];
+                            self.bz_snaps[0..=self.bz_base_offset - 1]
+                                .windows(2)
+                                .any(|w| w[0] == last && w[1] == c)
+                        });
+                }
+                if !is_banned {
                     root_moves[kept] = m;
                     kept += 1;
                 }
@@ -2290,7 +2553,7 @@ impl<'a> Searcher<'a> {
             self.publish_best(m);
         }
         if let Some(entry) = root_tt {
-            if entry.score.abs() < MATE_BOUND {
+            if entry.score.abs() < MATE_BOUND && (!BZ || (!respect_401 && snaps.is_empty())) {
                 result.score = entry.score;
             }
         }
@@ -2313,12 +2576,24 @@ impl<'a> Searcher<'a> {
             // fixed node budgets -> bench d8 9.4k=>17k, QB5k 45-53-2.-28.)
             self.stack.path_hash[0] = b.hash;
             self.stack.rep_base[0] = 0;
+            if BZ {
+                self.bz_rep_base[0] = 0;
+                self.bz_tainted[0] = false;
+            }
             for i in 0..n_root {
                 let m = root_moves[i];
                 let child = b.make(m);
                 self.stack.imp[1] = 3;
                 self.stack.path_hash[1] = child.hash;
                 self.stack.rep_base[1] = if m.is_clone() { 1 } else { 0 };
+                if BZ {
+                    self.bz_snaps[self.bz_base_offset + 1] = placement_snap(b, m);
+                    self.bz_rep_base[1] = if m.is_clone() {
+                        (self.bz_base_offset + 1) as u32
+                    } else {
+                        0
+                    };
+                }
                 // Root children: acc[1] = acc[0] + diffs (sancta lazy path).
                 if let Some(net) = self.sancta {
                     let (a, z) = self.stack.acc.split_at_mut(1);
@@ -2726,6 +3001,138 @@ xxx....
         assert!(r.best.is_some());
         assert_eq!(r.depth, 6);
         assert_eq!(r.stopped_by, Some(StopReason::Completed));
+    }
+
+    #[test]
+    fn bz_ply_401_cuts_off_after_black_201st_move() {
+        // Black has 4 stones and trails White (5 stones), EXCEPT c5->d6 (clone) captures e6 to lead 5-3.
+        // At game_ply == 400 (Black's 201st move, snaps.len() == 401), the judge terminates immediately after
+        // ply 401, so that 1-ply capture solves to +MATE - 1 at depth 1. At game_ply == 401 the game is over (0 nodes).
+        let board = ".....oo
+                     ....o..
+                     ..x....
+                     .......
+                     .......
+                     x....o.
+                     xx...o. b";
+        let b = Board::from_str(board).unwrap();
+        assert_eq!(b.counts(), (4, 5));
+
+        let mut se = Searcher::with_tt_bits(16);
+        let snaps_400 = vec![(b.occ[0], b.occ[1]); 401];
+        let r400 = se.search_bz_game(&b, &no_time(6), &[], &snaps_400, true);
+        assert_eq!(r400.score, MATE - 1, "ply-401 winning flip must solve at MATE - 1, got {}", r400.score);
+        assert_eq!(r400.depth, 1, "401-ply endgame must stop at depth 1, got {}", r400.depth);
+        let mv = r400.best.expect("must return move at game_ply 400");
+        let (fb, fw) = b.make(mv).bz_counts();
+        assert!(fb > fw, "must play capturing move to win ply 401, got ({fb}, {fw})");
+
+        // Solving near the ply-401 wall must not pollute TT for non-401 searches of the same board.
+        let r_unbounded = se.search_bz_game(&b, &no_time(2), &[], &[], false);
+        assert!(r_unbounded.score.abs() < MATE_BOUND, "horizon taint leaked into non-401 search: {}", r_unbounded.score);
+
+        // At game_ply == 399 (White's 200th move, bz_max_plies == 2), White must avoid letting Black
+        // reach a winning ply-401 board: exact 2-ply horizon finishes at depth 2 with no TT leakage.
+        let bw = Board::from_str(
+            ".....oo
+             ....o..
+             ..x....
+             .......
+             .......
+             x....o.
+             xx...o. w",
+        )
+        .unwrap();
+        let snaps_399 = vec![(bw.occ[0], bw.occ[1]); 400];
+        let mut sew = Searcher::with_tt_bits(16);
+        let r399 = sew.search_bz_game(&bw, &no_time(6), &[], &snaps_399, true);
+        assert_eq!(r399.depth, 2, "ply-399 exact 401 horizon should complete at depth 2, got {}", r399.depth);
+        assert!(r399.score >= MATE_BOUND, "White up 5-4 can preserve ply-401 win in 2 plies, got {}", r399.score);
+        let rw_clean = sew.search_bz_game(&bw, &no_time(2), &[], &[], false);
+        assert!(rw_clean.score.abs() < MATE_BOUND, "ply-399 horizon leaked into TT: {}", rw_clean.score);
+
+        // At game_ply == 401 (snaps.len() == 402), game already ended on ply 401 -> 0 nodes.
+        let snaps_401 = vec![(b.occ[0], b.occ[1]); 402];
+        let r401 = se.search_bz_game(&b, &no_time(6), &[], &snaps_401, true);
+        assert_eq!(r401.nodes, 0, "past ply 401 must search 0 nodes");
+        assert_eq!(r401.score, -MATE, "trailing 4-5 scores as loss at terminal 401");
+    }
+
+    #[test]
+    fn bz_forces_opponent_into_circular_move_forfeit_trap() {
+        // White has 15 stones vs Black's 1 stone, so White wins by massive material EXCEPT its only
+        // mobile piece is walled into {a7 (0), c7 (2)}, while Black jumps among {f7 (5), d5 (17), f5 (19)}.
+        // After (x@f7,o@a7)->(x@f5,o@a7)->(x@f5,o@c7)->(x@d5,o@c7)->(x@d5,o@a7), Black's jump d5->f5
+        // puts White into (x@f5, o@a7) where White's SOLE move a7->c7 repeats (snaps[1], snaps[2])
+        // and forfeits White by CIRCULAR_MOVE regardless of stone count.
+        let root0 = Board::from_str(
+            "o#.##x#
+             #######
+             ###.#.#
+             #######
+             #######
+             ooooooo
+             ooooooo b",
+        )
+        .unwrap();
+        // Moves on root0: f7(5) jumps to d5(17) or f5(19). White a7(0) jumps ONLY to c7(2).
+        let j_f7_f5 = Move { from: 5, to: 19 };
+        let j_a7_c7 = Move { from: 0, to: 2 };
+        let j_f5_d5 = Move { from: 19, to: 17 };
+        let j_c7_a7 = Move { from: 2, to: 0 };
+        let j_d5_f5 = Move { from: 17, to: 19 };
+
+        let mut cur = root0;
+        let mut snaps = vec![(cur.occ[0], cur.occ[1])];
+        for mv in [j_f7_f5, j_a7_c7, j_f5_d5, j_c7_a7] {
+            assert!(cur.legal_moves().contains(&mv), "illegal setup move {mv:?}");
+            snaps.push(placement_snap(&cur, mv));
+            cur = cur.make(mv);
+        }
+        // Now at `cur` (x@d5, o@a7, snaps.len()==5): Black's turn.
+        // snaps = [0:(f7,a7), 1:(f5,a7), 2:(f5,c7), 3:(d5,c7), 4:(d5,a7)].
+        // If Black plays d5->f5 (cur->(f5,a7) == snaps[1]), White MUST play a7->c7 ((f5,c7) == snaps[2]),
+        // which repeats (snaps[1], snaps[2]) and forfeits White by CIRCULAR_MOVE!
+        // Note: Black's `d5->f5` is tested both at max_depth=1 (hitting the depth==0 check) and max_depth=3.
+        let mut se = Searcher::with_tt_bits(16);
+        let r1 = se.search_bz_game(&cur, &no_time(1), &[], &snaps, true);
+        assert_eq!(r1.best, Some(j_d5_f5), "depth-1 search must spot forced CIRCULAR_MOVE trap");
+        assert_eq!(r1.score, MATE - 1, "depth-1 trap score must be MATE - 1, got {}", r1.score);
+
+        let r3 = se.search_bz_game(&cur, &no_time(3), &[], &snaps, true);
+        assert_eq!(r3.best, Some(j_d5_f5), "depth-3 search must spot forced CIRCULAR_MOVE trap");
+        assert_eq!(r3.score, MATE - 1, "depth-3 trap score must be MATE - 1, got {}", r3.score);
+
+        // Clean search on the SAME board `cur` without prior trap history must NOT see a cached +MATE!
+        let r_clean = se.search_bz_game(&cur, &no_time(2), &[], &[], false);
+        assert!(r_clean.score < 0, "TT poisoned by trap search! clean score = {}", r_clean.score);
+    }
+
+    #[test]
+    fn bz_allows_legal_revisit_when_prior_move_differs() {
+        // White (15 stones vs Black's 1) can cycle a7<->c7; Black can jump between f7(5), d5(17), f5(19)
+        // with NO clone moves anywhere.
+        // At depth 4 from b0 = (x@f7, o@a7):
+        //   ply0 B: f7->f5 (s1), ply1 W: a7->c7 (s2), ply2 B: f5->f7 (s3), ply3 W: c7->a7 (s4 == s0).
+        // Old path_hash banned ply3 (W c7->a7) 1 ply too early, giving Black a fake +MATE-3!
+        // Botzone judge PERMITS s4 because s3=(f7,c7) never appeared before, so White does not forfeit on ply 3.
+        let b0 = Board::from_str(
+            "o#.##x#
+             #######
+             ###.#.#
+             #######
+             #######
+             ooooooo
+             ooooooo b",
+        )
+        .unwrap();
+        let mut se = Searcher::with_tt_bits(16);
+        let r = se.search_bz_game(&b0, &no_time(4), &[], &[], false);
+        assert!(
+            r.score < 0,
+            "legal 4-ply revisit s4 must not trigger fake repetition forfeit mate: score = {}",
+            r.score
+        );
     }
 
     #[test]
