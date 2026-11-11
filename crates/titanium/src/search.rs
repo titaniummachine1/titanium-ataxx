@@ -246,7 +246,7 @@ impl TtBucket {
     }
 }
 
-use crate::board::{box1, reach_union, Board, Move, MoveList, RING1, SQUARES};
+use crate::board::{box1, reach_union, Board, Move, MoveList, RING1, RING2, SQUARES};
 use crate::nnue::Nnue;
 use crate::sancta::{S1Acc, S1Net};
 use crate::tuple::TupleTable;
@@ -540,57 +540,140 @@ pub fn evaluate(b: &Board, tup: Option<&TupleTable>, native_tup: bool) -> i32 {
 const HIST_DIV: i32 = HIST_MAX / ORD_HIST_FULL;
 const _: () = assert!(HIST_MAX % ORD_HIST_FULL == 0);
 
-#[inline]
-fn score_into<const SKIP_TT: bool>(
+/// Fused move generation + scoring (+ optional policy head): iterates legal
+/// destinations in ascending `to` order (identical tie-break order to
+/// `legal_moves_dedup_into`), sharing per-destination (`flips`, `tholes`,
+/// `k3_to`) and per-origin (`conn`, `from_holes`, `k3_from`) work across jumps.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
     b: &Board,
     list: &mut MoveList,
     tt_mv: u32,
     ply: u32,
     killers: &[(u32, u32); MAX_PLY],
     history: &History,
+    pol: Option<(&crate::policy::Policy, &[(u16, f32)], f32)>,
 ) {
-    b.legal_moves_dedup_into(list);
+    use std::mem::MaybeUninit;
+
+    list.clear();
+    let me = b.me();
     let opp = b.opp();
-    let me = b.occ[b.turn as usize];
+    let empty = b.empty();
+    let mut targets = reach_union(me) & empty;
     let (k1, k2) = killers[ply as usize];
     let hist = &history[b.turn as usize];
     let mut tt_index = usize::MAX;
-    let mut i = 0;
-    while i < list.len() {
-        let m = list.move_at(i);
-        // the TT move is a ttcodec move code: a clone matches by destination, a jump by (from, to)
-        if tt_mv != 0 && crate::ttcodec::move_code(m) as u32 == tt_mv {
-            if SKIP_TT {
-                list.swap_remove(i);
-                continue;
-            }
-            tt_index = i;
-            list.set_score(i, i32::MAX / 2);
-            i += 1;
-            continue;
-        }
-        let mut score = (opp & RING1[m.to as usize]).count_ones() as i32 * ORD_CAPTURE_UNIT;
-        // Clone preference: a clone nets one more stone than a jump and
-        // leaves the origin defended ("duplicate as much as you can").
-        // (exp/ab A tested no-asymmetry: 41-55, keep preference.)
-        if m.is_clone() {
-            score += ORD_CLONE_BONUS;
+
+    let mut orig_valid: u64 = 0;
+    let mut orig_conn = [MaybeUninit::<i32>::uninit(); 49];
+    let mut orig_g = [MaybeUninit::<f32>::uninit(); 49];
+    let mut orig_tor = [MaybeUninit::<i32>::uninit(); 49];
+
+    while targets != 0 {
+        let to = targets.trailing_zeros() as u8;
+        targets &= targets - 1;
+        let tu = to as usize;
+        let r1_to = RING1[tu];
+        let caps = (opp & r1_to).count_ones() as i32;
+        let cap_sc = caps * ORD_CAPTURE_UNIT;
+
+        let clones = me & r1_to;
+        let jumps = me & RING2[tu];
+
+        let (flips, tholes, k3_to) = if HAS_POLICY {
+            (
+                (caps as usize).min(8),
+                ((r1_to & empty).count_ones() as usize).min(8),
+                crate::policy::k3code_pub(me, opp, to),
+            )
         } else {
-            // exp/ab O1 (hole-aware jumps): a jump vacates its origin â€”
-            // leaving a connected origin breaks formation, so penalty
-            // scales with own stones adjacent to the origin square.
-            let conn = (me & RING1[m.from as usize]).count_ones() as i32;
-            score -= ORD_JUMP_PEN + conn * ORD_JUMP_CONN;
+            (0, 0, 0)
+        };
+
+        if clones != 0 {
+            let from = clones.trailing_zeros() as u8;
+            let m = Move { from, to };
+            if tt_mv != 0 && (1 + to as u32) == tt_mv {
+                if !SKIP_TT {
+                    tt_index = list.len();
+                    list.push_scored(m, ORD_TT);
+                }
+            } else {
+                // Clone preference: a clone nets one more stone than a jump and
+                // leaves the origin defended ("duplicate as much as you can").
+                // (exp/ab A tested no-asymmetry: 41-55, keep preference.)
+                let mut sc = cap_sc + ORD_CLONE_BONUS;
+                let kk = ((to as u32) << 8) | to as u32;
+                if kk == k1 || kk == k2 {
+                    sc += ORD_KILLER;
+                }
+                sc += hist[tu][tu] / HIST_DIV;
+                if HAS_POLICY {
+                    let (p, xin, w) = pol.unwrap();
+                    let z = p.clone_logit_pre(to, flips, tholes, k3_to, xin);
+                    sc = sc.saturating_add((z * w) as i32);
+                }
+                list.push_scored(m, sc);
+            }
         }
-        let kk = kill_key(m);
-        if kk == k1 || kk == k2 {
-            score += ORD_KILLER;
+
+        if jumps != 0 {
+            let (j_prefix, j_td) = if HAS_POLICY {
+                let (p, _, _) = pol.unwrap();
+                p.jump_dest_parts(to, flips, tholes, k3_to)
+            } else {
+                (0.0, 0)
+            };
+            let mut js = jumps;
+            while js != 0 {
+                let from = js.trailing_zeros() as u8;
+                js &= js - 1;
+                let m = Move { from, to };
+                if tt_mv != 0 && crate::ttcodec::jump_code(from, to) as u32 == tt_mv {
+                    if !SKIP_TT {
+                        tt_index = list.len();
+                        list.push_scored(m, ORD_TT);
+                    }
+                    continue;
+                }
+                let fu = from as usize;
+                let fbit = 1u64 << from;
+                if orig_valid & fbit == 0 {
+                    orig_valid |= fbit;
+                    orig_conn[fu].write((me & RING1[fu]).count_ones() as i32);
+                    if HAS_POLICY {
+                        let (p, _, _) = pol.unwrap();
+                        let fh = ((RING1[fu] & empty).count_ones() as usize).min(8);
+                        let k3f = crate::policy::k3code_pub(me, opp, from);
+                        let (fg, ft) = p.jump_orig_parts(from, fh, k3f);
+                        orig_g[fu].write(fg);
+                        orig_tor[fu].write(ft);
+                    }
+                }
+                // SAFETY: `orig_valid & fbit != 0` ensures `orig_conn[fu]` (and `orig_g[fu]`/`orig_tor[fu]` under `HAS_POLICY`) was written.
+                let conn = unsafe { orig_conn[fu].assume_init() };
+                // exp/ab O1 (hole-aware jumps): a jump vacates its origin —
+                // leaving a connected origin breaks formation, so penalty
+                // scales with own stones adjacent to the origin square.
+                let mut sc = cap_sc - (ORD_JUMP_PEN + conn * ORD_JUMP_CONN);
+                let kk = m.to_u32();
+                if kk == k1 || kk == k2 {
+                    sc += ORD_KILLER;
+                }
+                sc += hist[fu][tu] / HIST_DIV;
+                if HAS_POLICY {
+                    let (p, xin, w) = pol.unwrap();
+                    let (fg, ft) = unsafe { (orig_g[fu].assume_init(), orig_tor[fu].assume_init()) };
+                    let z = p.jump_finish(to, j_prefix, j_td, fg, ft, xin);
+                    sc = sc.saturating_add((z * w) as i32);
+                }
+                list.push_scored(m, sc);
+            }
         }
-        let (hf, ht) = hist_key(m);
-        score += hist[hf][ht] / HIST_DIV;
-        list.set_score(i, score);
-        i += 1;
     }
+
     if !SKIP_TT && tt_index != usize::MAX && tt_index != 0 {
         list.swap(tt_index, 0);
     }
@@ -1706,12 +1789,52 @@ impl<'a> Searcher<'a> {
         }
 
         {
-            let list = &mut self.stack.lists[ply as usize];
-            score_into::<true>(b, list, skip_tt_mv, ply, &self.killers, &self.history);
+            match (self.policy, self.nnue) {
+                (Some(pol), Some(nn)) if depth >= self.pol_min => {
+                    if pol.dim > 0 && nn.pairwise {
+                        let mut buf = std::mem::take(&mut self.pol_buf);
+                        nn.policy_xin(b, &mut buf);
+                        let list = &mut self.stack.lists[ply as usize];
+                        gen_and_score_into::<true, true>(
+                            b,
+                            list,
+                            skip_tt_mv,
+                            ply,
+                            &self.killers,
+                            &self.history,
+                            Some((pol, &buf, self.pol_w)),
+                        );
+                        self.pol_buf = buf;
+                    } else {
+                        let list = &mut self.stack.lists[ply as usize];
+                        gen_and_score_into::<true, true>(
+                            b,
+                            list,
+                            skip_tt_mv,
+                            ply,
+                            &self.killers,
+                            &self.history,
+                            Some((pol, &[], self.pol_w)),
+                        );
+                    }
+                }
+                _ => {
+                    let list = &mut self.stack.lists[ply as usize];
+                    gen_and_score_into::<true, false>(
+                        b,
+                        list,
+                        skip_tt_mv,
+                        ply,
+                        &self.killers,
+                        &self.history,
+                        None,
+                    );
+                }
+            }
             // Fallthrough terminal: legal_moves_dedup_into tracks dedup
             // multiplicities, so len>0 always â€” but double-pass positions
             // have no children to search: score the pass-through.
-            if list.is_empty() && skip_tt_mv == 0 {
+            if self.stack.lists[ply as usize].is_empty() && skip_tt_mv == 0 {
                 self.heuristic_used = true;
                 let raw = match (self.nnue, self.sancta) {
                     (None, Some(net)) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
@@ -1729,27 +1852,6 @@ impl<'a> Searcher<'a> {
                     static_eval,
                 );
                 return static_eval;
-            }
-        }
-
-        if let (Some(pol), Some(nn)) = (self.policy, self.nnue) {
-            let n = self.stack.lists[ply as usize].len();
-            if n > 1 && depth >= self.pol_min {
-                let mut buf = std::mem::take(&mut self.pol_buf);
-                nn.policy_xin(b, &mut buf);
-                let mut kc = crate::policy::KCache::new();
-                for i in 0..n {
-                    let (m, sc) = {
-                        let l = &self.stack.lists[ply as usize];
-                        (l.move_at(i), l.score_at(i))
-                    };
-                    if sc == ORD_TT {
-                        continue;
-                    }
-                    let add = (pol.logit_k(b, m, &buf, &mut kc) * self.pol_w) as i32;
-                    self.stack.lists[ply as usize].set_score(i, sc.saturating_add(add));
-                }
-                self.pol_buf = buf;
             }
         }
 
@@ -1865,15 +1967,16 @@ impl<'a> Searcher<'a> {
                         let sn = small_net();
                         let pa = sn_parent
                             .get_or_insert_with(|| sn.acc(b.occ[bt], b.occ[1 - bt], b.blockers));
-                        let ca = sn.child_acc(
+                        let lo = sn.child_bound(
                             pa,
                             b.occ[bt],
                             b.occ[1 - bt],
                             child.occ[ct],
                             child.occ[1 - ct],
-                        );
-                        let lo = sn.bound_acc(&ca, child.empty().count_ones(), static_eval, hand)
-                            - FUT_SN_M;
+                            child.empty().count_ones(),
+                            static_eval,
+                            hand,
+                        ) - FUT_SN_M;
                         if new_depth - (alpha.saturating_add(lo) / MB_FUT_DIV).clamp(0, 64) <= 0
                             && best > -MATE_BOUND
                         {
@@ -2134,7 +2237,7 @@ impl<'a> Searcher<'a> {
             // array (best-first). Each iteration reorders the array.
             let (kill, hist) = (&self.killers, &self.history);
             let root = &mut self.stack.lists[0];
-            score_into::<false>(b, root, tt_mv, 0, kill, hist);
+            gen_and_score_into::<false, false>(b, root, tt_mv, 0, kill, hist, None);
         }
         let n_root = self.stack.lists[0].len();
         if n_root == 0 {
@@ -2776,6 +2879,115 @@ xxx....
                 let (e, d) = unpack_eval_dis(packed);
                 assert_eq!(e, eval_cp.clamp(-16384, 16383));
                 assert_eq!(d, dis_cp.clamp(0, 16383));
+            }
+        }
+    }
+
+    #[test]
+    fn gen_and_score_matches_reference() {
+        let mut x: u64 = 0xD1B5_4A32_D192_ED03;
+        let next_u64 = |s: &mut u64| {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        };
+        let mut killers = [(0u32, 0u32); MAX_PLY];
+        let mut history = Box::new([[[0i32; 49]; 49]; 2]);
+        for s in 0..2 {
+            for f in 0..49 {
+                for t in 0..49 {
+                    history[s][f][t] = ((next_u64(&mut x) % (2 * HIST_MAX as u64)) as i64 - HIST_MAX as i64) as i32;
+                }
+            }
+        }
+        let pol = crate::policy::bundled().expect("bundled policy");
+        let pol_w = 100_000.0f32;
+        let mut ref_list = MoveList::new();
+        let mut new_list = MoveList::new();
+
+        for n in 0..200 {
+            let mut b = Board::start();
+            for _ in 0..(n % 22) {
+                b.legal_moves_dedup_into(&mut ref_list);
+                if ref_list.is_empty() || b.game_over() {
+                    break;
+                }
+                let idx = (next_u64(&mut x) as usize) % ref_list.len();
+                b = b.make(ref_list.move_at(idx));
+            }
+            if b.game_over() {
+                continue;
+            }
+            let ply = (n % 16) as u32;
+            b.legal_moves_dedup_into(&mut ref_list);
+            if ref_list.is_empty() {
+                continue;
+            }
+            let tt_mv = if n % 3 == 0 {
+                0
+            } else {
+                crate::ttcodec::move_code(ref_list.move_at((next_u64(&mut x) as usize) % ref_list.len())) as u32
+            };
+            let k1 = kill_key(ref_list.move_at((next_u64(&mut x) as usize) % ref_list.len()));
+            let k2 = kill_key(ref_list.move_at((next_u64(&mut x) as usize) % ref_list.len()));
+            killers[ply as usize] = (k1, k2);
+
+            for with_pol in [false, true] {
+                let mut kc = crate::policy::KCache::new();
+                let mut expected: Vec<(Move, i32)> = Vec::new();
+                let opp = b.opp();
+                let me = b.occ[b.turn as usize];
+                let hist = &history[b.turn as usize];
+                let mut tt_pos = None;
+                for m in ref_list.iter() {
+                    if tt_mv != 0 && crate::ttcodec::move_code(m) as u32 == tt_mv {
+                        tt_pos = Some(expected.len());
+                        expected.push((m, ORD_TT));
+                        continue;
+                    }
+                    let mut sc = (opp & RING1[m.to as usize]).count_ones() as i32 * ORD_CAPTURE_UNIT;
+                    if m.is_clone() {
+                        sc += ORD_CLONE_BONUS;
+                    } else {
+                        let conn = (me & RING1[m.from as usize]).count_ones() as i32;
+                        sc -= ORD_JUMP_PEN + conn * ORD_JUMP_CONN;
+                    }
+                    let kk = kill_key(m);
+                    if kk == k1 || kk == k2 {
+                        sc += ORD_KILLER;
+                    }
+                    let (hf, ht) = hist_key(m);
+                    sc += hist[hf][ht] / HIST_DIV;
+                    if with_pol {
+                        let add = (pol.logit_k(&b, m, &[], &mut kc) * pol_w) as i32;
+                        sc = sc.saturating_add(add);
+                    }
+                    expected.push((m, sc));
+                }
+
+                // Check SKIP_TT = true (all non-TT moves in identical order with identical scores)
+                if with_pol {
+                    gen_and_score_into::<true, true>(&b, &mut new_list, tt_mv, ply, &killers, &history, Some((pol, &[], pol_w)));
+                } else {
+                    gen_and_score_into::<true, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None);
+                }
+                let expected_skip: Vec<(Move, i32)> = expected.iter().copied().enumerate().filter(|(i, _)| Some(*i) != tt_pos).map(|(_, v)| v).collect();
+                let actual_skip: Vec<(Move, i32)> = (0..new_list.len()).map(|i| (new_list.move_at(i), new_list.score_at(i))).collect();
+                assert_eq!(actual_skip, expected_skip, "SKIP_TT=true mismatch n={n} with_pol={with_pol}");
+
+                // Check SKIP_TT = false (TT swapped to index 0)
+                if !with_pol {
+                    gen_and_score_into::<false, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None);
+                    let mut expected_noskip = expected.clone();
+                    if let Some(tp) = tt_pos {
+                        if tp != 0 {
+                            expected_noskip.swap(tp, 0);
+                        }
+                    }
+                    let actual_noskip: Vec<(Move, i32)> = (0..new_list.len()).map(|i| (new_list.move_at(i), new_list.score_at(i))).collect();
+                    assert_eq!(actual_noskip, expected_noskip, "SKIP_TT=false mismatch n={n}");
+                }
             }
         }
     }

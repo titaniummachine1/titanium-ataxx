@@ -583,6 +583,17 @@ impl MoveList {
         }
     }
 
+    #[inline(always)]
+    pub fn push_scored(&mut self, m: Move, s: i32) {
+        debug_assert!(self.len < MAX_MOVES, "move list overflow");
+        if self.len < MAX_MOVES {
+            let len = self.len;
+            self.moves[len] = m;
+            self.scores[len] = s;
+            self.len = len + 1;
+        }
+    }
+
     #[inline]
     pub fn score_at(&self, i: usize) -> i32 {
         self.scores[i]

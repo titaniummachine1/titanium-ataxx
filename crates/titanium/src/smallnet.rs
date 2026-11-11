@@ -102,6 +102,7 @@ impl SmallNet {
         }
     }
 
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
     #[inline(always)]
     fn sub(&self, acc: &mut [f32; D2], mut bb: u64, off: usize) {
         while bb != 0 {
@@ -128,23 +129,116 @@ impl SmallNet {
         a
     }
 
+    /// Child accumulator written into `out` from `parent`: keeps the 64 lanes in AVX2 YMM registers
+    /// across all board diffs when AVX2+FMA are active at compile time.
+    #[inline(always)]
+    fn child_acc_into(
+        &self,
+        parent: &[f32; D2],
+        p_own: u64,
+        p_opp: u64,
+        c_own: u64,
+        c_opp: u64,
+        out: &mut std::mem::MaybeUninit<[f32; D2]>,
+    ) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+        {
+            use std::arch::x86_64::*;
+            // SAFETY: D2=64, W=32, and rows holds 147 entries (all sq < 49 so off + sq < 147).
+            unsafe {
+                let p = parent.as_ptr();
+                let mut v0 = _mm256_loadu_ps(p.add(W));
+                let mut v1 = _mm256_loadu_ps(p.add(W + 8));
+                let mut v2 = _mm256_loadu_ps(p.add(W + 16));
+                let mut v3 = _mm256_loadu_ps(p.add(W + 24));
+                let mut v4 = _mm256_loadu_ps(p);
+                let mut v5 = _mm256_loadu_ps(p.add(8));
+                let mut v6 = _mm256_loadu_ps(p.add(16));
+                let mut v7 = _mm256_loadu_ps(p.add(24));
+
+                macro_rules! apply_bb {
+                    ($bb:expr, $off:expr, $op:ident) => {
+                        let mut bb = $bb;
+                        while bb != 0 {
+                            let sq = bb.trailing_zeros() as usize;
+                            bb &= bb - 1;
+                            let r = self.rows.get_unchecked($off + sq).as_ptr();
+                            v0 = $op(v0, _mm256_loadu_ps(r));
+                            v1 = $op(v1, _mm256_loadu_ps(r.add(8)));
+                            v2 = $op(v2, _mm256_loadu_ps(r.add(16)));
+                            v3 = $op(v3, _mm256_loadu_ps(r.add(24)));
+                            v4 = $op(v4, _mm256_loadu_ps(r.add(32)));
+                            v5 = $op(v5, _mm256_loadu_ps(r.add(40)));
+                            v6 = $op(v6, _mm256_loadu_ps(r.add(48)));
+                            v7 = $op(v7, _mm256_loadu_ps(r.add(56)));
+                        }
+                    };
+                }
+                apply_bb!(p_opp & !c_own, 0, _mm256_sub_ps);
+                let add_own = c_own & !p_opp;
+                if add_own != 0 {
+                    apply_bb!(add_own, 0, _mm256_add_ps);
+                }
+                apply_bb!(p_own & !c_opp, 49, _mm256_sub_ps);
+                apply_bb!(c_opp & !p_own, 49, _mm256_add_ps);
+
+                let ap = out.as_mut_ptr() as *mut f32;
+                _mm256_storeu_ps(ap, v0);
+                _mm256_storeu_ps(ap.add(8), v1);
+                _mm256_storeu_ps(ap.add(16), v2);
+                _mm256_storeu_ps(ap.add(24), v3);
+                _mm256_storeu_ps(ap.add(32), v4);
+                _mm256_storeu_ps(ap.add(40), v5);
+                _mm256_storeu_ps(ap.add(48), v6);
+                _mm256_storeu_ps(ap.add(56), v7);
+            }
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
+        {
+            let mut a = [0f32; D2];
+            a[..W].copy_from_slice(&parent[W..]);
+            a[W..].copy_from_slice(&parent[..W]);
+            self.sub(&mut a, p_opp & !c_own, 0);
+            self.add(&mut a, c_own & !p_opp, 0);
+            self.sub(&mut a, p_own & !c_opp, 49);
+            self.add(&mut a, c_opp & !p_own, 49);
+            out.write(a);
+        }
+    }
+
     /// Child accumulator from the parent's: the child's side to move is the parent's opponent, so the parent's
     /// accumulator with its halves swapped is the child's BEFORE the move; then only the squares the move changed are
     /// updated (landing square, vacated jump origin, converted stones). Blockers never change. `p_own` / `p_opp` =
     /// parent side to move's stones / the other side's; `c_own` / `c_opp` = the same for the child.
     pub fn child_acc(&self, parent: &[f32; D2], p_own: u64, p_opp: u64, c_own: u64, c_opp: u64) -> [f32; D2] {
-        let mut a = [0f32; D2];
-        a[..W].copy_from_slice(&parent[W..]);
-        a[W..].copy_from_slice(&parent[..W]);
-        // before the move the child's own stones were the parent's opponent's, its opponent's the parent's own
-        self.sub(&mut a, p_opp & !c_own, 0);
-        self.add(&mut a, c_own & !p_opp, 0);
-        self.sub(&mut a, p_own & !c_opp, 49);
-        self.add(&mut a, c_opp & !p_own, 49);
-        a
+        let mut a = std::mem::MaybeUninit::<[f32; D2]>::uninit();
+        self.child_acc_into(parent, p_own, p_opp, c_own, c_opp, &mut a);
+        // SAFETY: `child_acc_into` initializes all D2 lanes.
+        unsafe { a.assume_init() }
+    }
+
+    /// Direct child accumulator + bound: avoids returning `[f32; D2]` on stack.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn child_bound(
+        &self,
+        parent: &[f32; D2],
+        p_own: u64,
+        p_opp: u64,
+        c_own: u64,
+        c_opp: u64,
+        empties: u32,
+        parent_cp: i32,
+        hand_cp: i32,
+    ) -> i32 {
+        let mut a = std::mem::MaybeUninit::<[f32; D2]>::uninit();
+        self.child_acc_into(parent, p_own, p_opp, c_own, c_opp, &mut a);
+        // SAFETY: `child_acc_into` initializes all D2 lanes.
+        self.bound_acc(unsafe { a.assume_init_ref() }, empties, parent_cp, hand_cp)
     }
 
     /// Head on a ready accumulator: `empties` of the position, `parent_cp` / `hand_cp` as in `bound`.
+    #[inline(always)]
     pub fn bound_acc(&self, a: &[f32; D2], empties: u32, parent_cp: i32, hand_cp: i32) -> i32 {
         let bk = (empties as usize * NB / 50).min(NB - 1);
         let mut y = self.out_b[bk] + self.l1_out(a, bk);
@@ -237,6 +331,9 @@ mod tests {
                 for j in 0..D2 {
                     assert!((inc[j] - full[j]).abs() < 1e-4, "acc lane {j}: {} vs {}", inc[j], full[j]);
                 }
+                let ref_bound = net.bound_acc(&inc, c.empty().count_ones(), 123, -45);
+                let direct_bound = net.child_bound(&pa, b.occ[bt], b.occ[1 - bt], c.occ[ct], c.occ[1 - ct], c.empty().count_ones(), 123, -45);
+                assert_eq!(direct_bound, ref_bound);
                 checked += 1;
             }
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);

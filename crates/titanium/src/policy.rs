@@ -124,6 +124,11 @@ fn k3code(me: u64, opp: u64, sq: u8) -> usize {
     T3[bits8f(me, s)] as usize + 2 * T3[bits8f(opp, s)] as usize
 }
 
+#[inline(always)]
+pub(crate) fn k3code_pub(me: u64, opp: u64, sq: u8) -> usize {
+    k3code(me, opp, sq)
+}
+
 /// D502: per-node memo of the 3x3 codes (many moves share a destination or an origin square); new() per node
 pub struct KCache {
     valid: u64,
@@ -179,6 +184,102 @@ mod tests {
             let opp = a & !x;
             for sq in 0..49u8 {
                 assert_eq!(super::k3code(me, opp, sq), k3ref(me, opp, sq));
+            }
+        }
+    }
+
+    #[test]
+    fn precomputed_logits_match_logit_k() {
+        use crate::board::{Board, MoveList, RING1, RING2};
+        let mut x: u64 = 0x517CC1B727220A95;
+        let next_u64 = |s: &mut u64| {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        };
+        let bundled = super::bundled().expect("bundled policy");
+        let mut list = MoveList::new();
+        // Synthetic dim>0 TPOL2/TPOL3 policy + bundled TPOL3 dim==0 policy
+        let dim = 8usize;
+        let mut synth = super::Policy {
+            dim,
+            bias: [0.0; super::SLOTS],
+            g: [0.0; super::NSCAL],
+            u: vec![0.0; super::SLOTS * dim],
+            td: vec![0i16; 18 * super::P3],
+            tor: vec![0i16; 9 * super::P3],
+            cls: true,
+        };
+        for (i, v) in synth.bias.iter_mut().enumerate() {
+            *v = ((i as i32 - 49) as f32) * 0.03125;
+        }
+        for (i, v) in synth.g.iter_mut().enumerate() {
+            *v = ((i as i32 - 20) as f32) * 0.0625;
+        }
+        for (i, v) in synth.u.iter_mut().enumerate() {
+            *v = (((i % 17) as i32 - 8) as f32) * 0.015625;
+        }
+        for (i, v) in synth.td.iter_mut().enumerate() {
+            *v = ((i as i32 * 37) % 1000 - 500) as i16;
+        }
+        for (i, v) in synth.tor.iter_mut().enumerate() {
+            *v = ((i as i32 * 53) % 1000 - 500) as i16;
+        }
+        let xin = [(0u16, 0.25f32), (3u16, 0.75f32), (6u16, 0.125f32)];
+
+        for pol in [bundled, &synth] {
+            let x_slice: &[(u16, f32)] = if pol.dim > 0 { &xin } else { &[] };
+            for n in 0..80 {
+                let mut b = Board::start();
+                for _ in 0..(n % 24) {
+                    b.legal_moves_dedup_into(&mut list);
+                    if list.is_empty() || b.game_over() {
+                        break;
+                    }
+                    let idx = (next_u64(&mut x) as usize) % list.len();
+                    b = b.make(list.move_at(idx));
+                }
+                if b.game_over() {
+                    continue;
+                }
+                let mut kc = super::KCache::new();
+                let me = b.me();
+                let opp = b.opp();
+                let empty = b.empty();
+                let mut targets = crate::board::reach_union(me) & empty;
+                while targets != 0 {
+                    let to = targets.trailing_zeros() as u8;
+                    targets &= targets - 1;
+                    let flips = ((opp & RING1[to as usize]).count_ones() as usize).min(8);
+                    let tholes = ((RING1[to as usize] & empty).count_ones() as usize).min(8);
+                    let k3_to = super::k3code_pub(me, opp, to);
+
+                    let clones = me & RING1[to as usize];
+                    if clones != 0 {
+                        let m = crate::board::Move {
+                            from: clones.trailing_zeros() as u8,
+                            to,
+                        };
+                        let expected = pol.logit_k(&b, m, x_slice, &mut kc);
+                        let actual = pol.clone_logit_pre(to, flips, tholes, k3_to, x_slice);
+                        assert_eq!(actual.to_bits(), expected.to_bits(), "clone mv {m:?}");
+                    }
+
+                    let (jp, jtd) = pol.jump_dest_parts(to, flips, tholes, k3_to);
+                    let mut jumps = me & RING2[to as usize];
+                    while jumps != 0 {
+                        let from = jumps.trailing_zeros() as u8;
+                        jumps &= jumps - 1;
+                        let m = crate::board::Move { from, to };
+                        let fh = ((RING1[from as usize] & empty).count_ones() as usize).min(8);
+                        let k3_from = super::k3code_pub(me, opp, from);
+                        let (fg, ft) = pol.jump_orig_parts(from, fh, k3_from);
+                        let expected = pol.logit_k(&b, m, x_slice, &mut kc);
+                        let actual = pol.jump_finish(to, jp, jtd, fg, ft, x_slice);
+                        assert_eq!(actual.to_bits(), expected.to_bits(), "jump mv {m:?}");
+                    }
+                }
             }
         }
     }
@@ -248,6 +349,96 @@ impl Policy {
                 t += self.tor[os * P3 + kc.get(me, opp, m.from)] as i32;
             }
             z += t as f32 * (1.0 / TQ);
+        }
+        z
+    }
+
+    /// Logit of a clone landing on `to` from precomputed per-destination features.
+    /// Bit-identical to `logit_k`.
+    #[inline(always)]
+    pub(crate) fn clone_logit_pre(
+        &self,
+        to: u8,
+        flips: usize,
+        tholes: usize,
+        k3_to: usize,
+        xin: &[(u16, f32)],
+    ) -> f32 {
+        let slot = to as usize;
+        let mut z = self.bias[slot] + self.g[9 + flips] + self.g[27 + tholes];
+        if self.dim != 0 {
+            let row = &self.u[slot * self.dim..(slot + 1) * self.dim];
+            for &(i, v) in xin {
+                z += row[i as usize] * v;
+            }
+        }
+        if !self.td.is_empty() {
+            let ds = if self.cls { CLS[slot] as usize * 2 } else { slot };
+            z += self.td[ds * P3 + k3_to] as i32 as f32 * (1.0 / TQ);
+        }
+        z
+    }
+
+    /// Destination-only prefix and quantized pattern term for all jumps landing on `to`.
+    #[inline(always)]
+    pub(crate) fn jump_dest_parts(
+        &self,
+        to: u8,
+        flips: usize,
+        tholes: usize,
+        k3_to: usize,
+    ) -> (f32, i32) {
+        let slot = to as usize + 49;
+        let prefix = self.bias[slot] + self.g[flips] + self.g[18 + tholes];
+        let td = if !self.td.is_empty() {
+            let ds = if self.cls { CLS[to as usize] as usize * 2 + 1 } else { slot };
+            self.td[ds * P3 + k3_to] as i32
+        } else {
+            0
+        };
+        (prefix, td)
+    }
+
+    /// Origin-only scalar term and quantized pattern term for jumps leaving `from`.
+    #[inline(always)]
+    pub(crate) fn jump_orig_parts(
+        &self,
+        from: u8,
+        from_holes: usize,
+        k3_from: usize,
+    ) -> (f32, i32) {
+        let g = self.g[36 + from_holes];
+        let tor = if !self.td.is_empty() {
+            let os = if self.cls { CLS[from as usize] as usize } else { from as usize };
+            self.tor[os * P3 + k3_from] as i32
+        } else {
+            0
+        };
+        (g, tor)
+    }
+
+    /// Finish a jump logit from precomputed destination + origin parts.
+    /// Exact left-to-right IEEE-754 order matches `logit_k` bit-for-bit.
+    #[inline(always)]
+    pub(crate) fn jump_finish(
+        &self,
+        to: u8,
+        j_prefix: f32,
+        j_td: i32,
+        from_g: f32,
+        from_tor: i32,
+        xin: &[(u16, f32)],
+    ) -> f32 {
+        let mut z = j_prefix + from_g;
+        if self.dim != 0 {
+            let slot = to as usize + 49;
+            let row = &self.u[slot * self.dim..(slot + 1) * self.dim];
+            for &(i, v) in xin {
+                z += row[i as usize] * v;
+            }
+        }
+        if !self.td.is_empty() {
+            z += (j_td + from_tor) as f32 * (1.0 / TQ);
         }
         z
     }

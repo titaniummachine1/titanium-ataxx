@@ -102,6 +102,12 @@ pub fn decode_move(b: &crate::board::Board, code: u16) -> Option<Move> {
     }
 }
 
+/// Code of a move when both squares are known to be on-board (no pass/bounds branch).
+#[inline(always)]
+pub(crate) fn jump_code(from: u8, to: u8) -> u16 {
+    CODE[from as usize * NSQ + to as usize]
+}
+
 /// Code of a move (clones collapse to their destination, jumps keep (from, to), pass = PASS_CODE).
 #[inline(always)]
 pub fn move_code(m: Move) -> u16 {
