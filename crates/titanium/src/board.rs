@@ -929,11 +929,40 @@ impl Board {
         }
     }
 
+    /// Botzone-judge status `(over, has_moves_black, has_moves_white)` using a single
+    /// symmetric dilation of `empty` (and stopping after 1-step `box1` in the common case
+    /// where both sides have clone moves). Bit-identical to `(bz_over(), has_moves(0), has_moves(1))`.
+    #[inline(always)]
+    pub fn bz_status(&self) -> (bool, bool, bool) {
+        let empty = self.empty();
+        let r1 = box1(empty);
+        if (r1 & self.occ[0]) != 0 && (r1 & self.occ[1]) != 0 {
+            return (false, true, true);
+        }
+        let r2 = box1(r1);
+        let hm0 = (r2 & self.occ[0]) != 0;
+        let hm1 = (r2 & self.occ[1]) != 0;
+        (!hm0 || !hm1, hm0, hm1)
+    }
+
     /// Botzone-judge terminal: wipeout/full, or EITHER side stuck. The
     /// platform has no passes: the judge ends the game the moment one side
     /// cannot move, with the mobile side absorbing every empty square.
+    #[inline(always)]
     pub fn bz_over(&self) -> bool {
-        self.is_over() || !self.has_moves(0) || !self.has_moves(1)
+        self.bz_status().0
+    }
+
+    /// Filled counts under the Botzone stalemate rule from precomputed `(hm0, hm1)`.
+    #[inline(always)]
+    pub fn bz_counts_from(&self, hm0: bool, hm1: bool) -> (u32, u32) {
+        let (b, w) = self.counts();
+        let fill = SQUARES as u32 - self.blocker_cnt as u32;
+        match (hm0, hm1) {
+            (false, false) | (true, true) => (b, w),
+            (false, true) => (b, fill - b),
+            (true, false) => (fill - w, w),
+        }
     }
 
     /// Filled counts under the Botzone stalemate rule: a stuck side keeps
@@ -941,13 +970,8 @@ impl Board {
     /// (`mobile = SQUARES - blockers - stuck`, the judge's `49 - stuck` on
     /// blocker-free boards). Both stuck (or both mobile) -> raw counts.
     pub fn bz_counts(&self) -> (u32, u32) {
-        let (b, w) = self.counts();
-        let fill = SQUARES as u32 - self.blocker_cnt as u32;
-        match (self.has_moves(0), self.has_moves(1)) {
-            (false, false) | (true, true) => (b, w),
-            (false, true) => (b, fill - b),
-            (true, false) => (fill - w, w),
-        }
+        let (_, hm0, hm1) = self.bz_status();
+        self.bz_counts_from(hm0, hm1)
     }
 
     /// Standard 4-corner opening used by Botzone/libataxx: black a7+g1
@@ -1906,5 +1930,78 @@ mod tests {
         assert!(!r401_2);
         assert_eq!(snaps2, vec![(b1.occ[0], b1.occ[1])]);
         assert_eq!(b2.occ, b1.occ);
+    }
+
+    #[test]
+    fn bz_status_matches_reference() {
+        let ref_over = |b: &Board| b.is_over() || !b.has_moves(0) || !b.has_moves(1);
+        let ref_counts = |b: &Board| {
+            let (bw, ww) = b.counts();
+            let fill = SQUARES as u32 - b.blocker_cnt as u32;
+            match (b.has_moves(0), b.has_moves(1)) {
+                (false, false) | (true, true) => (bw, ww),
+                (false, true) => (bw, fill - bw),
+                (true, false) => (fill - ww, ww),
+            }
+        };
+
+        let mut seed: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        // 1. Playouts from startpos
+        for _ in 0..40 {
+            let mut b = Board::start();
+            for _ in 0..80 {
+                let (over, hm0, hm1) = b.bz_status();
+                assert_eq!(over, ref_over(&b), "playout over mismatch");
+                assert_eq!((hm0, hm1), (b.has_moves(0), b.has_moves(1)));
+                assert_eq!(b.bz_counts(), ref_counts(&b));
+                assert_eq!(b.bz_over(), over);
+                if b.game_over() {
+                    break;
+                }
+                let moves = b.legal_moves();
+                if moves.is_empty() {
+                    b = b.make_pass();
+                } else {
+                    b = b.make(moves.move_at((next() % moves.len() as u64) as usize));
+                }
+            }
+        }
+
+        // 2. Random sparse/dense/blocker/wipeout/full/jump-only boards
+        for _ in 0..2000 {
+            let mut occ0 = 0u64;
+            let mut occ1 = 0u64;
+            let mut blk = 0u64;
+            let r_thresh = (next() % 100) as u64;
+            for sq in 0..SQUARES as u8 {
+                let v = next() % 100;
+                let bit = bit_of(sq);
+                if v < r_thresh / 3 {
+                    occ0 |= bit;
+                } else if v < (2 * r_thresh) / 3 {
+                    occ1 |= bit;
+                } else if v < r_thresh && (next() % 4 == 0) {
+                    blk |= bit;
+                }
+            }
+            if next() % 16 == 0 {
+                occ0 = 0;
+            } else if next() % 16 == 1 {
+                occ1 = 0;
+            }
+            let b = Board::from_occ(occ0, occ1, blk, (next() & 1) as u8);
+            let (over, hm0, hm1) = b.bz_status();
+            assert_eq!(over, ref_over(&b), "rand over mismatch occ={:?}", b.occ);
+            assert_eq!((hm0, hm1), (b.has_moves(0), b.has_moves(1)));
+            assert_eq!(b.bz_counts(), ref_counts(&b));
+            assert_eq!(b.bz_over(), over);
+        }
     }
 }

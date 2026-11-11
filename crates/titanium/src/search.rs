@@ -694,8 +694,9 @@ fn terminal_score(b: &Board, ply: u32) -> i32 {
 /// Botzone-judge terminal score from the side-to-move's perspective: filled
 /// counts (the mobile side absorbs empties), so a stalemate of the opponent
 /// is a forced win, not a pass-and-continue. Same MATE shape as `terminal_score`.
-fn bz_terminal_score(b: &Board, ply: u32) -> i32 {
-    let (fb, fw) = b.bz_counts();
+#[inline(always)]
+fn bz_terminal_score_counts(b: &Board, hm0: bool, hm1: bool, ply: u32) -> i32 {
+    let (fb, fw) = b.bz_counts_from(hm0, hm1);
     let diff = if b.turn == 0 {
         fb as i32 - fw as i32
     } else {
@@ -708,6 +709,24 @@ fn bz_terminal_score(b: &Board, ply: u32) -> i32 {
     } else {
         0
     }
+}
+
+fn bz_terminal_score(b: &Board, ply: u32) -> i32 {
+    let (_, hm0, hm1) = b.bz_status();
+    bz_terminal_score_counts(b, hm0, hm1, ply)
+}
+
+#[inline(always)]
+fn banned_contains(buf: &[std::mem::MaybeUninit<(u64, u64)>; 32], n: usize, snap: (u64, u64)) -> bool {
+    let mut i = 0;
+    while i < n {
+        // SAFETY: callers only pass `n <= 32` after initializing slots `0..n`.
+        if unsafe { buf[i].assume_init() } == snap {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Pre-capture occupancy `(black, white)` right after `m` is placed, matching
@@ -1608,13 +1627,14 @@ impl<'a> Searcher<'a> {
         if BZ {
             // Botzone judge checks both sides after every move (!blackHasMove || !whiteHasMove):
             // if either side has no legal moves, or wipeout/full, the game ends immediately.
-            if b.bz_over() {
-                return bz_terminal_score(b, ply);
+            let (over, hm0, hm1) = b.bz_status();
+            if over {
+                return bz_terminal_score_counts(b, hm0, hm1, ply);
             }
             // Judge also ends the game unconditionally after ply 401 (Black's 201st half-move).
             if ply >= self.bz_max_plies {
                 self.bz_tainted[ply as usize] = true;
-                return bz_terminal_score(b, ply);
+                return bz_terminal_score_counts(b, hm0, hm1, ply);
             }
         } else if b.game_over() {
             return terminal_score(b, ply);
@@ -1634,7 +1654,7 @@ impl<'a> Searcher<'a> {
         let at_bz_horizon = BZ && ply.saturating_add(depth) >= self.bz_max_plies;
         let mut cur_v = 0usize;
         let mut rbase = 0usize;
-        let mut banned_snaps = [(0u64, 0u64); 32];
+        let mut banned_snaps = [std::mem::MaybeUninit::<(u64, u64)>::uninit(); 32];
         let mut n_banned = 0usize;
         let mut banned_overflow = false;
         if BZ {
@@ -1642,12 +1662,13 @@ impl<'a> Searcher<'a> {
             rbase = self.bz_rep_base[ply as usize] as usize;
             if self.bz_start_ply + ply >= 3 && cur_v >= rbase + 2 {
                 let last = self.bz_snaps[cur_v];
-                for i in rbase..=(cur_v - 2) {
-                    if self.bz_snaps[i] == last {
-                        let ban = self.bz_snaps[i + 1];
-                        if !banned_snaps[..n_banned].contains(&ban) {
-                            if n_banned < banned_snaps.len() {
-                                banned_snaps[n_banned] = ban;
+                let hist = &self.bz_snaps[rbase..cur_v];
+                for i in 0..hist.len() - 1 {
+                    if hist[i] == last {
+                        let ban = hist[i + 1];
+                        if !banned_contains(&banned_snaps, n_banned, ban) {
+                            if n_banned < 32 {
+                                banned_snaps[n_banned].write(ban);
                                 n_banned += 1;
                             } else {
                                 banned_overflow = true;
@@ -1794,7 +1815,7 @@ impl<'a> Searcher<'a> {
                             let from = froms.trailing_zeros() as u8;
                             froms &= froms - 1;
                             let snap = placement_snap(b, Move { from, to });
-                            let banned = banned_snaps[..n_banned].contains(&snap)
+                            let banned = banned_contains(&banned_snaps, n_banned, snap)
                                 || (banned_overflow && {
                                     let last = self.bz_snaps[cur_v];
                                     self.bz_snaps[rbase..=cur_v - 1]
@@ -1833,17 +1854,15 @@ impl<'a> Searcher<'a> {
                 skip_tt_mv = tt_mv;
                 let mut is_rep = false;
                 let mut c_snap = (0u64, 0u64);
-                if BZ {
+                if BZ && !m.is_clone() && n_banned > 0 {
                     c_snap = placement_snap(b, m);
-                    if !m.is_clone() && n_banned > 0 {
-                        is_rep = banned_snaps[..n_banned].contains(&c_snap)
-                            || (banned_overflow && {
-                                let last = self.bz_snaps[cur_v];
-                                self.bz_snaps[rbase..=cur_v - 1]
-                                    .windows(2)
-                                    .any(|w| w[0] == last && w[1] == c_snap)
-                            });
-                    }
+                    is_rep = banned_contains(&banned_snaps, n_banned, c_snap)
+                        || (banned_overflow && {
+                            let last = self.bz_snaps[cur_v];
+                            self.bz_snaps[rbase..=cur_v - 1]
+                                .windows(2)
+                                .any(|w| w[0] == last && w[1] == c_snap)
+                        });
                     if is_rep {
                         rep_skipped = true;
                         tainted = true;
@@ -1874,6 +1893,9 @@ impl<'a> Searcher<'a> {
                         self.ec_imp = 1;
                         self.stack.imp[ply as usize + 1] = 3;
                         if BZ {
+                            if m.is_clone() || n_banned == 0 {
+                                c_snap = placement_snap(b, m);
+                            }
                             self.bz_snaps[cur_v + 1] = c_snap;
                             self.bz_rep_base[ply as usize + 1] = if m.is_clone() {
                                 (cur_v + 1) as u32
@@ -2043,21 +2065,19 @@ impl<'a> Searcher<'a> {
             // first is reduced by how far its child's STATIC eval falls short of alpha, and a move reduced to depth
             // <= 0 is not searched at all. First move: full window, full depth (always searched, so best is set).
             let mut c_snap = (0u64, 0u64);
-            if BZ {
+            if BZ && !m.is_clone() && n_banned > 0 {
                 c_snap = placement_snap(b, m);
-                if !m.is_clone() && n_banned > 0 {
-                    let is_rep = banned_snaps[..n_banned].contains(&c_snap)
-                        || (banned_overflow && {
-                            let last = self.bz_snaps[cur_v];
-                            self.bz_snaps[rbase..=cur_v - 1]
-                                .windows(2)
-                                .any(|w| w[0] == last && w[1] == c_snap)
-                        });
-                    if is_rep {
-                        rep_skipped = true;
-                        tainted = true;
-                        continue;
-                    }
+                let is_rep = banned_contains(&banned_snaps, n_banned, c_snap)
+                    || (banned_overflow && {
+                        let last = self.bz_snaps[cur_v];
+                        self.bz_snaps[rbase..=cur_v - 1]
+                            .windows(2)
+                            .any(|w| w[0] == last && w[1] == c_snap)
+                    });
+                if is_rep {
+                    rep_skipped = true;
+                    tainted = true;
+                    continue;
                 }
             }
             let child = b.make(m);
@@ -2086,14 +2106,7 @@ impl<'a> Searcher<'a> {
             // D590 (user): the top ~10-15 moves are real candidates the search often keeps unreduced
             self.ec_imp = (move_idx < 12) as u32;
             self.stack.imp[ply as usize + 1] = if move_idx == 0 { 3 } else if move_idx < 12 { 2 } else { 1 };
-            if BZ {
-                self.bz_snaps[cur_v + 1] = c_snap;
-                self.bz_rep_base[ply as usize + 1] = if m.is_clone() {
-                    (cur_v + 1) as u32
-                } else {
-                    rbase as u32
-                };
-            } else {
+            if !BZ {
                 self.stack.path_hash[ply as usize + 1] = child.hash;
                 self.stack.rep_base[ply as usize + 1] = if m.is_clone() {
                     ply + 1
@@ -2201,6 +2214,17 @@ impl<'a> Searcher<'a> {
                 self.heuristic_used = true;
                 move_idx += 1;
                 continue;
+            }
+            if BZ {
+                if m.is_clone() || n_banned == 0 {
+                    c_snap = placement_snap(b, m);
+                }
+                self.bz_snaps[cur_v + 1] = c_snap;
+                self.bz_rep_base[ply as usize + 1] = if m.is_clone() {
+                    (cur_v + 1) as u32
+                } else {
+                    rbase as u32
+                };
             }
             let mut score;
             if move_idx == 0 {
@@ -2431,12 +2455,15 @@ impl<'a> Searcher<'a> {
         // Instant terminal fast path (Botzone rules): a full board, a stuck
         // side (including a stuck OPPONENT, which movegen alone would miss),
         // or already past ply 401 ends the game on the spot: zero nodes searched.
-        if BZ && (b.bz_over() || self.bz_max_plies == 0) {
-            result.score = bz_terminal_score(b, 0);
-            result.elapsed = self.elapsed();
-            result.nodes = self.nodes;
-            result.stopped_by = Some(StopReason::Completed);
-            return result;
+        if BZ {
+            let (over, hm0, hm1) = b.bz_status();
+            if over || self.bz_max_plies == 0 {
+                result.score = bz_terminal_score_counts(b, hm0, hm1, 0);
+                result.elapsed = self.elapsed();
+                result.nodes = self.nodes;
+                result.stopped_by = Some(StopReason::Completed);
+                return result;
+            }
         }
         self.tt.step_age();
         if self.tt.age == 1 {
