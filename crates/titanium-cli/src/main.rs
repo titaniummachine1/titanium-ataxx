@@ -148,6 +148,7 @@ fn main() -> ExitCode {
             args.iter().any(|x| x == "--corr"),
             network_flag(&args),
             max_depth_flag(&args),
+            args.iter().any(|x| x == "--bz"),
         ),
         "match" => match_cmd(
             flag_int(&args, "--games").unwrap_or(20) as u32,
@@ -205,7 +206,7 @@ fn print_help() {
          \x20 --max-depth 1..255 limits iterative deepening; --nnue and --depth remain aliases.\n\
          \x20 --exact-search disables the fast futility filter; --no-fut-sn remains an alias.\n\
          \x20 titanium-cli bench [--max-depth N] [--network FILE]  search speed benchmark\n\
-         \x20 titanium-cli serve [--max-depth 30]                 UAI engine (30 is the Botzone cap)\n\
+         \x20 titanium-cli serve [--max-depth 30] [--bz]          UAI engine (30 is the Botzone cap)\n\
          \x20 titanium-cli match --games N --opp \"CMD\" [--net F] [--opp-net F]\n\
          \x20             [--time-limit-ms MS --node-limit N --opponent-max-depth N]\n\
          \x20             [--out F]                       colors alternate\n\
@@ -1428,6 +1429,34 @@ fn out_line(s: &str) {
     let _ = o.flush();
 }
 
+fn serve_search(
+    searcher: &mut Searcher,
+    b: &Board,
+    snaps: &[(u64, u64)],
+    respect_401: bool,
+    bz: bool,
+    limits: &SearchLimits,
+) -> Option<titanium::SearchResult> {
+    if bz {
+        if b.game_over() || !b.has_moves(b.turn) {
+            return None;
+        }
+        // Fallback to classic when the opponent already has 0 moves while we still have moves
+        // (possible only if `--bz` is driven under classic pass rules).
+        let r = if b.bz_over() {
+            searcher.search(b, limits)
+        } else {
+            searcher.search_bz_game(b, limits, &[], snaps, respect_401)
+        };
+        Some(r)
+    } else {
+        if b.game_over() || !b.has_moves(b.turn) {
+            return None;
+        }
+        Some(searcher.search(b, limits))
+    }
+}
+
 fn serve_cmd(
     tt_bits: usize,
     net_spec: Option<String>,
@@ -1436,6 +1465,7 @@ fn serve_cmd(
     corr: bool,
     nnue_spec: Option<String>,
     max_depth: u8,
+    bz: bool,
 ) -> ExitCode {
     let stdin = io::stdin();
     let mut searcher = Searcher::with_tt_bits_unconfigured(tt_bits);
@@ -1448,9 +1478,10 @@ fn serve_cmd(
         }
     };
     eprintln!(
-        "serve: network={}, max-depth={}",
+        "serve: network={}, max-depth={}{}",
         network_description(&nnue_spec),
-        max_depth
+        max_depth,
+        if bz { ", rules=botzone" } else { "" }
     );
     let tup_spec = eff_tuple_spec(&tup_spec, &nnue_spec);
     // Eval presets come from --net / --tuple ONLY. Owned tables outlive the
@@ -1475,6 +1506,8 @@ fn serve_cmd(
     searcher.set_corr(corr);
     searcher.set_nnue(owned_nn.as_ref());
     let mut current: Option<Board> = None;
+    let mut bz_snaps: Vec<(u64, u64)> = Vec::new();
+    let mut respect_401 = false;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         let t = line.trim().to_string();
@@ -1495,10 +1528,28 @@ fn serve_cmd(
             out_line("readyok");
         } else if t == "uainewgame" {
             searcher.reset_for_new_game();
+            bz_snaps.clear();
+            respect_401 = false;
         } else if let Some(args) = t.strip_prefix("position ") {
-            current = Board::from_uai_position(args);
-            if current.is_none() {
-                out_line(&format!("info string bad position: {args}"));
+            if bz {
+                match Board::from_uai_position_bz(args) {
+                    Some((b, snaps, r401)) => {
+                        current = Some(b);
+                        bz_snaps = snaps;
+                        respect_401 = r401;
+                    }
+                    None => {
+                        current = None;
+                        bz_snaps.clear();
+                        respect_401 = false;
+                        out_line(&format!("info string bad position: {args}"));
+                    }
+                }
+            } else {
+                current = Board::from_uai_position(args);
+                if current.is_none() {
+                    out_line(&format!("info string bad position: {args}"));
+                }
             }
         } else if t.starts_with("go") {
             let mut nodes = None;
@@ -1516,9 +1567,6 @@ fn serve_cmd(
             let reply = current
                 .as_ref()
                 .map(|b| {
-                    if b.game_over() || !b.has_moves(b.turn) {
-                        return "0000".to_string();
-                    }
                     let explicit_depth = depth.is_some();
                     let depth = depth
                         .unwrap_or(u32::from(max_depth))
@@ -1535,7 +1583,9 @@ fn serve_cmd(
                         max_nodes: nodes,
                         max_depth: depth as u8,
                     };
-                    let r = searcher.search(b, &limits);
+                    let Some(r) = serve_search(&mut searcher, b, &bz_snaps, respect_401, bz, &limits) else {
+                        return "0000".to_string();
+                    };
                     // mandatory for gate analysis: what the engine thought of the move it played
                     out_line(&uai_info(&r));
                     match r.best {
@@ -2515,4 +2565,25 @@ fn treebook_cmd(
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_bz_falls_back_when_opponent_stuck_under_classic() {
+        // White has no legal moves, Black is mobile -> bz_over() is true even though Black has a move.
+        // `serve_search` in `--bz` mode must still return a legal Black move (never 0000 forfeit).
+        let fen = "oxx4/xxx4/xxx4/7/7/7/6x x 0 1";
+        let (b, snaps, r401) = Board::from_uai_position_bz(&format!("fen {fen}")).unwrap();
+        assert!(b.has_moves(0) && !b.has_moves(1) && b.bz_over());
+        let mut se = Searcher::with_tt_bits_unconfigured(14);
+        let nn = titanium::nnue::Nnue::bundled();
+        se.set_nnue(Some(&nn));
+        let lim = SearchLimits { time: None, max_nodes: None, max_depth: 3 };
+        let res = serve_search(&mut se, &b, &snaps, r401, true, &lim).expect("must return search result");
+        let mv = res.best.expect("must not forfeit when side-to-move has legal moves");
+        assert!(b.legal_moves().contains(&mv));
+    }
 }

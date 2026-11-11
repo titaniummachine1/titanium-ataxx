@@ -714,13 +714,7 @@ fn bz_terminal_score(b: &Board, ply: u32) -> i32 {
 /// the Botzone judge's `savehistory()` snapshot for repetition detection.
 #[inline(always)]
 fn placement_snap(b: &Board, m: Move) -> (u64, u64) {
-    let me = b.turn as usize;
-    let mut occ = b.occ;
-    if !m.is_clone() {
-        occ[me] &= !(1u64 << m.from);
-    }
-    occ[me] |= 1u64 << m.to;
-    (occ[0], occ[1])
+    b.placement_snap(m)
 }
 
 /// Move scoring is fixed: TT move > killers > captures*W + history, consumed

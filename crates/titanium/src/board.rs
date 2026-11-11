@@ -1235,6 +1235,19 @@ impl Board {
         }
     }
 
+    /// Pre-capture occupancy `(black, white)` right after `m` is placed, matching
+    /// the Botzone judge's `savehistory()` snapshot for repetition detection.
+    #[inline(always)]
+    pub fn placement_snap(&self, m: Move) -> (u64, u64) {
+        let me = self.turn as usize;
+        let mut occ = self.occ;
+        if !m.is_clone() {
+            occ[me] &= !(1u64 << m.from);
+        }
+        occ[me] |= 1u64 << m.to;
+        (occ[0], occ[1])
+    }
+
     /// Parse a UAI `position` argument: `startpos` or `fen <fen>`, optionally
     /// followed by `moves m1 m2 ...`. Any unparsable or illegal move = None.
     pub fn from_uai_position(args: &str) -> Option<Board> {
@@ -1252,6 +1265,31 @@ impl Board {
             b = b.make_uai(m);
         }
         Some(b)
+    }
+
+    /// Parse a UAI `position` argument together with pre-capture placement
+    /// snapshots for Botzone-rules search, plus whether full game-ply history
+    /// from `startpos` is known (`respect_401`).
+    pub fn from_uai_position_bz(args: &str) -> Option<(Board, Vec<(u64, u64)>, bool)> {
+        let (base, moves) = match args.split_once(" moves") {
+            Some((b, m)) => (b.trim(), m),
+            None => (args.trim(), ""),
+        };
+        let (mut b, respect_401) = if base == "startpos" {
+            (Board::start(), true)
+        } else {
+            (Board::from_ataxx_fen(base.strip_prefix("fen ")?.trim())?, false)
+        };
+        let mut snaps = Vec::with_capacity(16);
+        snaps.push((b.occ[0], b.occ[1]));
+        for tok in moves.split_whitespace() {
+            let m = b.parse_uai_move(tok)?;
+            if !m.is_pass() {
+                snaps.push(b.placement_snap(m));
+            }
+            b = b.make_uai(m);
+        }
+        Some((b, snaps, respect_401))
     }
 
     /// Parse a square name like "d4".
@@ -1846,5 +1884,27 @@ mod tests {
                 b = b.make(moves.move_at((rng() % moves.len() as u64) as usize));
             }
         }
+    }
+
+    #[test]
+    fn uai_position_bz_tracks_snaps_and_horizon_flag() {
+        let s = Board::start();
+        let (b1, snaps1, r401_1) = Board::from_uai_position_bz("startpos moves b7 g7g5").unwrap();
+        assert!(r401_1);
+        assert_eq!(snaps1.len(), 3);
+        assert_eq!(snaps1[0], (s.occ[0], s.occ[1]));
+        let m1 = s.parse_uai_move("b7").unwrap();
+        assert_eq!(snaps1[1], s.placement_snap(m1));
+        let after1 = s.make(m1);
+        let m2 = after1.parse_uai_move("g7g5").unwrap();
+        assert_eq!(snaps1[2], after1.placement_snap(m2));
+        assert_eq!(b1.occ, after1.make(m2).occ);
+
+        let fen = b1.to_ataxx_fen();
+        let (b2, snaps2, r401_2) =
+            Board::from_uai_position_bz(&format!("fen {fen}")).unwrap();
+        assert!(!r401_2);
+        assert_eq!(snaps2, vec![(b1.occ[0], b1.occ[1])]);
+        assert_eq!(b2.occ, b1.occ);
     }
 }
