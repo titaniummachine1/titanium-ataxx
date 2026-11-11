@@ -627,6 +627,13 @@ impl MoveList {
         self.scores.swap(i, j);
     }
 
+    #[inline]
+    pub fn swap_remove(&mut self, i: usize) {
+        self.len -= 1;
+        self.moves[i] = self.moves[self.len];
+        self.scores[i] = self.scores[self.len];
+    }
+
     /// Lazily extract the highest-scored remaining move (swap-with-last).
     /// Cheaper than a full sort at cut-nodes: alpha-beta usually refutes in
     /// the first few picks, and this only ever pays for what it uses.

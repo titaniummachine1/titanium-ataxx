@@ -537,8 +537,11 @@ pub fn evaluate(b: &Board, tup: Option<&TupleTable>, native_tup: bool) -> i32 {
 /// Free function (not a method) so negamax can borrow the move stack
 /// mutably while reading killers/history immutably â€” no split-borrow
 /// fight, no unsafe, no clone.
+const HIST_DIV: i32 = HIST_MAX / ORD_HIST_FULL;
+const _: () = assert!(HIST_MAX % ORD_HIST_FULL == 0);
+
 #[inline]
-fn score_into(
+fn score_into<const SKIP_TT: bool>(
     b: &Board,
     list: &mut MoveList,
     tt_mv: u32,
@@ -548,15 +551,22 @@ fn score_into(
 ) {
     b.legal_moves_dedup_into(list);
     let opp = b.opp();
+    let me = b.occ[b.turn as usize];
     let (k1, k2) = killers[ply as usize];
     let hist = &history[b.turn as usize];
     let mut tt_index = usize::MAX;
-    for i in 0..list.len() {
+    let mut i = 0;
+    while i < list.len() {
         let m = list.move_at(i);
         // the TT move is a ttcodec move code: a clone matches by destination, a jump by (from, to)
-        if crate::ttcodec::move_code(m) as u32 == tt_mv {
+        if tt_mv != 0 && crate::ttcodec::move_code(m) as u32 == tt_mv {
+            if SKIP_TT {
+                list.swap_remove(i);
+                continue;
+            }
             tt_index = i;
             list.set_score(i, i32::MAX / 2);
+            i += 1;
             continue;
         }
         let mut score = (opp & RING1[m.to as usize]).count_ones() as i32 * ORD_CAPTURE_UNIT;
@@ -569,7 +579,7 @@ fn score_into(
             // exp/ab O1 (hole-aware jumps): a jump vacates its origin â€”
             // leaving a connected origin breaks formation, so penalty
             // scales with own stones adjacent to the origin square.
-            let conn = (b.occ[b.turn as usize] & RING1[m.from as usize]).count_ones() as i32;
+            let conn = (me & RING1[m.from as usize]).count_ones() as i32;
             score -= ORD_JUMP_PEN + conn * ORD_JUMP_CONN;
         }
         let kk = kill_key(m);
@@ -577,10 +587,11 @@ fn score_into(
             score += ORD_KILLER;
         }
         let (hf, ht) = hist_key(m);
-        score += (hist[hf][ht] as i64 * ORD_HIST_FULL as i64 / HIST_MAX as i64) as i32;
+        score += hist[hf][ht] / HIST_DIV;
         list.set_score(i, score);
+        i += 1;
     }
-    if tt_index != usize::MAX && tt_index != 0 {
+    if !SKIP_TT && tt_index != usize::MAX && tt_index != 0 {
         list.swap(tt_index, 0);
     }
 }
@@ -1619,13 +1630,88 @@ impl<'a> Searcher<'a> {
             return static_eval;
         }
 
+        let mut best = i32::MIN;
+        let mut best_mv: u32 = 0xFFFF;
+        let mut move_idx = 0usize;
+        let mut rep_skipped = false;
+        let mut skip_tt_mv: u32 = 0;
+
+        // Pre-movegen TT move fast path: decode & verify legality in O(1) and search first;
+        // on a beta cutoff, return immediately without generating/scoring the full move list.
+        if tt_mv != 0 {
+            if let Some(m) = crate::ttcodec::decode_move(b, tt_mv as u16) {
+                skip_tt_mv = tt_mv;
+                let child = b.make(m);
+                let mut is_rep = false;
+                if !m.is_clone() {
+                    let base = self.stack.rep_base[ply as usize] as usize;
+                    if (ply as usize) >= base + 1 {
+                        let mut i = ply as usize - 1;
+                        loop {
+                            if self.stack.path_hash[i] == child.hash {
+                                is_rep = true;
+                                break;
+                            }
+                            if i < base + 2 {
+                                break;
+                            }
+                            i -= 2;
+                        }
+                    }
+                }
+                if is_rep {
+                    rep_skipped = true;
+                } else {
+                    self.prefetch_child(child.hash);
+                    self.ec_imp = 1;
+                    self.stack.imp[ply as usize + 1] = 3;
+                    self.stack.path_hash[ply as usize + 1] = child.hash;
+                    self.stack.rep_base[ply as usize + 1] = if m.is_clone() {
+                        ply + 1
+                    } else {
+                        self.stack.rep_base[ply as usize]
+                    };
+                    if let Some(net) = self.sancta {
+                        let (a, z) = self.stack.acc.split_at_mut(ply as usize + 1);
+                        net.update_child(&a[ply as usize], &mut z[0], b, &child);
+                    }
+                    let score =
+                        -self.negamax::<BZ>(&child, -beta, -alpha, depth - 1, ply + 1, true);
+                    if self.stop {
+                        return 0;
+                    }
+                    move_idx = 1;
+                    if score <= alpha {
+                        self.hist_add(b.turn as usize, m, -((depth * depth) as i32));
+                    }
+                    best = score;
+                    best_mv = m.to_u32();
+                    if score > alpha {
+                        alpha = score;
+                        if alpha >= beta {
+                            self.on_cutoff(b, m, depth, ply);
+                            if best > alpha_orig && best_mv != 0xFFFF {
+                                self.hist_add(
+                                    b.turn as usize,
+                                    m,
+                                    HIST_SCALE * (depth * depth) as i32,
+                                );
+                            }
+                            self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply, raw);
+                            return best;
+                        }
+                    }
+                }
+            }
+        }
+
         {
             let list = &mut self.stack.lists[ply as usize];
-            score_into(b, list, tt_mv, ply, &self.killers, &self.history);
+            score_into::<true>(b, list, skip_tt_mv, ply, &self.killers, &self.history);
             // Fallthrough terminal: legal_moves_dedup_into tracks dedup
             // multiplicities, so len>0 always â€” but double-pass positions
             // have no children to search: score the pass-through.
-            if list.is_empty() {
+            if list.is_empty() && skip_tt_mv == 0 {
                 self.heuristic_used = true;
                 let raw = match (self.nnue, self.sancta) {
                     (None, Some(net)) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
@@ -1696,10 +1782,6 @@ impl<'a> Searcher<'a> {
             }
         }
 
-        let mut best = i32::MIN;
-        let mut best_mv: u32 = 0xFFFF;
-        let mut move_idx = 0usize;
-        let mut rep_skipped = false;
         // futility small net: the parent's accumulator, built at the first child that needs it (D110)
         let mut sn_parent: Option<[f32; 64]> = None;
         let mut lmr_cnt = 0i32;
@@ -1762,21 +1844,29 @@ impl<'a> Searcher<'a> {
                 && alpha.abs() < MATE_BOUND
             {
                 // child eval is from the child's side to move = minus our static value of the move
+                let mut cached_eval: Option<(i32, i32)> = None;
+                let mut hand_cache: Option<i32> = None;
                 if FUT_CHEAP_M > 0 && self.fut_sn && self.nnue.is_some() {
-                    let slot = (child.hash as usize) & (self.ecache.len() - 1);
-                    let cached = if self.ec2.is_some() {
-                        self.ec2_get(&child).is_some()
+                    cached_eval = if self.ec2.is_some() {
+                        self.ec2_get(&child).map(unpack_eval_dis)
                     } else {
-                        self.ecache[slot].0 == child.hash && self.ecache[slot].1 != i32::MIN
+                        let slot = (child.hash as usize) & (self.ecache.len() - 1);
+                        let (k, v) = self.ecache[slot];
+                        if k == child.hash && v != i32::MIN {
+                            Some(unpack_eval_dis(v))
+                        } else {
+                            None
+                        }
                     };
-                    if !cached {
+                    if cached_eval.is_none() {
                         let hand = evaluate(&child, None, false);
+                        hand_cache = Some(hand);
                         let (bt, ct) = (b.turn as usize, child.turn as usize);
                         let sn = small_net();
-                        let pa = *sn_parent
+                        let pa = sn_parent
                             .get_or_insert_with(|| sn.acc(b.occ[bt], b.occ[1 - bt], b.blockers));
                         let ca = sn.child_acc(
-                            &pa,
+                            pa,
                             b.occ[bt],
                             b.occ[1 - bt],
                             child.occ[ct],
@@ -1793,7 +1883,32 @@ impl<'a> Searcher<'a> {
                         }
                     }
                 }
-                let (ce, child_dis) = self.leaf_eval_with_dis(&child);
+                let (ce, child_dis) = if let Some(ed) = cached_eval {
+                    ed
+                } else if FUT_CHEAP_M > 0 && self.fut_sn && self.nnue.is_some() {
+                    let (eval, dis) = if let (Some(nn), Some(h)) = (
+                        self.nnue,
+                        hand_cache.filter(|_| self.tuple.is_none() && !self.tup_native),
+                    ) {
+                        if nn.v2 {
+                            nn.eval_with_dis(&child, h)
+                        } else {
+                            nn.eval_with_dis(&child, 0)
+                        }
+                    } else {
+                        self.leaf_eval_raw_with_dis(&child)
+                    };
+                    let packed = pack_eval_dis(eval, dis);
+                    if self.ec2.is_some() {
+                        self.ec2_put(&child, packed);
+                    } else {
+                        let slot = (child.hash as usize) & (self.ecache.len() - 1);
+                        self.ecache[slot] = (child.hash, packed);
+                    }
+                    (eval, dis)
+                } else {
+                    self.leaf_eval_with_dis(&child)
+                };
                 child_eval = pack_eval_dis(ce, child_dis);
                 let vol_credit = (child_dis * DIS_FUT_NUM) >> 7;
                 let shortfall = alpha.saturating_add(ce) - vol_credit;
@@ -2019,7 +2134,7 @@ impl<'a> Searcher<'a> {
             // array (best-first). Each iteration reorders the array.
             let (kill, hist) = (&self.killers, &self.history);
             let root = &mut self.stack.lists[0];
-            score_into(b, root, tt_mv, 0, kill, hist);
+            score_into::<false>(b, root, tt_mv, 0, kill, hist);
         }
         let n_root = self.stack.lists[0].len();
         if n_root == 0 {

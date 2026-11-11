@@ -51,6 +51,57 @@ const fn build_codes() -> [u16; NSQ * NSQ] {
 /// code of the move (from, to), index from * 49 + to; 0 for a non-move
 static CODE: [u16; NSQ * NSQ] = build_codes();
 
+const fn build_inv_jumps() -> [(u8, u8); 480] {
+    let mut inv = [(0u8, 0u8); 480];
+    let mut next = 0usize;
+    let mut f = 0;
+    while f < NSQ {
+        let mut to = 0;
+        while to < NSQ {
+            if cheb(f, to) == 2 {
+                inv[next] = (f as u8, to as u8);
+                next += 1;
+            }
+            to += 1;
+        }
+        f += 1;
+    }
+    inv
+}
+
+static INV_JUMPS: [(u8, u8); 480] = build_inv_jumps();
+
+/// Decode a 10-bit TT move code back to a legal move on `b` without generating the full move list.
+/// Returns `None` for empty (`0`), `PASS_CODE`, out-of-range codes, or pseudo-legal moves illegal on `b`.
+#[inline]
+pub fn decode_move(b: &crate::board::Board, code: u16) -> Option<Move> {
+    if code == 0 || code > MAX_MOVE_CODE {
+        return None;
+    }
+    let me = b.me();
+    let empty = b.empty();
+    if code <= 49 {
+        let to = (code - 1) as u8;
+        if (empty >> to) & 1 == 0 {
+            return None;
+        }
+        let clones = me & crate::board::RING1[to as usize];
+        if clones == 0 {
+            return None;
+        }
+        Some(Move {
+            from: clones.trailing_zeros() as u8,
+            to,
+        })
+    } else {
+        let (from, to) = INV_JUMPS[(code - 50) as usize];
+        if ((me >> from) & (empty >> to) & 1) == 0 {
+            return None;
+        }
+        Some(Move { from, to })
+    }
+}
+
 /// Code of a move (clones collapse to their destination, jumps keep (from, to), pass = PASS_CODE).
 #[inline(always)]
 pub fn move_code(m: Move) -> u16 {
@@ -140,6 +191,39 @@ mod tests {
         assert_eq!(code_of_u32(0), 0);
         assert!(PASS_CODE > MAX_MOVE_CODE && PASS_CODE < 1024);
         assert_eq!(code_of_u32(Move { from: 0, to: 2 }.to_u32()), move_code(Move { from: 0, to: 2 }));
+    }
+
+    #[test]
+    fn decode_move_matches_legal_moves_dedup() {
+        use crate::board::{Board, MoveList};
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut list = MoveList::new();
+        for n in 0..400 {
+            let mut b = Board::start();
+            for _ in 0..(n % 20) {
+                b.legal_moves_dedup_into(&mut list);
+                if list.is_empty() || b.game_over() {
+                    break;
+                }
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b = b.make(list.move_at((x as usize) % list.len()));
+            }
+            if b.game_over() {
+                continue;
+            }
+            b.legal_moves_dedup_into(&mut list);
+            let mut expected = [None; 530];
+            for m in list.iter() {
+                expected[move_code(m) as usize] = Some(m);
+            }
+            for code in 0..=MAX_MOVE_CODE {
+                assert_eq!(decode_move(&b, code), expected[code as usize], "code {code}");
+            }
+            assert_eq!(decode_move(&b, PASS_CODE), None);
+            assert_eq!(decode_move(&b, MAX_MOVE_CODE + 1), None);
+        }
     }
 
     #[test]
