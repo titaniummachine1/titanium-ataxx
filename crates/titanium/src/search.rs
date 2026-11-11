@@ -246,7 +246,7 @@ impl TtBucket {
     }
 }
 
-use crate::board::{dist_union, jump_union, Board, Move, MoveList, RING1, SQUARES};
+use crate::board::{box1, reach_union, Board, Move, MoveList, RING1, SQUARES};
 use crate::nnue::Nnue;
 use crate::sancta::{S1Acc, S1Net};
 use crate::tuple::TupleTable;
@@ -454,32 +454,35 @@ const MULTICAP_PEN: i32 = 20;
 /// computed once per side, not once per term).
 #[inline]
 fn enemy_landings(b: &Board, them: u8) -> u64 {
-    let tp = b.occ[them as usize];
-    b.empty() & (dist_union(tp, 1) | jump_union(tp))
+    b.empty() & reach_union(b.occ[them as usize])
 }
 
 /// E2: stones of `side` the enemy can currently convert â€” own stones ring-1
 /// of an enemy-reachable landing square.
 #[inline]
 fn endangered_count(b: &Board, side: u8, landings_them: u64) -> u32 {
-    (b.occ[side as usize] & dist_union(landings_them, 1)).count_ones()
+    (b.occ[side as usize] & box1(landings_them)).count_ones()
 }
 
 /// E4: for each enemy-reachable landing square, own stones there beyond the
 /// first (each extra one = a stone lost in the same single enemy move).
+/// Computed branch-free via O(1) CSA bit-planes (`nnfeat::victim_planes`).
+#[inline]
 fn multicapture_penalty(b: &Board, side: u8, landings_them: u64) -> i32 {
-    let us = b.occ[side as usize];
-    let mut pen = 0i32;
-    let mut ls = landings_them;
-    while ls != 0 {
-        let sq = ls.trailing_zeros() as usize;
-        ls &= ls - 1;
-        let n = (RING1[sq] & us).count_ones() as i32;
-        if n >= 2 {
-            pen += (n - 1) * MULTICAP_PEN;
-        }
+    if landings_them == 0 {
+        return 0;
     }
-    pen
+    let [p0, p1, p2, p3] = crate::nnfeat::victim_planes(b.occ[side as usize]);
+    let active = landings_them & (p1 | p2 | p3);
+    if active == 0 {
+        return 0;
+    }
+    let extra = (active & p0).count_ones()
+        + 2 * (active & p1).count_ones()
+        + 4 * (active & p2).count_ones()
+        + 8 * (active & p3).count_ones()
+        - active.count_ones();
+    extra as i32 * MULTICAP_PEN
 }
 
 /// Static eval from the side-to-move's perspective. Material + PST + tempo
@@ -1572,7 +1575,7 @@ impl<'a> Searcher<'a> {
         // board not too full (forced-pass danger zone). R = 3.
         // (exp/ab B: R = 2 pooled 108-84-8, straddles, parked for 3rd leg.)
         if null_allowed && !BZ && depth > 2 && beta.abs() < MATE_BOUND {
-            let clone_targets = (dist_union(b.occ[b.turn as usize], 1) & b.empty()).count_ones();
+            let clone_targets = (box1(b.occ[b.turn as usize]) & b.empty()).count_ones();
             // fill < 0.54 as integer: pieces*50 < 26*49 (no per-node float div).
             if clone_targets >= 11
                 && (b.piece_cnt[0] as u32 + b.piece_cnt[1] as u32) * 50 < 26 * SQUARES as u32

@@ -69,7 +69,7 @@ impl<T: Copy> Drop for Aligned<T> {
 
 /// For each byte mask, the positions of its set bits in ascending order (rest 0): lets the activation scan store 8
 /// candidate indices at once and advance by the popcount instead of looping over bits with a mispredicted exit.
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 const fn bit_pos_table() -> [[u8; 8]; 256] {
     let mut t = [[0u8; 8]; 256];
     let mut b = 0;
@@ -87,8 +87,43 @@ const fn bit_pos_table() -> [[u8; 8]; 256] {
     }
     t
 }
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 static BIT_POS: [[u8; 8]; 256] = bit_pos_table();
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SimdTier {
+    Scalar,
+    Avx2,
+    Avx512,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn simd_tier() -> SimdTier {
+    if cfg!(target_feature = "avx512f")
+        && cfg!(target_feature = "avx512bw")
+        && cfg!(target_feature = "avx512vl")
+        && cfg!(target_feature = "fma")
+    {
+        return SimdTier::Avx512;
+    }
+    static TIER: std::sync::OnceLock<SimdTier> = std::sync::OnceLock::new();
+    *TIER.get_or_init(|| {
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("fma")
+        {
+            SimdTier::Avx512
+        } else if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+        {
+            SimdTier::Avx2
+        } else {
+            SimdTier::Scalar
+        }
+    })
+}
 
 pub struct Nnue {
     /// cheap identity of the net file (config::fingerprint); the bundled policy head only applies to the bundled net
@@ -324,7 +359,14 @@ impl Nnue {
                 _ => (&self.ftbq[..w], idx),
             };
             // SAFETY: the half-slice has w lanes, fully written by ft_sum
-            unsafe { self.ft_sum(acc.as_mut_ptr().add(half * w), w, rows, init) };
+            #[cfg(target_arch = "x86_64")]
+            match simd_tier() {
+                SimdTier::Avx512 => unsafe { self.ft_sum::<2>(acc.as_mut_ptr().add(half * w), w, rows, init) },
+                SimdTier::Avx2 => unsafe { self.ft_sum::<1>(acc.as_mut_ptr().add(half * w), w, rows, init) },
+                SimdTier::Scalar => unsafe { self.ft_sum::<0>(acc.as_mut_ptr().add(half * w), w, rows, init) },
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unsafe { self.ft_sum::<0>(acc.as_mut_ptr().add(half * w), w, rows, init) };
         }
         let inv = 1.0 / QA as f32;
         let qa = QA as i16;
@@ -343,37 +385,31 @@ impl Nnue {
     pub fn forward_with_dis(&self, b: &Board, s57: f32) -> (f32, i32) {
         #[cfg(target_arch = "x86_64")]
         {
-            if std::arch::is_x86_feature_detected!("avx512bw")
-                && std::arch::is_x86_feature_detected!("avx512vl")
-                && std::arch::is_x86_feature_detected!("fma")
-            {
+            match simd_tier() {
                 // SAFETY: AVX-512F/BW/VL and FMA support verified at runtime above.
-                return unsafe { self.forward_with_dis_avx512(b, s57) };
-            }
-            if std::arch::is_x86_feature_detected!("avx2")
-                && std::arch::is_x86_feature_detected!("fma")
-            {
+                SimdTier::Avx512 => return unsafe { self.forward_with_dis_avx512(b, s57) },
                 // SAFETY: AVX-2 and FMA support verified at runtime above.
-                return unsafe { self.forward_with_dis_avx2(b, s57) };
+                SimdTier::Avx2 => return unsafe { self.forward_with_dis_avx2(b, s57) },
+                SimdTier::Scalar => {}
             }
         }
-        self.forward_with_dis_inner(b, s57)
+        self.forward_with_dis_inner::<0>(b, s57)
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,fma")]
     unsafe fn forward_with_dis_avx512(&self, b: &Board, s57: f32) -> (f32, i32) {
-        self.forward_with_dis_inner(b, s57)
+        self.forward_with_dis_inner::<2>(b, s57)
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
     unsafe fn forward_with_dis_avx2(&self, b: &Board, s57: f32) -> (f32, i32) {
-        self.forward_with_dis_inner(b, s57)
+        self.forward_with_dis_inner::<1>(b, s57)
     }
 
     #[inline(always)]
-    fn forward_with_dis_inner(&self, b: &Board, s57: f32) -> (f32, i32) {
+    fn forward_with_dis_inner<const SIMD: u8>(&self, b: &Board, s57: f32) -> (f32, i32) {
         let mut us = [0u32; nnfeat::MAX_ACTIVE];
         let mut them = [0u32; nnfeat::MAX_ACTIVE];
         let (nu, nt) = nnfeat::both_into(b, self.groups, &mut us, &mut them);
@@ -399,7 +435,7 @@ impl Nnue {
                 _ => (&self.ftbq[..w], idx),
             };
             // SAFETY: half * w + w <= 2 * MAX_W; ft_sum initialises all w lanes of this half
-            unsafe { self.ft_sum(accp.add(half * w), w, rows, init) };
+            unsafe { self.ft_sum::<SIMD>(accp.add(half * w), w, rows, init) };
         }
         // SAFETY: both halves (2 * w lanes) were just fully written
         let acc: &[i16] = unsafe { std::slice::from_raw_parts(accp, 2 * w) };
@@ -418,13 +454,24 @@ impl Nnue {
             p1 += pst[f as usize];
         }
         let ps = [p0, p1];
-        self.head_with_dis(acc, bucket, ps, s57)
+        self.head_with_dis::<SIMD>(acc, bucket, ps, s57)
     }
 
     /// a = bias + sum of the active rows (wrapping i16, so any order is bit-identical). The accumulator is kept in
     /// registers one CH-lane block at a time: each row costs one load+add per vector instead of load/add/store.
     #[inline(always)]
-    unsafe fn ft_sum(&self, out: *mut i16, w: usize, idx: &[u32], init: &[i16]) {
+    unsafe fn ft_sum<const SIMD: u8>(&self, out: *mut i16, w: usize, idx: &[u32], init: &[i16]) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if SIMD == 2 && w % 128 == 0 {
+                unsafe { self.ft_sum_avx512(out, w, idx, init) };
+                return;
+            }
+            if SIMD == 1 && w % 128 == 0 {
+                unsafe { self.ft_sum_avx2(out, w, idx, init) };
+                return;
+            }
+        }
         const CH: usize = 128;
         if w % CH != 0 {
             std::ptr::copy_nonoverlapping(init.as_ptr(), out, w);
@@ -452,7 +499,160 @@ impl Nnue {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,fma")]
+    #[inline]
+    unsafe fn ft_sum_avx512(&self, out: *mut i16, w: usize, idx: &[u32], init: &[i16]) {
+        use std::arch::x86_64::*;
+        const CH: usize = 128;
+        let base = self.ftq.as_ptr();
+        for c in (0..w).step_by(CH) {
+            let ip = unsafe { init.as_ptr().add(c) as *const __m512i };
+            let mut r0 = unsafe { _mm512_loadu_si512(ip) };
+            let mut r1 = unsafe { _mm512_loadu_si512(ip.add(1)) };
+            let mut r2 = unsafe { _mm512_loadu_si512(ip.add(2)) };
+            let mut r3 = unsafe { _mm512_loadu_si512(ip.add(3)) };
+            for &f in idx {
+                let rp = unsafe { base.add(f as usize * w + c) as *const __m512i };
+                r0 = _mm512_add_epi16(r0, unsafe { _mm512_loadu_si512(rp) });
+                r1 = _mm512_add_epi16(r1, unsafe { _mm512_loadu_si512(rp.add(1)) });
+                r2 = _mm512_add_epi16(r2, unsafe { _mm512_loadu_si512(rp.add(2)) });
+                r3 = _mm512_add_epi16(r3, unsafe { _mm512_loadu_si512(rp.add(3)) });
+            }
+            let op = unsafe { out.add(c) as *mut __m512i };
+            unsafe {
+                _mm512_storeu_si512(op, r0);
+                _mm512_storeu_si512(op.add(1), r1);
+                _mm512_storeu_si512(op.add(2), r2);
+                _mm512_storeu_si512(op.add(3), r3);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn ft_sum_avx2(&self, out: *mut i16, w: usize, idx: &[u32], init: &[i16]) {
+        use std::arch::x86_64::*;
+        let base = self.ftq.as_ptr();
+        if w == 256 {
+            let ip = init.as_ptr() as *const __m256i;
+            let mut r0 = unsafe { _mm256_loadu_si256(ip) };
+            let mut r1 = unsafe { _mm256_loadu_si256(ip.add(1)) };
+            let mut r2 = unsafe { _mm256_loadu_si256(ip.add(2)) };
+            let mut r3 = unsafe { _mm256_loadu_si256(ip.add(3)) };
+            let mut r4 = unsafe { _mm256_loadu_si256(ip.add(4)) };
+            let mut r5 = unsafe { _mm256_loadu_si256(ip.add(5)) };
+            let mut r6 = unsafe { _mm256_loadu_si256(ip.add(6)) };
+            let mut r7 = unsafe { _mm256_loadu_si256(ip.add(7)) };
+            let mut r8 = unsafe { _mm256_loadu_si256(ip.add(8)) };
+            let mut r9 = unsafe { _mm256_loadu_si256(ip.add(9)) };
+            let mut r10 = unsafe { _mm256_loadu_si256(ip.add(10)) };
+            let mut r11 = unsafe { _mm256_loadu_si256(ip.add(11)) };
+            let mut r12 = unsafe { _mm256_loadu_si256(ip.add(12)) };
+            let mut r13 = unsafe { _mm256_loadu_si256(ip.add(13)) };
+            let mut r14 = unsafe { _mm256_loadu_si256(ip.add(14)) };
+            let mut r15 = unsafe { _mm256_loadu_si256(ip.add(15)) };
+            for &f in idx {
+                let rp = unsafe { base.add((f as usize) << 8) as *const __m256i };
+                r0 = _mm256_add_epi16(r0, unsafe { _mm256_loadu_si256(rp) });
+                r1 = _mm256_add_epi16(r1, unsafe { _mm256_loadu_si256(rp.add(1)) });
+                r2 = _mm256_add_epi16(r2, unsafe { _mm256_loadu_si256(rp.add(2)) });
+                r3 = _mm256_add_epi16(r3, unsafe { _mm256_loadu_si256(rp.add(3)) });
+                r4 = _mm256_add_epi16(r4, unsafe { _mm256_loadu_si256(rp.add(4)) });
+                r5 = _mm256_add_epi16(r5, unsafe { _mm256_loadu_si256(rp.add(5)) });
+                r6 = _mm256_add_epi16(r6, unsafe { _mm256_loadu_si256(rp.add(6)) });
+                r7 = _mm256_add_epi16(r7, unsafe { _mm256_loadu_si256(rp.add(7)) });
+                r8 = _mm256_add_epi16(r8, unsafe { _mm256_loadu_si256(rp.add(8)) });
+                r9 = _mm256_add_epi16(r9, unsafe { _mm256_loadu_si256(rp.add(9)) });
+                r10 = _mm256_add_epi16(r10, unsafe { _mm256_loadu_si256(rp.add(10)) });
+                r11 = _mm256_add_epi16(r11, unsafe { _mm256_loadu_si256(rp.add(11)) });
+                r12 = _mm256_add_epi16(r12, unsafe { _mm256_loadu_si256(rp.add(12)) });
+                r13 = _mm256_add_epi16(r13, unsafe { _mm256_loadu_si256(rp.add(13)) });
+                r14 = _mm256_add_epi16(r14, unsafe { _mm256_loadu_si256(rp.add(14)) });
+                r15 = _mm256_add_epi16(r15, unsafe { _mm256_loadu_si256(rp.add(15)) });
+            }
+            let op = out as *mut __m256i;
+            unsafe {
+                _mm256_storeu_si256(op, r0);
+                _mm256_storeu_si256(op.add(1), r1);
+                _mm256_storeu_si256(op.add(2), r2);
+                _mm256_storeu_si256(op.add(3), r3);
+                _mm256_storeu_si256(op.add(4), r4);
+                _mm256_storeu_si256(op.add(5), r5);
+                _mm256_storeu_si256(op.add(6), r6);
+                _mm256_storeu_si256(op.add(7), r7);
+                _mm256_storeu_si256(op.add(8), r8);
+                _mm256_storeu_si256(op.add(9), r9);
+                _mm256_storeu_si256(op.add(10), r10);
+                _mm256_storeu_si256(op.add(11), r11);
+                _mm256_storeu_si256(op.add(12), r12);
+                _mm256_storeu_si256(op.add(13), r13);
+                _mm256_storeu_si256(op.add(14), r14);
+                _mm256_storeu_si256(op.add(15), r15);
+            }
+            return;
+        }
+        const CH: usize = 128;
+        for c in (0..w).step_by(CH) {
+            let ip = unsafe { init.as_ptr().add(c) as *const __m256i };
+            let mut r0 = unsafe { _mm256_loadu_si256(ip) };
+            let mut r1 = unsafe { _mm256_loadu_si256(ip.add(1)) };
+            let mut r2 = unsafe { _mm256_loadu_si256(ip.add(2)) };
+            let mut r3 = unsafe { _mm256_loadu_si256(ip.add(3)) };
+            let mut r4 = unsafe { _mm256_loadu_si256(ip.add(4)) };
+            let mut r5 = unsafe { _mm256_loadu_si256(ip.add(5)) };
+            let mut r6 = unsafe { _mm256_loadu_si256(ip.add(6)) };
+            let mut r7 = unsafe { _mm256_loadu_si256(ip.add(7)) };
+            for &f in idx {
+                let rp = unsafe { base.add(f as usize * w + c) as *const __m256i };
+                r0 = _mm256_add_epi16(r0, unsafe { _mm256_loadu_si256(rp) });
+                r1 = _mm256_add_epi16(r1, unsafe { _mm256_loadu_si256(rp.add(1)) });
+                r2 = _mm256_add_epi16(r2, unsafe { _mm256_loadu_si256(rp.add(2)) });
+                r3 = _mm256_add_epi16(r3, unsafe { _mm256_loadu_si256(rp.add(3)) });
+                r4 = _mm256_add_epi16(r4, unsafe { _mm256_loadu_si256(rp.add(4)) });
+                r5 = _mm256_add_epi16(r5, unsafe { _mm256_loadu_si256(rp.add(5)) });
+                r6 = _mm256_add_epi16(r6, unsafe { _mm256_loadu_si256(rp.add(6)) });
+                r7 = _mm256_add_epi16(r7, unsafe { _mm256_loadu_si256(rp.add(7)) });
+            }
+            let op = unsafe { out.add(c) as *mut __m256i };
+            unsafe {
+                _mm256_storeu_si256(op, r0);
+                _mm256_storeu_si256(op.add(1), r1);
+                _mm256_storeu_si256(op.add(2), r2);
+                _mm256_storeu_si256(op.add(3), r3);
+                _mm256_storeu_si256(op.add(4), r4);
+                _mm256_storeu_si256(op.add(5), r5);
+                _mm256_storeu_si256(op.add(6), r6);
+                _mm256_storeu_si256(op.add(7), r7);
+            }
+        }
+    }
+
     pub fn bench_ft(&self, b: &Board) -> i32 {
+        #[cfg(target_arch = "x86_64")]
+        match simd_tier() {
+            SimdTier::Avx512 => return unsafe { self.bench_ft_avx512(b) },
+            SimdTier::Avx2 => return unsafe { self.bench_ft_avx2(b) },
+            SimdTier::Scalar => {}
+        }
+        self.bench_ft_inner::<0>(b)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,fma")]
+    unsafe fn bench_ft_avx512(&self, b: &Board) -> i32 {
+        self.bench_ft_inner::<2>(b)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn bench_ft_avx2(&self, b: &Board) -> i32 {
+        self.bench_ft_inner::<1>(b)
+    }
+
+    #[inline(always)]
+    fn bench_ft_inner<const SIMD: u8>(&self, b: &Board) -> i32 {
         let (us, nu, them, nt) = nnfeat::both(b, self.groups);
         let w = self.width;
         let empties = b.empty().count_ones() as usize;
@@ -463,7 +663,7 @@ impl Nnue {
         for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
             let idx = &idx[..n];
             // SAFETY: w <= MAX_W
-            unsafe { self.ft_sum(acc[half].as_mut_ptr(), w, idx, &self.ftbq[..w]) };
+            unsafe { self.ft_sum::<SIMD>(acc[half].as_mut_ptr(), w, idx, &self.ftbq[..w]) };
             for &f in idx {
                 ps[half] += pst[f as usize];
             }
@@ -474,7 +674,7 @@ impl Nnue {
     /// Everything after the feature transformer: int16 accumulators -> activations -> sparse L1 -> L2 -> output.
     /// Activations are computed on the fly (no zeroed scratch array); arithmetic and order are exactly as before.
     #[inline(always)]
-    fn head_with_dis(&self, acc: &[i16], bucket: usize, ps: [f32; 2], s57: f32) -> (f32, i32) {
+    fn head_with_dis<const SIMD: u8>(&self, acc: &[i16], bucket: usize, ps: [f32; 2], s57: f32) -> (f32, i32) {
         let w = self.width;
         let inv = 1.0 / QA as f32;
         let qa = QA as i16;
@@ -497,35 +697,15 @@ impl Nnue {
                     cnt += (a[j] > 0 && a[h + j] > 0) as usize;
                 }
             }
-        } else if cfg!(target_feature = "avx2") && w % 32 == 0 {
-            #[cfg(target_feature = "avx2")]
-            for half in 0..2 {
-                use std::arch::x86_64::*;
-                let a = &acc[half * w..(half + 1) * w];
-                for base in (0..w).step_by(32) {
-                    // SAFETY: AVX2 is enabled at compile time; base + 32 <= w <= MAX_W so both 16-lane loads are in bounds.
-                    let m = unsafe {
-                        let z = _mm256_setzero_si256();
-                        let p = a.as_ptr().add(base) as *const __m256i;
-                        let c0 = _mm256_cmpgt_epi16(_mm256_loadu_si256(p), z);
-                        let c1 = _mm256_cmpgt_epi16(_mm256_loadu_si256(p.add(1)), z);
-                        // packs works per 128-bit lane: fix the lane order, then one bit per i16 lane
-                        let pk = _mm256_permute4x64_epi64::<0xD8>(_mm256_packs_epi16(c0, c1));
-                        _mm256_movemask_epi8(pk) as u32
-                    };
-                    // four mask bytes: each byte's set-bit positions come from a table and are stored 8 at a time (entries
-                    // past the popcount are overwritten by the next store); no data-dependent branches, same indices, same order
-                    for k in 0..4 {
-                        let byte = ((m >> (8 * k)) & 0xFF) as usize;
-                        // SAFETY: the 8-entry store starts at cnt <= 2 * w - 1 and the buffer has 8 spare entries
-                        unsafe {
-                            let idx = _mm_cvtepu8_epi16(_mm_loadl_epi64(BIT_POS[byte].as_ptr() as *const __m128i));
-                            let off = _mm_set1_epi16((half * w + base + 8 * k) as i16);
-                            _mm_storeu_si128(nzp.add(cnt) as *mut __m128i, _mm_add_epi16(idx, off));
-                        }
-                        cnt += byte.count_ones() as usize;
-                    }
-                }
+        } else if cfg!(target_arch = "x86_64") && SIMD == 2 && w % 32 == 0 {
+            #[cfg(target_arch = "x86_64")]
+            {
+                cnt = unsafe { Self::collect_nz_avx512(acc, w, nzp) };
+            }
+        } else if cfg!(target_arch = "x86_64") && SIMD == 1 && w % 32 == 0 {
+            #[cfg(target_arch = "x86_64")]
+            {
+                cnt = unsafe { Self::collect_nz_avx2(acc, w, nzp) };
             }
         } else if w % 64 == 0 {
             // 64-lane masks (compare + movemask), then walk the set bits ascending: same indices, same order
@@ -557,55 +737,25 @@ impl Nnue {
         // SAFETY: the first cnt entries were written above (cnt <= 2 * w <= 2 * MAX_W)
         let nz: &[u16] = unsafe { std::slice::from_raw_parts(nzp, cnt) };
         if !self.pairwise && l1 == 16 {
-            // accumulator held in registers; no division per input; per-lane add order = ascending input order, as before
-            #[cfg(target_feature = "avx2")]
-            {
-                use std::arch::x86_64::*;
-                // SAFETY: AVX2 is enabled at compile time; h1 has >= 16 lanes and every column slice is 16 floats.
-                // mul then add (no fused multiply-add): the per-lane result is the same sequential sum as the scalar loop
-                unsafe {
-                    let mut h0 = _mm256_loadu_ps(h1.as_ptr());
-                    let mut h8 = _mm256_loadu_ps(h1.as_ptr().add(8));
-                    if w % 8 == 0 {
-                        // every lane's activation once, vectorised (clamp to [0, QA], exact int -> f32, times 1/QA: the same
-                        // three operations as the scalar form); the input loop then only broadcasts and multiply-adds
-                        let mut vals = std::mem::MaybeUninit::<[f32; 2 * MAX_W]>::uninit();
-                        let vp = vals.as_mut_ptr() as *mut f32;
-                        let zero = _mm256_setzero_si256();
-                        let top = _mm256_set1_epi16(qa);
-                        let invv = _mm256_set1_ps(inv);
-                        for c in (0..2 * w).step_by(16) {
-                            let x = _mm256_loadu_si256(acc.as_ptr().add(c) as *const __m256i);
-                            let x = _mm256_min_epi16(_mm256_max_epi16(x, zero), top);
-                            let lo = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(x)));
-                            let hi = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(x)));
-                            _mm256_storeu_ps(vp.add(c), _mm256_mul_ps(lo, invv));
-                            _mm256_storeu_ps(vp.add(c + 8), _mm256_mul_ps(hi, invv));
-                        }
-                        assert!(base + din * 16 <= self.l1_wt.len());
-                        let wt = self.l1_wt.as_ptr().add(base);
-                        for &i in nz {
-                            // i < 2 * w = din, so the 16-float column and the activation are in bounds
-                            let i = i as usize;
-                            let v = _mm256_broadcast_ss(&*vp.add(i));
-                            let col = wt.add(i * 16);
-                            h0 = _mm256_add_ps(h0, _mm256_mul_ps(v, _mm256_loadu_ps(col)));
-                            h8 = _mm256_add_ps(h8, _mm256_mul_ps(v, _mm256_loadu_ps(col.add(8))));
-                        }
-                    } else {
-                        for &i in nz {
-                            let i = i as usize;
-                            let v = _mm256_set1_ps(acc[i].clamp(0, qa) as f32 * inv);
-                            let col = self.l1_wt[base + i * 16..base + i * 16 + 16].as_ptr();
-                            h0 = _mm256_add_ps(h0, _mm256_mul_ps(v, _mm256_loadu_ps(col)));
-                            h8 = _mm256_add_ps(h8, _mm256_mul_ps(v, _mm256_loadu_ps(col.add(8))));
-                        }
+            #[cfg(target_arch = "x86_64")]
+            if SIMD == 2 {
+                unsafe { self.sparse_l1_avx512(acc, w, din, base, qa, inv, nz, &mut h1) };
+            } else if SIMD == 1 {
+                unsafe { self.sparse_l1_avx2(acc, w, din, base, qa, inv, nz, &mut h1) };
+            } else {
+                let mut h = [0f32; 16];
+                h.copy_from_slice(&h1[..16]);
+                for &i in nz {
+                    let i = i as usize;
+                    let v = acc[i].clamp(0, qa) as f32 * inv;
+                    let col: &[f32; 16] = self.l1_wt[base + i * 16..base + i * 16 + 16].try_into().unwrap();
+                    for j in 0..16 {
+                        h[j] += v * col[j];
                     }
-                    _mm256_storeu_ps(h1.as_mut_ptr(), h0);
-                    _mm256_storeu_ps(h1.as_mut_ptr().add(8), h8);
                 }
+                h1[..16].copy_from_slice(&h);
             }
-            #[cfg(not(target_feature = "avx2"))]
+            #[cfg(not(target_arch = "x86_64"))]
             {
                 let mut h = [0f32; 16];
                 h.copy_from_slice(&h1[..16]);
@@ -688,6 +838,168 @@ impl Nnue {
             0
         };
         (eval_logit, dis_cp)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,fma")]
+    #[inline]
+    unsafe fn collect_nz_avx512(acc: &[i16], w: usize, nzp: *mut u16) -> usize {
+        use std::arch::x86_64::*;
+        let mut cnt = 0usize;
+        let z = _mm512_setzero_si512();
+        for half in 0..2 {
+            let a = &acc[half * w..(half + 1) * w];
+            for base in (0..w).step_by(32) {
+                let m = unsafe {
+                    _mm512_cmpgt_epi16_mask(_mm512_loadu_si512(a.as_ptr().add(base) as *const __m512i), z)
+                };
+                for k in 0..4 {
+                    let byte = ((m >> (8 * k)) & 0xFF) as usize;
+                    unsafe {
+                        let idx = _mm_cvtepu8_epi16(_mm_loadl_epi64(BIT_POS[byte].as_ptr() as *const __m128i));
+                        let off = _mm_set1_epi16((half * w + base + 8 * k) as i16);
+                        _mm_storeu_si128(nzp.add(cnt) as *mut __m128i, _mm_add_epi16(idx, off));
+                    }
+                    cnt += byte.count_ones() as usize;
+                }
+            }
+        }
+        cnt
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn collect_nz_avx2(acc: &[i16], w: usize, nzp: *mut u16) -> usize {
+        use std::arch::x86_64::*;
+        let mut cnt = 0usize;
+        let z = _mm256_setzero_si256();
+        for half in 0..2 {
+            let a = &acc[half * w..(half + 1) * w];
+            for base in (0..w).step_by(32) {
+                let m = unsafe {
+                    let p = a.as_ptr().add(base) as *const __m256i;
+                    let c0 = _mm256_cmpgt_epi16(_mm256_loadu_si256(p), z);
+                    let c1 = _mm256_cmpgt_epi16(_mm256_loadu_si256(p.add(1)), z);
+                    let pk = _mm256_permute4x64_epi64::<0xD8>(_mm256_packs_epi16(c0, c1));
+                    _mm256_movemask_epi8(pk) as u32
+                };
+                for k in 0..4 {
+                    let byte = ((m >> (8 * k)) & 0xFF) as usize;
+                    unsafe {
+                        let idx = _mm_cvtepu8_epi16(_mm_loadl_epi64(BIT_POS[byte].as_ptr() as *const __m128i));
+                        let off = _mm_set1_epi16((half * w + base + 8 * k) as i16);
+                        _mm_storeu_si128(nzp.add(cnt) as *mut __m128i, _mm_add_epi16(idx, off));
+                    }
+                    cnt += byte.count_ones() as usize;
+                }
+            }
+        }
+        cnt
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,fma")]
+    #[inline]
+    unsafe fn sparse_l1_avx512(
+        &self,
+        acc: &[i16],
+        w: usize,
+        din: usize,
+        base: usize,
+        qa: i16,
+        inv: f32,
+        nz: &[u16],
+        h1: &mut [f32; MAX_H],
+    ) {
+        use std::arch::x86_64::*;
+        unsafe {
+            let mut h = _mm512_loadu_ps(h1.as_ptr());
+            if w % 8 == 0 {
+                let mut vals = std::mem::MaybeUninit::<[f32; 2 * MAX_W]>::uninit();
+                let vp = vals.as_mut_ptr() as *mut f32;
+                let zero = _mm256_setzero_si256();
+                let top = _mm256_set1_epi16(qa);
+                let invv = _mm512_set1_ps(inv);
+                for c in (0..2 * w).step_by(16) {
+                    let x = _mm256_loadu_si256(acc.as_ptr().add(c) as *const __m256i);
+                    let x = _mm256_min_epi16(_mm256_max_epi16(x, zero), top);
+                    let f = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(x));
+                    _mm512_storeu_ps(vp.add(c), _mm512_mul_ps(f, invv));
+                }
+                assert!(base + din * 16 <= self.l1_wt.len());
+                let wt = self.l1_wt.as_ptr().add(base);
+                for &i in nz {
+                    let i = i as usize;
+                    let v = _mm512_set1_ps(*vp.add(i));
+                    let col = wt.add(i * 16);
+                    h = _mm512_add_ps(h, _mm512_mul_ps(v, _mm512_loadu_ps(col)));
+                }
+            } else {
+                for &i in nz {
+                    let i = i as usize;
+                    let v = _mm512_set1_ps(acc[i].clamp(0, qa) as f32 * inv);
+                    let col = self.l1_wt[base + i * 16..base + i * 16 + 16].as_ptr();
+                    h = _mm512_add_ps(h, _mm512_mul_ps(v, _mm512_loadu_ps(col)));
+                }
+            }
+            _mm512_storeu_ps(h1.as_mut_ptr(), h);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn sparse_l1_avx2(
+        &self,
+        acc: &[i16],
+        w: usize,
+        din: usize,
+        base: usize,
+        qa: i16,
+        inv: f32,
+        nz: &[u16],
+        h1: &mut [f32; MAX_H],
+    ) {
+        use std::arch::x86_64::*;
+        unsafe {
+            let mut h0 = _mm256_loadu_ps(h1.as_ptr());
+            let mut h8 = _mm256_loadu_ps(h1.as_ptr().add(8));
+            if w % 8 == 0 {
+                let mut vals = std::mem::MaybeUninit::<[f32; 2 * MAX_W]>::uninit();
+                let vp = vals.as_mut_ptr() as *mut f32;
+                let zero = _mm256_setzero_si256();
+                let top = _mm256_set1_epi16(qa);
+                let invv = _mm256_set1_ps(inv);
+                for c in (0..2 * w).step_by(16) {
+                    let x = _mm256_loadu_si256(acc.as_ptr().add(c) as *const __m256i);
+                    let x = _mm256_min_epi16(_mm256_max_epi16(x, zero), top);
+                    let lo = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(x)));
+                    let hi = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(x)));
+                    _mm256_storeu_ps(vp.add(c), _mm256_mul_ps(lo, invv));
+                    _mm256_storeu_ps(vp.add(c + 8), _mm256_mul_ps(hi, invv));
+                }
+                assert!(base + din * 16 <= self.l1_wt.len());
+                let wt = self.l1_wt.as_ptr().add(base);
+                for &i in nz {
+                    let i = i as usize;
+                    let v = _mm256_broadcast_ss(&*vp.add(i));
+                    let col = wt.add(i * 16);
+                    h0 = _mm256_add_ps(h0, _mm256_mul_ps(v, _mm256_loadu_ps(col)));
+                    h8 = _mm256_add_ps(h8, _mm256_mul_ps(v, _mm256_loadu_ps(col.add(8))));
+                }
+            } else {
+                for &i in nz {
+                    let i = i as usize;
+                    let v = _mm256_set1_ps(acc[i].clamp(0, qa) as f32 * inv);
+                    let col = self.l1_wt[base + i * 16..base + i * 16 + 16].as_ptr();
+                    h0 = _mm256_add_ps(h0, _mm256_mul_ps(v, _mm256_loadu_ps(col)));
+                    h8 = _mm256_add_ps(h8, _mm256_mul_ps(v, _mm256_loadu_ps(col.add(8))));
+                }
+            }
+            _mm256_storeu_ps(h1.as_mut_ptr(), h0);
+            _mm256_storeu_ps(h1.as_mut_ptr().add(8), h8);
+        }
     }
 
     /// Exact training-parity path (plain f32, allocating): the reference the fast path is measured against.

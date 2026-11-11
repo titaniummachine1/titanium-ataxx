@@ -114,26 +114,37 @@ pub fn dist_union(bb: u64, d: u32) -> u64 {
         & FULL // down shifts spill past bit 48; stays 49-bit clean
 }
 
+/// 3x3 Chebyshev-<=1 separable dilation (`x` and its 8 neighbours) in 10 ops.
+#[inline(always)]
+pub fn box1(x: u64) -> u64 {
+    let h = x | ((x & !FILE_A) >> 1) | ((x & !FILE_G) << 1);
+    (h | (h >> 7) | (h << 7)) & FULL
+}
+
+/// 5x5 Chebyshev-<=2 separable dilation (`box1(box1(x))`). Masked with any
+/// set disjoint from `x` (such as `empty`), equals `(dist_union(x, 1) | jump_union(x)) & empty`
+/// at nearly twice the speed.
+#[inline(always)]
+pub fn reach_union(x: u64) -> u64 {
+    box1(box1(x))
+}
+
 /// Full Chebyshev-2 ring (16 cells): straight + diagonal 2-steps plus the
 /// knight offsets. Ataxx jumps reach every square of the 5x5 neighborhood
 /// outside the 3x3 center. Off-board spill is removed here: left-shifted
 /// bits (>= 49) would otherwise wrap back onto the board through the
 /// knight shifts (e.g. 49 >> 1 = 48).
-#[inline]
+#[inline(always)]
 pub fn jump_union(bb: u64) -> u64 {
-    let up = bb >> 14;
-    let dn = (bb << 14) & FULL;
-    let lf = (bb & !(FILE_A | FILE_B)) >> 2;
-    let rt = (bb & !(FILE_F | FILE_G)) << 2;
-    let ul = (bb & !(FILE_A | FILE_B)) >> 16;
-    let ur = (bb & !(FILE_F | FILE_G)) >> 12;
-    let dl = (bb & !(FILE_A | FILE_B)) << 12;
-    let drr = (bb & !(FILE_F | FILE_G)) << 16;
-    let v2 = (up | dn) & FULL;
-    let h2 = lf | rt;
-    let n1 = ((v2 & !FILE_A) >> 1) | ((v2 & !FILE_G) << 1); // (±2,±1)
-    let n2 = (h2 >> 7) | ((h2 << 7) & FULL);                // (±1,±2)
-    (up | dn | lf | rt | ul | ur | dl | drr | n1 | n2) & FULL
+    const IN_NOT_A: u64 = FULL & !FILE_A;
+    const IN_NOT_G: u64 = FULL & !FILE_G;
+    const IN_NOT_AB: u64 = FULL & !(FILE_A | FILE_B);
+    const IN_NOT_FG: u64 = FULL & !(FILE_F | FILE_G);
+    let v2 = ((bb & FULL) >> 14) | (bb << 14);
+    let top_bot = v2 | ((v2 & IN_NOT_A) >> 1) | ((v2 & IN_NOT_G) << 1);
+    let h2 = ((bb & IN_NOT_AB) >> 2) | ((bb & IN_NOT_FG) << 2);
+    let sides = h2 | (h2 >> 7) | (h2 << 7) | (h2 >> 14) | (h2 << 14);
+    (top_bot | sides) & FULL
 }
 
 /// Exactly-Chebyshev-distance-d neighbor masks, computed at compile time.
@@ -406,7 +417,7 @@ pub fn perft_bb(me: u64, opp: u64, block: u64, depth: u32) -> u64 {
         return 1;
     }
     let empty = !(me | opp | block) & FULL;
-    let targets = (dist_union(me, 1) | jump_union(me)) & empty;
+    let targets = reach_union(me) & empty;
 
     if depth == 1 {
         // Bulk-count (from, to) pairs with no move materialization. The
@@ -711,11 +722,12 @@ impl Board {
         self.occ[1 - self.turn as usize]
     }
 
-    /// Squares this side could land on right now (branch-free bitboard math:
-    /// Chebyshev-1 ring + full Chebyshev-2 ring, masked to empty squares).
+    /// Squares this side could land on right now (separable 5x5 dilation masked
+    /// to empty squares — bit-identical to `(dist_union(p, 1) | jump_union(p)) & empty`).
+    #[inline(always)]
     pub fn targets(&self, side: u8) -> u64 {
         let pieces = self.occ[side as usize];
-        (dist_union(pieces, 1) | jump_union(pieces)) & self.empty()
+        reach_union(pieces) & self.empty()
     }
 
     /// Quick "does this side have any legal move" check.

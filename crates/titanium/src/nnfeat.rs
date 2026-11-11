@@ -26,7 +26,7 @@
 
 #[cfg(test)]
 use crate::board::{dist_union, jump_union};
-use crate::board::{Board, FILE_A, FILE_G, FULL, RING1, SQUARES};
+use crate::board::{reach_union, Board, FILE_A, FILE_G, FULL, RING1, SQUARES};
 
 pub const G1: u32 = 1;
 pub const G2: u32 = 2;
@@ -84,13 +84,13 @@ fn box1(x: u64) -> u64 {
 /// Empty squares a side with `stones` can land on (clone or jump) = the 5x5 box minus the stones themselves.
 #[inline(always)]
 fn landing(stones: u64, empty: u64) -> u64 {
-    box1(box1(stones)) & empty
+    reach_union(stones) & empty
 }
 
 /// Bit planes (ones, twos, fours, eights) of the number of `v` stones in the 8-neighbourhood of every square,
 /// built with a carry-save adder over the 8 shifted masks.
 #[inline(always)]
-fn victim_planes(v: u64) -> [u64; 4] {
+pub fn victim_planes(v: u64) -> [u64; 4] {
     let s0 = (v >> 1) & !FILE_G;
     let s1 = (v << 1) & !FILE_A;
     let s2 = v >> 7;
@@ -629,7 +629,15 @@ pub fn both_into(b: &Board, groups: u32, us: &mut [u32; MAX_ACTIVE], them: &mut 
     if groups & G1 != 0 {
         #[cfg(target_arch = "x86_64")]
         {
-            if std::is_x86_feature_detected!("avx2") {
+            #[inline(always)]
+            fn avx2_ready() -> bool {
+                if cfg!(target_feature = "avx2") {
+                    return true;
+                }
+                static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *HAS.get_or_init(|| std::is_x86_feature_detected!("avx2"))
+            }
+            if avx2_ready() {
                 // SAFETY: AVX2 checked above; the arrays hold MAX_ACTIVE >= 64 entries.
                 unsafe {
                     g1_avx2(pa, pb, empty, clone_a, clone_b, land_a, land_b, nl_a, nl_b, &pla, &plb, &victim_planes(empty), us.as_mut_ptr(), them.as_mut_ptr())
