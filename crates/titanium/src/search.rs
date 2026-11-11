@@ -716,17 +716,11 @@ fn bz_terminal_score(b: &Board, ply: u32) -> i32 {
     bz_terminal_score_counts(b, hm0, hm1, ply)
 }
 
-#[inline(always)]
-fn banned_contains(buf: &[std::mem::MaybeUninit<(u64, u64)>; 32], n: usize, snap: (u64, u64)) -> bool {
-    let mut i = 0;
-    while i < n {
-        // SAFETY: callers only pass `n <= 32` after initializing slots `0..n`.
-        if unsafe { buf[i].assume_init() } == snap {
-            return true;
-        }
-        i += 1;
-    }
-    false
+#[derive(Clone, Copy, Default)]
+struct BzPly {
+    rep_base: u32,
+    ban_start: u16,
+    tainted: bool,
 }
 
 /// Pre-capture occupancy `(black, white)` right after `m` is placed, matching
@@ -1226,11 +1220,11 @@ pub struct Searcher<'a> {
     /// Relative ply horizon from root where Botzone judge terminates at ply 401
     /// (`401 - bz_start_ply`, or `u32::MAX` when disabled).
     bz_max_plies: u32,
-    /// Index in `bz_snaps` of the most recent clone move on the active path (or `0` for the pre-root tail).
-    bz_rep_base: Box<[u32; MAX_PLY]>,
-    /// True if the node score depended on Botzone history-specific repetition bans or the ply-401 horizon
-    /// and therefore must not be cached in TT / CorrHist.
-    bz_tainted: Box<[bool; MAX_PLY]>,
+    /// Per-ply Botzone state packed into 8 bytes/ply (`rep_base`, `ban_start`, `tainted`).
+    bz_ply: Box<[BzPly; MAX_PLY]>,
+    /// Shared scratch stack for Botzone banned repetition snapshots (`[ban_start..ban_start + n_banned]`).
+    /// Keeps the 512-byte buffer off every recursive `negamax::<true>` stack frame.
+    bz_banned: Vec<(u64, u64)>,
 }
 
 /// Monotonic milliseconds since process start (native default time source).
@@ -1319,8 +1313,8 @@ impl<'a> Searcher<'a> {
             bz_base_offset: 0,
             bz_start_ply: 0,
             bz_max_plies: u32::MAX,
-            bz_rep_base: Box::new([0u32; MAX_PLY]),
-            bz_tainted: Box::new([false; MAX_PLY]),
+            bz_ply: Box::new([BzPly::default(); MAX_PLY]),
+            bz_banned: Vec::with_capacity(256),
         }
     }
 
@@ -1596,6 +1590,98 @@ impl<'a> Searcher<'a> {
         }
     }
 
+    /// Slow path for Botzone (`BZ = true`) jump-repetition collection.
+    /// Populates `self.bz_banned[ban_start..ban_start + n_banned]` and returns `(n_banned, overflow)`.
+    #[cold]
+    #[inline(never)]
+    fn collect_bz_bans_cold(
+        &mut self,
+        cur_v: usize,
+        rbase: usize,
+        ban_start: usize,
+    ) -> (usize, bool) {
+        self.bz_banned.truncate(ban_start);
+        let last = self.bz_snaps[cur_v];
+        let hist = &self.bz_snaps[rbase..cur_v];
+        let mut n = 0usize;
+        let mut overflow = false;
+        // Distances 1..=3 cannot repeat under alternating non-pass Botzone moves (d=1: placement bit
+        // flips; d=2: empty target holds opponent; d=3: P-piece vacating x returns as Q on x pre-captures).
+        for i in 0..hist.len().saturating_sub(3) {
+            if hist[i] == last {
+                let ban = hist[i + 1];
+                if !self.bz_banned[ban_start..ban_start + n].contains(&ban) {
+                    if n < 32 {
+                        self.bz_banned.push(ban);
+                        n += 1;
+                    } else {
+                        overflow = true;
+                    }
+                }
+            }
+        }
+        (n, overflow)
+    }
+
+    /// Cold check whether candidate placement snapshot `snap` repeats an earlier `(last -> snap)` transition.
+    #[cold]
+    #[inline(never)]
+    fn is_bz_snap_banned(
+        &self,
+        cur_v: usize,
+        rbase: usize,
+        ban_start: usize,
+        n_banned: usize,
+        overflow: bool,
+        snap: (u64, u64),
+    ) -> bool {
+        if self.bz_banned[ban_start..ban_start + n_banned].contains(&snap) {
+            return true;
+        }
+        if overflow {
+            let last = self.bz_snaps[cur_v];
+            return self.bz_snaps[rbase..cur_v.saturating_sub(2)]
+                .windows(2)
+                .any(|w| w[0] == last && w[1] == snap);
+        }
+        false
+    }
+
+    /// Cold depth-0 check whether any legal jump avoids a Botzone `CIRCULAR_MOVE` forfeit when no clones exist.
+    #[cold]
+    #[inline(never)]
+    fn has_unbanned_bz_jump(
+        &self,
+        b: &Board,
+        cur_v: usize,
+        rbase: usize,
+        ban_start: usize,
+        n_banned: usize,
+        overflow: bool,
+    ) -> bool {
+        let me = b.me();
+        let empty = b.empty();
+        // Clone moves strictly increase piece count and can never repeat an earlier snapshot.
+        if (box1(me) & empty) != 0 {
+            return true;
+        }
+        let mut js_targets = jump_union(me) & empty;
+        while js_targets != 0 {
+            let to = js_targets.trailing_zeros() as u8;
+            js_targets &= js_targets - 1;
+            let mut froms = me & RING2[to as usize];
+            while froms != 0 {
+                let from = froms.trailing_zeros() as u8;
+                froms &= froms - 1;
+                let snap = placement_snap(b, Move { from, to });
+                if !self.is_bz_snap_banned(cur_v, rbase, ban_start, n_banned, overflow, snap) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     #[inline]
     fn negamax<const BZ: bool>(
         &mut self,
@@ -1608,7 +1694,7 @@ impl<'a> Searcher<'a> {
     ) -> i32 {
         self.nodes += 1;
         if BZ {
-            self.bz_tainted[ply as usize] = false;
+            self.bz_ply[ply as usize].tainted = false;
         }
         // Hard stack guard (release builds too): never index past the MAX_PLY-sized stacks.
         if ply as usize >= MAX_PLY - 1 {
@@ -1633,7 +1719,7 @@ impl<'a> Searcher<'a> {
             }
             // Judge also ends the game unconditionally after ply 401 (Black's 201st half-move).
             if ply >= self.bz_max_plies {
-                self.bz_tainted[ply as usize] = true;
+                self.bz_ply[ply as usize].tainted = true;
                 return bz_terminal_score_counts(b, hm0, hm1, ply);
             }
         } else if b.game_over() {
@@ -1654,27 +1740,18 @@ impl<'a> Searcher<'a> {
         let at_bz_horizon = BZ && ply.saturating_add(depth) >= self.bz_max_plies;
         let mut cur_v = 0usize;
         let mut rbase = 0usize;
-        let mut banned_snaps = [std::mem::MaybeUninit::<(u64, u64)>::uninit(); 32];
+        let mut ban_start = 0usize;
         let mut n_banned = 0usize;
         let mut banned_overflow = false;
         if BZ {
+            let bp = self.bz_ply[ply as usize];
             cur_v = self.bz_base_offset + ply as usize;
-            rbase = self.bz_rep_base[ply as usize] as usize;
-            if self.bz_start_ply + ply >= 3 && cur_v >= rbase + 2 {
+            rbase = bp.rep_base as usize;
+            ban_start = bp.ban_start as usize;
+            if self.bz_start_ply + ply >= 4 && cur_v >= rbase + 4 {
                 let last = self.bz_snaps[cur_v];
-                let hist = &self.bz_snaps[rbase..cur_v];
-                for i in 0..hist.len() - 1 {
-                    if hist[i] == last {
-                        let ban = hist[i + 1];
-                        if !banned_contains(&banned_snaps, n_banned, ban) {
-                            if n_banned < 32 {
-                                banned_snaps[n_banned].write(ban);
-                                n_banned += 1;
-                            } else {
-                                banned_overflow = true;
-                            }
-                        }
-                    }
+                if self.bz_snaps[rbase..cur_v - 3].contains(&last) {
+                    (n_banned, banned_overflow) = self.collect_bz_bans_cold(cur_v, rbase, ban_start);
                 }
             }
         }
@@ -1789,7 +1866,7 @@ impl<'a> Searcher<'a> {
                 if self.stop {
                     return 0;
                 }
-                if BZ && self.bz_tainted[ply as usize] {
+                if BZ && self.bz_ply[ply as usize].tainted {
                     tainted = true;
                 }
                 if score >= pc_beta && score < MATE_BOUND && !(BZ && tainted) {
@@ -1800,42 +1877,14 @@ impl<'a> Searcher<'a> {
         }
 
         if depth == 0 {
-            if BZ && n_banned > 0 {
-                let me = b.me();
-                let empty = b.empty();
-                // Clone moves strictly increase piece count and can never repeat an earlier snapshot.
-                if (box1(me) & empty) == 0 {
-                    let mut has_unbanned = false;
-                    let mut js_targets = jump_union(me) & empty;
-                    'chk: while js_targets != 0 {
-                        let to = js_targets.trailing_zeros() as u8;
-                        js_targets &= js_targets - 1;
-                        let mut froms = me & RING2[to as usize];
-                        while froms != 0 {
-                            let from = froms.trailing_zeros() as u8;
-                            froms &= froms - 1;
-                            let snap = placement_snap(b, Move { from, to });
-                            let banned = banned_contains(&banned_snaps, n_banned, snap)
-                                || (banned_overflow && {
-                                    let last = self.bz_snaps[cur_v];
-                                    self.bz_snaps[rbase..=cur_v - 1]
-                                        .windows(2)
-                                        .any(|w| w[0] == last && w[1] == snap)
-                                });
-                            if !banned {
-                                has_unbanned = true;
-                                break 'chk;
-                            }
-                        }
-                    }
-                    if !has_unbanned {
-                        self.bz_tainted[ply as usize] = true;
-                        return -MATE + ply as i32;
-                    }
-                }
+            if BZ && n_banned > 0
+                && !self.has_unbanned_bz_jump(b, cur_v, rbase, ban_start, n_banned, banned_overflow)
+            {
+                self.bz_ply[ply as usize].tainted = true;
+                return -MATE + ply as i32;
             }
             if BZ {
-                self.bz_tainted[ply as usize] = tainted;
+                self.bz_ply[ply as usize].tainted = tainted;
             }
             self.heuristic_used = true;
             return static_eval;
@@ -1856,13 +1905,14 @@ impl<'a> Searcher<'a> {
                 let mut c_snap = (0u64, 0u64);
                 if BZ && !m.is_clone() && n_banned > 0 {
                     c_snap = placement_snap(b, m);
-                    is_rep = banned_contains(&banned_snaps, n_banned, c_snap)
-                        || (banned_overflow && {
-                            let last = self.bz_snaps[cur_v];
-                            self.bz_snaps[rbase..=cur_v - 1]
-                                .windows(2)
-                                .any(|w| w[0] == last && w[1] == c_snap)
-                        });
+                    is_rep = self.is_bz_snap_banned(
+                        cur_v,
+                        rbase,
+                        ban_start,
+                        n_banned,
+                        banned_overflow,
+                        c_snap,
+                    );
                     if is_rep {
                         rep_skipped = true;
                         tainted = true;
@@ -1897,10 +1947,14 @@ impl<'a> Searcher<'a> {
                                 c_snap = placement_snap(b, m);
                             }
                             self.bz_snaps[cur_v + 1] = c_snap;
-                            self.bz_rep_base[ply as usize + 1] = if m.is_clone() {
-                                (cur_v + 1) as u32
-                            } else {
-                                rbase as u32
+                            self.bz_ply[ply as usize + 1] = BzPly {
+                                rep_base: if m.is_clone() {
+                                    (cur_v + 1) as u32
+                                } else {
+                                    rbase as u32
+                                },
+                                ban_start: (ban_start + n_banned) as u16,
+                                tainted: false,
                             };
                         } else {
                             self.stack.path_hash[ply as usize + 1] = child.hash;
@@ -1919,7 +1973,7 @@ impl<'a> Searcher<'a> {
                         if self.stop {
                             return 0;
                         }
-                        if BZ && self.bz_tainted[ply as usize + 1] {
+                        if BZ && self.bz_ply[ply as usize + 1].tainted {
                             tainted = true;
                         }
                         move_idx = 1;
@@ -1940,7 +1994,7 @@ impl<'a> Searcher<'a> {
                                     );
                                 }
                                 if BZ {
-                                    self.bz_tainted[ply as usize] = tainted;
+                                    self.bz_ply[ply as usize].tainted = tainted;
                                 }
                                 if !(BZ && tainted) {
                                     self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply, raw);
@@ -2067,13 +2121,14 @@ impl<'a> Searcher<'a> {
             let mut c_snap = (0u64, 0u64);
             if BZ && !m.is_clone() && n_banned > 0 {
                 c_snap = placement_snap(b, m);
-                let is_rep = banned_contains(&banned_snaps, n_banned, c_snap)
-                    || (banned_overflow && {
-                        let last = self.bz_snaps[cur_v];
-                        self.bz_snaps[rbase..=cur_v - 1]
-                            .windows(2)
-                            .any(|w| w[0] == last && w[1] == c_snap)
-                    });
+                let is_rep = self.is_bz_snap_banned(
+                    cur_v,
+                    rbase,
+                    ban_start,
+                    n_banned,
+                    banned_overflow,
+                    c_snap,
+                );
                 if is_rep {
                     rep_skipped = true;
                     tainted = true;
@@ -2220,10 +2275,14 @@ impl<'a> Searcher<'a> {
                     c_snap = placement_snap(b, m);
                 }
                 self.bz_snaps[cur_v + 1] = c_snap;
-                self.bz_rep_base[ply as usize + 1] = if m.is_clone() {
-                    (cur_v + 1) as u32
-                } else {
-                    rbase as u32
+                self.bz_ply[ply as usize + 1] = BzPly {
+                    rep_base: if m.is_clone() {
+                        (cur_v + 1) as u32
+                    } else {
+                        rbase as u32
+                    },
+                    ban_start: (ban_start + n_banned) as u16,
+                    tainted: false,
                 };
             }
             let mut score;
@@ -2232,7 +2291,7 @@ impl<'a> Searcher<'a> {
                 if self.stop {
                     return 0;
                 }
-                if BZ && self.bz_tainted[ply as usize + 1] {
+                if BZ && self.bz_ply[ply as usize + 1].tainted {
                     tainted = true;
                 }
             } else {
@@ -2248,7 +2307,7 @@ impl<'a> Searcher<'a> {
                 if self.stop {
                     return 0;
                 }
-                if BZ && self.bz_tainted[ply as usize + 1] {
+                if BZ && self.bz_ply[ply as usize + 1].tainted {
                     tainted = true;
                 }
                 if score > alpha {
@@ -2258,7 +2317,7 @@ impl<'a> Searcher<'a> {
                     if self.stop {
                         return 0;
                     }
-                    if BZ && self.bz_tainted[ply as usize + 1] {
+                    if BZ && self.bz_ply[ply as usize + 1].tainted {
                         tainted = true;
                     }
                 }
@@ -2283,7 +2342,7 @@ impl<'a> Searcher<'a> {
         if best == i32::MIN {
             // Every legal move from this node repeated an ancestor position (CIRCULAR_MOVE forfeit).
             if BZ {
-                self.bz_tainted[ply as usize] = true;
+                self.bz_ply[ply as usize].tainted = true;
             }
             return -MATE + ply as i32;
         }
@@ -2295,7 +2354,7 @@ impl<'a> Searcher<'a> {
             );
         }
         if BZ {
-            self.bz_tainted[ply as usize] = tainted;
+            self.bz_ply[ply as usize].tainted = tainted;
         }
         if !rep_skipped && !(BZ && tainted) {
             self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply, raw);
@@ -2449,6 +2508,8 @@ impl<'a> Searcher<'a> {
             let base_len = self.bz_snaps.len();
             self.bz_base_offset = base_len - 1;
             self.bz_snaps.resize(base_len + MAX_PLY + 2, (0, 0));
+            self.bz_banned.clear();
+            self.bz_ply[0] = BzPly::default();
         }
 
         let mut result = SearchResult::default();
@@ -2598,8 +2659,8 @@ impl<'a> Searcher<'a> {
             self.stack.path_hash[0] = b.hash;
             self.stack.rep_base[0] = 0;
             if BZ {
-                self.bz_rep_base[0] = 0;
-                self.bz_tainted[0] = false;
+                self.bz_banned.clear();
+                self.bz_ply[0] = BzPly::default();
             }
             for i in 0..n_root {
                 let m = root_moves[i];
@@ -2609,10 +2670,14 @@ impl<'a> Searcher<'a> {
                 self.stack.rep_base[1] = if m.is_clone() { 1 } else { 0 };
                 if BZ {
                     self.bz_snaps[self.bz_base_offset + 1] = placement_snap(b, m);
-                    self.bz_rep_base[1] = if m.is_clone() {
-                        (self.bz_base_offset + 1) as u32
-                    } else {
-                        0
+                    self.bz_ply[1] = BzPly {
+                        rep_base: if m.is_clone() {
+                            (self.bz_base_offset + 1) as u32
+                        } else {
+                            0
+                        },
+                        ban_start: 0,
+                        tainted: false,
                     };
                 }
                 // Root children: acc[1] = acc[0] + diffs (sancta lazy path).
@@ -3154,6 +3219,103 @@ xxx....
             "legal 4-ply revisit s4 must not trigger fake repetition forfeit mate: score = {}",
             r.score
         );
+    }
+
+    #[test]
+    fn bz_ban_collector_matches_naive_across_distances_and_overflow() {
+        // 1. Random legal jump-heavy BZ sequences from random positions: verify that no alternating
+        // non-pass placement-snap sequence ever repeats at distance 1, 2, or 3 even across captures.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next_u64 = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut list = MoveList::new();
+        for _case in 0..80 {
+            let mut b = Board::botzone_start();
+            let warmup = (next_u64() % 18) as usize;
+            for _ in 0..warmup {
+                b.legal_moves_dedup_into(&mut list);
+                if list.is_empty() || b.bz_over() {
+                    break;
+                }
+                let idx = (next_u64() as usize) % list.len();
+                b = b.make(list.move_at(idx));
+            }
+            if b.bz_over() {
+                continue;
+            }
+            let mut snaps = vec![(b.occ[0], b.occ[1])];
+            let mut rbase = 0usize;
+            for _step in 0..40 {
+                b.legal_moves_dedup_into(&mut list);
+                if list.is_empty() || b.bz_over() {
+                    break;
+                }
+                // Bias heavily toward jumps so same-epoch sequences happen often.
+                let mut jumps = Vec::new();
+                for i in 0..list.len() {
+                    let m = list.move_at(i);
+                    if !m.is_clone() {
+                        jumps.push(m);
+                    }
+                }
+                let m = if !jumps.is_empty() && (next_u64() % 10 != 0) {
+                    jumps[(next_u64() as usize) % jumps.len()]
+                } else {
+                    list.move_at((next_u64() as usize) % list.len())
+                };
+                snaps.push(placement_snap(&b, m));
+                b = b.make(m);
+                let cur = snaps.len() - 1;
+                if m.is_clone() {
+                    rbase = cur;
+                } else if cur >= rbase + 1 {
+                    let last = snaps[cur];
+                    for prev in rbase..cur {
+                        let dist = cur - prev;
+                        if dist <= 3 {
+                            assert_ne!(
+                                snaps[prev], last,
+                                "unexpected snapshot repeat at distance {dist}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Directly verify collect_bz_bans_cold + is_bz_snap_banned on >32 banned successors (overflow path)
+        // and stack-preserving child truncation.
+        let mut se = Searcher::with_tt_bits(12);
+        let root_snap = (0x1u64, 0x2u64);
+        se.bz_snaps.clear();
+        for i in 0..40u64 {
+            se.bz_snaps.push(root_snap);
+            se.bz_snaps.push((0x100u64 + i, 0x200u64));
+        }
+        // Final spacing >= 4 before current snapshot.
+        se.bz_snaps.push((0x999u64, 0x888u64));
+        se.bz_snaps.push((0x99Au64, 0x889u64));
+        se.bz_snaps.push((0x99Bu64, 0x88Au64));
+        se.bz_snaps.push(root_snap);
+        let cur_v = se.bz_snaps.len() - 1;
+        // Pre-seed ancestor entry at index 0..1 to ensure child truncation never clobbers ancestors.
+        se.bz_banned.clear();
+        se.bz_banned.push((0xDEAD, 0xBEEF));
+        let (n, overflow) = se.collect_bz_bans_cold(cur_v, 0, 1);
+        assert_eq!(n, 32);
+        assert!(overflow);
+        assert_eq!(se.bz_banned[0], (0xDEAD, 0xBEEF));
+        for i in 0..40u64 {
+            assert!(
+                se.is_bz_snap_banned(cur_v, 0, 1, n, overflow, (0x100u64 + i, 0x200u64)),
+                "overflow ban {i} must still be caught"
+            );
+        }
+        assert!(!se.is_bz_snap_banned(cur_v, 0, 1, n, overflow, (0x100u64 + 99, 0x200u64)));
     }
 
     #[test]
