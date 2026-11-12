@@ -1760,6 +1760,7 @@ impl<'a> Searcher<'a> {
         // Transposition table probe. Missing entry at depth >= 4 -> IIR
         // (internal iterative reduction, Moonbird): the node has no cached
         // best move to order by, so search one ply less.
+        let is_pv = beta - alpha > 1;
         let alpha_orig = alpha;
         let mut tt_mv: u32 = 0;
         let mut depth = depth;
@@ -1767,26 +1768,18 @@ impl<'a> Searcher<'a> {
             tt_mv = e.mv;
             if !(BZ && (n_banned > 0 || at_bz_horizon)) && e.depth as u32 >= depth {
                 let s = score_from_tt(e.score, ply);
-                match e.flag {
-                    FLAG_EXACT => {
-                        if s.abs() < MATE_BOUND || (MATE - s.abs()) as u32 >= depth {
-                            self.heuristic_used = true;
-                        }
-                        return s;
-                    }
-                    FLAG_LOWER => {
-                        if s > alpha {
-                            alpha = s;
-                        }
-                    }
-                    FLAG_UPPER => {
-                        if s < beta {
-                            beta = s;
-                        }
-                    }
-                    _ => {}
-                }
-                if alpha >= beta {
+                let cut = if !is_pv {
+                    e.flag == FLAG_EXACT
+                        || (e.flag == FLAG_LOWER && s >= beta)
+                        || (e.flag == FLAG_UPPER && s <= alpha)
+                } else {
+                    ply == 1
+                        && alpha <= -MATE_BOUND
+                        && beta < MATE_BOUND
+                        && e.flag != FLAG_UPPER
+                        && s >= beta
+                };
+                if cut {
                     if s.abs() < MATE_BOUND || (MATE - s.abs()) as u32 >= depth {
                         self.heuristic_used = true;
                     }
@@ -1816,7 +1809,8 @@ impl<'a> Searcher<'a> {
         // far below alpha that even a generous error margin cannot recover
         // -> fail low. Safe in Ataxx because the eval is capture-risk-aware.
         // Disabled when alpha/beta are mate scores so centipawn evals never prune mate lines.
-        if null_allowed
+        if !is_pv
+            && null_allowed
             && !(BZ && (n_banned > 0 || at_bz_horizon))
             && ply > 0
             && depth <= 4
