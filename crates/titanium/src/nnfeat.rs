@@ -116,7 +116,7 @@ pub fn victim_planes(v: u64) -> [u64; 4] {
 
 /// Add 1 to the count of every square in `m` (a new victim stone adds 1 to each of its 8 neighbours).
 #[inline(always)]
-fn planes_add(p: &mut [u64; 4], m: u64) {
+pub(crate) fn planes_add(p: &mut [u64; 4], m: u64) {
     let c0 = p[0] & m;
     p[0] ^= m;
     let c1 = p[1] & c0;
@@ -126,9 +126,21 @@ fn planes_add(p: &mut [u64; 4], m: u64) {
     p[3] ^= c2;
 }
 
-/// Largest victim count over the candidate squares, read off the bit planes (no per-candidate loop).
+/// Subtract 1 from the count of every square in `m` (exact inverse of `planes_add` when every bit in `m` has count >= 1).
 #[inline(always)]
-fn planes_max(cand: u64, p: &[u64; 4]) -> u32 {
+pub(crate) fn planes_sub(p: &mut [u64; 4], m: u64) {
+    let b0 = !p[0] & m;
+    p[0] ^= m;
+    let b1 = !p[1] & b0;
+    p[1] ^= b0;
+    let b2 = !p[2] & b1;
+    p[2] ^= b1;
+    p[3] ^= b2;
+}
+
+/// Largest victim count over the candidate squares and the mask of candidates achieving it, read off the bit planes.
+#[inline(always)]
+pub(crate) fn planes_max_mask(cand: u64, p: &[u64; 4]) -> (u32, u64) {
     let mut m = cand;
     let mut best = 0u32;
     for k in (0..4).rev() {
@@ -138,7 +150,13 @@ fn planes_max(cand: u64, p: &[u64; 4]) -> u32 {
             m = x;
         }
     }
-    best
+    (best, m)
+}
+
+/// Largest victim count over the candidate squares, read off the bit planes (no per-candidate loop).
+#[inline(always)]
+pub(crate) fn planes_max(cand: u64, p: &[u64; 4]) -> u32 {
+    planes_max_mask(cand, p).0
 }
 
 /// Anchor of one perspective without per-square branches: among the candidate squares (landable by us, next to an enemy
@@ -901,6 +919,24 @@ mod tests {
             let nx = features(&b, 0, ALL_GROUPS, &mut x);
             let ny = features(&s, 1, ALL_GROUPS, &mut y);
             assert_eq!(&x[..nx], &y[..ny]);
+        }
+    }
+
+    #[test]
+    fn planes_sub_matches_victim_planes() {
+        let mut seed = 0x1234_9876_55aa_00ffu64;
+        for _ in 0..2000 {
+            let b = rand_board(&mut seed);
+            let own = b.occ[0];
+            if own == 0 {
+                continue;
+            }
+            let from = own.trailing_zeros() as usize;
+            let fbit = 1u64 << from;
+            let mut p = victim_planes(own);
+            planes_sub(&mut p, RING1[from]);
+            let expected = victim_planes(own & !fbit);
+            assert_eq!(p, expected, "planes_sub mismatch for own={own:#x} from={from}");
         }
     }
 }

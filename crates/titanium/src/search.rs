@@ -407,8 +407,11 @@ const ORD_CLONE_BONUS: i32 = 500;
 const ORD_JUMP_PEN: i32 = 500;
 /// exp/ab O1: extra jump penalty per own stone neighboring the origin.
 const ORD_JUMP_CONN: i32 = 250;
-const ORD_PLUG_HOLE_UNIT: i32 = env_usize(option_env!("ORD_PLUG_HOLE_UNIT"), 400) as i32;
-const ORD_EVAC_UNIT: i32 = env_usize(option_env!("ORD_EVAC_UNIT"), 250) as i32;
+/// exp/tactical-mvv-lva v2: exact 2-ply piece-count differential SEE (`MyGain - MaxOppReplyGain`)
+/// computed statically via O(1) carry-save bit-planes (`victim_planes`, `planes_add`, `planes_sub`, `planes_max_mask`),
+/// using natural 500/diff units (`1000` per flipped stone = `ORD_CAPTURE_UNIT`) at `depth >= MVV2_MIN_DEPTH`.
+const ORD_MVV2_UNIT: i32 = 500;
+const MVV2_MIN_DEPTH: u32 = 2;
 const ORD_HISTORY_MAX: i32 = 90_000;
 /// exp/search-histmb: Moonbird 1.1.0 history (searchUtils.nim) keyed [stm][from][to] (clones keyed [to][to]):
 /// +depth^2 for the move that raised alpha, -depth^2/24 for every searched move that did not, |h| capped at 107000
@@ -542,13 +545,125 @@ pub fn evaluate(b: &Board, tup: Option<&TupleTable>, native_tup: bool) -> i32 {
 const HIST_DIV: i32 = HIST_MAX / ORD_HIST_FULL;
 const _: () = assert!(HIST_MAX % ORD_HIST_FULL == 0);
 
+/// Exact brute-force 2-ply piece-count oracle (used in unit tests to verify bit-plane parity):
+/// after moving `me` onto `to` (clone if `from_jump.is_none()`, jump from `from` if `Some(from)`),
+/// returns the opponent's maximum 1-ply piece-count differential gain (`1 + 2 * opp_caps` for clones,
+/// `2 * opp_caps` for jumps, `0` if opponent has no clone/capture reply).
+#[cfg(test)]
+#[inline]
+pub(crate) fn mvv2_max_opp_gain_ref(
+    me: u64,
+    opp: u64,
+    empty: u64,
+    to: u8,
+    from_jump: Option<u8>,
+) -> i32 {
+    let tu = to as usize;
+    let sbit = 1u64 << tu;
+    let conv = opp & RING1[tu];
+    let mut me1 = me | sbit | conv;
+    let opp1 = opp & !conv;
+    let mut empty1 = empty & !sbit;
+    if let Some(from) = from_jump {
+        let fbit = 1u64 << from;
+        me1 &= !fbit;
+        empty1 |= fbit;
+    }
+    let mut best_gain = 0i32;
+    let mut oc = box1(opp1) & empty1;
+    while oc != 0 {
+        let s = oc.trailing_zeros() as usize;
+        oc &= oc - 1;
+        let c = (me1 & RING1[s]).count_ones() as i32;
+        best_gain = best_gain.max(1 + 2 * c);
+    }
+    let mut oj = reach_union(opp1) & empty1;
+    while oj != 0 {
+        let s = oj.trailing_zeros() as usize;
+        oj &= oj - 1;
+        if (opp1 & RING2[s]) != 0 {
+            let c = (me1 & RING1[s]).count_ones() as i32;
+            best_gain = best_gain.max(2 * c);
+        }
+    }
+    best_gain
+}
+
+/// Per-destination post-move bit-plane and opponent-reach state shared across a clone onto `to`
+/// and every jump landing on `to`.
+#[inline(always)]
+fn mvv2_to_state(
+    opp: u64,
+    p_base: [u64; 4],
+    du_me: u64,
+    b1_opp0: u64,
+    b2_opp0: u64,
+    to: usize,
+) -> ([u64; 4], u64, u64, u64) {
+    let r1_to = RING1[to];
+    let conv = opp & r1_to;
+    let mut p_to = p_base;
+    crate::nnfeat::planes_add(&mut p_to, r1_to);
+    let mut near_to = du_me | r1_to;
+    let mut cv = conv;
+    while cv != 0 {
+        let x = cv.trailing_zeros() as usize;
+        cv &= cv - 1;
+        let rx = RING1[x];
+        crate::nnfeat::planes_add(&mut p_to, rx);
+        near_to |= rx;
+    }
+    let (b1_opp, b2_opp) = if conv == 0 {
+        (b1_opp0, b2_opp0)
+    } else {
+        let opp1 = opp & !r1_to;
+        let b1 = box1(opp1);
+        (b1, box1(b1))
+    };
+    (p_to, near_to, b1_opp, b2_opp)
+}
+
+/// O(1) static bit-plane lookup of opponent's maximum 1-ply differential gain on `(opp1, me1, empty_after)`.
+#[inline(always)]
+fn mvv2_max_opp_from_state(
+    p: &[u64; 4],
+    near_to: u64,
+    b1_opp: u64,
+    b2_opp: u64,
+    empty_after: u64,
+) -> i32 {
+    let cand_all = b2_opp & empty_after & near_to;
+    if cand_all == 0 {
+        return ((b1_opp & empty_after) != 0) as i32;
+    }
+    let cand_c = b1_opp & cand_all;
+    let (m_any, max_mask) = crate::nnfeat::planes_max_mask(cand_all, p);
+    if (cand_c & max_mask) != 0 {
+        1 + 2 * (m_any as i32)
+    } else if m_any > 0 {
+        2 * (m_any as i32)
+    } else {
+        ((b1_opp & empty_after) != 0) as i32
+    }
+}
+
+#[inline(always)]
+const fn mvv2_base_score(is_clone: bool, caps: i32, conn: i32, max_opp: i32) -> i32 {
+    let base = if is_clone {
+        caps * ORD_CAPTURE_UNIT + ORD_CLONE_BONUS
+    } else {
+        caps * ORD_CAPTURE_UNIT - (ORD_JUMP_PEN + conn * ORD_JUMP_CONN)
+    };
+    base - max_opp * ORD_MVV2_UNIT
+}
+
 /// Fused move generation + scoring (+ optional policy head): iterates legal
 /// destinations in ascending `to` order (identical tie-break order to
 /// `legal_moves_dedup_into`), sharing per-destination (`flips`, `tholes`,
 /// `k3_to`) and per-origin (`conn`, `from_holes`, `k3_from`) work across jumps.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
+fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool, const USE_MVV: bool>(
     b: &Board,
     list: &mut MoveList,
     tt_mv: u32,
@@ -564,14 +679,19 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
     let opp = b.opp();
     let empty = b.empty();
     let mut targets = reach_union(me) & empty;
-    let opp_reach = reach_union(opp) & empty;
     let (k1, k2) = killers[ply as usize];
     let hist = &history[b.turn as usize];
     let mut tt_index = usize::MAX;
 
+    let (p_base, du_me, b1_opp0, b2_opp0) = if USE_MVV {
+        let b1 = box1(opp);
+        (crate::nnfeat::victim_planes(me), box1(me), b1, box1(b1))
+    } else {
+        ([0; 4], 0, 0, 0)
+    };
+
     let mut orig_valid: u64 = 0;
     let mut orig_conn = [MaybeUninit::<i32>::uninit(); 49];
-    let mut orig_evac = [MaybeUninit::<i32>::uninit(); 49];
     let mut orig_g = [MaybeUninit::<f32>::uninit(); 49];
     let mut orig_tor = [MaybeUninit::<i32>::uninit(); 49];
 
@@ -579,23 +699,20 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
         let to = targets.trailing_zeros() as u8;
         targets &= targets - 1;
         let tu = to as usize;
+        let sbit = 1u64 << tu;
         let r1_to = RING1[tu];
         let caps = (opp & r1_to).count_ones() as i32;
         let cap_sc = caps * ORD_CAPTURE_UNIT;
-        let to_is_opp_landing = (opp_reach & (1u64 << tu)) != 0;
-        let plug_bonus = if ORD_PLUG_HOLE_UNIT > 0 && to_is_opp_landing {
-            let threatened = (me & r1_to).count_ones() as i32;
-            if threatened >= 2 {
-                (threatened - 1) * ORD_PLUG_HOLE_UNIT
-            } else {
-                0
-            }
-        } else {
-            0
-        };
 
         let clones = me & r1_to;
         let jumps = me & RING2[tu];
+
+        let (p_to, near_to, b1_opp, b2_opp) = if USE_MVV {
+            mvv2_to_state(opp, p_base, du_me, b1_opp0, b2_opp0, tu)
+        } else {
+            ([0; 4], 0, 0, 0)
+        };
+        let empty_c = empty & !sbit;
 
         let (flips, tholes, k3_to) = if HAS_POLICY {
             (
@@ -619,7 +736,12 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
                 // Clone preference: a clone nets one more stone than a jump and
                 // leaves the origin defended ("duplicate as much as you can").
                 // (exp/ab A tested no-asymmetry: 41-55, keep preference.)
-                let mut sc = cap_sc + ORD_CLONE_BONUS + plug_bonus;
+                let mut sc = if USE_MVV {
+                    let max_opp = mvv2_max_opp_from_state(&p_to, near_to, b1_opp, b2_opp, empty_c);
+                    mvv2_base_score(true, caps, 0, max_opp)
+                } else {
+                    cap_sc + ORD_CLONE_BONUS
+                };
                 let kk = ((to as u32) << 8) | to as u32;
                 if kk == k1 || kk == k2 {
                     sc += ORD_KILLER;
@@ -659,33 +781,6 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
                     orig_valid |= fbit;
                     let r1_from = RING1[fu];
                     orig_conn[fu].write((me & r1_from).count_ones() as i32);
-                    let evac_sc = if ORD_EVAC_UNIT > 0 {
-                        // Check if from was touching any opponent landing square
-                        let danger_holes = opp_reach & r1_from;
-                        if danger_holes != 0 {
-                            // Sum threatened count on adjacent holes
-                            let mut dh = danger_holes;
-                            let mut max_threat = 0i32;
-                            while dh != 0 {
-                                let h = dh.trailing_zeros() as usize;
-                                dh &= dh - 1;
-                                let t = (me & RING1[h]).count_ones() as i32;
-                                if t > max_threat {
-                                    max_threat = t;
-                                }
-                            }
-                            if max_threat >= 2 {
-                                ORD_EVAC_UNIT * (max_threat - 1)
-                            } else {
-                                0
-                            }
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    };
-                    orig_evac[fu].write(evac_sc);
                     if HAS_POLICY {
                         let (p, _, _) = pol.unwrap();
                         let fh = ((r1_from & empty).count_ones() as usize).min(8);
@@ -695,13 +790,20 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
                         orig_tor[fu].write(ft);
                     }
                 }
-                // SAFETY: `orig_valid & fbit != 0` ensures `orig_conn[fu]`, `orig_evac[fu]` (and `orig_g[fu]`/`orig_tor[fu]` under `HAS_POLICY`) was written.
+                // SAFETY: `orig_valid & fbit != 0` ensures `orig_conn[fu]` (and `orig_g[fu]`/`orig_tor[fu]` under `HAS_POLICY`) was written.
                 let conn = unsafe { orig_conn[fu].assume_init() };
-                let evac = unsafe { orig_evac[fu].assume_init() };
                 // exp/ab O1 (hole-aware jumps): a jump vacates its origin —
                 // leaving a connected origin breaks formation, so penalty
                 // scales with own stones adjacent to the origin square.
-                let mut sc = cap_sc + plug_bonus + evac - (ORD_JUMP_PEN + conn * ORD_JUMP_CONN);
+                let mut sc = if USE_MVV {
+                    let mut p_j = p_to;
+                    crate::nnfeat::planes_sub(&mut p_j, RING1[fu]);
+                    let max_opp =
+                        mvv2_max_opp_from_state(&p_j, near_to, b1_opp, b2_opp, empty_c | fbit);
+                    mvv2_base_score(false, caps, conn, max_opp)
+                } else {
+                    cap_sc - (ORD_JUMP_PEN + conn * ORD_JUMP_CONN)
+                };
                 let kk = m.to_u32();
                 if kk == k1 || kk == k2 {
                     sc += ORD_KILLER;
@@ -2046,46 +2148,83 @@ impl<'a> Searcher<'a> {
         }
 
         {
+            let use_mvv = depth >= MVV2_MIN_DEPTH;
             match (self.policy, self.nnue) {
                 (Some(pol), Some(nn)) if depth >= self.pol_min => {
                     if pol.dim > 0 && nn.pairwise {
                         let mut buf = std::mem::take(&mut self.pol_buf);
                         nn.policy_xin(b, &mut buf);
                         let list = &mut self.stack.lists[ply as usize];
-                        gen_and_score_into::<true, true>(
-                            b,
-                            list,
-                            skip_tt_mv,
-                            ply,
-                            &self.killers,
-                            &self.history,
-                            Some((pol, &buf, self.pol_w)),
-                        );
+                        if use_mvv {
+                            gen_and_score_into::<true, true, true>(
+                                b,
+                                list,
+                                skip_tt_mv,
+                                ply,
+                                &self.killers,
+                                &self.history,
+                                Some((pol, &buf, self.pol_w)),
+                            );
+                        } else {
+                            gen_and_score_into::<true, true, false>(
+                                b,
+                                list,
+                                skip_tt_mv,
+                                ply,
+                                &self.killers,
+                                &self.history,
+                                Some((pol, &buf, self.pol_w)),
+                            );
+                        }
                         self.pol_buf = buf;
                     } else {
                         let list = &mut self.stack.lists[ply as usize];
-                        gen_and_score_into::<true, true>(
-                            b,
-                            list,
-                            skip_tt_mv,
-                            ply,
-                            &self.killers,
-                            &self.history,
-                            Some((pol, &[], self.pol_w)),
-                        );
+                        if use_mvv {
+                            gen_and_score_into::<true, true, true>(
+                                b,
+                                list,
+                                skip_tt_mv,
+                                ply,
+                                &self.killers,
+                                &self.history,
+                                Some((pol, &[], self.pol_w)),
+                            );
+                        } else {
+                            gen_and_score_into::<true, true, false>(
+                                b,
+                                list,
+                                skip_tt_mv,
+                                ply,
+                                &self.killers,
+                                &self.history,
+                                Some((pol, &[], self.pol_w)),
+                            );
+                        }
                     }
                 }
                 _ => {
                     let list = &mut self.stack.lists[ply as usize];
-                    gen_and_score_into::<true, false>(
-                        b,
-                        list,
-                        skip_tt_mv,
-                        ply,
-                        &self.killers,
-                        &self.history,
-                        None,
-                    );
+                    if use_mvv {
+                        gen_and_score_into::<true, false, true>(
+                            b,
+                            list,
+                            skip_tt_mv,
+                            ply,
+                            &self.killers,
+                            &self.history,
+                            None,
+                        );
+                    } else {
+                        gen_and_score_into::<true, false, false>(
+                            b,
+                            list,
+                            skip_tt_mv,
+                            ply,
+                            &self.killers,
+                            &self.history,
+                            None,
+                        );
+                    }
                 }
             }
             // Fallthrough terminal: legal_moves_dedup_into tracks dedup
@@ -2594,7 +2733,7 @@ impl<'a> Searcher<'a> {
             // array (best-first). Each iteration reorders the array.
             let (kill, hist) = (&self.killers, &self.history);
             let root = &mut self.stack.lists[0];
-            gen_and_score_into::<false, false>(b, root, tt_mv, 0, kill, hist, None);
+            gen_and_score_into::<false, false, true>(b, root, tt_mv, 0, kill, hist, None);
         }
         let n_root = self.stack.lists[0].len();
         if n_root == 0 {
@@ -3574,6 +3713,116 @@ xxx....
     }
 
     #[test]
+    fn mvv2_bitplane_matches_2ply_legal_moves_bruteforce() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let next_u64 = |s: &mut u64| {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        };
+        let mut list = MoveList::new();
+        let mut opp_list = MoveList::new();
+        for n in 0..2500 {
+            let b = if n % 3 == 0 {
+                // Sparse/dense/arbitrary bitboards including blockers and wipeout/no-move cases.
+                let m0 = next_u64(&mut x) & crate::board::FULL;
+                let m1 = (next_u64(&mut x) & crate::board::FULL) & !m0;
+                let blk = if n % 6 == 0 {
+                    (next_u64(&mut x) & crate::board::FULL) & !(m0 | m1)
+                } else {
+                    0
+                };
+                Board::from_occ(m0, m1, blk, (n & 1) as u8)
+            } else {
+                let mut g = Board::start();
+                for _ in 0..(n % 34) {
+                    g.legal_moves_dedup_into(&mut list);
+                    if list.is_empty() || g.game_over() {
+                        break;
+                    }
+                    let idx = (next_u64(&mut x) as usize) % list.len();
+                    g = g.make(list.move_at(idx));
+                }
+                g
+            };
+            if b.game_over() {
+                continue;
+            }
+            b.legal_moves_dedup_into(&mut list);
+            if list.is_empty() {
+                continue;
+            }
+            let me_side = b.turn as usize;
+            let opp_side = 1 - me_side;
+            let me = b.me();
+            let opp = b.opp();
+            let empty = b.empty();
+            let d0 = me.count_ones() as i32 - opp.count_ones() as i32;
+            let p_base = crate::nnfeat::victim_planes(me);
+            let du_me = box1(me);
+            let b1_opp0 = box1(opp);
+            let b2_opp0 = box1(b1_opp0);
+
+            for m in list.iter() {
+                let c1 = b.make(m);
+                c1.legal_moves_dedup_into(&mut opp_list);
+                let min_diff_2ply = if opp_list.is_empty() {
+                    c1.piece_cnt[me_side] as i32 - c1.piece_cnt[opp_side] as i32
+                } else {
+                    let mut best = i32::MAX;
+                    for r in opp_list.iter() {
+                        let c2 = c1.make(r);
+                        let d2 = c2.piece_cnt[me_side] as i32 - c2.piece_cnt[opp_side] as i32;
+                        if d2 < best {
+                            best = d2;
+                        }
+                    }
+                    best
+                };
+
+                let tu = m.to as usize;
+                let sbit = 1u64 << tu;
+                let caps = (opp & RING1[tu]).count_ones() as i32;
+                let my_gain = (m.is_clone() as i32) + 2 * caps;
+                let max_opp_ref = mvv2_max_opp_gain_ref(
+                    me,
+                    opp,
+                    empty,
+                    m.to,
+                    if m.is_clone() { None } else { Some(m.from) },
+                );
+                assert_eq!(
+                    d0 + my_gain - max_opp_ref,
+                    min_diff_2ply,
+                    "2-ply minimax stone-diff mismatch at n={n} move={m:?}"
+                );
+
+                let (p_to, near_to, b1_opp, b2_opp) =
+                    mvv2_to_state(opp, p_base, du_me, b1_opp0, b2_opp0, tu);
+                let empty_c = empty & !sbit;
+                let max_opp_planes = if m.is_clone() {
+                    mvv2_max_opp_from_state(&p_to, near_to, b1_opp, b2_opp, empty_c)
+                } else {
+                    let mut p_j = p_to;
+                    crate::nnfeat::planes_sub(&mut p_j, RING1[m.from as usize]);
+                    mvv2_max_opp_from_state(
+                        &p_j,
+                        near_to,
+                        b1_opp,
+                        b2_opp,
+                        empty_c | (1u64 << m.from as usize),
+                    )
+                };
+                assert_eq!(
+                    max_opp_planes, max_opp_ref,
+                    "bitplane vs brute-force mismatch at n={n} move={m:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn gen_and_score_matches_reference() {
         let mut x: u64 = 0xD1B5_4A32_D192_ED03;
         let next_u64 = |s: &mut u64| {
@@ -3623,87 +3872,109 @@ xxx....
             let k2 = kill_key(ref_list.move_at((next_u64(&mut x) as usize) % ref_list.len()));
             killers[ply as usize] = (k1, k2);
 
-            for with_pol in [false, true] {
-                let mut kc = crate::policy::KCache::new();
-                let mut expected: Vec<(Move, i32)> = Vec::new();
-                let opp = b.opp();
-                let me = b.occ[b.turn as usize];
-                let hist = &history[b.turn as usize];
-                let mut tt_pos = None;
-                for m in ref_list.iter() {
-                    if tt_mv != 0 && crate::ttcodec::move_code(m) as u32 == tt_mv {
-                        tt_pos = Some(expected.len());
-                        expected.push((m, ORD_TT));
-                        continue;
-                    }
-                    let mut sc = (opp & RING1[m.to as usize]).count_ones() as i32 * ORD_CAPTURE_UNIT;
-                    if m.is_clone() {
-                        sc += ORD_CLONE_BONUS;
-                    } else {
-                        let conn = (me & RING1[m.from as usize]).count_ones() as i32;
-                        sc -= ORD_JUMP_PEN + conn * ORD_JUMP_CONN;
-                    }
+            for use_mvv in [false, true] {
+                for with_pol in [false, true] {
+                    let mut kc = crate::policy::KCache::new();
+                    let mut expected: Vec<(Move, i32)> = Vec::new();
+                    let opp = b.opp();
+                    let me = b.occ[b.turn as usize];
                     let empty = b.empty();
-                    if ORD_PLUG_HOLE_UNIT > 0 && ((reach_union(opp) & empty) & (1u64 << m.to as usize)) != 0 {
-                        let threatened = (me & RING1[m.to as usize]).count_ones() as i32;
-                        if threatened >= 2 {
-                            sc += (threatened - 1) * ORD_PLUG_HOLE_UNIT;
+                    let hist = &history[b.turn as usize];
+                    let mut tt_pos = None;
+                    for m in ref_list.iter() {
+                        if tt_mv != 0 && crate::ttcodec::move_code(m) as u32 == tt_mv {
+                            tt_pos = Some(expected.len());
+                            expected.push((m, ORD_TT));
+                            continue;
                         }
-                    }
-                    if ORD_EVAC_UNIT > 0 && !m.is_clone() {
-                        let opp_reach = reach_union(opp) & empty;
-                        let r1_from = RING1[m.from as usize];
-                        let danger_holes = opp_reach & r1_from;
-                        if danger_holes != 0 {
-                            let mut dh = danger_holes;
-                            let mut max_threat = 0i32;
-                            while dh != 0 {
-                                let h = dh.trailing_zeros() as usize;
-                                dh &= dh - 1;
-                                let t = (me & RING1[h]).count_ones() as i32;
-                                if t > max_threat {
-                                    max_threat = t;
-                                }
-                            }
-                            if max_threat >= 2 {
-                                sc += (max_threat - 1) * ORD_EVAC_UNIT;
-                            }
+                        let caps = (opp & RING1[m.to as usize]).count_ones() as i32;
+                        let conn = if m.is_clone() {
+                            0
+                        } else {
+                            (me & RING1[m.from as usize]).count_ones() as i32
+                        };
+                        let mut sc = if use_mvv {
+                            let max_opp = mvv2_max_opp_gain_ref(
+                                me,
+                                opp,
+                                empty,
+                                m.to,
+                                if m.is_clone() { None } else { Some(m.from) },
+                            );
+                            mvv2_base_score(m.is_clone(), caps, conn, max_opp)
+                        } else if m.is_clone() {
+                            caps * ORD_CAPTURE_UNIT + ORD_CLONE_BONUS
+                        } else {
+                            caps * ORD_CAPTURE_UNIT - (ORD_JUMP_PEN + conn * ORD_JUMP_CONN)
+                        };
+                        let kk = kill_key(m);
+                        if kk == k1 || kk == k2 {
+                            sc += ORD_KILLER;
                         }
+                        let (hf, ht) = hist_key(m);
+                        sc += hist[hf][ht] / HIST_DIV;
+                        if with_pol {
+                            let add = (pol.logit_k(&b, m, &[], &mut kc) * pol_w) as i32;
+                            sc = sc.saturating_add(add);
+                        }
+                        expected.push((m, sc));
                     }
-                    let kk = kill_key(m);
-                    if kk == k1 || kk == k2 {
-                        sc += ORD_KILLER;
-                    }
-                    let (hf, ht) = hist_key(m);
-                    sc += hist[hf][ht] / HIST_DIV;
-                    if with_pol {
-                        let add = (pol.logit_k(&b, m, &[], &mut kc) * pol_w) as i32;
-                        sc = sc.saturating_add(add);
-                    }
-                    expected.push((m, sc));
-                }
 
-                // Check SKIP_TT = true (all non-TT moves in identical order with identical scores)
-                if with_pol {
-                    gen_and_score_into::<true, true>(&b, &mut new_list, tt_mv, ply, &killers, &history, Some((pol, &[], pol_w)));
-                } else {
-                    gen_and_score_into::<true, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None);
-                }
-                let expected_skip: Vec<(Move, i32)> = expected.iter().copied().enumerate().filter(|(i, _)| Some(*i) != tt_pos).map(|(_, v)| v).collect();
-                let actual_skip: Vec<(Move, i32)> = (0..new_list.len()).map(|i| (new_list.move_at(i), new_list.score_at(i))).collect();
-                assert_eq!(actual_skip, expected_skip, "SKIP_TT=true mismatch n={n} with_pol={with_pol}");
-
-                // Check SKIP_TT = false (TT swapped to index 0)
-                if !with_pol {
-                    gen_and_score_into::<false, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None);
-                    let mut expected_noskip = expected.clone();
-                    if let Some(tp) = tt_pos {
-                        if tp != 0 {
-                            expected_noskip.swap(tp, 0);
-                        }
+                    // Check SKIP_TT = true (all non-TT moves in identical order with identical scores)
+                    match (with_pol, use_mvv) {
+                        (true, true) => gen_and_score_into::<true, true, true>(
+                            &b, &mut new_list, tt_mv, ply, &killers, &history, Some((pol, &[], pol_w)),
+                        ),
+                        (true, false) => gen_and_score_into::<true, true, false>(
+                            &b, &mut new_list, tt_mv, ply, &killers, &history, Some((pol, &[], pol_w)),
+                        ),
+                        (false, true) => gen_and_score_into::<true, false, true>(
+                            &b, &mut new_list, tt_mv, ply, &killers, &history, None,
+                        ),
+                        (false, false) => gen_and_score_into::<true, false, false>(
+                            &b, &mut new_list, tt_mv, ply, &killers, &history, None,
+                        ),
                     }
-                    let actual_noskip: Vec<(Move, i32)> = (0..new_list.len()).map(|i| (new_list.move_at(i), new_list.score_at(i))).collect();
-                    assert_eq!(actual_noskip, expected_noskip, "SKIP_TT=false mismatch n={n}");
+                    let expected_skip: Vec<(Move, i32)> = expected
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .filter(|(i, _)| Some(*i) != tt_pos)
+                        .map(|(_, v)| v)
+                        .collect();
+                    let actual_skip: Vec<(Move, i32)> = (0..new_list.len())
+                        .map(|i| (new_list.move_at(i), new_list.score_at(i)))
+                        .collect();
+                    assert_eq!(
+                        actual_skip, expected_skip,
+                        "SKIP_TT=true mismatch n={n} with_pol={with_pol} use_mvv={use_mvv}"
+                    );
+
+                    // Check SKIP_TT = false (TT swapped to index 0)
+                    if !with_pol {
+                        if use_mvv {
+                            gen_and_score_into::<false, false, true>(
+                                &b, &mut new_list, tt_mv, ply, &killers, &history, None,
+                            );
+                        } else {
+                            gen_and_score_into::<false, false, false>(
+                                &b, &mut new_list, tt_mv, ply, &killers, &history, None,
+                            );
+                        }
+                        let mut expected_noskip = expected.clone();
+                        if let Some(tp) = tt_pos {
+                            if tp != 0 {
+                                expected_noskip.swap(tp, 0);
+                            }
+                        }
+                        let actual_noskip: Vec<(Move, i32)> = (0..new_list.len())
+                            .map(|i| (new_list.move_at(i), new_list.score_at(i)))
+                            .collect();
+                        assert_eq!(
+                            actual_noskip, expected_noskip,
+                            "SKIP_TT=false mismatch n={n} use_mvv={use_mvv}"
+                        );
+                    }
                 }
             }
         }
