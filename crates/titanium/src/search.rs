@@ -407,6 +407,8 @@ const ORD_CLONE_BONUS: i32 = 500;
 const ORD_JUMP_PEN: i32 = 500;
 /// exp/ab O1: extra jump penalty per own stone neighboring the origin.
 const ORD_JUMP_CONN: i32 = 250;
+const ORD_PLUG_HOLE_UNIT: i32 = env_usize(option_env!("ORD_PLUG_HOLE_UNIT"), 400) as i32;
+const ORD_EVAC_UNIT: i32 = env_usize(option_env!("ORD_EVAC_UNIT"), 250) as i32;
 const ORD_HISTORY_MAX: i32 = 90_000;
 /// exp/search-histmb: Moonbird 1.1.0 history (searchUtils.nim) keyed [stm][from][to] (clones keyed [to][to]):
 /// +depth^2 for the move that raised alpha, -depth^2/24 for every searched move that did not, |h| capped at 107000
@@ -562,12 +564,14 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
     let opp = b.opp();
     let empty = b.empty();
     let mut targets = reach_union(me) & empty;
+    let opp_reach = reach_union(opp) & empty;
     let (k1, k2) = killers[ply as usize];
     let hist = &history[b.turn as usize];
     let mut tt_index = usize::MAX;
 
     let mut orig_valid: u64 = 0;
     let mut orig_conn = [MaybeUninit::<i32>::uninit(); 49];
+    let mut orig_evac = [MaybeUninit::<i32>::uninit(); 49];
     let mut orig_g = [MaybeUninit::<f32>::uninit(); 49];
     let mut orig_tor = [MaybeUninit::<i32>::uninit(); 49];
 
@@ -578,6 +582,17 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
         let r1_to = RING1[tu];
         let caps = (opp & r1_to).count_ones() as i32;
         let cap_sc = caps * ORD_CAPTURE_UNIT;
+        let to_is_opp_landing = (opp_reach & (1u64 << tu)) != 0;
+        let plug_bonus = if ORD_PLUG_HOLE_UNIT > 0 && to_is_opp_landing {
+            let threatened = (me & r1_to).count_ones() as i32;
+            if threatened >= 2 {
+                (threatened - 1) * ORD_PLUG_HOLE_UNIT
+            } else {
+                0
+            }
+        } else {
+            0
+        };
 
         let clones = me & r1_to;
         let jumps = me & RING2[tu];
@@ -604,7 +619,7 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
                 // Clone preference: a clone nets one more stone than a jump and
                 // leaves the origin defended ("duplicate as much as you can").
                 // (exp/ab A tested no-asymmetry: 41-55, keep preference.)
-                let mut sc = cap_sc + ORD_CLONE_BONUS;
+                let mut sc = cap_sc + ORD_CLONE_BONUS + plug_bonus;
                 let kk = ((to as u32) << 8) | to as u32;
                 if kk == k1 || kk == k2 {
                     sc += ORD_KILLER;
@@ -642,22 +657,51 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
                 let fbit = 1u64 << from;
                 if orig_valid & fbit == 0 {
                     orig_valid |= fbit;
-                    orig_conn[fu].write((me & RING1[fu]).count_ones() as i32);
+                    let r1_from = RING1[fu];
+                    orig_conn[fu].write((me & r1_from).count_ones() as i32);
+                    let evac_sc = if ORD_EVAC_UNIT > 0 {
+                        // Check if from was touching any opponent landing square
+                        let danger_holes = opp_reach & r1_from;
+                        if danger_holes != 0 {
+                            // Sum threatened count on adjacent holes
+                            let mut dh = danger_holes;
+                            let mut max_threat = 0i32;
+                            while dh != 0 {
+                                let h = dh.trailing_zeros() as usize;
+                                dh &= dh - 1;
+                                let t = (me & RING1[h]).count_ones() as i32;
+                                if t > max_threat {
+                                    max_threat = t;
+                                }
+                            }
+                            if max_threat >= 2 {
+                                ORD_EVAC_UNIT * (max_threat - 1)
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    orig_evac[fu].write(evac_sc);
                     if HAS_POLICY {
                         let (p, _, _) = pol.unwrap();
-                        let fh = ((RING1[fu] & empty).count_ones() as usize).min(8);
+                        let fh = ((r1_from & empty).count_ones() as usize).min(8);
                         let k3f = crate::policy::k3code_pub(me, opp, from);
                         let (fg, ft) = p.jump_orig_parts(from, fh, k3f);
                         orig_g[fu].write(fg);
                         orig_tor[fu].write(ft);
                     }
                 }
-                // SAFETY: `orig_valid & fbit != 0` ensures `orig_conn[fu]` (and `orig_g[fu]`/`orig_tor[fu]` under `HAS_POLICY`) was written.
+                // SAFETY: `orig_valid & fbit != 0` ensures `orig_conn[fu]`, `orig_evac[fu]` (and `orig_g[fu]`/`orig_tor[fu]` under `HAS_POLICY`) was written.
                 let conn = unsafe { orig_conn[fu].assume_init() };
+                let evac = unsafe { orig_evac[fu].assume_init() };
                 // exp/ab O1 (hole-aware jumps): a jump vacates its origin —
                 // leaving a connected origin breaks formation, so penalty
                 // scales with own stones adjacent to the origin square.
-                let mut sc = cap_sc - (ORD_JUMP_PEN + conn * ORD_JUMP_CONN);
+                let mut sc = cap_sc + plug_bonus + evac - (ORD_JUMP_PEN + conn * ORD_JUMP_CONN);
                 let kk = m.to_u32();
                 if kk == k1 || kk == k2 {
                     sc += ORD_KILLER;
@@ -3598,6 +3642,33 @@ xxx....
                     } else {
                         let conn = (me & RING1[m.from as usize]).count_ones() as i32;
                         sc -= ORD_JUMP_PEN + conn * ORD_JUMP_CONN;
+                    }
+                    let empty = b.empty();
+                    if ORD_PLUG_HOLE_UNIT > 0 && ((reach_union(opp) & empty) & (1u64 << m.to as usize)) != 0 {
+                        let threatened = (me & RING1[m.to as usize]).count_ones() as i32;
+                        if threatened >= 2 {
+                            sc += (threatened - 1) * ORD_PLUG_HOLE_UNIT;
+                        }
+                    }
+                    if ORD_EVAC_UNIT > 0 && !m.is_clone() {
+                        let opp_reach = reach_union(opp) & empty;
+                        let r1_from = RING1[m.from as usize];
+                        let danger_holes = opp_reach & r1_from;
+                        if danger_holes != 0 {
+                            let mut dh = danger_holes;
+                            let mut max_threat = 0i32;
+                            while dh != 0 {
+                                let h = dh.trailing_zeros() as usize;
+                                dh &= dh - 1;
+                                let t = (me & RING1[h]).count_ones() as i32;
+                                if t > max_threat {
+                                    max_threat = t;
+                                }
+                            }
+                            if max_threat >= 2 {
+                                sc += (max_threat - 1) * ORD_EVAC_UNIT;
+                            }
+                        }
                     }
                     let kk = kill_key(m);
                     if kk == k1 || kk == k2 {
