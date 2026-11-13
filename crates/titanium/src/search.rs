@@ -546,7 +546,7 @@ const _: () = assert!(HIST_MAX % ORD_HIST_FULL == 0);
 /// `k3_to`) and per-origin (`conn`, `from_holes`, `k3_from`) work across jumps.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
+fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool, const HAS_SEE: bool>(
     b: &Board,
     list: &mut MoveList,
     tt_mv: u32,
@@ -566,6 +566,18 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
     let hist = &history[b.turn as usize];
     let mut tt_index = usize::MAX;
 
+    let (p_base, b1_opp0, b2_opp0, ph_off) = if HAS_POLICY && HAS_SEE {
+        let b1 = crate::nnfeat::box1(opp);
+        (
+            crate::nnfeat::victim_planes(me),
+            b1,
+            crate::nnfeat::box1(b1),
+            crate::policy::see_phase_off(empty),
+        )
+    } else {
+        ([0; 4], 0, 0, 0)
+    };
+
     let mut orig_valid: u64 = 0;
     let mut orig_conn = [MaybeUninit::<i32>::uninit(); 49];
     let mut orig_g = [MaybeUninit::<f32>::uninit(); 49];
@@ -576,7 +588,8 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
         targets &= targets - 1;
         let tu = to as usize;
         let r1_to = RING1[tu];
-        let caps = (opp & r1_to).count_ones() as i32;
+        let flips_m = opp & r1_to;
+        let caps = flips_m.count_ones() as i32;
         let cap_sc = caps * ORD_CAPTURE_UNIT;
 
         let clones = me & r1_to;
@@ -590,6 +603,24 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
             )
         } else {
             (0, 0, 0)
+        };
+
+        let tbit = 1u64 << tu;
+        let (p_to, b1o, b2o) = if HAS_POLICY && HAS_SEE {
+            if flips_m == 0 {
+                let mut pt = p_base;
+                crate::nnfeat::planes_add(&mut pt, r1_to);
+                (pt, b1_opp0, b2_opp0)
+            } else {
+                let b1 = crate::nnfeat::box1(opp & !flips_m);
+                (
+                    crate::nnfeat::victim_planes(me | tbit | flips_m),
+                    b1,
+                    crate::nnfeat::box1(b1),
+                )
+            }
+        } else {
+            ([0; 4], 0, 0)
         };
 
         if clones != 0 {
@@ -612,7 +643,14 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
                 sc += hist[tu][tu] / HIST_DIV;
                 if HAS_POLICY {
                     let (p, xin, w) = pol.unwrap();
-                    let z = p.clone_logit_pre(to, flips, tholes, k3_to, xin);
+                    let sv = if HAS_SEE {
+                        let ea = empty & !tbit;
+                        let oi = crate::policy::see_opp_state(b1o & ea, b2o & ea, &p_to);
+                        p.see_val(ph_off, 1 + 2 * caps as usize, oi)
+                    } else {
+                        0.0
+                    };
+                    let z = p.clone_logit_pre(to, flips, tholes, k3_to, sv, xin);
                     sc = sc.saturating_add((z * w) as i32);
                 }
                 list.push_scored(m, sc);
@@ -666,7 +704,16 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
                 if HAS_POLICY {
                     let (p, xin, w) = pol.unwrap();
                     let (fg, ft) = unsafe { (orig_g[fu].assume_init(), orig_tor[fu].assume_init()) };
-                    let z = p.jump_finish(to, j_prefix, j_td, fg, ft, xin);
+                    let sv = if HAS_SEE {
+                        let mut pa = p_to;
+                        crate::nnfeat::planes_sub(&mut pa, RING1[fu]);
+                        let ea = (empty & !tbit) | fbit;
+                        let oi = crate::policy::see_opp_state(b1o & ea, b2o & ea, &pa);
+                        p.see_val(ph_off, 2 * caps as usize, oi)
+                    } else {
+                        0.0
+                    };
+                    let z = p.jump_finish(to, j_prefix, j_td, fg, ft, sv, xin);
                     sc = sc.saturating_add((z * w) as i32);
                 }
                 list.push_scored(m, sc);
@@ -1198,6 +1245,9 @@ pub struct Searcher<'a> {
     policy: Option<&'a crate::policy::Policy>,
     pol_w: f32,
     pol_min: u32,
+    /// First depth at which the TPOL5 SEE input is computed (default 2). The policy itself
+    /// still runs at every depth >= pol_min: skipping it at depth 1 broke depth-1 futility (D744).
+    pol_see_min: u32,
     /// set_policy was called explicitly: set_nnue must not drop it
     pol_explicit: bool,
     pol_buf: Vec<(u16, f32)>,
@@ -1303,7 +1353,10 @@ impl<'a> Searcher<'a> {
             nnue: None,
             policy: crate::policy::global(),
             pol_w: crate::policy::env_f32("TI_POLW", 100000.0),
+            // D744 fix: the TPOL5 head runs at EVERY depth (d1 included). Only the extra SEE
+            // input is depth-gated; skipping the whole policy at d1 cost -82 Elo (3.9% blunders).
             pol_min: crate::policy::env_f32("TI_POLMIN", 1.0) as u32,
+            pol_see_min: crate::policy::env_f32("TI_POLSEE_MIN", 2.0) as u32,
             pol_explicit: false,
             pol_buf: Vec::new(),
             tup_native: false,
@@ -2008,32 +2061,56 @@ impl<'a> Searcher<'a> {
                         let mut buf = std::mem::take(&mut self.pol_buf);
                         nn.policy_xin(b, &mut buf);
                         let list = &mut self.stack.lists[ply as usize];
-                        gen_and_score_into::<true, true>(
-                            b,
-                            list,
-                            skip_tt_mv,
-                            ply,
-                            &self.killers,
-                            &self.history,
-                            Some((pol, &buf, self.pol_w)),
-                        );
+                        if depth >= self.pol_see_min && pol.has_see() {
+                            gen_and_score_into::<true, true, true>(
+                                b,
+                                list,
+                                skip_tt_mv,
+                                ply,
+                                &self.killers,
+                                &self.history,
+                                Some((pol, &buf, self.pol_w)),
+                            );
+                        } else {
+                            gen_and_score_into::<true, true, false>(
+                                b,
+                                list,
+                                skip_tt_mv,
+                                ply,
+                                &self.killers,
+                                &self.history,
+                                Some((pol, &buf, self.pol_w)),
+                            );
+                        }
                         self.pol_buf = buf;
                     } else {
                         let list = &mut self.stack.lists[ply as usize];
-                        gen_and_score_into::<true, true>(
-                            b,
-                            list,
-                            skip_tt_mv,
-                            ply,
-                            &self.killers,
-                            &self.history,
-                            Some((pol, &[], self.pol_w)),
-                        );
+                        if depth >= self.pol_see_min && pol.has_see() {
+                            gen_and_score_into::<true, true, true>(
+                                b,
+                                list,
+                                skip_tt_mv,
+                                ply,
+                                &self.killers,
+                                &self.history,
+                                Some((pol, &[], self.pol_w)),
+                            );
+                        } else {
+                            gen_and_score_into::<true, true, false>(
+                                b,
+                                list,
+                                skip_tt_mv,
+                                ply,
+                                &self.killers,
+                                &self.history,
+                                Some((pol, &[], self.pol_w)),
+                            );
+                        }
                     }
                 }
                 _ => {
                     let list = &mut self.stack.lists[ply as usize];
-                    gen_and_score_into::<true, false>(
+                    gen_and_score_into::<true, false, false>(
                         b,
                         list,
                         skip_tt_mv,
@@ -2550,7 +2627,7 @@ impl<'a> Searcher<'a> {
             // array (best-first). Each iteration reorders the array.
             let (kill, hist) = (&self.killers, &self.history);
             let root = &mut self.stack.lists[0];
-            gen_and_score_into::<false, false>(b, root, tt_mv, 0, kill, hist, None);
+            gen_and_score_into::<false, false, false>(b, root, tt_mv, 0, kill, hist, None);
         }
         let n_root = self.stack.lists[0].len();
         if n_root == 0 {
@@ -3548,6 +3625,15 @@ xxx....
             }
         }
         let pol = crate::policy::bundled().expect("bundled policy");
+        let pol5 = {
+            let mut raw5 = b"TPOL5\0\0\0".to_vec();
+            raw5.extend_from_slice(&0u32.to_le_bytes());
+            for i in 0..crate::policy::SLOTS { raw5.extend_from_slice(&(((i as i32 - 49) as f32) * 0.03125).to_le_bytes()); }
+            for i in 0..crate::policy::NSCAL { raw5.extend_from_slice(&(((i as i32 - 20) as f32) * 0.0625).to_le_bytes()); }
+            for i in 0..crate::policy::NSEE { raw5.extend_from_slice(&(((i as i32 * 31) % 200 - 100) as f32 * 0.015625).to_le_bytes()); }
+            for i in 0..(27 * 6561) { raw5.extend_from_slice(&(((i as i32 * 17) % 1000 - 500) as f32 / 2048.0).to_le_bytes()); }
+            crate::policy::Policy::from_bytes(&raw5).expect("TPOL5")
+        };
         let pol_w = 100_000.0f32;
         let mut ref_list = MoveList::new();
         let mut new_list = MoveList::new();
@@ -3579,7 +3665,12 @@ xxx....
             let k2 = kill_key(ref_list.move_at((next_u64(&mut x) as usize) % ref_list.len()));
             killers[ply as usize] = (k1, k2);
 
-            for with_pol in [false, true] {
+            for mode in [0u8, 1u8, 2u8] {
+                let active_pol = match mode {
+                    1 => Some(pol),
+                    2 => Some(&pol5),
+                    _ => None,
+                };
                 let mut kc = crate::policy::KCache::new();
                 let mut expected: Vec<(Move, i32)> = Vec::new();
                 let opp = b.opp();
@@ -3605,26 +3696,26 @@ xxx....
                     }
                     let (hf, ht) = hist_key(m);
                     sc += hist[hf][ht] / HIST_DIV;
-                    if with_pol {
-                        let add = (pol.logit_k(&b, m, &[], &mut kc) * pol_w) as i32;
+                    if let Some(p) = active_pol {
+                        let add = (p.logit_k(&b, m, &[], &mut kc) * pol_w) as i32;
                         sc = sc.saturating_add(add);
                     }
                     expected.push((m, sc));
                 }
 
                 // Check SKIP_TT = true (all non-TT moves in identical order with identical scores)
-                if with_pol {
-                    gen_and_score_into::<true, true>(&b, &mut new_list, tt_mv, ply, &killers, &history, Some((pol, &[], pol_w)));
-                } else {
-                    gen_and_score_into::<true, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None);
+                match active_pol {
+                    Some(p) if p.has_see() => gen_and_score_into::<true, true, true>(&b, &mut new_list, tt_mv, ply, &killers, &history, Some((p, &[], pol_w))),
+                    Some(p) => gen_and_score_into::<true, true, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, Some((p, &[], pol_w))),
+                    None => gen_and_score_into::<true, false, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None),
                 }
                 let expected_skip: Vec<(Move, i32)> = expected.iter().copied().enumerate().filter(|(i, _)| Some(*i) != tt_pos).map(|(_, v)| v).collect();
                 let actual_skip: Vec<(Move, i32)> = (0..new_list.len()).map(|i| (new_list.move_at(i), new_list.score_at(i))).collect();
-                assert_eq!(actual_skip, expected_skip, "SKIP_TT=true mismatch n={n} with_pol={with_pol}");
+                assert_eq!(actual_skip, expected_skip, "SKIP_TT=true mismatch n={n} mode={mode}");
 
                 // Check SKIP_TT = false (TT swapped to index 0)
-                if !with_pol {
-                    gen_and_score_into::<false, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None);
+                if mode == 0 {
+                    gen_and_score_into::<false, false, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None);
                     let mut expected_noskip = expected.clone();
                     if let Some(tp) = tt_pos {
                         if tp != 0 {

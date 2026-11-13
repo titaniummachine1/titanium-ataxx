@@ -34,6 +34,11 @@ fn main() -> ExitCode {
     if let Some(p) = flag_str(&args, "--policy") {
         titanium::policy::configure(&p);
     }
+    // --pol-see-min N: first depth that feeds the TPOL5 SEE table (default 2). The policy itself
+    // always runs from depth 1; this only gates the extra SEE input (D744).
+    if let Some(n) = flag_int(&args, "--pol-see-min") {
+        std::env::set_var("TI_POLSEE_MIN", n.to_string());
+    }
     // --ecache-bits N: eval cache size (log2 entries, default 22 = 32 MB ranked layout; D575/D606)
     if let Some(n) = flag_int(&args, "--ecache-bits") {
         titanium::search::set_ecache_bits(n as usize);
