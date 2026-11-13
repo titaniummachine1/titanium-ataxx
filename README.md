@@ -156,3 +156,6 @@ Titanium includes automated deployment tooling for [Botzone](https://www.botzone
 - **[Zataxx](https://github.com/zzzzz151/Zataxx)** by [zzzzz151](https://github.com/zzzzz151) — Open-source Rust Ataxx engine that served as a key sparring partner and benchmark for Titanium, and provided `libataxx` perft/move-generation test suites and NNUE/search insights.
 - **[Sanctaphraxx](https://github.com/Ciekce/sanctaphraxx)** by [Ciekce](https://github.com/Ciekce) — Open-source Rust neural Ataxx engine used as an early sparring partner and speed/NNUE reference whose compact incremental NNUE architecture informed Titanium's earliest neural experiments.
 - **[Stockfish](https://github.com/official-stockfish/Stockfish) & [Reckless](https://github.com/codedeliveryservice/Reckless)** — For foundational principles in mate distance pruning, iterative deepening bounds, and robust engine design.
+
+## Contributing
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, gate rules and open ideas (static-exchange residuals, sibling-relative futility, policy-gap reductions).
