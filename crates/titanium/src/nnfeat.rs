@@ -76,7 +76,7 @@ pub static BOX2: [u64; SQUARES] = build_box2();
 
 /// 3x3 dilation (the stones and their 8 neighbours), separable: 10 ops instead of eight masked shifts.
 #[inline(always)]
-fn box1(x: u64) -> u64 {
+pub(crate) fn box1(x: u64) -> u64 {
     let h = x | ((x & !FILE_A) >> 1) | ((x & !FILE_G) << 1);
     (h | (h >> 7) | (h << 7)) & FULL
 }
@@ -116,7 +116,7 @@ pub fn victim_planes(v: u64) -> [u64; 4] {
 
 /// Add 1 to the count of every square in `m` (a new victim stone adds 1 to each of its 8 neighbours).
 #[inline(always)]
-fn planes_add(p: &mut [u64; 4], m: u64) {
+pub(crate) fn planes_add(p: &mut [u64; 4], m: u64) {
     let c0 = p[0] & m;
     p[0] ^= m;
     let c1 = p[1] & c0;
@@ -126,9 +126,21 @@ fn planes_add(p: &mut [u64; 4], m: u64) {
     p[3] ^= c2;
 }
 
+/// Subtract 1 from the count of every square in `m` (removing a stone from each of its 8 neighbours' counts >= 1).
+#[inline(always)]
+pub(crate) fn planes_sub(p: &mut [u64; 4], m: u64) {
+    let b0 = !p[0] & m;
+    p[0] ^= m;
+    let b1 = !p[1] & b0;
+    p[1] ^= b0;
+    let b2 = !p[2] & b1;
+    p[2] ^= b1;
+    p[3] ^= b2;
+}
+
 /// Largest victim count over the candidate squares, read off the bit planes (no per-candidate loop).
 #[inline(always)]
-fn planes_max(cand: u64, p: &[u64; 4]) -> u32 {
+pub(crate) fn planes_max(cand: u64, p: &[u64; 4]) -> u32 {
     let mut m = cand;
     let mut best = 0u32;
     for k in (0..4).rev() {
