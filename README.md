@@ -159,3 +159,9 @@ Titanium includes automated deployment tooling for [Botzone](https://www.botzone
 
 ## Contributing
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, gate rules and open ideas (static-exchange residuals, sibling-relative futility, policy-gap reductions).
+
+## Training data
+The packed NNUE training set (	rain_v9, al_v9_clean, aux/Kata target files) is hosted on ModelScope: https://www.modelscope.cn/datasets/titaniummachine1/titanium_ataxx
+
+Note: rows carry positions, search scores, game result and side to move only; there is no game id or ply, so trajectory-based targets (lambda returns, multi-step forecasts) need the data regenerated with those fields. Format: 48-byte records (see `crates`/hub `ti data pack`).
+

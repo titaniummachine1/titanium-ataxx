@@ -29,3 +29,6 @@ Speed-sensitive code assumes AVX2/FMA (`x86-64-v3`); build with the repo's defau
 - SmallNet without the unused hand-eval skip, then refit.
 
 Please open a PR against `main` with the gate numbers in the description.
+
+## Data
+Training data download: https://www.modelscope.cn/datasets/titaniummachine1/titanium_ataxx (see README for format caveats).
