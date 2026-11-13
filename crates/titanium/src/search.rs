@@ -1245,8 +1245,10 @@ pub struct Searcher<'a> {
     policy: Option<&'a crate::policy::Policy>,
     pol_w: f32,
     pol_min: u32,
-    /// First depth at which the TPOL5 SEE input is computed (default 2). The policy itself
-    /// still runs at every depth >= pol_min: skipping it at depth 1 broke depth-1 futility (D744).
+    /// First depth at which the TPOL5 SEE input is computed. Default 99 = never (D749/D751: the
+    /// bundled head 380F609C was gated and promoted with the SEE input OFF; with it on the same head
+    /// lost 31.5 Elo at 100 ms). The policy itself still runs at every depth >= pol_min: skipping it
+    /// at depth 1 broke depth-1 futility (D744).
     pol_see_min: u32,
     /// set_policy was called explicitly: set_nnue must not drop it
     pol_explicit: bool,
@@ -1356,7 +1358,7 @@ impl<'a> Searcher<'a> {
             // D744 fix: the TPOL5 head runs at EVERY depth (d1 included). Only the extra SEE
             // input is depth-gated; skipping the whole policy at d1 cost -82 Elo (3.9% blunders).
             pol_min: crate::policy::env_f32("TI_POLMIN", 1.0) as u32,
-            pol_see_min: crate::policy::env_f32("TI_POLSEE_MIN", 2.0) as u32,
+            pol_see_min: crate::policy::env_f32("TI_POLSEE_MIN", 99.0) as u32,
             pol_explicit: false,
             pol_buf: Vec::new(),
             tup_native: false,
