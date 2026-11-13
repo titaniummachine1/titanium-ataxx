@@ -1245,6 +1245,9 @@ pub struct Searcher<'a> {
     policy: Option<&'a crate::policy::Policy>,
     pol_w: f32,
     pol_min: u32,
+    /// First depth at which the TPOL5 SEE input is computed (default 2). The policy itself
+    /// still runs at every depth >= pol_min: skipping it at depth 1 broke depth-1 futility (D744).
+    pol_see_min: u32,
     /// set_policy was called explicitly: set_nnue must not drop it
     pol_explicit: bool,
     pol_buf: Vec<(u16, f32)>,
@@ -1350,10 +1353,10 @@ impl<'a> Searcher<'a> {
             nnue: None,
             policy: crate::policy::global(),
             pol_w: crate::policy::env_f32("TI_POLW", 100000.0),
-            pol_min: crate::policy::env_f32(
-                "TI_POLMIN",
-                if crate::policy::global().is_some_and(|p| p.has_see()) { 2.0 } else { 1.0 },
-            ) as u32,
+            // D744 fix: the TPOL5 head runs at EVERY depth (d1 included). Only the extra SEE
+            // input is depth-gated; skipping the whole policy at d1 cost -82 Elo (3.9% blunders).
+            pol_min: crate::policy::env_f32("TI_POLMIN", 1.0) as u32,
+            pol_see_min: crate::policy::env_f32("TI_POLSEE_MIN", 2.0) as u32,
             pol_explicit: false,
             pol_buf: Vec::new(),
             tup_native: false,
@@ -2058,7 +2061,7 @@ impl<'a> Searcher<'a> {
                         let mut buf = std::mem::take(&mut self.pol_buf);
                         nn.policy_xin(b, &mut buf);
                         let list = &mut self.stack.lists[ply as usize];
-                        if depth >= 2 && pol.has_see() {
+                        if depth >= self.pol_see_min && pol.has_see() {
                             gen_and_score_into::<true, true, true>(
                                 b,
                                 list,
@@ -2082,7 +2085,7 @@ impl<'a> Searcher<'a> {
                         self.pol_buf = buf;
                     } else {
                         let list = &mut self.stack.lists[ply as usize];
-                        if depth >= 2 && pol.has_see() {
+                        if depth >= self.pol_see_min && pol.has_see() {
                             gen_and_score_into::<true, true, true>(
                                 b,
                                 list,
