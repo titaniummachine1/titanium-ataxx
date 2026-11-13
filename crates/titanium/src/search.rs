@@ -1225,6 +1225,12 @@ pub struct Searcher<'a> {
     /// Shared scratch stack for Botzone banned repetition snapshots (`[ban_start..ban_start + n_banned]`).
     /// Keeps the 512-byte buffer off every recursive `negamax::<true>` stack frame.
     bz_banned: Vec<(u64, u64)>,
+    // Screen knobs for E1 (sibling-relative futility) & E2 (logit-gap LMR)
+    e1_sib_m: i32,
+    e2_min_idx: usize,
+    e2_early_gap: i32,
+    e2_safe_gap: i32,
+    e2_gap_div: i32,
 }
 
 /// Monotonic milliseconds since process start (native default time source).
@@ -1315,6 +1321,11 @@ impl<'a> Searcher<'a> {
             bz_max_plies: u32::MAX,
             bz_ply: Box::new([BzPly::default(); MAX_PLY]),
             bz_banned: Vec::with_capacity(256),
+            e1_sib_m: crate::policy::env_f32("TI_E1_M", 30000.0) as i32,
+            e2_min_idx: crate::policy::env_f32("TI_E2_MIN", MB_LMR_MIN_IDX as f32) as usize,
+            e2_early_gap: crate::policy::env_f32("TI_E2_EARLY", 0.0) as i32,
+            e2_safe_gap: crate::policy::env_f32("TI_E2_SAFE", 0.0) as i32,
+            e2_gap_div: crate::policy::env_f32("TI_E2_GDIV", 0.0) as i32,
         }
     }
 
@@ -2100,13 +2111,31 @@ impl<'a> Searcher<'a> {
         // futility small net: the parent's accumulator, built at the first child that needs it (D110)
         let mut sn_parent: Option<[f32; 64]> = None;
         let mut lmr_cnt = 0i32;
+        let mut best_sib_eval = i32::MIN;
+        let mut top_base_sc = i32::MIN;
+        let (k1, k2) = self.killers[ply as usize];
+        let use_logit_lmr = depth >= self.pol_min && self.policy.is_some() && self.nnue.is_some();
         loop {
-            let m = {
+            let (m, raw_sc) = {
                 let list = &mut self.stack.lists[ply as usize];
                 if list.is_empty() {
                     break;
                 }
-                list.pop_best()
+                list.pop_best_scored()
+            };
+            let gap = if use_logit_lmr && raw_sc != ORD_TT {
+                let kk = m.to_u32();
+                let base_sc = if kk == k1 || kk == k2 {
+                    raw_sc - ORD_KILLER
+                } else {
+                    raw_sc
+                };
+                if base_sc > top_base_sc {
+                    top_base_sc = base_sc;
+                }
+                (top_base_sc - base_sc).max(0)
+            } else {
+                0
             };
 
             // Moonbird-style selectivity (exp/search-moonbird A): late moves get a gentle LMR, every move after the
@@ -2168,8 +2197,25 @@ impl<'a> Searcher<'a> {
                 net.update_child(&a[ply as usize], &mut z[0], b, &child);
             }
             let mut new_depth = depth as i32;
-            if move_idx >= MB_LMR_MIN_IDX && !at_bz_horizon {
-                new_depth = depth as i32 * MB_LMR_HALFLIFE / (MB_LMR_HALFLIFE + lmr_cnt);
+            let do_lmr = if !at_bz_horizon {
+                if use_logit_lmr {
+                    let safe = self.e2_safe_gap > 0 && gap < self.e2_safe_gap && move_idx < 12;
+                    let early = self.e2_early_gap > 0 && gap >= self.e2_early_gap && move_idx >= 2;
+                    !safe && (move_idx >= self.e2_min_idx || early)
+                } else {
+                    move_idx >= MB_LMR_MIN_IDX
+                }
+            } else {
+                false
+            };
+            if do_lmr {
+                let eff_cnt = lmr_cnt
+                    + if use_logit_lmr && self.e2_gap_div > 0 {
+                        gap / self.e2_gap_div
+                    } else {
+                        0
+                    };
+                new_depth = depth as i32 * MB_LMR_HALFLIFE / (MB_LMR_HALFLIFE + eff_cnt);
                 lmr_cnt += 1;
             }
             let mut child_eval = i32::MIN;
@@ -2179,6 +2225,11 @@ impl<'a> Searcher<'a> {
                 && self.sancta.is_none()
                 && alpha.abs() < MATE_BOUND
             {
+                let eff_alpha = if self.e1_sib_m < 30000 && best_sib_eval > i32::MIN {
+                    alpha.max(best_sib_eval.saturating_sub(self.e1_sib_m))
+                } else {
+                    alpha
+                };
                 // child eval is from the child's side to move = minus our static value of the move
                 let mut cached_eval: Option<(i32, i32)> = None;
                 let mut hand_cache: Option<i32> = None;
@@ -2211,7 +2262,7 @@ impl<'a> Searcher<'a> {
                             static_eval,
                             hand,
                         ) - FUT_SN_M;
-                        if new_depth - (alpha.saturating_add(lo) / MB_FUT_DIV).clamp(0, 64) <= 0
+                        if new_depth - (eff_alpha.saturating_add(lo) / MB_FUT_DIV).clamp(0, 64) <= 0
                             && best > -MATE_BOUND
                         {
                             self.heuristic_used = true;
@@ -2246,9 +2297,10 @@ impl<'a> Searcher<'a> {
                 } else {
                     self.leaf_eval_with_dis(&child)
                 };
+                best_sib_eval = best_sib_eval.max(-ce);
                 child_eval = pack_eval_dis(ce, child_dis);
                 let vol_credit = (child_dis * DIS_FUT_NUM) >> 7;
-                let shortfall = alpha.saturating_add(ce) - vol_credit;
+                let shortfall = eff_alpha.saturating_add(ce) - vol_credit;
                 new_depth -= (shortfall / MB_FUT_DIV).clamp(0, 64);
                 if child_dis > 300 && new_depth < depth as i32 {
                     new_depth += 1;

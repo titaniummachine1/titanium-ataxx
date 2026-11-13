@@ -645,11 +645,11 @@ impl MoveList {
         self.scores[i] = self.scores[self.len];
     }
 
-    /// Lazily extract the highest-scored remaining move (swap-with-last).
+    /// Lazily extract the highest-scored remaining move and its score (swap-with-last).
     /// Cheaper than a full sort at cut-nodes: alpha-beta usually refutes in
     /// the first few picks, and this only ever pays for what it uses.
     #[inline]
-    pub fn pop_best(&mut self) -> Move {
+    pub fn pop_best_scored(&mut self) -> (Move, i32) {
         debug_assert!(self.len > 0);
         let mut best_i = 0;
         let mut best_s = self.scores[0];
@@ -663,7 +663,12 @@ impl MoveList {
         self.len -= 1;
         self.moves[best_i] = self.moves[self.len];
         self.scores[best_i] = self.scores[self.len];
-        m
+        (m, best_s)
+    }
+
+    #[inline]
+    pub fn pop_best(&mut self) -> Move {
+        self.pop_best_scored().0
     }
 }
 
