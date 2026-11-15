@@ -30,91 +30,6 @@ fn ec_check(hash: u64, empties: u32, imp: u32) -> u32 {
 }
 const EC_IMP_BIT: u32 = 1 << 6;
 
-/// D643/D652 (user): STAGED SIZE. The ranked tables do not start at their full size: they start at an L1-sized table and
-/// JUMP to an L2-sized, then an L3-sized, then the full table (--tt-bits / --ecache-bits, 22 bits by default) when the
-/// current stage overflows (more than half of its slots filled). NEVER by doubling or one more bit (user rule D652, it never
-/// worked; my doubling version lost at 1000 / 3300 ms, D649). A search that touches only a few thousand positions stays
-/// inside the CPU cache; a long search ends at the full size. The stage sizes come from the TARGET CPU's cache sizes read at
-/// engine start (crate::cacheinfo, CPUID, never compile-time constants): L1d, L2, L3 / 2 (the L3 is shared), the TT taking
-/// 2/3 and the eval cache 1/3 of each budget (the same 2:1 split as the full 64 MB + 32 MB). Growth never rehashes: the index
-/// mask widens, the newly exposed buckets are cleared at that moment, entries whose new index bits differ are stranded and
-/// evicted like any stale entry. A new game resets to stage 1. The flags below: 0 = automatic stages; N = a 2-stage
-/// table starting at 2^N entries (N >= the full size = fixed size, for experiments and parity checks).
-static TT_MIN_BITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static ECACHE_MIN_BITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-pub fn set_tt_min_bits(b: usize) {
-    TT_MIN_BITS.store(if b == 0 { 0 } else { b.clamp(4, 30) }, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn set_ecache_min_bits(b: usize) {
-    ECACHE_MIN_BITS.store(if b == 0 { 0 } else { b.clamp(4, 30) }, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// which cache levels are used as stages: bit 0 = L1d, bit 1 = L2, bit 2 = L3 / 2 (default 0 = NO staging: the full size from the first search. The L3-first start gained +17..25% nodes in cold-table tests but nothing in real games, D664; 4 = L3 then full).
-/// Fewer stages are allowed (user D652) but a stage is always a cache-level size, never something in between.
-static STAGE_MASK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// intermediate RAM stages between the L3 stage and the full size (default 0 = jump L3 -> full)
-static RAM_STAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-pub fn set_ram_stages(n: usize) {
-    RAM_STAGES.store(n.min(6), std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn set_cache_stages(mask: u32) {
-    STAGE_MASK.store(mask & 7, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn floor_pow2(n: usize) -> usize {
-    if n == 0 {
-        1
-    } else {
-        1usize << (usize::BITS - 1 - n.leading_zeros())
-    }
-}
-
-/// Bucket counts (64-byte buckets, powers of two, strictly increasing, the last = `nb_max`) of the stages.
-/// `explicit_bits` != 0: [2^bits entries' worth of buckets, nb_max]; 0: the cache-sized stages, `share` = this table's
-/// fraction (numerator, denominator) of each cache budget, `per_bucket` = entries per bucket of the flag's bit convention.
-fn stage_list(nb_max: usize, explicit_bits: usize, per_bucket: usize, share: (usize, usize), c: crate::cacheinfo::CacheSizes, mask: u32, ram: usize) -> Vec<usize> {
-    if explicit_bits != 0 {
-        let nb = (1usize << explicit_bits).div_ceil(per_bucket).clamp(1, nb_max);
-        return if nb >= nb_max { vec![nb_max] } else { vec![nb, nb_max] };
-    }
-    let mut st: Vec<usize> = Vec::new();
-    for (i, budget) in [c.l1d, c.l2, c.l3 / 2].into_iter().enumerate() {
-        if mask & (1 << i) == 0 {
-            continue; // this cache level is not used as a stage (D652: fewer jumps are fine, but only at cache-level sizes)
-        }
-        let nb = floor_pow2(budget * share.0 / share.1 / 64).clamp(1, nb_max);
-        if nb < nb_max && st.last().map_or(true, |&l| nb > l) {
-            st.push(nb);
-        }
-    }
-    // extra jumps are allowed beyond the L3 stage, because that part lives in RAM (user D652): `ram` intermediate stages,
-    // geometrically spaced between the last cache stage and the full size (cache levels themselves never get in-between sizes)
-    if ram > 0 {
-        if let Some(&lo) = st.last() {
-            let ratio = nb_max as f64 / lo as f64;
-            for j in 1..=ram {
-                let nb = floor_pow2((lo as f64 * ratio.powf(j as f64 / (ram + 1) as f64)) as usize);
-                if nb > *st.last().unwrap() && nb < nb_max {
-                    st.push(nb);
-                }
-            }
-        }
-    }
-    st.push(nb_max);
-    st
-}
-
-fn tt_stage_list(nb_max: usize) -> Vec<usize> {
-    stage_list(nb_max, TT_MIN_BITS.load(std::sync::atomic::Ordering::Relaxed), 4, (2, 3), crate::cacheinfo::sizes(), STAGE_MASK.load(std::sync::atomic::Ordering::Relaxed), RAM_STAGES.load(std::sync::atomic::Ordering::Relaxed))
-}
-
-fn ec_stage_list(nb_max: usize) -> Vec<usize> {
-    stage_list(nb_max, ECACHE_MIN_BITS.load(std::sync::atomic::Ordering::Relaxed), 8, (1, 3), crate::cacheinfo::sizes(), STAGE_MASK.load(std::sync::atomic::Ordering::Relaxed), RAM_STAGES.load(std::sync::atomic::Ordering::Relaxed))
-}
 /// D650 (user idea): BIT-PACKED TT entry, 10 bytes = 80 bits, 6 per 64-byte bucket (60 bytes + 4 spare) instead of
 /// 4 x 16 bytes: +50% entries in the same memory, still one cache line per probe. Layout (little endian):
 ///   bytes 0-3 check (high 32 hash bits) | 4-5 score (16-bit code, ttcodec::enc_score) | 6 depth |
@@ -128,14 +43,8 @@ fn ec_stage_list(nb_max: usize) -> Vec<usize> {
 struct TtBucket([u8; 64]);
 
 const TT_EBYTES: usize = 10;
-/// entries per bucket in the packed layout (--tt-ways N: 4 reproduces the old 16-byte table's replacement behaviour)
+/// entries per bucket in the packed layout
 const TT_MAX_WAYS: usize = 6;
-
-static TT_WAYS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(TT_MAX_WAYS);
-
-pub fn set_tt_ways(w: usize) {
-    TT_WAYS.store(w.clamp(1, TT_MAX_WAYS), std::sync::atomic::Ordering::Relaxed);
-}
 
 /// unpacked view of one TT slot
 #[derive(Clone, Copy)]
@@ -686,16 +595,8 @@ const FLAG_UPPER: u8 = 3;
 /// Ranked bucketed transposition table (D590): packed 10-byte entries, TT_MAX_WAYS per 64-byte bucket.
 pub struct Tt {
     v2: Box<[TtBucket]>,
-    /// active bucket mask (adaptive size: grows towards nb_max, see TT_MIN_BITS)
+    /// bucket index mask (bucket count - 1)
     mask: usize,
-    /// full bucket count, minimum bucket count, slots filled since the last reset (ranked mode)
-    nb_max: usize,
-    /// bucket counts of the stages (L1, L2, L3, full: D652) and the current stage
-    stages: Vec<usize>,
-    stage: usize,
-    filled: usize,
-    /// entries per bucket in use (packed layout, <= TT_MAX_WAYS)
-    ways: usize,
     pub age: u8,
     /// empties of the current search root (255 = nothing is dead): entries/cache lines with more empties are unreachable
     pub root_empties: u8,
@@ -705,64 +606,12 @@ impl Tt {
     /// 2^bits / 4 buckets (bits <= 25).
     pub fn new(bits: usize) -> Tt {
         let nb = (1usize << bits.min(25)) / 4;
-        let stages = tt_stage_list(nb);
-        Tt {
-            v2: vec![TtBucket::EMPTY; nb].into_boxed_slice(),
-            mask: stages[0] - 1,
-            nb_max: nb,
-            stages,
-            stage: 0,
-            filled: 0,
-            ways: TT_WAYS.load(std::sync::atomic::Ordering::Relaxed),
-            root_empties: 255,
-            age: 0,
-        }
+        Tt { v2: vec![TtBucket::EMPTY; nb].into_boxed_slice(), mask: nb - 1, root_empties: 255, age: 0 }
     }
 
     pub fn clear(&mut self) {
-        // back to stage 1; only that part is cleared now, the rest is cleared when it is exposed (grow)
-        self.stage = 0;
-        let nb0 = self.stages[0];
-        self.mask = nb0 - 1;
-        self.filled = 0;
-        self.v2[..nb0].fill(TtBucket::EMPTY);
+        self.v2.fill(TtBucket::EMPTY);
         self.age = 0;
-    }
-
-    /// Staged size (D652): JUMP to the next stage (L1 -> L2 -> L3 -> full), never by doubling. Never rehash: the mask
-    /// widens, the newly exposed buckets are cleared now, stranded entries age out.
-    #[cold]
-    fn grow(&mut self) {
-        if self.stage + 1 < self.stages.len() {
-            self.jump_to(self.stage + 1);
-        }
-    }
-
-    /// Jump to `stage` (never backwards): widen the mask, clear the newly exposed buckets, keep the stranded entries.
-    fn jump_to(&mut self, stage: usize) {
-        let cur = self.mask + 1;
-        if stage <= self.stage || stage >= self.stages.len() || cur >= self.nb_max {
-            return;
-        }
-        self.stage = stage;
-        let new = self.stages[stage].max(cur);
-        self.v2[cur..new].fill(TtBucket::EMPTY);
-        self.mask = new - 1;
-        self.filled = self.filled * cur / new;
-    }
-
-    /// First search of a game (fresh table): start at the smallest stage whose capacity holds 4x the expected nodes of
-    /// the search, so a short search stays in a cache-sized table and a long one starts at the full size and never
-    /// jumps in the middle of a search (D657: L3-first +25% nodes at 100 ms, -7% at 1000 ms because of the late jump).
-    fn start_stage(&mut self, expected_nodes: usize) {
-        if self.filled != 0 {
-            return;
-        }
-        let mut s = 0;
-        while s + 1 < self.stages.len() && self.stages[s] * self.ways < 4usize.saturating_mul(expected_nodes) {
-            s += 1;
-        }
-        self.jump_to(s);
     }
 
     #[inline(always)]
@@ -783,9 +632,8 @@ impl Tt {
         let age = self.age & 15;
         let chk = (key >> 32) as u32;
         let ext = ((key >> 27) & 31) as u8;
-        let ways = self.ways;
         let bk = &mut self.v2[(key as usize) & self.mask];
-        for i in 0..ways {
+        for i in 0..TT_MAX_WAYS {
             if bk.flag(i) != 0 && bk.chk(i) == chk && bk.ext(i) == ext && (empties == 255 || bk.empties(i) == empties) {
                 bk.set_age(i, age);
                 let e = bk.get(i);
@@ -801,7 +649,7 @@ impl Tt {
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn store_e(&mut self, key: u64, mv: u32, score: i32, depth: u8, flag: u8, empties: u8, imp: u8) {
-        let (age, root_empties, mask, ways) = (self.age & 15, self.root_empties, self.mask, self.ways);
+        let (age, root_empties, mask, ways) = (self.age & 15, self.root_empties, self.mask, TT_MAX_WAYS);
         let bk = &mut self.v2[(key as usize) & mask];
         let chk = (key >> 32) as u32;
         let ext = ((key >> 27) & 31) as u8;
@@ -829,14 +677,7 @@ impl Tt {
             e.depth as i32 + 4 * e.imp as i32 + if e.score.abs() >= MATE_BOUND { 16 } else { 0 } - 3 * a
         };
         let victim = (0..ways).min_by_key(|&i| worth(i)).unwrap_or(0);
-        let was_empty = bk.flag(victim) == 0;
         bk.set(victim, &TtE2 { chk, score, code, depth, flag, imp, age, empties, ext });
-        if was_empty {
-            self.filled += 1;
-            if self.filled * 2 > (self.mask + 1) * self.ways && self.mask + 1 < self.nb_max {
-                self.grow();
-            }
-        }
     }
 }
 
@@ -936,13 +777,8 @@ pub struct Searcher<'a> {
     ec2: Box<[EcBucket]>,
     /// D586/D590: importance of the next eval-cache store (1 = a searched node or one of the top-12 moves, 0 = a late move)
     ec_imp: u32,
-    /// D643 adaptive size of the ranked eval cache: active bucket count (power of two, grows by doubling when more than
-    /// half of the active slots were filled), minimum bucket count, slots filled since the last reset
+    /// eval-cache bucket count (power of two)
     ec_act: usize,
-    /// bucket counts of the stages (L1, L2, L3, full: D652) and the current stage
-    ec_stages: Vec<usize>,
-    ec_stage: usize,
-    ec_filled: usize,
     /// Two killer moves per ply (packed u32 moves), refreshed on cutoffs.
     killers: Box<[(u32, u32); MAX_PLY]>,
     /// History heuristic: [mover][to] cutoff counters, aged per search.
@@ -1029,10 +865,7 @@ impl<'a> Searcher<'a> {
             ec2: vec![EcBucket([EC_EMPTY; 8]); (1usize << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)) / 8]
                 .into_boxed_slice(),
             ec_imp: 1,
-            ec_act: ec_stage_list((1usize << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)) / 8)[0],
-            ec_stages: ec_stage_list((1usize << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)) / 8),
-            ec_stage: 0,
-            ec_filled: 0,
+            ec_act: (1usize << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)) / 8,
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[[0; 49]; 49]; 2]),
             tuple: None,
@@ -1092,43 +925,7 @@ impl<'a> Searcher<'a> {
     }
 
     fn clear_ecache(&mut self) {
-        // back to stage 1; only that part is cleared now, the rest is cleared when it is exposed (ec_grow)
-        self.ec_stage = 0;
-        self.ec_act = self.ec_stages[0];
-        self.ec_filled = 0;
-        self.ec2[..self.ec_act].fill(EcBucket([EC_EMPTY; 8]));
-    }
-
-    /// Staged size (D652): JUMP to the next eval-cache stage (L1 -> L2 -> L3 -> full), never by doubling. Never rehash.
-    #[cold]
-    fn ec_grow(&mut self) {
-        if self.ec_stage + 1 < self.ec_stages.len() {
-            self.ec_jump_to(self.ec_stage + 1);
-        }
-    }
-
-    fn ec_jump_to(&mut self, stage: usize) {
-        let cur = self.ec_act;
-        if stage <= self.ec_stage || stage >= self.ec_stages.len() {
-            return;
-        }
-        self.ec_stage = stage;
-        let new = self.ec_stages[stage].max(cur);
-        self.ec2[cur..new].fill(EcBucket([EC_EMPTY; 8]));
-        self.ec_act = new;
-        self.ec_filled = self.ec_filled * cur / new;
-    }
-
-    /// Same rule as `Tt::start_stage` for the eval cache (8 entries per bucket).
-    fn ec_start_stage(&mut self, expected_nodes: usize) {
-        if self.ec_filled != 0 {
-            return;
-        }
-        let mut s = 0;
-        while s + 1 < self.ec_stages.len() && self.ec_stages[s] * 8 < 4usize.saturating_mul(expected_nodes) {
-            s += 1;
-        }
-        self.ec_jump_to(s);
+        self.ec2.fill(EcBucket([EC_EMPTY; 8]));
     }
 
     /// D585: bucketed eval-cache probe; a hit moves the entry to the front of its line (LRU order)
@@ -1166,16 +963,9 @@ impl<'a> Searcher<'a> {
             .or_else(|| (0..8).find(|&i| ((bk[i] >> 32) as u32 & 63) > root_empties))
             .or_else(|| (0..8).rev().find(|&i| (bk[i] >> 32) as u32 & EC_IMP_BIT == 0))
             .unwrap_or(7);
-        let was_empty = bk[victim] as u32 == 0x8000_0000;
         bk.copy_within(0..victim, 1);
         let ext = (((b.hash >> 37) & 3) as u64) << 29;
         bk[0] = ((chk as u64) << 32) | (v as u32 as u64 & 0x1FFF_FFFF) | ext;
-        if was_empty {
-            self.ec_filled += 1;
-            if self.ec_filled * 2 > self.ec_act * 8 && self.ec_stage + 1 < self.ec_stages.len() {
-                self.ec_grow();
-            }
-        }
     }
 
     /// D585: start loading the child's eval-cache line and TT slot while the parent still works on the move
@@ -2110,16 +1900,6 @@ impl<'a> Searcher<'a> {
             }
         }
         self.tt.step_age();
-        if self.tt.age == 1 {
-            // first search of a game (a new game resets the age to 0): pick the starting table stage from the budget
-            let expected = match (limits.max_nodes, limits.time) {
-                (Some(n), _) => n as usize,
-                (None, Some(t)) => (t.as_millis() as usize).saturating_mul(120), // ~120 nodes per ms on a typical core
-                _ => usize::MAX, // unknown budget: the full size
-            };
-            self.tt.start_stage(expected);
-            self.ec_start_stage(expected);
-        }
         // Age the history table so old cutoffs don't dominate forever.
         for side in self.history.iter_mut() {
             for row in side.iter_mut() {
@@ -2976,67 +2756,6 @@ xxx....
         let other_key = key ^ (1 << 40); // same bucket, different check bits
         tt.store_e(other_key, 99, 200, 3, FLAG_EXACT, 30, 1);
         assert_eq!(tt.probe_e(other_key, 30).unwrap().score, 200);
-    }
-
-    #[test]
-    fn size_stages_jump_l1_l2_l3_then_full_never_by_doubling() {
-        let c = crate::cacheinfo::FALLBACK; // 32 KB L1d, 256 KB L2, 8 MB L3
-        let tt = stage_list(1 << 20, 0, 4, (2, 3), c, 7, 0);
-        let ec = stage_list(1 << 19, 0, 8, (1, 3), c, 7, 0);
-        assert_eq!(tt, vec![256, 2048, 32768, 1 << 20]);
-        assert_eq!(ec, vec![128, 1024, 16384, 1 << 19]);
-        for st in [&tt, &ec] {
-            for w in st.windows(2) {
-                assert!(w[1] >= 8 * w[0], "a stage jump is at least 8x, not a doubling: {st:?}");
-            }
-            assert!(st.iter().all(|n| n.is_power_of_two()));
-        }
-        // a big cache never makes a stage larger than the full table; a tiny table collapses the stages
-        assert_eq!(stage_list(64, 0, 4, (2, 3), c, 7, 0), vec![64]);
-        // explicit start size: two stages, or fixed when it is not smaller than the full size
-        assert_eq!(stage_list(1 << 20, 14, 4, (2, 3), c, 7, 0), vec![1 << 12, 1 << 20]);
-        assert_eq!(stage_list(1 << 20, 22, 4, (2, 3), c, 7, 0), vec![1 << 20]);
-        // fewer stages: only the chosen cache levels, e.g. L2 + L3, L3 only, or none (= the fixed full size)
-        assert_eq!(stage_list(1 << 20, 0, 4, (2, 3), c, 6, 0), vec![2048, 32768, 1 << 20]);
-        assert_eq!(stage_list(1 << 20, 0, 4, (2, 3), c, 4, 0), vec![32768, 1 << 20]);
-        assert_eq!(stage_list(1 << 20, 0, 4, (2, 3), c, 0, 0), vec![1 << 20]);
-        // extra jumps are allowed only in RAM (beyond the L3 stage), geometrically spaced
-        assert_eq!(stage_list(1 << 20, 0, 4, (2, 3), c, 7, 1), vec![256, 2048, 32768, 131072, 1 << 20]);
-        assert_eq!(stage_list(1 << 20, 0, 4, (2, 3), c, 7, 2), vec![256, 2048, 32768, 65536, 262144, 1 << 20]);
-    }
-
-    #[test]
-    fn start_stage_follows_the_budget_and_never_goes_back() {
-        let fresh = || {
-            let mut t = Tt::new(22);
-            t.stages = vec![256, 2048, 32768, 1 << 20];
-            t.stage = 0;
-            t.mask = 255;
-            t.filled = 0;
-            t
-        };
-        // 6 entries per bucket, the table must hold 4x the expected nodes
-        let mut t = fresh();
-        t.start_stage(300); // 1,200 <= 256 x 6
-        assert_eq!((t.stage, t.mask + 1), (0, 256));
-        let mut t = fresh();
-        t.start_stage(9_000); // a 100 ms search: 36,000 -> the 32768-bucket (L3-sized) stage
-        assert_eq!((t.stage, t.mask + 1), (2, 32768));
-        let mut t = fresh();
-        t.start_stage(500_000); // the Botzone clock: the full table at once
-        assert_eq!((t.stage, t.mask + 1), (3, 1 << 20));
-        let mut t = fresh();
-        t.start_stage(usize::MAX); // unknown budget: full
-        assert_eq!(t.stage, 3);
-        // a table that already holds entries keeps its stage; jump_to never goes backwards
-        let mut t = fresh();
-        t.filled = 1;
-        t.start_stage(500_000);
-        assert_eq!(t.stage, 0);
-        let mut t = fresh();
-        t.jump_to(2);
-        t.jump_to(1);
-        assert_eq!(t.stage, 2);
     }
 
     #[test]
