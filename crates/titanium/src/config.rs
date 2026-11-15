@@ -4,7 +4,7 @@
 //! Defaults compiled in: big NNUE (data/nnue/nnue_main.tnn), futility small net (data/nnue/fut_small.tsn), move-ordering
 //! policy head (data/nnue/policy_main.bin, fitted or gate-verified with the bundled big net; it stays ON with any big net,
 //! D821), futility small net ON, policy weight 1e5 points
-//! per logit, child-eval ordering (EVORD) OFF. data/nnue/BUNDLE.txt pins the sha256 of each file; the unit tests below fail
+//! per logit. data/nnue/BUNDLE.txt pins the sha256 of each file; the unit tests below fail
 //! when a file is swapped without updating the pin (or when the policy head was not fitted on the bundled net).
 //! Overrides, all explicit: `--network <bundled|FILE|none>`, `--policy <bundled|FILE|none>` (env TI_POLICY the same),
 //! `--exact-search` (no small net), env TI_POLW / TI_POLMIN. `titanium-cli info` prints the effective configuration.
@@ -94,7 +94,6 @@ pub fn pin(name: &str) -> Option<&'static str> {
 
 /// Multi-line effective configuration (the `info` command).
 pub fn report(net: Option<&crate::nnue::Nnue>) -> String {
-    let b = crate::search::build_knobs();
     let sha8 = |d: &[u8]| sha256_hex(d)[..8].to_uppercase();
     let bundled_net = crate::nnue::BUNDLED_NNUE;
     let is_bundled = net.map(|n| n.fingerprint) == Some(crate::nnue::Nnue::bundled_fingerprint());
@@ -124,13 +123,6 @@ pub fn report(net: Option<&crate::nnue::Nnue>) -> String {
         crate::policy::env_f32("TI_POLMIN", 1.0)
     ));
     s.push_str(&format!("futility small net {}\n", if crate::search::fut_sn_on() { "ON" } else { "off (exact search)" }));
-    s.push_str(&format!(
-        "build knobs        FUT_CHEAP_M {} FUT_SN_M {} EVORD_W {} EVORD_MIN_DEPTH {} EVORD_CACHE {}\n",
-        b.0, b.1, b.2, b.3, b.4
-    ));
-    if b != crate::search::DEFAULT_BUILD_KNOBS {
-        s.push_str("WARNING: build knobs differ from the shipped defaults (a cargo-build env var was set); this is NOT the strongest configuration\n");
-    }
     s
 }
 
@@ -164,14 +156,8 @@ mod tests {
         );
     }
 
-    /// Shipped defaults are the strongest settings: no cargo-build env var changed a tuned constant.
     #[test]
-    fn build_knobs_are_the_shipped_defaults() {
-        assert_eq!(
-            crate::search::build_knobs(),
-            crate::search::DEFAULT_BUILD_KNOBS,
-            "FUT_CHEAP_M / FUT_SN_M / EVORD_* env vars were set at build time"
-        );
+    fn bundled_policy_parses() {
         assert!(crate::policy::bundled().is_some(), "bundled policy head does not parse");
     }
 

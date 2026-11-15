@@ -34,11 +34,6 @@ fn main() -> ExitCode {
     if let Some(p) = flag_str(&args, "--policy") {
         titanium::policy::configure(&p);
     }
-    // --pol-see-min N: first depth that feeds the TPOL5 SEE table (default 99 = off, the promoted
-    // setting, D751). The policy itself always runs from depth 1; this only gates the extra SEE input (D744).
-    if let Some(n) = flag_int(&args, "--pol-see-min") {
-        std::env::set_var("TI_POLSEE_MIN", n.to_string());
-    }
     // --ecache-bits N: eval cache size (log2 entries, default 22 = 32 MB ranked layout; D575/D606)
     if let Some(n) = flag_int(&args, "--ecache-bits") {
         titanium::search::set_ecache_bits(n as usize);
@@ -80,7 +75,6 @@ fn main() -> ExitCode {
         "perft" => perft_cmd(first_int(&args).unwrap_or(4) as u32),
         "bench" => bench_cmd(
             depth_flag(&args, 8),
-            flag_str(&args, "--net"),
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
             network_flag(&args),
@@ -147,7 +141,6 @@ fn main() -> ExitCode {
         "genbench" => genbench_cmd(flag_int(&args, "--iters").unwrap_or(200_000) as u64),
         "serve" => serve_cmd(
             flag_int(&args, "--tt-bits").unwrap_or(20) as usize,
-            flag_str(&args, "--net"),
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
             args.iter().any(|x| x == "--corr"),
@@ -159,8 +152,6 @@ fn main() -> ExitCode {
             flag_int(&args, "--games").unwrap_or(20) as u32,
             flag_int_alias(&args, "--time-limit-ms", "--time").unwrap_or(1000) as u64,
             flag_str(&args, "--opp"),
-            flag_str(&args, "--net"),
-            flag_str(&args, "--opp-net"),
             flag_str(&args, "--tuple"),
             flag_str(&args, "--opp-tuple"),
             args.iter().any(|x| x == "--tuple-native"),
@@ -332,37 +323,6 @@ fn perft_cmd(depth: u32) -> ExitCode {
 
 // ---------- bench ----------
 
-fn load_net_preset(spec: &Option<String>) -> Result<Option<titanium::S1Net>, String> {
-    // --net none (or flag absent) = classical. --net <path> = that .s1.
-    // Owned net, NO Arc: Searcher keeps a raw pointer for the search
-    // duration (caller-owned, read-only). Zero refcount in the tree.
-    match spec {
-        None => Ok(None),
-        Some(s) if s == "none" || s.is_empty() => Ok(None),
-        Some(s) => {
-            let path = if s == "default" {
-                "data/nnue/sancta_w.s1".into()
-            } else {
-                s.clone()
-            };
-            match titanium::S1Net::load(&path) {
-                Some(n) => Ok(Some(n)),
-                None => Err(format!("net file missing: {path}")),
-            }
-        }
-    }
-}
-
-fn net_flag_str(spec: &Option<String>) -> String {
-    // Re-emit for match children: --net <spec> flows to the opp serve child
-    // as --opp-net; same binary, no env inheritance games.
-    match spec {
-        None => "--net none".to_string(),
-        Some(s) if s == "none" || s.is_empty() => "--net none".to_string(),
-        Some(s) => format!("--net {s}"),
-    }
-}
-
 /// Shipped champion: main runs this unless --tuple says otherwise.
 pub const DEFAULT_TUP: &str = "data/nnue/tupS57v2.tup";
 
@@ -467,7 +427,6 @@ fn corr_flag_str(on: bool) -> String {
 
 fn bench_cmd(
     depth: u8,
-    net_spec: Option<String>,
     tup_spec: Option<String>,
     tup_native: bool,
     nnue_spec: Option<String>,
@@ -486,19 +445,6 @@ fn bench_cmd(
         depth
     );
     let tup_spec = eff_tuple_spec(&tup_spec, &nnue_spec);
-    let net = match load_net_preset(&net_spec) {
-        Ok(n) => {
-            match &net_spec {
-                Some(s) if s != "none" && !s.is_empty() => println!("Bench: net ON ({s})"),
-                _ => println!("Bench: classical (no net)"),
-            }
-            n
-        }
-        Err(e) => {
-            eprintln!("Bench: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
     let tup = match load_tuple_preset(&tup_spec) {
         Ok(t) => {
             match &tup_spec {
@@ -520,7 +466,6 @@ fn bench_cmd(
         max_depth: depth,
     };
     let mut searcher = Searcher::new_unconfigured();
-    searcher.set_sancta(net.as_ref());
     searcher.set_tuple(tup.as_ref());
     searcher.set_tuple_native(tup_native && tup.is_some());
     searcher.set_nnue(nn.as_ref());
@@ -551,7 +496,6 @@ fn bench_cmd(
         for line in text.lines().step_by(step).take(n) {
             let Some(pos) = Board::from_str(line) else { continue };
             let mut s = Searcher::new_unconfigured();
-            s.set_sancta(net.as_ref());
             s.set_tuple(tup.as_ref());
             s.set_tuple_native(tup_native && tup.is_some());
             s.set_nnue(nn.as_ref());
@@ -1464,7 +1408,6 @@ fn serve_search(
 
 fn serve_cmd(
     tt_bits: usize,
-    net_spec: Option<String>,
     tup_spec: Option<String>,
     tup_native: bool,
     corr: bool,
@@ -1489,16 +1432,6 @@ fn serve_cmd(
         if bz { ", rules=botzone" } else { "" }
     );
     let tup_spec = eff_tuple_spec(&tup_spec, &nnue_spec);
-    // Eval presets come from --net / --tuple ONLY. Owned tables outlive the
-    // loop; searcher borrows them per-position (no refcount).
-    let owned = match load_net_preset(&net_spec) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("serve: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    searcher.set_sancta(owned.as_ref());
     let owned_tup = match load_tuple_preset(&tup_spec) {
         Ok(t) => t,
         Err(e) => {
@@ -1750,8 +1683,6 @@ fn match_cmd(
     games: u32,
     time_ms: u64,
     opp_cmd: Option<String>,
-    net_spec: Option<String>,
-    opp_net_spec: Option<String>,
     tup_spec: Option<String>,
     opp_tup_spec: Option<String>,
     tup_native: bool,
@@ -1790,23 +1721,6 @@ fn match_cmd(
         network_description(&opp_nnue_spec),
         max_depth
     );
-    // Eval presets, explicit per side — no env vars anywhere:
-    // --net = OUR side (in-process), --opp-net = child side (appended to the
-    // opp serve command). --opp self = both in-process (opp side gets opp-net).
-    let net = match load_net_preset(&net_spec) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("match: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let opp_net = match load_net_preset(&opp_net_spec) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("match: opp {e}");
-            return ExitCode::FAILURE;
-        }
-    };
     let tup = match load_tuple_preset(&tup_spec) {
         Ok(t) => t,
         Err(e) => {
@@ -1832,9 +1746,6 @@ fn match_cmd(
                 // Auto-append opp presets to "<exe> serve" child commands.
                 let mut with_flags = c;
                 if with_flags.trim_end().ends_with("serve") {
-                    if !with_flags.contains("--net") {
-                        with_flags = format!("{with_flags} {}", net_flag_str(&opp_net_spec));
-                    }
                     if !with_flags.contains("--tuple") {
                         with_flags = format!("{with_flags} {}", tuple_flag_str(&opp_tup_spec));
                     }
@@ -1871,13 +1782,13 @@ fn match_cmd(
 
     let mut tally = (0u32, 0u32, 0u32); // titanium wins, opp wins, draws
     let limits_desc = format!(
-        "titanium limits: {}, net: {} vs {}",
+        "titanium limits: {}, network: {} vs {}",
         match max_nodes {
             Some(n) => format!("{n} nodes"),
             None => format!("{time_ms} ms"),
         },
-        net_spec.as_deref().unwrap_or("none"),
-        opp_net_spec.as_deref().unwrap_or("none"),
+        network_description(&nnue_spec),
+        network_description(&child_nnue),
     );
     let mut report = String::new();
     report.push_str(&format!(
@@ -1964,13 +1875,11 @@ fn match_cmd(
             o.send("uainewgame");
         }
         let mut searcher = Searcher::new_unconfigured(); // fresh TT per game
-        searcher.set_sancta(net.as_ref());
         searcher.set_tuple(tup.as_ref());
         searcher.set_tuple_native(tup_native && tup.is_some());
         searcher.set_corr(corr);
         searcher.set_nnue(nn.as_ref());
         let mut opp_searcher = Searcher::new_unconfigured(); // for --opp self
-        opp_searcher.set_sancta(opp_net.as_ref());
         opp_searcher.set_tuple(opp_tup.as_ref());
         opp_searcher.set_tuple_native(opp_tup_native && opp_tup.is_some());
         opp_searcher.set_corr(opp_corr);

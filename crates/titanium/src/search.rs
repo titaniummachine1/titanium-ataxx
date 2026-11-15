@@ -248,7 +248,6 @@ impl TtBucket {
 
 use crate::board::{box1, jump_union, reach_union, Board, Move, MoveList, RING1, RING2, SQUARES};
 use crate::nnue::Nnue;
-use crate::sancta::{S1Acc, S1Net};
 use crate::tuple::TupleTable;
 use std::time::Duration;
 
@@ -263,13 +262,9 @@ const INF: i32 = MATE + 1000;
 const MAX_PLY: usize = u8::MAX as usize + 1;
 
 /// Per-ply move buffers, one alloc per Searcher, reused across searches.
-/// `acc` carries the lazy sancta accumulator per ply (refresh_root once at
-/// the root, update_child parent->child diffs). OFF path = None check only.
-/// MoveList 256x2B moves + 256x4B scores + len = ~1.5KB, acc 2x64x2B =
-/// 256B -> ~1.8KB/ply, ~72KB total. No Clone, no Vec, no Drop in the tree.
+/// MoveList 256x2B moves + 256x4B scores + len = ~1.5KB/ply. No Clone, no Vec, no Drop in the tree.
 struct MoveStack {
     lists: Box<[MoveList; MAX_PLY]>,
-    acc: Box<[S1Acc; MAX_PLY]>,
     /// exp/search-moonbird: static eval the parent already computed for the child at this ply (futility
     /// reduction), consumed at the child's entry so the eval is not paid twice. i32::MIN = none.
     pre_eval: Box<[i32; MAX_PLY]>,
@@ -286,7 +281,6 @@ impl MoveStack {
     fn new() -> MoveStack {
         MoveStack {
             lists: Box::new([MoveList::new(); MAX_PLY]),
-            acc: Box::new([[[0; 64]; 2]; MAX_PLY]),
             pre_eval: Box::new([i32::MIN; MAX_PLY]),
             path_hash: Box::new([0u64; MAX_PLY]),
             rep_base: Box::new([0u32; MAX_PLY]),
@@ -335,18 +329,6 @@ pub fn unpack_eval_dis(packed: i32) -> (i32, i32) {
     let d = ((p >> 15) & 0x3FFF) as i32;
     (e, d)
 }
-/// exp/fut-cheap (D108): before the NNUE child eval of the futility step, a cheap estimate of it
-/// pred = (357 * hand(child) - 542 * parent static eval) / 1000 + 248 (least squares on 4.1M recorded futility calls of
-/// e11827d1, residual sd 191 cp; the hand eval costs ~72 ns vs ~6.5 us for the NNUE; S57 was a better fit but costs
-/// 1.8 us). If the move would be pruned even with the child eval FUT_CHEAP_M cp lower than predicted (better for us), it
-/// is pruned without the NNUE eval (offline at M 350: 49% of those NNUE evals saved, 2.8% of the moves the net keeps
-/// pruned). BUILD-TIME env FUT_CHEAP_M (0 = off).
-const FUT_CHEAP_M: i32 = env_usize(option_env!("FUT_CHEAP_M"), 350) as i32;
-/// exp/fut-sn (D110): the cheap estimate above is replaced by the futility small net's LOWER BOUND of the big net's child
-/// eval (crate::smallnet, compiled in); FUT_SN_M = extra cp subtracted from that bound (BUILD-TIME env, default 0).
-/// FUT_CHEAP_M only switches the pre-filter on (> 0) or off (0) here.
-const FUT_SN_M: i32 = env_usize(option_env!("FUT_SN_M"), 0) as i32;
-
 /// Process-wide switch for the futility small net (D112): ON by default (as strong per node as main, 5k +3 [-30,+37],
 /// x1.77 faster). `titanium-cli ... --no-fut-sn` turns it off for exact full-strength search (slower). Read once per
 /// search into the searcher, never per node.
@@ -355,14 +337,6 @@ static FUT_SN_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 pub fn fut_sn_on() -> bool {
     FUT_SN_ON.load(std::sync::atomic::Ordering::Relaxed)
 }
-
-/// (FUT_CHEAP_M, FUT_SN_M, EVORD_W, EVORD_MIN_DEPTH, EVORD_CACHE as 0/1): the cargo-build-time knobs, for `info` and the defaults test.
-pub fn build_knobs() -> (i32, i32, i32, u32, u32) {
-    (FUT_CHEAP_M, FUT_SN_M, EVORD_W, EVORD_MIN_DEPTH, EVORD_CACHE as u32)
-}
-
-/// The shipped (strongest, gated) values of the build-time knobs.
-pub const DEFAULT_BUILD_KNOBS: (i32, i32, i32, u32, u32) = (350, 0, 0, 1, 1);
 
 pub fn set_fut_sn(on: bool) {
     FUT_SN_ON.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -377,30 +351,6 @@ fn small_net() -> &'static crate::smallnet::SmallNet {
 // ordering signal can structurally leak into its neighbor).
 const ORD_TT: i32 = i32::MAX / 2;
 
-const fn env_usize(v: Option<&str>, default: usize) -> usize {
-    match v {
-        Some(v) => {
-            let b = v.as_bytes();
-            let mut i = 0;
-            let mut n = 0usize;
-            while i < b.len() {
-                n = n * 10 + (b[i] - b'0') as usize;
-                i += 1;
-            }
-            n
-        }
-        None => default,
-    }
-}
-/// exp/eval-order (user idea): moves are also ordered by their child's static eval (our view = minus the child's
-/// eval, cp), weight EVORD_W ordering points per cp on top of the usual score (capture 1000/stone, killer 100000,
-/// history <= 2000); TT move stays first. Default 100 with EVORD_CACHE=1 (user order 2026-10-25); 0 = off. The evals are cached, so the futility child evals reuse
-/// them. BUILD-TIME (env EVORD_W / EVORD_MIN_DEPTH at cargo build).
-const EVORD_W: i32 = env_usize(option_env!("EVORD_W"), 0) as i32;
-const EVORD_MIN_DEPTH: u32 = env_usize(option_env!("EVORD_MIN_DEPTH"), 1) as u32;
-/// 1 = only children whose eval is ALREADY in the eval cache (e.g. from the previous iterative-deepening pass) get the
-/// eval term, scored as their gain over the node's own static eval; no new eval is ever computed for ordering.
-const EVORD_CACHE: bool = env_usize(option_env!("EVORD_CACHE"), 1) == 1;
 const ORD_KILLER: i32 = 100_000;
 const ORD_CAPTURE_UNIT: i32 = 1000; // per conversion, max 8
 const ORD_CLONE_BONUS: i32 = 500;
@@ -546,14 +496,14 @@ const _: () = assert!(HIST_MAX % ORD_HIST_FULL == 0);
 /// `k3_to`) and per-origin (`conn`, `from_holes`, `k3_from`) work across jumps.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool, const HAS_SEE: bool>(
+fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
     b: &Board,
     list: &mut MoveList,
     tt_mv: u32,
     ply: u32,
     killers: &[(u32, u32); MAX_PLY],
     history: &History,
-    pol: Option<(&crate::policy::Policy, &[(u16, f32)], f32)>,
+    pol: Option<(&crate::policy::Policy, f32)>,
 ) {
     use std::mem::MaybeUninit;
 
@@ -565,18 +515,6 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool, const HAS_SEE
     let (k1, k2) = killers[ply as usize];
     let hist = &history[b.turn as usize];
     let mut tt_index = usize::MAX;
-
-    let (p_base, b1_opp0, b2_opp0, ph_off) = if HAS_POLICY && HAS_SEE {
-        let b1 = crate::nnfeat::box1(opp);
-        (
-            crate::nnfeat::victim_planes(me),
-            b1,
-            crate::nnfeat::box1(b1),
-            crate::policy::see_phase_off(empty),
-        )
-    } else {
-        ([0; 4], 0, 0, 0)
-    };
 
     let mut orig_valid: u64 = 0;
     let mut orig_conn = [MaybeUninit::<i32>::uninit(); 49];
@@ -605,24 +543,6 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool, const HAS_SEE
             (0, 0, 0)
         };
 
-        let tbit = 1u64 << tu;
-        let (p_to, b1o, b2o) = if HAS_POLICY && HAS_SEE {
-            if flips_m == 0 {
-                let mut pt = p_base;
-                crate::nnfeat::planes_add(&mut pt, r1_to);
-                (pt, b1_opp0, b2_opp0)
-            } else {
-                let b1 = crate::nnfeat::box1(opp & !flips_m);
-                (
-                    crate::nnfeat::victim_planes(me | tbit | flips_m),
-                    b1,
-                    crate::nnfeat::box1(b1),
-                )
-            }
-        } else {
-            ([0; 4], 0, 0)
-        };
-
         if clones != 0 {
             let from = clones.trailing_zeros() as u8;
             let m = Move { from, to };
@@ -642,15 +562,8 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool, const HAS_SEE
                 }
                 sc += hist[tu][tu] / HIST_DIV;
                 if HAS_POLICY {
-                    let (p, xin, w) = pol.unwrap();
-                    let sv = if HAS_SEE {
-                        let ea = empty & !tbit;
-                        let oi = crate::policy::see_opp_state(b1o & ea, b2o & ea, &p_to);
-                        p.see_val(ph_off, 1 + 2 * caps as usize, oi)
-                    } else {
-                        0.0
-                    };
-                    let z = p.clone_logit_pre(to, flips, tholes, k3_to, sv, xin);
+                    let (p, w) = pol.unwrap();
+                    let z = p.clone_logit_pre(to, flips, tholes, k3_to);
                     sc = sc.saturating_add((z * w) as i32);
                 }
                 list.push_scored(m, sc);
@@ -659,7 +572,7 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool, const HAS_SEE
 
         if jumps != 0 {
             let (j_prefix, j_td) = if HAS_POLICY {
-                let (p, _, _) = pol.unwrap();
+                let (p, _) = pol.unwrap();
                 p.jump_dest_parts(to, flips, tholes, k3_to)
             } else {
                 (0.0, 0)
@@ -682,7 +595,7 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool, const HAS_SEE
                     orig_valid |= fbit;
                     orig_conn[fu].write((me & RING1[fu]).count_ones() as i32);
                     if HAS_POLICY {
-                        let (p, _, _) = pol.unwrap();
+                        let (p, _) = pol.unwrap();
                         let fh = ((RING1[fu] & empty).count_ones() as usize).min(8);
                         let k3f = crate::policy::k3code_pub(me, opp, from);
                         let (fg, ft) = p.jump_orig_parts(from, fh, k3f);
@@ -702,18 +615,9 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool, const HAS_SEE
                 }
                 sc += hist[fu][tu] / HIST_DIV;
                 if HAS_POLICY {
-                    let (p, xin, w) = pol.unwrap();
+                    let (p, w) = pol.unwrap();
                     let (fg, ft) = unsafe { (orig_g[fu].assume_init(), orig_tor[fu].assume_init()) };
-                    let sv = if HAS_SEE {
-                        let mut pa = p_to;
-                        crate::nnfeat::planes_sub(&mut pa, RING1[fu]);
-                        let ea = (empty & !tbit) | fbit;
-                        let oi = crate::policy::see_opp_state(b1o & ea, b2o & ea, &pa);
-                        p.see_val(ph_off, 2 * caps as usize, oi)
-                    } else {
-                        0.0
-                    };
-                    let z = p.jump_finish(to, j_prefix, j_td, fg, ft, sv, xin);
+                    let z = p.jump_finish(j_prefix, j_td, fg, ft);
                     sc = sc.saturating_add((z * w) as i32);
                 }
                 list.push_scored(m, sc);
@@ -1232,35 +1136,23 @@ pub struct Searcher<'a> {
     killers: Box<[(u32, u32); MAX_PLY]>,
     /// History heuristic: [mover][to] cutoff counters, aged per search.
     history: Box<History>,
-    /// Optional sancta net (None = classical slim eval). Borrowed weights,
-    /// set once via set_sancta, read-only in the tree. Zero refcount,
-    /// zero unsafe â€” the borrow checker proves the net outlives the search.
-    sancta: Option<&'a S1Net>,
-    /// Optional n-tuple table (None = pure hand eval). Borrowed, read-only
-    /// in the tree, same zero-cost-OFF pattern as sancta.
+    /// Optional n-tuple table (None = pure hand eval). Borrowed, read-only in the tree.
     tuple: Option<&'a TupleTable>,
-    /// Optional exp/nnue net (None = unchanged eval path). Takes precedence over sancta/tuple when set.
+    /// Optional exp/nnue net (None = unchanged eval path). Takes precedence over the tuple when set.
     nnue: Option<&'a Nnue>,
     /// exp/policy: move-ordering policy head (None = unchanged), weight (ordering points per logit), min depth, scratch.
     policy: Option<&'a crate::policy::Policy>,
     pol_w: f32,
     pol_min: u32,
-    /// First depth at which the TPOL5 SEE input is computed. Default 99 = never (D749/D751: the
-    /// bundled head 380F609C was gated and promoted with the SEE input OFF; with it on the same head
-    /// lost 31.5 Elo at 100 ms). The policy itself still runs at every depth >= pol_min: skipping it
-    /// at depth 1 broke depth-1 futility (D744).
-    pol_see_min: u32,
     /// set_policy was called explicitly: set_nnue must not drop it
     pol_explicit: bool,
-    pol_buf: Vec<(u16, f32)>,
     /// Tuple-native eval mode: skip E2/E4 scans, mat+PST+tempo+tuples only.
     /// False by default (full hand eval + optional additive tuples).
     tup_native: bool,
     /// Correction history (None = OFF, zero-cost branch). Owned tables,
     /// reset per game; never merged into weights or TT.
     corr: Option<CorrHist>,
-    /// Per-ply move/acc buffers, reused across searches (no per-search
-    /// alloc: MoveStack is ~72KB of lists + acc, was rebuilt per search).
+    /// Per-ply move buffers, reused across searches (no per-search alloc).
     stack: MoveStack,
     /// Botzone (`BZ = true`) game placement snapshots `(black_occ, white_occ)` covering
     /// the current stone-count epoch from pre-root history plus in-tree plies at `bz_base_offset + ply`.
@@ -1350,17 +1242,13 @@ impl<'a> Searcher<'a> {
             ec_filled: 0,
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[[0; 49]; 49]; 2]),
-            sancta: None,
             tuple: None,
             nnue: None,
             policy: crate::policy::global(),
             pol_w: crate::policy::env_f32("TI_POLW", 100000.0),
-            // D744 fix: the TPOL5 head runs at EVERY depth (d1 included). Only the extra SEE
-            // input is depth-gated; skipping the whole policy at d1 cost -82 Elo (3.9% blunders).
+            // D744 fix: the head runs at EVERY depth (d1 included); skipping it at d1 cost -82 Elo (3.9% blunders).
             pol_min: crate::policy::env_f32("TI_POLMIN", 1.0) as u32,
-            pol_see_min: crate::policy::env_f32("TI_POLSEE_MIN", 99.0) as u32,
             pol_explicit: false,
-            pol_buf: Vec::new(),
             tup_native: false,
             corr: None,
             stack: MoveStack::new(),
@@ -1376,13 +1264,6 @@ impl<'a> Searcher<'a> {
     /// A production searcher with the strongest NNUE bundled into this build.
     pub fn with_main_network() -> Searcher<'static> {
         Searcher::with_tt_bits(20)
-    }
-
-    /// Attach a sancta net (None = classical). Borrowed for the search
-    /// duration; zero-cost OFF (None branch).
-    pub fn set_sancta(&mut self, net: Option<&'a S1Net>) {
-        self.sancta = net;
-        self.clear_ecache();
     }
 
     /// Attach an n-tuple table (None = pure hand eval). Borrowed for the
@@ -1424,8 +1305,6 @@ impl<'a> Searcher<'a> {
         self.corr = on.then(CorrHist::new);
     }
 
-    /// Static eval of a non-sancta node: the NNUE when one is loaded (exp/nnue), else the tuple/classical eval.
-    /// Every static eval goes through here (node entry AND the futility child eval) so pruning and leaves agree.
     fn clear_ecache(&mut self) {
         self.ecache.fill((0, i32::MIN));
         if let Some(e) = self.ec2.as_mut() {
@@ -1844,18 +1723,12 @@ impl<'a> Searcher<'a> {
             depth -= 1;
         }
 
-        // Lazy incremental sancta: root refreshed once in search(); every
-        // child acc = parent acc + bitboard diffs at make() time (below).
-        // OFF = single branch to classical, zero-cost.
-        // forward_ready(acc, stm) is ALREADY stm-relative (like evaluate) —
-        // no negation (that was the 0-50 bug: double-negated white nodes).
-        let (raw, node_dis) = match (self.nnue, self.sancta) {
-            (None, Some(net)) => (net.forward_ready(&self.stack.acc[ply as usize], b.turn), 0),
-            _ if pre != i32::MIN => unpack_eval_dis(pre),
-            _ => {
-                self.ec_imp = 1;
-                self.leaf_eval_with_dis(b)
-            }
+        // static eval: the parent's futility child eval when it passed one down, else the (cached) leaf eval
+        let (raw, node_dis) = if pre != i32::MIN {
+            unpack_eval_dis(pre)
+        } else {
+            self.ec_imp = 1;
+            self.leaf_eval_with_dis(b)
         };
         let static_eval = self.corrected(b, raw);
 
@@ -1891,9 +1764,6 @@ impl<'a> Searcher<'a> {
                 self.stack.imp[ply as usize + 1] = 0;
                 self.stack.path_hash[ply as usize + 1] = child.hash;
                 self.stack.rep_base[ply as usize + 1] = self.stack.rep_base[ply as usize];
-                // NMP pass flips stm: sancta acc is color-relative so it
-                // stays valid — just forward the other perspective.
-                // (pass: no stones change, no diff update needed.)
                 let score =
                     -self.negamax::<BZ>(&child, -beta, -beta + 1, depth - 3, ply + 1, false);
                 if self.stop {
@@ -2012,10 +1882,6 @@ impl<'a> Searcher<'a> {
                                 self.stack.rep_base[ply as usize]
                             };
                         }
-                        if let Some(net) = self.sancta {
-                            let (a, z) = self.stack.acc.split_at_mut(ply as usize + 1);
-                            net.update_child(&a[ply as usize], &mut z[0], b, &child);
-                        }
                         let score =
                             -self.negamax::<BZ>(&child, -beta, -alpha, depth - 1, ply + 1, true);
                         if self.stop {
@@ -2057,61 +1923,21 @@ impl<'a> Searcher<'a> {
 
         {
             match (self.policy, self.nnue) {
-                (Some(pol), Some(nn)) if depth >= self.pol_min => {
-                    if pol.dim > 0 && nn.pairwise {
-                        let mut buf = std::mem::take(&mut self.pol_buf);
-                        nn.policy_xin(b, &mut buf);
-                        let list = &mut self.stack.lists[ply as usize];
-                        if depth >= self.pol_see_min && pol.has_see() {
-                            gen_and_score_into::<true, true, true>(
-                                b,
-                                list,
-                                skip_tt_mv,
-                                ply,
-                                &self.killers,
-                                &self.history,
-                                Some((pol, &buf, self.pol_w)),
-                            );
-                        } else {
-                            gen_and_score_into::<true, true, false>(
-                                b,
-                                list,
-                                skip_tt_mv,
-                                ply,
-                                &self.killers,
-                                &self.history,
-                                Some((pol, &buf, self.pol_w)),
-                            );
-                        }
-                        self.pol_buf = buf;
-                    } else {
-                        let list = &mut self.stack.lists[ply as usize];
-                        if depth >= self.pol_see_min && pol.has_see() {
-                            gen_and_score_into::<true, true, true>(
-                                b,
-                                list,
-                                skip_tt_mv,
-                                ply,
-                                &self.killers,
-                                &self.history,
-                                Some((pol, &[], self.pol_w)),
-                            );
-                        } else {
-                            gen_and_score_into::<true, true, false>(
-                                b,
-                                list,
-                                skip_tt_mv,
-                                ply,
-                                &self.killers,
-                                &self.history,
-                                Some((pol, &[], self.pol_w)),
-                            );
-                        }
-                    }
+                (Some(pol), Some(_)) if depth >= self.pol_min => {
+                    let list = &mut self.stack.lists[ply as usize];
+                    gen_and_score_into::<true, true>(
+                        b,
+                        list,
+                        skip_tt_mv,
+                        ply,
+                        &self.killers,
+                        &self.history,
+                        Some((pol, self.pol_w)),
+                    );
                 }
                 _ => {
                     let list = &mut self.stack.lists[ply as usize];
-                    gen_and_score_into::<true, false, false>(
+                    gen_and_score_into::<true, false>(
                         b,
                         list,
                         skip_tt_mv,
@@ -2127,10 +1953,7 @@ impl<'a> Searcher<'a> {
             // have no children to search: score the pass-through.
             if self.stack.lists[ply as usize].is_empty() && skip_tt_mv == 0 {
                 self.heuristic_used = true;
-                let raw = match (self.nnue, self.sancta) {
-                    (None, Some(net)) => net.forward_ready(&self.stack.acc[ply as usize], b.turn),
-                    _ => self.leaf_eval(b),
-                };
+                let raw = self.leaf_eval(b);
                 let static_eval = self.corrected(b, raw);
                 self.finish_node(
                     b,
@@ -2143,35 +1966,6 @@ impl<'a> Searcher<'a> {
                     static_eval,
                 );
                 return static_eval;
-            }
-        }
-
-        if EVORD_W > 0 && depth >= EVORD_MIN_DEPTH && self.sancta.is_none() {
-            let n = self.stack.lists[ply as usize].len();
-            if n > 1 {
-                for i in 0..n {
-                    let (m, sc) = {
-                        let l = &self.stack.lists[ply as usize];
-                        (l.move_at(i), l.score_at(i))
-                    };
-                    if sc == ORD_TT {
-                        continue;
-                    }
-                    let child = b.make(m);
-                    let add = if EVORD_CACHE {
-                        let (k, v) = self.ecache[(child.hash as usize) & (self.ecache.len() - 1)];
-                        if k == child.hash && v != i32::MIN {
-                            let (ce, _) = unpack_eval_dis(v);
-                            (-ce).saturating_sub(static_eval)
-                        } else {
-                            0
-                        }
-                    } else {
-                        -self.leaf_eval(&child)
-                    };
-                    self.stack.lists[ply as usize]
-                        .set_score(i, sc.saturating_add(add.saturating_mul(EVORD_W)));
-                }
             }
         }
 
@@ -2241,10 +2035,6 @@ impl<'a> Searcher<'a> {
                     self.stack.rep_base[ply as usize]
                 };
             }
-            if let Some(net) = self.sancta {
-                let (a, z) = self.stack.acc.split_at_mut(ply as usize + 1);
-                net.update_child(&a[ply as usize], &mut z[0], b, &child);
-            }
             let mut new_depth = depth as i32;
             if move_idx >= MB_LMR_MIN_IDX && !at_bz_horizon {
                 new_depth = depth as i32 * MB_LMR_HALFLIFE / (MB_LMR_HALFLIFE + lmr_cnt);
@@ -2254,13 +2044,12 @@ impl<'a> Searcher<'a> {
             if move_idx >= MB_FUT_MIN_IDX
                 && !at_bz_horizon
                 && new_depth > 0
-                && self.sancta.is_none()
                 && alpha.abs() < MATE_BOUND
             {
                 // child eval is from the child's side to move = minus our static value of the move
                 let mut cached_eval: Option<(i32, i32)> = None;
                 let mut hand_cache: Option<i32> = None;
-                if FUT_CHEAP_M > 0 && self.fut_sn && self.nnue.is_some() {
+                if self.fut_sn && self.nnue.is_some() {
                     cached_eval = if self.ec2.is_some() {
                         self.ec2_get(&child).map(unpack_eval_dis)
                     } else {
@@ -2288,7 +2077,7 @@ impl<'a> Searcher<'a> {
                             child.empty().count_ones(),
                             static_eval,
                             hand,
-                        ) - FUT_SN_M;
+                        );
                         if new_depth - (alpha.saturating_add(lo) / MB_FUT_DIV).clamp(0, 64) <= 0
                             && best > -MATE_BOUND
                         {
@@ -2300,7 +2089,7 @@ impl<'a> Searcher<'a> {
                 }
                 let (ce, child_dis) = if let Some(ed) = cached_eval {
                     ed
-                } else if FUT_CHEAP_M > 0 && self.fut_sn && self.nnue.is_some() {
+                } else if self.fut_sn && self.nnue.is_some() {
                     let (eval, dis) = if let (Some(nn), Some(h)) = (
                         self.nnue,
                         hand_cache.filter(|_| self.tuple.is_none() && !self.tup_native),
@@ -2628,7 +2417,7 @@ impl<'a> Searcher<'a> {
             // array (best-first). Each iteration reorders the array.
             let (kill, hist) = (&self.killers, &self.history);
             let root = &mut self.stack.lists[0];
-            gen_and_score_into::<false, false, false>(b, root, tt_mv, 0, kill, hist, None);
+            gen_and_score_into::<false, false>(b, root, tt_mv, 0, kill, hist, None);
         }
         let n_root = self.stack.lists[0].len();
         if n_root == 0 {
@@ -2644,7 +2433,6 @@ impl<'a> Searcher<'a> {
             return result; // caller must handle pass / game over
         }
         // Root best-so-far: drained best-first into a fixed array.
-        // Root acc refreshed once (sancta lazy path: children diff from it).
         let mut root_moves = [Move::PASS; 256];
         let mut root_banned_snaps = [(0u64, 0u64); 32];
         let mut n_root_banned = 0usize;
@@ -2695,9 +2483,6 @@ impl<'a> Searcher<'a> {
                 n_root
             }
         };
-        if let Some(net) = self.sancta {
-            net.refresh_root(b, &mut self.stack.acc[0]);
-        }
         // Initial fallback move: prioritize the proven TT move if legal, else first root move.
         let tt_legal_mv = if tt_mv != 0 {
             (0..n_root)
@@ -2755,11 +2540,6 @@ impl<'a> Searcher<'a> {
                         ban_start: 0,
                         tainted: false,
                     };
-                }
-                // Root children: acc[1] = acc[0] + diffs (sancta lazy path).
-                if let Some(net) = self.sancta {
-                    let (a, z) = self.stack.acc.split_at_mut(1);
-                    net.update_child(&a[0], &mut z[0], b, &child);
                 }
                 let score =
                     -self.negamax::<BZ>(&child, -INF, -alpha, u32::from(depth - 1), 1, true);
@@ -3626,14 +3406,14 @@ xxx....
             }
         }
         let pol = crate::policy::bundled().expect("bundled policy");
-        let pol5 = {
-            let mut raw5 = b"TPOL5\0\0\0".to_vec();
-            raw5.extend_from_slice(&0u32.to_le_bytes());
-            for i in 0..crate::policy::SLOTS { raw5.extend_from_slice(&(((i as i32 - 49) as f32) * 0.03125).to_le_bytes()); }
-            for i in 0..crate::policy::NSCAL { raw5.extend_from_slice(&(((i as i32 - 20) as f32) * 0.0625).to_le_bytes()); }
-            for i in 0..crate::policy::NSEE { raw5.extend_from_slice(&(((i as i32 * 31) % 200 - 100) as f32 * 0.015625).to_le_bytes()); }
-            for i in 0..(27 * 6561) { raw5.extend_from_slice(&(((i as i32 * 17) % 1000 - 500) as f32 / 2048.0).to_le_bytes()); }
-            crate::policy::Policy::from_bytes(&raw5).expect("TPOL5")
+        // synthetic TPOL3 head (the bundled one is the real played head; both go through the one ordering path)
+        let pol3 = {
+            let mut raw = b"TPOL3\0\0\0".to_vec();
+            raw.extend_from_slice(&0u32.to_le_bytes());
+            for i in 0..crate::policy::SLOTS { raw.extend_from_slice(&(((i as i32 - 49) as f32) * 0.03125).to_le_bytes()); }
+            for i in 0..crate::policy::NSCAL { raw.extend_from_slice(&(((i as i32 - 20) as f32) * 0.0625).to_le_bytes()); }
+            for i in 0..(27 * 6561) { raw.extend_from_slice(&(((i as i32 * 17) % 1000 - 500) as f32 / 2048.0).to_le_bytes()); }
+            crate::policy::Policy::from_bytes(&raw).expect("TPOL3")
         };
         let pol_w = 100_000.0f32;
         let mut ref_list = MoveList::new();
@@ -3669,7 +3449,7 @@ xxx....
             for mode in [0u8, 1u8, 2u8] {
                 let active_pol = match mode {
                     1 => Some(pol),
-                    2 => Some(&pol5),
+                    2 => Some(&pol3),
                     _ => None,
                 };
                 let mut kc = crate::policy::KCache::new();
@@ -3698,7 +3478,7 @@ xxx....
                     let (hf, ht) = hist_key(m);
                     sc += hist[hf][ht] / HIST_DIV;
                     if let Some(p) = active_pol {
-                        let add = (p.logit_k(&b, m, &[], &mut kc) * pol_w) as i32;
+                        let add = (p.logit_k(&b, m, &mut kc) * pol_w) as i32;
                         sc = sc.saturating_add(add);
                     }
                     expected.push((m, sc));
@@ -3706,9 +3486,8 @@ xxx....
 
                 // Check SKIP_TT = true (all non-TT moves in identical order with identical scores)
                 match active_pol {
-                    Some(p) if p.has_see() => gen_and_score_into::<true, true, true>(&b, &mut new_list, tt_mv, ply, &killers, &history, Some((p, &[], pol_w))),
-                    Some(p) => gen_and_score_into::<true, true, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, Some((p, &[], pol_w))),
-                    None => gen_and_score_into::<true, false, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None),
+                    Some(p) => gen_and_score_into::<true, true>(&b, &mut new_list, tt_mv, ply, &killers, &history, Some((p, pol_w))),
+                    None => gen_and_score_into::<true, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None),
                 }
                 let expected_skip: Vec<(Move, i32)> = expected.iter().copied().enumerate().filter(|(i, _)| Some(*i) != tt_pos).map(|(_, v)| v).collect();
                 let actual_skip: Vec<(Move, i32)> = (0..new_list.len()).map(|i| (new_list.move_at(i), new_list.score_at(i))).collect();
@@ -3716,7 +3495,7 @@ xxx....
 
                 // Check SKIP_TT = false (TT swapped to index 0)
                 if mode == 0 {
-                    gen_and_score_into::<false, false, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None);
+                    gen_and_score_into::<false, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None);
                     let mut expected_noskip = expected.clone();
                     if let Some(tp) = tt_pos {
                         if tp != 0 {

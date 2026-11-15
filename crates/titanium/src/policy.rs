@@ -1,31 +1,25 @@
-//! Move-ordering policy head (exp/policy, docs/POLICY_PLAN.md). logit(m) = bias[slot] + scalar move features
-//! + U[slot] . xin, where xin is the sparse pairwise accumulator product the value net's L1 reads. Fitted by `ti policy`.
-//! File: magic "TPOL1\0\0\0", u32 dim, f32 bias[98], f32 g[45], f32 u[98*dim], little endian.
-//! TPOL2 (D486): the same, then f32 dest[98][6561] + f32 orig[49][6561]: one lookup per move on the base-3 code of the
-//! 8 cells around the destination (and, for jumps, around the origin), mover-relative, as `ti policy --pat k3` fits it.
+//! Move-ordering policy head (docs/POLICY_PLAN.md). logit(m) = bias[slot] + scalar move features + the 3x3 pattern
+//! tables around the destination (and, for jumps, around the origin), shared by the 9 edge classes (TPOL3, D502).
+//! File: magic "TPOL3\0\0\0", u32 dim (must be 0), f32 bias[98], f32 g[45], f32 dest[18][6561], f32 orig[9][6561].
+//! "TPOL5" = the same plus a SEE block after g; play never reads it (D748/D751), so it is skipped on load (D894) until
+//! the no-SEE head (D893) replaces the shipped one. TPOL1/TPOL2 (no tables / per-square tables, dim > 0) are gone (LAWS A11).
 use crate::board::{Board, Move, RING1};
 
 
-/// Bundled head (fitted by `ti policy --feat x --out-bin` on the bundled net data/nnue/nnue_main.tnn). Env TI_POLICY=none disables, =path overrides.
+/// Bundled head (data/nnue/policy_main.bin). Env TI_POLICY=none disables, =path overrides.
 static BUNDLED: &[u8] = include_bytes!("../../../data/nnue/policy_main.bin");
 
 pub const SLOTS: usize = 98;
 pub const NSCAL: usize = 45;
-pub const NSEE_BASE: usize = 18 * 19;
-pub const NSEE: usize = 8 * NSEE_BASE;
+/// size of the TPOL5 SEE block that is skipped on load
+const NSEE: usize = 8 * 18 * 19;
 
 pub struct Policy {
-    pub dim: usize,
     bias: [f32; SLOTS],
     g: [f32; NSCAL],
-    see: Vec<f32>,
-    u: Vec<f32>,
-    /// D486 pattern tables (empty for TPOL1)
-    /// D502: stored as i16 at TQ (1/2048 logit steps, |table| <= 16): half the cache footprint of f32 (the nps cost)
+    /// D486/D502 pattern tables, i16 at TQ (1/2048 logit steps), shared by the 9 edge classes
     td: Vec<i16>,
     tor: Vec<i16>,
-    /// D502 TPOL3: tables shared by the 9 edge classes (row/col in {0, 1..5, 6}) instead of per square
-    cls: bool,
 }
 
 /// edge class of a square: (row class) * 3 + (col class), class 0 = first line, 1 = inner, 2 = last line
@@ -44,6 +38,8 @@ static CLS: [u8; 49] = {
 
 const P3: usize = 6561;
 const TQ: f32 = 2048.0;
+const ND: usize = 18;
+const NO: usize = 9;
 
 /// D493 speed: per square, the 8 neighbour squares in the fixed order NW N NE W E SW S SE; off-board = bit 63 (never set
 /// on a 49-square board, so it reads as empty = digit 0, exactly like the trainer's bounds check).
@@ -105,18 +101,6 @@ static NBM: [u64; 49] = {
 fn bits8f(x: u64, s: usize) -> usize {
     let y = (x & NBM[s]) << 8;
     (((y >> s) & 7) | (((y >> (s + 7)) & 1) << 3) | (((y >> (s + 9)) & 1) << 4) | (((y >> (s + 14)) & 7) << 5)) as usize
-}
-
-#[allow(dead_code)]
-#[inline(always)]
-fn bits8(x: u64, nb: &[u8; 8]) -> usize {
-    let mut v = 0usize;
-    let mut j = 0;
-    while j < 8 {
-        v |= (((x >> nb[j]) & 1) as usize) << j;
-        j += 1;
-    }
-    v
 }
 
 /// Base-3 code of the 8 neighbours of `sq` (0 empty/off-board, 1 `me`, 2 `opp`), order NW N NE W E SW S SE, digit 0 most
@@ -191,6 +175,34 @@ mod tests {
         }
     }
 
+    /// synthetic head as a file: TPOL3, or TPOL5 with a SEE block that must be skipped (same logits as the TPOL3)
+    pub(crate) fn synth_bytes(tpol5: bool) -> Vec<u8> {
+        let mut raw = if tpol5 { b"TPOL5\0\0\0".to_vec() } else { b"TPOL3\0\0\0".to_vec() };
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        for i in 0..super::SLOTS { raw.extend_from_slice(&(((i as i32 - 49) as f32) * 0.03125).to_le_bytes()); }
+        for i in 0..super::NSCAL { raw.extend_from_slice(&(((i as i32 - 20) as f32) * 0.0625).to_le_bytes()); }
+        if tpol5 {
+            for i in 0..super::NSEE { raw.extend_from_slice(&(((i as i32 * 31) % 200 - 100) as f32 * 0.015625).to_le_bytes()); }
+        }
+        for i in 0..((super::ND + super::NO) * super::P3) {
+            raw.extend_from_slice(&(((i as i32 * 17) % 1000 - 500) as f32 / 2048.0).to_le_bytes());
+        }
+        raw
+    }
+
+    #[test]
+    fn tpol5_loads_without_its_see_block() {
+        let a = super::Policy::from_bytes(&synth_bytes(false)).expect("TPOL3");
+        let b = super::Policy::from_bytes(&synth_bytes(true)).expect("TPOL5");
+        assert_eq!(a.bias, b.bias);
+        assert_eq!(a.g, b.g);
+        assert_eq!(a.td, b.td);
+        assert_eq!(a.tor, b.tor);
+        let mut bad = synth_bytes(false);
+        bad[8..12].copy_from_slice(&4u32.to_le_bytes());
+        assert!(super::Policy::from_bytes(&bad).is_err(), "dim > 0 must be refused");
+    }
+
     #[test]
     fn precomputed_logits_match_logit_k() {
         use crate::board::{Board, MoveList, RING1, RING2};
@@ -202,62 +214,9 @@ mod tests {
             *s
         };
         let bundled = super::bundled().expect("bundled policy");
+        let synth = super::Policy::from_bytes(&synth_bytes(false)).expect("TPOL3");
         let mut list = MoveList::new();
-        // Synthetic dim>0 TPOL2/TPOL3 policy + bundled TPOL3 dim==0 policy
-        let dim = 8usize;
-        let mut synth = super::Policy {
-            dim,
-            bias: [0.0; super::SLOTS],
-            g: [0.0; super::NSCAL],
-            see: Vec::new(),
-            u: vec![0.0; super::SLOTS * dim],
-            td: vec![0i16; 18 * super::P3],
-            tor: vec![0i16; 9 * super::P3],
-            cls: true,
-        };
-        let mut synth5 = super::Policy {
-            dim: 0,
-            bias: [0.0; super::SLOTS],
-            g: [0.0; super::NSCAL],
-            see: (0..super::NSEE).map(|i| ((i as i32 * 29) % 200 - 100) as f32 * 0.015625).collect(),
-            u: Vec::new(),
-            td: vec![0i16; 18 * super::P3],
-            tor: vec![0i16; 9 * super::P3],
-            cls: true,
-        };
-        for (i, v) in synth.bias.iter_mut().enumerate() {
-            *v = ((i as i32 - 49) as f32) * 0.03125;
-        }
-        for (i, v) in synth.g.iter_mut().enumerate() {
-            *v = ((i as i32 - 20) as f32) * 0.0625;
-        }
-        for (i, v) in synth.u.iter_mut().enumerate() {
-            *v = (((i % 17) as i32 - 8) as f32) * 0.015625;
-        }
-        for (i, v) in synth.td.iter_mut().enumerate() {
-            *v = ((i as i32 * 37) % 1000 - 500) as i16;
-        }
-        for (i, v) in synth.tor.iter_mut().enumerate() {
-            *v = ((i as i32 * 53) % 1000 - 500) as i16;
-        }
-        synth5.bias = synth.bias;
-        synth5.g = synth.g;
-        synth5.td.copy_from_slice(&synth.td);
-        synth5.tor.copy_from_slice(&synth.tor);
-        // Also test TPOL5 binary serialization -> Policy::from_bytes round-trip
-        let mut raw5 = b"TPOL5\0\0\0".to_vec();
-        raw5.extend_from_slice(&0u32.to_le_bytes());
-        for v in synth5.bias { raw5.extend_from_slice(&v.to_le_bytes()); }
-        for v in synth5.g { raw5.extend_from_slice(&v.to_le_bytes()); }
-        for &v in &synth5.see { raw5.extend_from_slice(&v.to_le_bytes()); }
-        for &v in &synth5.td { raw5.extend_from_slice(&(v as f32 * (1.0 / super::TQ)).to_le_bytes()); }
-        for &v in &synth5.tor { raw5.extend_from_slice(&(v as f32 * (1.0 / super::TQ)).to_le_bytes()); }
-        let synth5_parsed = super::Policy::from_bytes(&raw5).expect("TPOL5 parse");
-        assert!(synth5_parsed.has_see());
-        let xin = [(0u16, 0.25f32), (3u16, 0.75f32), (6u16, 0.125f32)];
-
-        for pol in [bundled, &synth, &synth5_parsed] {
-            let x_slice: &[(u16, f32)] = if pol.dim > 0 { &xin } else { &[] };
+        for pol in [bundled, &synth] {
             for n in 0..80 {
                 let mut b = Board::start();
                 for _ in 0..(n % 24) {
@@ -275,58 +234,21 @@ mod tests {
                 let me = b.me();
                 let opp = b.opp();
                 let empty = b.empty();
-                let p_base = crate::nnfeat::victim_planes(me);
-                let b1_0 = crate::nnfeat::box1(opp);
-                let b2_0 = crate::nnfeat::box1(b1_0);
-                let ph_off = super::see_phase_off(empty);
                 let mut targets = crate::board::reach_union(me) & empty;
                 while targets != 0 {
                     let to = targets.trailing_zeros() as u8;
                     targets &= targets - 1;
                     let r1_to = RING1[to as usize];
-                    let flips_m = opp & r1_to;
-                    let flips = (flips_m.count_ones() as usize).min(8);
+                    let flips = ((opp & r1_to).count_ones() as usize).min(8);
                     let tholes = ((r1_to & empty).count_ones() as usize).min(8);
                     let k3_to = super::k3code_pub(me, opp, to);
-
-                    let (p_to, b1o, b2o) = if pol.has_see() {
-                        let (b1o, b2o) = if flips_m == 0 {
-                            (b1_0, b2_0)
-                        } else {
-                            let b1 = crate::nnfeat::box1(opp & !flips_m);
-                            (b1, crate::nnfeat::box1(b1))
-                        };
-                        let mut pt = p_base;
-                        crate::nnfeat::planes_add(&mut pt, r1_to);
-                        let mut fm = flips_m;
-                        while fm != 0 {
-                            let u = fm.trailing_zeros() as usize;
-                            fm &= fm - 1;
-                            crate::nnfeat::planes_add(&mut pt, RING1[u]);
-                        }
-                        (pt, b1o, b2o)
-                    } else {
-                        ([0; 4], 0, 0)
-                    };
-
                     let clones = me & r1_to;
                     if clones != 0 {
-                        let m = crate::board::Move {
-                            from: clones.trailing_zeros() as u8,
-                            to,
-                        };
-                        let sv = if pol.has_see() {
-                            let ea = empty & !(1u64 << to);
-                            let oi = super::see_opp_state(b1o & ea, b2o & ea, &p_to);
-                            pol.see_val(ph_off, 1 + 2 * (flips_m.count_ones() as usize), oi)
-                        } else {
-                            0.0
-                        };
-                        let expected = pol.logit_k(&b, m, x_slice, &mut kc);
-                        let actual = pol.clone_logit_pre(to, flips, tholes, k3_to, sv, x_slice);
+                        let m = crate::board::Move { from: clones.trailing_zeros() as u8, to };
+                        let expected = pol.logit_k(&b, m, &mut kc);
+                        let actual = pol.clone_logit_pre(to, flips, tholes, k3_to);
                         assert_eq!(actual.to_bits(), expected.to_bits(), "clone mv {m:?}");
                     }
-
                     let (jp, jtd) = pol.jump_dest_parts(to, flips, tholes, k3_to);
                     let mut jumps = me & RING2[to as usize];
                     while jumps != 0 {
@@ -336,17 +258,8 @@ mod tests {
                         let fh = ((RING1[from as usize] & empty).count_ones() as usize).min(8);
                         let k3_from = super::k3code_pub(me, opp, from);
                         let (fg, ft) = pol.jump_orig_parts(from, fh, k3_from);
-                        let sv = if pol.has_see() {
-                            let mut pa = p_to;
-                            crate::nnfeat::planes_sub(&mut pa, RING1[from as usize]);
-                            let ea = (empty & !(1u64 << to)) | (1u64 << from);
-                            let oi = super::see_opp_state(b1o & ea, b2o & ea, &pa);
-                            pol.see_val(ph_off, 2 * (flips_m.count_ones() as usize), oi)
-                        } else {
-                            0.0
-                        };
-                        let expected = pol.logit_k(&b, m, x_slice, &mut kc);
-                        let actual = pol.jump_finish(to, jp, jtd, fg, ft, sv, x_slice);
+                        let expected = pol.logit_k(&b, m, &mut kc);
+                        let actual = pol.jump_finish(jp, jtd, fg, ft);
                         assert_eq!(actual.to_bits(), expected.to_bits(), "jump mv {m:?}");
                     }
                 }
@@ -355,56 +268,26 @@ mod tests {
     }
 }
 
-/// Exact 1-ply opponent reply differential state after our move:
-/// 0 = opponent has no legal moves; 1..=18 = 1 + max_opp_diff (0..=17).
-#[inline(always)]
-pub(crate) fn see_opp_state(b1_empty: u64, b2_empty: u64, p: &[u64; 4]) -> usize {
-    if b2_empty == 0 {
-        return 0;
-    }
-    let cl = if b1_empty != 0 {
-        1 + 2 * crate::nnfeat::planes_max(b1_empty, p)
-    } else {
-        0
-    };
-    let jp = 2 * crate::nnfeat::planes_max(b2_empty, p);
-    1 + cl.max(jp) as usize
-}
-
-#[inline(always)]
-pub(crate) fn see_phase_off(empty: u64) -> usize {
-    ((empty.count_ones() as usize).saturating_sub(1) / 6).min(7) * NSEE_BASE
-}
-
 impl Policy {
-    #[inline(always)]
-    pub fn has_see(&self) -> bool {
-        !self.see.is_empty()
-    }
-
-    #[inline(always)]
-    pub(crate) fn see_val(&self, ph_off: usize, my_diff: usize, opp_idx: usize) -> f32 {
-        self.see[ph_off + my_diff * 19 + opp_idx]
-    }
-
     pub fn load(path: &str) -> std::io::Result<Policy> {
         Self::from_bytes(&std::fs::read(path)?)
     }
 
     pub fn from_bytes(d: &[u8]) -> std::io::Result<Policy> {
         let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
-        let v5 = d.len() >= 12 && &d[..8] == b"TPOL5\0\0\0";
-        let v3 = (d.len() >= 12 && &d[..8] == b"TPOL3\0\0\0") || v5;
-        let v2 = (d.len() >= 12 && &d[..8] == b"TPOL2\0\0\0") || v3;
-        if d.len() < 12 || (&d[..8] != b"TPOL1\0\0\0" && !v2) {
+        if d.len() < 12 {
             return Err(bad("bad policy magic"));
         }
-        let dim = u32::from_le_bytes(d[8..12].try_into().unwrap()) as usize;
-        let nsee = if v5 { NSEE } else { 0 };
-        let n1 = SLOTS + NSCAL + nsee + SLOTS * dim;
-        let (nds, nos) = if v3 { (18, 9) } else { (SLOTS, 49) };
-        let n = n1 + if v2 { (nds + nos) * P3 } else { 0 };
-        if d.len() != 12 + 4 * n {
+        let nsee = match &d[..8] {
+            b"TPOL3\0\0\0" => 0,
+            b"TPOL5\0\0\0" => NSEE,
+            _ => return Err(bad("bad policy magic (only TPOL3/TPOL5 heads exist)")),
+        };
+        if u32::from_le_bytes(d[8..12].try_into().unwrap()) != 0 {
+            return Err(bad("policy dim must be 0 (no accumulator input)"));
+        }
+        let n1 = SLOTS + NSCAL + nsee;
+        if d.len() != 12 + 4 * (n1 + (ND + NO) * P3) {
             return Err(bad("bad policy size"));
         }
         let f: Vec<f32> = d[12..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
@@ -412,180 +295,74 @@ impl Policy {
         bias.copy_from_slice(&f[..SLOTS]);
         let mut g = [0f32; NSCAL];
         g.copy_from_slice(&f[SLOTS..SLOTS + NSCAL]);
-        let see = if v5 { f[SLOTS + NSCAL..SLOTS + NSCAL + NSEE].to_vec() } else { Vec::new() };
         let q = |x: &[f32]| -> Vec<i16> { x.iter().map(|v| (v * TQ).round().clamp(-32767.0, 32767.0) as i16).collect() };
-        let (td, tor) = if v2 { (q(&f[n1..n1 + nds * P3]), q(&f[n1 + nds * P3..])) } else { (Vec::new(), Vec::new()) };
-        Ok(Policy { dim, bias, g, see, u: f[SLOTS + NSCAL + nsee..n1].to_vec(), td, tor, cls: v3 })
+        let (td, tor) = (q(&f[n1..n1 + ND * P3]), q(&f[n1 + ND * P3..]));
+        Ok(Policy { bias, g, td, tor })
     }
 
-    /// Logit of move `m` in `b` given the sparse accumulator product `xin` (index, value).
+    /// Logit of move `m` in `b`.
     #[inline]
-    pub fn logit(&self, b: &Board, m: Move, xin: &[(u16, f32)]) -> f32 {
-        self.logit_k(b, m, xin, &mut KCache::new())
+    pub fn logit(&self, b: &Board, m: Move) -> f32 {
+        self.logit_k(b, m, &mut KCache::new())
     }
 
-    /// `logit` with a per-node code cache (search ordering loop: one KCache per node, same board for every move)
+    /// `logit` with a per-node code cache (one KCache per node, same board for every move). Bit-identical to the
+    /// ordering loop's `clone_logit_pre` / `jump_finish` (test precomputed_logits_match_logit_k).
     #[inline]
-    pub fn logit_k(&self, b: &Board, m: Move, xin: &[(u16, f32)], kc: &mut KCache) -> f32 {
+    pub fn logit_k(&self, b: &Board, m: Move, kc: &mut KCache) -> f32 {
         let clone = m.is_clone();
         let c = clone as usize;
         let empty = b.empty();
-        let flips_raw = b.captures(m.to) as usize;
-        let flips = flips_raw.min(8);
+        let flips = (b.captures(m.to) as usize).min(8);
         let tholes = ((RING1[m.to as usize] & empty).count_ones() as usize).min(8);
         let slot = m.to as usize + 49 * (!clone) as usize;
         let mut z = self.bias[slot] + self.g[c * 9 + flips] + self.g[18 + c * 9 + tholes];
         if !clone {
             z += self.g[36 + ((RING1[m.from as usize] & empty).count_ones() as usize).min(8)];
         }
-        if !self.see.is_empty() {
-            let (me, opp) = (b.me(), b.opp());
-            let tu = m.to as usize;
-            let flips_m = opp & RING1[tu];
-            let opp_p = opp & !flips_m;
-            let b1o = crate::nnfeat::box1(opp_p);
-            let b2o = crate::nnfeat::box1(b1o);
-            let mut p = crate::nnfeat::victim_planes(me);
-            crate::nnfeat::planes_add(&mut p, RING1[tu]);
-            let mut fm = flips_m;
-            while fm != 0 {
-                let u = fm.trailing_zeros() as usize;
-                fm &= fm - 1;
-                crate::nnfeat::planes_add(&mut p, RING1[u]);
-            }
-            let tbit = 1u64 << tu;
-            let ea = if clone {
-                empty & !tbit
-            } else {
-                crate::nnfeat::planes_sub(&mut p, RING1[m.from as usize]);
-                (empty & !tbit) | (1u64 << m.from)
-            };
-            let oi = see_opp_state(b1o & ea, b2o & ea, &p);
-            let my_diff = clone as usize + 2 * flips_raw;
-            z += self.see_val(see_phase_off(empty), my_diff, oi);
+        let (me, opp) = (b.me(), b.opp());
+        let ds = CLS[m.to as usize] as usize * 2 + (!clone) as usize;
+        let mut t = self.td[ds * P3 + kc.get(me, opp, m.to)] as i32;
+        if !clone {
+            t += self.tor[CLS[m.from as usize] as usize * P3 + kc.get(me, opp, m.from)] as i32;
         }
-        let row = &self.u[slot * self.dim..(slot + 1) * self.dim];
-        for &(i, v) in xin {
-            z += row[i as usize] * v;
-        }
-        if !self.td.is_empty() {
-            let (me, opp) = (b.me(), b.opp());
-            let (ds, os) = if self.cls {
-                (CLS[m.to as usize] as usize * 2 + (!clone) as usize, CLS[m.from as usize] as usize)
-            } else {
-                (slot, m.from as usize)
-            };
-            let mut t = self.td[ds * P3 + kc.get(me, opp, m.to)] as i32;
-            if !clone {
-                t += self.tor[os * P3 + kc.get(me, opp, m.from)] as i32;
-            }
-            z += t as f32 * (1.0 / TQ);
-        }
+        z += t as f32 * (1.0 / TQ);
         z
     }
 
-    /// Logit of a clone landing on `to` from precomputed per-destination features.
-    /// Bit-identical to `logit_k`.
+    /// Logit of a clone landing on `to` from precomputed per-destination features. Bit-identical to `logit_k`.
     #[inline(always)]
-    pub(crate) fn clone_logit_pre(
-        &self,
-        to: u8,
-        flips: usize,
-        tholes: usize,
-        k3_to: usize,
-        see_val: f32,
-        xin: &[(u16, f32)],
-    ) -> f32 {
+    pub(crate) fn clone_logit_pre(&self, to: u8, flips: usize, tholes: usize, k3_to: usize) -> f32 {
         let slot = to as usize;
         let mut z = self.bias[slot] + self.g[9 + flips] + self.g[27 + tholes];
-        if !self.see.is_empty() {
-            z += see_val;
-        }
-        if self.dim != 0 {
-            let row = &self.u[slot * self.dim..(slot + 1) * self.dim];
-            for &(i, v) in xin {
-                z += row[i as usize] * v;
-            }
-        }
-        if !self.td.is_empty() {
-            let ds = if self.cls { CLS[slot] as usize * 2 } else { slot };
-            z += self.td[ds * P3 + k3_to] as i32 as f32 * (1.0 / TQ);
-        }
+        z += self.td[CLS[slot] as usize * 2 * P3 + k3_to] as i32 as f32 * (1.0 / TQ);
         z
     }
 
     /// Destination-only prefix and quantized pattern term for all jumps landing on `to`.
     #[inline(always)]
-    pub(crate) fn jump_dest_parts(
-        &self,
-        to: u8,
-        flips: usize,
-        tholes: usize,
-        k3_to: usize,
-    ) -> (f32, i32) {
-        let slot = to as usize + 49;
-        let prefix = self.bias[slot] + self.g[flips] + self.g[18 + tholes];
-        let td = if !self.td.is_empty() {
-            let ds = if self.cls { CLS[to as usize] as usize * 2 + 1 } else { slot };
-            self.td[ds * P3 + k3_to] as i32
-        } else {
-            0
-        };
-        (prefix, td)
+    pub(crate) fn jump_dest_parts(&self, to: u8, flips: usize, tholes: usize, k3_to: usize) -> (f32, i32) {
+        let prefix = self.bias[to as usize + 49] + self.g[flips] + self.g[18 + tholes];
+        (prefix, self.td[(CLS[to as usize] as usize * 2 + 1) * P3 + k3_to] as i32)
     }
 
     /// Origin-only scalar term and quantized pattern term for jumps leaving `from`.
     #[inline(always)]
-    pub(crate) fn jump_orig_parts(
-        &self,
-        from: u8,
-        from_holes: usize,
-        k3_from: usize,
-    ) -> (f32, i32) {
-        let g = self.g[36 + from_holes];
-        let tor = if !self.td.is_empty() {
-            let os = if self.cls { CLS[from as usize] as usize } else { from as usize };
-            self.tor[os * P3 + k3_from] as i32
-        } else {
-            0
-        };
-        (g, tor)
+    pub(crate) fn jump_orig_parts(&self, from: u8, from_holes: usize, k3_from: usize) -> (f32, i32) {
+        (self.g[36 + from_holes], self.tor[CLS[from as usize] as usize * P3 + k3_from] as i32)
     }
 
-    /// Finish a jump logit from precomputed destination + origin parts.
-    /// Exact left-to-right IEEE-754 order matches `logit_k` bit-for-bit.
+    /// Finish a jump logit from precomputed destination + origin parts. Same IEEE-754 order as `logit_k`.
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn jump_finish(
-        &self,
-        to: u8,
-        j_prefix: f32,
-        j_td: i32,
-        from_g: f32,
-        from_tor: i32,
-        see_val: f32,
-        xin: &[(u16, f32)],
-    ) -> f32 {
+    pub(crate) fn jump_finish(&self, j_prefix: f32, j_td: i32, from_g: f32, from_tor: i32) -> f32 {
         let mut z = j_prefix + from_g;
-        if !self.see.is_empty() {
-            z += see_val;
-        }
-        if self.dim != 0 {
-            let slot = to as usize + 49;
-            let row = &self.u[slot * self.dim..(slot + 1) * self.dim];
-            for &(i, v) in xin {
-                z += row[i as usize] * v;
-            }
-        }
-        if !self.td.is_empty() {
-            z += (j_td + from_tor) as f32 * (1.0 / TQ);
-        }
+        z += (j_td + from_tor) as f32 * (1.0 / TQ);
         z
     }
 }
 
-/// Process-wide policy for experiments: env TI_POLICY=<TPOL1 file>; ordering weight TI_POLW (default 100000 points per logit),
-/// minimum depth TI_POLMIN (default 1). None when TI_POLICY is unset or unreadable.
+/// Process-wide policy: `--policy` / env TI_POLICY (bundled when unset, `none` = off); ordering weight TI_POLW (default
+/// 100000 points per logit), minimum depth TI_POLMIN (default 1).
 pub fn global() -> Option<&'static Policy> {
     static P: std::sync::OnceLock<Option<Policy>> = std::sync::OnceLock::new();
     P.get_or_init(|| match spec().as_deref() {

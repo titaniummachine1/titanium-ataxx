@@ -126,18 +126,6 @@ pub(crate) fn planes_add(p: &mut [u64; 4], m: u64) {
     p[3] ^= c2;
 }
 
-/// Subtract 1 from the count of every square in `m` (removing a stone from each of its 8 neighbours' counts >= 1).
-#[inline(always)]
-pub(crate) fn planes_sub(p: &mut [u64; 4], m: u64) {
-    let b0 = !p[0] & m;
-    p[0] ^= m;
-    let b1 = !p[1] & b0;
-    p[1] ^= b0;
-    let b2 = !p[2] & b1;
-    p[2] ^= b1;
-    p[3] ^= b2;
-}
-
 /// Largest victim count over the candidate squares, read off the bit planes (no per-candidate loop).
 #[inline(always)]
 pub(crate) fn planes_max(cand: u64, p: &[u64; 4]) -> u32 {
