@@ -1396,13 +1396,12 @@ impl<'a> Searcher<'a> {
 
     pub fn set_nnue(&mut self, n: Option<&'a Nnue>) {
         self.nnue = n;
-        // The bundled policy head is fitted on the bundled big net (config.rs pins it): with any other net its
-        // ordering is meaningless, so it switches itself off unless the user chose a head (--policy FILE / TI_POLICY).
-        if !self.pol_explicit && !crate::policy::is_forced() {
-            self.policy = match n {
-                Some(x) if x.fingerprint != crate::nnue::Nnue::bundled_fingerprint() => None,
-                _ => crate::policy::global(),
-            };
+        // D821 (user 2026-11-15: "run as a bundle from main with an optional override of EACH net"): every net is overridden
+        // independently. Changing the big net no longer switches the bundled policy head off; only `--policy none` / a
+        // policy file changes the policy. (The old switch-off silently cost -80..-150 Elo in the net gates of D814-D817; the
+        // bundled head reads no accumulator input on this architecture, D490, and gated fine with another net, D818/D820.)
+        if !self.pol_explicit {
+            self.policy = crate::policy::global();
         }
         self.clear_ecache();
     }

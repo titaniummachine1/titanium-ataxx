@@ -2,7 +2,8 @@
 //! "strongest engine by default, cannot accidentally build the wrong thing, still changeable with commands and net files").
 //!
 //! Defaults compiled in: big NNUE (data/nnue/nnue_main.tnn), futility small net (data/nnue/fut_small.tsn), move-ordering
-//! policy head (data/nnue/policy_main.bin, fitted on the bundled big net), futility small net ON, policy weight 1e5 points
+//! policy head (data/nnue/policy_main.bin, fitted or gate-verified with the bundled big net; it stays ON with any big net,
+//! D821), futility small net ON, policy weight 1e5 points
 //! per logit, child-eval ordering (EVORD) OFF. data/nnue/BUNDLE.txt pins the sha256 of each file; the unit tests below fail
 //! when a file is swapped without updating the pin (or when the policy head was not fitted on the bundled net).
 //! Overrides, all explicit: `--network <bundled|FILE|none>`, `--policy <bundled|FILE|none>` (env TI_POLICY the same),
@@ -112,10 +113,10 @@ pub fn report(net: Option<&crate::nnue::Nnue>) -> String {
         match net {
             None => "none (classical eval)".to_string(),
             Some(_) if is_bundled => "bundled".to_string(),
-            Some(_) => "CUSTOM (the bundled policy head is off unless --policy FILE is given)".to_string(),
+            Some(_) => "CUSTOM (policy and small net stay as configured: each net is overridden on its own)".to_string(),
         }
     ));
-    let pol_on = crate::policy::global().is_some() && (is_bundled || crate::policy::is_forced());
+    let pol_on = crate::policy::global().is_some();
     s.push_str(&format!(
         "policy head        {} weight {} min depth {}\n",
         if pol_on { "ON" } else { "off" },
@@ -155,7 +156,12 @@ mod tests {
         );
         assert_eq!(Some(sha256_hex(crate::policy::bundled_bytes()).as_str()), pin("policy"), "data/nnue/policy_main.bin changed: update BUNDLE.txt");
         assert_eq!(Some(sha256_hex(crate::smallnet::blob()).as_str()), pin("small"), "data/nnue/fut_small.tsn changed: update BUNDLE.txt");
-        assert_eq!(pin("net"), pin("policy_fitted_on_net"), "the bundled policy head was fitted on a different net: refit (ti policy) and set policy_fitted_on_net");
+        // the head is either fitted on the bundled net or gate-verified with it (policy_gated_with_net, D821: the head reads no
+        // accumulator input on this architecture, so a net retrain keeps it valid once a gate shows it)
+        assert!(
+            pin("net") == pin("policy_fitted_on_net") || pin("net") == pin("policy_gated_with_net"),
+            "the bundled policy head was neither fitted nor gated with the bundled net: refit (ti policy) or gate, then set the pin"
+        );
     }
 
     /// Shipped defaults are the strongest settings: no cargo-build env var changed a tuned constant.

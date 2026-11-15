@@ -607,8 +607,8 @@ fn spec() -> Option<String> {
     CONFIGURED.get().cloned().or_else(|| std::env::var("TI_POLICY").ok())
 }
 
-/// True when the user chose a policy file explicitly (then it is used with any net); the default bundled head is
-/// fitted on the bundled net only and switches itself off for any other net (see Searcher::set_nnue).
+/// True when the user chose a policy file explicitly. Since D821 the bundled head stays on with any big net (each net is
+/// overridden on its own: `--policy none` turns it off); kept for callers that report the choice.
 pub fn is_forced() -> bool {
     !matches!(spec().as_deref(), None | Some("bundled"))
 }
