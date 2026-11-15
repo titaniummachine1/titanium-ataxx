@@ -13,7 +13,9 @@
 //! (S21e, zero gate loss): H+V tables = 16KB total, L1-resident — the
 //! lookups stop missing L2. Inactive directions cost zero lookups.
 
-use crate::board::{block2_index, dist_union, jump_union, Board, PAIR_BLOCKS, RING1, SQ_BLOCKS};
+use crate::board::{dist_union, jump_union, Board, PAIR_BLOCKS, RING1, SQ_BLOCKS};
+#[cfg(test)]
+use crate::board::block2_index;
 
 /// Magic header of `.tup` weight files (v4: bias + i8 singles + sparse dirs).
 pub const TUP_MAGIC: [u8; 4] = *b"TUP4";
@@ -92,20 +94,6 @@ fn conv_key(occ_foe: u64, sq: usize) -> usize {
 }
 
 /// Max conversion available to `own` stones (foe = enemy bits).
-fn maxconv(own: u64, foe: u64, empty: u64) -> usize {
-    let mut best = 0u32;
-    let mut land = empty & (dist_union(own, 1) | crate::board::jump_union(own));
-    while land != 0 {
-        let sq = land.trailing_zeros() as usize;
-        land &= land - 1;
-        let c = (foe & RING1[sq]).count_ones();
-        if c > best {
-            best = c;
-        }
-    }
-    best.min(8) as usize
-}
-
 /// Ternary anchor mult (1/3/9/27 from SQ_BLOCKS) -> quaternary mult.
 #[inline]
 fn qmult(m3: u8) -> u8 {

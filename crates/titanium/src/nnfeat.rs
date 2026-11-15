@@ -858,7 +858,7 @@ mod tests {
     #[test]
     fn both_matches_features_blockers() {
         let mut seed = 0x0b10_c4e5_7a11_0001u64;
-        let mut next = |seed: &mut u64| {
+        let next = |seed: &mut u64| {
             *seed ^= *seed << 13;
             *seed ^= *seed >> 7;
             *seed ^= *seed << 17;

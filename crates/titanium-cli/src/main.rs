@@ -38,10 +38,6 @@ fn main() -> ExitCode {
     if let Some(n) = flag_int(&args, "--ecache-bits") {
         titanium::search::set_ecache_bits(n as usize);
     }
-    // --ecache-mode 0: old direct-mapped eval cache instead of the ranked 8-way default (D585); use with --ecache-bits 16
-    if let Some(n) = flag_int(&args, "--ecache-mode") {
-        titanium::search::set_ecache_mode(n as usize);
-    }
     // --cache-stages MASK: which cache levels are size stages (1 = L1d, 2 = L2, 4 = L3/2; default 0 = no staging, the full size), D652
     if let Some(n) = flag_int(&args, "--cache-stages") {
         titanium::search::set_cache_stages(n as u32);
@@ -61,10 +57,6 @@ fn main() -> ExitCode {
     }
     if let Some(n) = flag_int(&args, "--ecache-min-bits") {
         titanium::search::set_ecache_min_bits(n as usize);
-    }
-    // --tt-mode 0: old 24-byte single-slot TT instead of the ranked 4-way default (D590)
-    if let Some(n) = flag_int(&args, "--tt-mode") {
-        titanium::search::set_tt_mode(n as usize);
     }
     match cmd {
         "info" => {
@@ -143,7 +135,6 @@ fn main() -> ExitCode {
             flag_int(&args, "--tt-bits").unwrap_or(20) as usize,
             flag_str(&args, "--tuple"),
             args.iter().any(|x| x == "--tuple-native"),
-            args.iter().any(|x| x == "--corr"),
             network_flag(&args),
             max_depth_flag(&args),
             args.iter().any(|x| x == "--bz"),
@@ -163,8 +154,6 @@ fn main() -> ExitCode {
             flag_int_alias(&args, "--node-limit", "--nodes").map(|n| n as u64),
             flag_int(&args, "--start-game").unwrap_or(1) as u32,
             flag_str(&args, "--out"),
-            args.iter().any(|x| x == "--corr"),
-            args.iter().any(|x| x == "--opp-corr"),
             flag_str(&args, "--book"),
             flag_int(&args, "--book-start").unwrap_or(0) as u32,
             network_flag(&args),
@@ -415,15 +404,6 @@ fn tuple_flag_str(spec: &Option<String>) -> String {
     }
 }
 
-fn corr_flag_str(on: bool) -> String {
-    // Re-emit for match children: --corr flows to the opp serve child.
-    // Absent = off (experiments are opt-in on both sides).
-    if on {
-        "--corr".to_string()
-    } else {
-        String::new()
-    }
-}
 
 fn bench_cmd(
     depth: u8,
@@ -1410,7 +1390,6 @@ fn serve_cmd(
     tt_bits: usize,
     tup_spec: Option<String>,
     tup_native: bool,
-    corr: bool,
     nnue_spec: Option<String>,
     max_depth: u8,
     bz: bool,
@@ -1441,7 +1420,6 @@ fn serve_cmd(
     };
     searcher.set_tuple(owned_tup.as_ref());
     searcher.set_tuple_native(tup_native && owned_tup.is_some());
-    searcher.set_corr(corr);
     searcher.set_nnue(owned_nn.as_ref());
     let mut current: Option<Board> = None;
     let mut bz_snaps: Vec<(u64, u64)> = Vec::new();
@@ -1693,8 +1671,6 @@ fn match_cmd(
     max_nodes: Option<u64>,
     start_game: u32,
     out: Option<String>,
-    corr: bool,
-    opp_corr: bool,
     book_spec: Option<String>,
     book_start: u32,
     nnue_spec: Option<String>,
@@ -1751,9 +1727,6 @@ fn match_cmd(
                     }
                     if !with_flags.contains("--network") && !with_flags.contains("--nnue") {
                         with_flags = format!("{with_flags} {}", nnue_flag_str(&child_nnue));
-                    }
-                    if opp_corr && !with_flags.contains("--corr") {
-                        with_flags = format!("{with_flags} {}", corr_flag_str(true));
                     }
                     if opp_tup_native && !with_flags.contains("--tuple-native") {
                         with_flags = format!("{with_flags} --tuple-native");
@@ -1877,12 +1850,10 @@ fn match_cmd(
         let mut searcher = Searcher::new_unconfigured(); // fresh TT per game
         searcher.set_tuple(tup.as_ref());
         searcher.set_tuple_native(tup_native && tup.is_some());
-        searcher.set_corr(corr);
         searcher.set_nnue(nn.as_ref());
         let mut opp_searcher = Searcher::new_unconfigured(); // for --opp self
         opp_searcher.set_tuple(opp_tup.as_ref());
         opp_searcher.set_tuple_native(opp_tup_native && opp_tup.is_some());
-        opp_searcher.set_corr(opp_corr);
         opp_searcher.set_nnue(opp_nn.as_ref());
         let titanium_is_black = game % 2 == 1;
         let mut log = String::new();

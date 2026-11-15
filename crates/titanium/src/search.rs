@@ -12,17 +12,10 @@ pub fn set_ecache_bits(bits: usize) {
     ECACHE_BITS.store(bits.clamp(10, 26), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// D585: eval-cache layout. 1 (default) = cache-line buckets: 8 entries of 8 bytes per 64-byte line (32-bit check =
+/// D585: eval-cache layout = cache-line buckets: 8 entries of 8 bytes per 64-byte line (32-bit check =
 /// 25 hash bits + importance bit + 6 bits of empties, 32-bit packed eval), one memory fetch per probe, victim =
 /// empty > dead (fewer stones than the search root: unreachable) > least recently used unimportant entry, plus a
-/// prefetch of the child's eval-cache line and TT slot as soon as the move is made. 0 = the old direct-mapped table
-/// of (u64 key, i32) entries.
-static ECACHE_MODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
-
-pub fn set_ecache_mode(m: usize) {
-    ECACHE_MODE.store(m.min(1), std::sync::atomic::Ordering::Relaxed);
-}
-
+/// prefetch of the child's eval-cache line and TT slot as soon as the move is made.
 const EC_EMPTY: u64 = 0x8000_0000; // low half = i32::MIN (never a packed eval), check 0
 
 #[derive(Clone, Copy)]
@@ -36,13 +29,6 @@ fn ec_check(hash: u64, empties: u32, imp: u32) -> u32 {
     (((hash >> 39) as u32) << 7) | ((imp & 1) << 6) | (empties & 63)
 }
 const EC_IMP_BIT: u32 = 1 << 6;
-
-/// D590: ranked TT (TT_MODE 1, default): 16-byte entries, 4 per 64-byte line. 0 = the old 24-byte single-slot table.
-static TT_MODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
-
-pub fn set_tt_mode(m: usize) {
-    TT_MODE.store(m.min(1), std::sync::atomic::Ordering::Relaxed);
-}
 
 /// D643/D652 (user): STAGED SIZE. The ranked tables do not start at their full size: they start at an L1-sized table and
 /// JUMP to an L2-sized, then an L3-sized, then the full table (--tt-bits / --ecache-bits, 22 bits by default) when the
@@ -684,99 +670,22 @@ fn placement_snap(b: &Board, m: Move) -> (u64, u64) {
 /// Move scoring is fixed: TT move > killers > captures*W + history, consumed
 /// lazily (repeated argmax â€” only pays for moves examined before a cutoff).
 
-/// Transposition table entry (24 bytes with padding).
+/// A TT probe hit (the packed bucket entry, decoded).
 #[derive(Clone, Copy)]
 struct TtEntry {
-    key: u64,
-    mv: u32, // packed Move; 0xFFFF = pass; 0 = none (eval cache entries)
+    mv: u32, // ttcodec move code; 0 = none
     score: i32,
     depth: u8,
-    flag: u8, // 0 empty, 1 exact, 2 lower, 3 upper
-    age: u8,  // Generation age for FIFO/LRU eviction without RAM increase (fits in compiler padding)
-    /// empties of the stored position (padding byte). Empties never increase in Ataxx, so an entry with more
-    /// empties than the search root can never be reached again (D571). 0 = unknown.
-    empties: u8,
+    flag: u8, // 1 exact, 2 lower, 3 upper
 }
 
-const _: () = assert!(std::mem::size_of::<TtEntry>() == 24);
-
-const FLAG_EMPTY: u8 = 0;
 const FLAG_EXACT: u8 = 1;
 const FLAG_LOWER: u8 = 2;
 const FLAG_UPPER: u8 = 3;
 
-/// Correction history (S54 experiment, OFF unless enabled via set_corr):
-/// per-context EMA of (search score - static eval), added to future static
-/// evals. Two cheap O(1) keys: stm piece-diff bucket + empties bucket.
-/// Bounded, reset per game, never stored in TT (TT keeps search scores).
-const CORR_SIZE: usize = 64;
-const CORR_SCALE: i32 = 256;
-const CORR_WMAX: i32 = 128;
-/// Per-entry rails (raw cp): search artifacts beyond this don't teach.
-const CORR_TGT_MAX: i32 = 256;
-const CORR_ENTRY_MAX: i32 = 512;
-/// Applied correction rails (raw cp sum): small nudge, never a verdict.
-const CORR_APPLY_MAX: i32 = 64;
-
-pub struct CorrHist {
-    pd: Box<[i32; CORR_SIZE]>,
-    em: Box<[i32; CORR_SIZE]>,
-}
-
-impl CorrHist {
-    pub fn new() -> Self {
-        CorrHist {
-            pd: Box::new([0; CORR_SIZE]),
-            em: Box::new([0; CORR_SIZE]),
-        }
-    }
-
-    #[inline]
-    fn idx_pd(b: &Board) -> usize {
-        let d = b.piece_cnt[0] as i32 - b.piece_cnt[1] as i32 + 49;
-        ((d / 2).clamp(0, 63)) as usize
-    }
-
-    #[inline]
-    fn idx_em(b: &Board) -> usize {
-        let e = b.empty().count_ones() as usize;
-        (e * CORR_SIZE / 50).min(CORR_SIZE - 1)
-    }
-
-    /// Corrected static eval (stm-relative in, stm-relative out).
-    #[inline]
-    pub fn apply(&self, b: &Board, raw: i32) -> i32 {
-        let c = (self.pd[Self::idx_pd(b)] + self.em[Self::idx_em(b)]) / 4;
-        raw + c.clamp(-CORR_APPLY_MAX, CORR_APPLY_MAX)
-    }
-
-    /// EMA toward (search - static), depth-weighted. Skips mate scores
-    /// (not eval error) and zero diffs (no information).
-    pub fn update(&mut self, b: &Board, best: i32, static_eval: i32, depth: u32) {
-        if best.abs() > MATE_BOUND || static_eval.abs() > MATE_BOUND {
-            return;
-        }
-        let diff = (best - static_eval).clamp(-CORR_TGT_MAX, CORR_TGT_MAX);
-        if diff == 0 {
-            return;
-        }
-        let w = ((depth * depth + 2 * depth + 1) as i32).min(CORR_WMAX);
-        for (tab, idx) in [
-            (&mut *self.pd, Self::idx_pd(b)),
-            (&mut *self.em, Self::idx_em(b)),
-        ] {
-            let e = tab[idx];
-            tab[idx] = (e + w * (diff - e) / CORR_SCALE).clamp(-CORR_ENTRY_MAX, CORR_ENTRY_MAX);
-        }
-    }
-}
-
-/// Fixed-size transposition table, power-of-two entry count. Depth-0 EXACT
-/// entries double as the eval cache (Ataxx transpositions repeat a lot).
+/// Ranked bucketed transposition table (D590): packed 10-byte entries, TT_MAX_WAYS per 64-byte bucket.
 pub struct Tt {
-    buf: Vec<TtEntry>,
-    /// D590 ranked buckets (Some = TT_MODE 1; then `buf` is a 1-entry dummy)
-    v2: Option<Box<[TtBucket]>>,
+    v2: Box<[TtBucket]>,
     /// active bucket mask (adaptive size: grows towards nb_max, see TT_MIN_BITS)
     mask: usize,
     /// full bucket count, minimum bucket count, slots filled since the last reset (ranked mode)
@@ -793,61 +702,30 @@ pub struct Tt {
 }
 
 impl Tt {
-    /// 2^bits entries (bits=20 -> 1M entries, 24 MB; ranked mode: 16 B entries, 4 per line).
+    /// 2^bits / 4 buckets (bits <= 25).
     pub fn new(bits: usize) -> Tt {
-        if TT_MODE.load(std::sync::atomic::Ordering::Relaxed) == 1 {
-            let nb = (1usize << bits.min(25)) / 4;
-            let mut t = Tt::new_v1(0);
-            t.v2 = Some(vec![TtBucket::EMPTY; nb].into_boxed_slice());
-            t.nb_max = nb;
-            t.stages = tt_stage_list(nb);
-            t.stage = 0;
-            t.mask = t.stages[0] - 1;
-            t.ways = TT_WAYS.load(std::sync::atomic::Ordering::Relaxed);
-            return t;
-        }
-        Tt::new_v1(bits)
-    }
-
-    fn new_v1(bits: usize) -> Tt {
-        let size = 1usize << bits.min(24);
+        let nb = (1usize << bits.min(25)) / 4;
+        let stages = tt_stage_list(nb);
         Tt {
-            buf: vec![
-                TtEntry {
-                    key: 0,
-                    mv: 0,
-                    score: 0,
-                    depth: 0,
-                    flag: FLAG_EMPTY,
-                    age: 0,
-                    empties: 0,
-                };
-                size
-            ],
-            mask: size - 1,
-            nb_max: 0,
-            stages: Vec::new(),
+            v2: vec![TtBucket::EMPTY; nb].into_boxed_slice(),
+            mask: stages[0] - 1,
+            nb_max: nb,
+            stages,
             stage: 0,
             filled: 0,
-            ways: TT_MAX_WAYS,
-            v2: None,
+            ways: TT_WAYS.load(std::sync::atomic::Ordering::Relaxed),
             root_empties: 255,
             age: 0,
         }
     }
 
     pub fn clear(&mut self) {
-        for e in self.buf.iter_mut() {
-            e.flag = FLAG_EMPTY;
-        }
-        if let Some(v) = self.v2.as_mut() {
-            // back to stage 1; only that part is cleared now, the rest is cleared when it is exposed (grow)
-            self.stage = 0;
-            let nb0 = self.stages[0];
-            self.mask = nb0 - 1;
-            self.filled = 0;
-            v[..nb0].fill(TtBucket::EMPTY);
-        }
+        // back to stage 1; only that part is cleared now, the rest is cleared when it is exposed (grow)
+        self.stage = 0;
+        let nb0 = self.stages[0];
+        self.mask = nb0 - 1;
+        self.filled = 0;
+        self.v2[..nb0].fill(TtBucket::EMPTY);
         self.age = 0;
     }
 
@@ -868,9 +746,7 @@ impl Tt {
         }
         self.stage = stage;
         let new = self.stages[stage].max(cur);
-        if let Some(v) = self.v2.as_mut() {
-            v[cur..new].fill(TtBucket::EMPTY);
-        }
+        self.v2[cur..new].fill(TtBucket::EMPTY);
         self.mask = new - 1;
         self.filled = self.filled * cur / new;
     }
@@ -879,7 +755,7 @@ impl Tt {
     /// the search, so a short search stays in a cache-sized table and a long one starts at the full size and never
     /// jumps in the middle of a search (D657: L3-first +25% nodes at 100 ms, -7% at 1000 ms because of the late jump).
     fn start_stage(&mut self, expected_nodes: usize) {
-        if self.v2.is_none() || self.filled != 0 {
+        if self.filled != 0 {
             return;
         }
         let mut s = 0;
@@ -891,10 +767,7 @@ impl Tt {
 
     #[inline(always)]
     fn slot_ptr(&self, key: u64) -> *const i8 {
-        if let Some(v) = self.v2.as_ref() {
-            return &v[(key as usize) & self.mask] as *const TtBucket as *const i8;
-        }
-        &self.buf[(key as usize) & self.mask] as *const TtEntry as *const i8
+        &self.v2[(key as usize) & self.mask] as *const TtBucket as *const i8
     }
 
     #[inline]
@@ -902,55 +775,34 @@ impl Tt {
         self.age = self.age.wrapping_add(1);
     }
 
-    #[inline]
-    fn probe(&mut self, key: u64) -> Option<TtEntry> {
-        self.probe_e(key, 255)
-    }
-
     /// Probe with the position's empty-square count (D641/D647, user): stones never disappear in Ataxx, so a position
     /// has exactly one stone count, and a hash match whose stored empties differ is a false positive. 255 = unchecked.
+    /// The returned `mv` is a ttcodec MOVE CODE (not a packed from/to).
     #[inline]
     fn probe_e(&mut self, key: u64, empties: u8) -> Option<TtEntry> {
-        // NOTE: the returned `mv` is a ttcodec MOVE CODE (not a packed from/to) in both table modes.
-        if let Some(v) = self.v2.as_mut() {
-            let age = self.age & 15;
-            let chk = (key >> 32) as u32;
-            let ext = ((key >> 27) & 31) as u8;
-            let ways = self.ways;
-            let bk = &mut v[(key as usize) & self.mask];
-            for i in 0..ways {
-                if bk.flag(i) != 0 && bk.chk(i) == chk && bk.ext(i) == ext && (empties == 255 || bk.empties(i) == empties) {
-                    bk.set_age(i, age);
-                    let e = bk.get(i);
-                    return Some(TtEntry { key, mv: e.code as u32, score: e.score, depth: e.depth, flag: e.flag, age: self.age, empties: e.empties });
-                }
+        let age = self.age & 15;
+        let chk = (key >> 32) as u32;
+        let ext = ((key >> 27) & 31) as u8;
+        let ways = self.ways;
+        let bk = &mut self.v2[(key as usize) & self.mask];
+        for i in 0..ways {
+            if bk.flag(i) != 0 && bk.chk(i) == chk && bk.ext(i) == ext && (empties == 255 || bk.empties(i) == empties) {
+                bk.set_age(i, age);
+                let e = bk.get(i);
+                return Some(TtEntry { mv: e.code as u32, score: e.score, depth: e.depth, flag: e.flag });
             }
-            return None;
         }
-        let e = &mut self.buf[(key as usize) & self.mask];
-        if e.flag != FLAG_EMPTY && e.key == key {
-            e.age = self.age;
-            let mut r = *e;
-            r.mv = crate::ttcodec::code_of_u32(r.mv) as u32;
-            Some(r)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn store(&mut self, key: u64, mv: u32, score: i32, depth: u8, flag: u8) {
-        self.store_e(key, mv, score, depth, flag, 0, 1);
+        None
     }
 
     /// D590 ranked store: same position -> update (refutation move kept on fail-low); else the victim is an empty
     /// slot, else a dead entry (more empties than the root), else the lowest worth = depth + 4 x importance
     /// + 16 if proven - 3 x age (searches since last touched, capped at 4)
     #[inline]
-    fn store_v2(&mut self, key: u64, mv: u32, score: i32, depth: u8, flag: u8, empties: u8, imp: u8) {
+    #[allow(clippy::too_many_arguments)]
+    fn store_e(&mut self, key: u64, mv: u32, score: i32, depth: u8, flag: u8, empties: u8, imp: u8) {
         let (age, root_empties, mask, ways) = (self.age & 15, self.root_empties, self.mask, self.ways);
-        let Some(v) = self.v2.as_mut() else { return };
-        let bk = &mut v[(key as usize) & mask];
+        let bk = &mut self.v2[(key as usize) & mask];
         let chk = (key >> 32) as u32;
         let ext = ((key >> 27) & 31) as u8;
         let mut code = crate::ttcodec::code_of_u32(mv);
@@ -984,44 +836,6 @@ impl Tt {
             if self.filled * 2 > (self.mask + 1) * self.ways && self.mask + 1 < self.nb_max {
                 self.grow();
             }
-        }
-    }
-
-    #[inline]
-    fn store_e(&mut self, key: u64, mut mv: u32, score: i32, depth: u8, flag: u8, empties: u8, imp: u8) {
-        if self.v2.is_some() {
-            self.store_v2(key, mv, score, depth, flag, empties, imp);
-            return;
-        }
-        let e = &mut self.buf[(key as usize) & self.mask];
-        let same_pos = e.flag != FLAG_EMPTY && e.key == key;
-
-        // Preserve refutation move on fail-low (FLAG_UPPER):
-        if same_pos && flag == FLAG_UPPER && e.mv != 0 && e.mv != 0xFFFF {
-            mv = e.mv;
-        }
-
-        // Replacement policy:
-        // 1. Slot is empty
-        // 2. Same position (always update bounds/depth)
-        // 3. Stale generation/age (older turns aged out from dead subtrees)
-        // 4. Deeper or equal depth
-        let age_diff = self.age.wrapping_sub(e.age);
-        let replace = e.flag == FLAG_EMPTY
-            || same_pos
-            || (!same_pos && (age_diff >= 2 || (age_diff == 1 && depth.saturating_add(4) >= e.depth)))
-            || e.depth <= depth;
-
-        if replace {
-            *e = TtEntry {
-                key,
-                mv,
-                score,
-                depth,
-                flag,
-                age: self.age,
-                empties,
-            };
         }
     }
 }
@@ -1117,12 +931,9 @@ pub struct Searcher<'a> {
     safety_ms: f64,
     /// Transposition table (persists across searches in the same Searcher).
     tt: Tt,
-    /// exp/nnue-speed: static-eval cache (position hash -> raw eval). The eval is a pure function of the position, so a
-    /// hit returns exactly what a recomputation would: search is bit-identical, only faster (iterative deepening
-    /// re-evaluates ~42% of positions). Cleared on new game and whenever the eval source changes.
-    ecache: Box<[(u64, i32)]>,
-    /// D585 bucketed eval cache (Some = ECACHE_MODE 1; then `ecache` is a 1-entry dummy)
-    ec2: Option<Box<[EcBucket]>>,
+    /// Static-eval cache (D585 ranked buckets): the eval is a pure function of the position, so a hit returns exactly
+    /// what a recomputation would. Cleared on new game and whenever the eval source changes.
+    ec2: Box<[EcBucket]>,
     /// D586/D590: importance of the next eval-cache store (1 = a searched node or one of the top-12 moves, 0 = a late move)
     ec_imp: u32,
     /// D643 adaptive size of the ranked eval cache: active bucket count (power of two, grows by doubling when more than
@@ -1149,9 +960,6 @@ pub struct Searcher<'a> {
     /// Tuple-native eval mode: skip E2/E4 scans, mat+PST+tempo+tuples only.
     /// False by default (full hand eval + optional additive tuples).
     tup_native: bool,
-    /// Correction history (None = OFF, zero-cost branch). Owned tables,
-    /// reset per game; never merged into weights or TT.
-    corr: Option<CorrHist>,
     /// Per-ply move buffers, reused across searches (no per-search alloc).
     stack: MoveStack,
     /// Botzone (`BZ = true`) game placement snapshots `(black_occ, white_occ)` covering
@@ -1218,23 +1026,8 @@ impl<'a> Searcher<'a> {
             best_sink: None,
             safety_ms: 10.0,
             tt: Tt::new(bits),
-            ecache: vec![
-                (0u64, i32::MIN);
-                if ECACHE_MODE.load(std::sync::atomic::Ordering::Relaxed) == 1 {
-                    1
-                } else {
-                    1 << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)
-                }
-            ]
-            .into_boxed_slice(),
-            ec2: if ECACHE_MODE.load(std::sync::atomic::Ordering::Relaxed) == 1 {
-                Some(
-                    vec![EcBucket([EC_EMPTY; 8]); (1usize << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)) / 8]
-                        .into_boxed_slice(),
-                )
-            } else {
-                None
-            },
+            ec2: vec![EcBucket([EC_EMPTY; 8]); (1usize << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)) / 8]
+                .into_boxed_slice(),
             ec_imp: 1,
             ec_act: ec_stage_list((1usize << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)) / 8)[0],
             ec_stages: ec_stage_list((1usize << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)) / 8),
@@ -1250,7 +1043,6 @@ impl<'a> Searcher<'a> {
             pol_min: crate::policy::env_f32("TI_POLMIN", 1.0) as u32,
             pol_explicit: false,
             tup_native: false,
-            corr: None,
             stack: MoveStack::new(),
             bz_snaps: Vec::with_capacity(MAX_PLY + 64),
             bz_base_offset: 0,
@@ -1299,21 +1091,12 @@ impl<'a> Searcher<'a> {
         self.clear_ecache();
     }
 
-    /// Correction-history tables, off by default. Enabled searchers learn
-    /// per-context eval biases within a game; disabled = main behavior.
-    pub fn set_corr(&mut self, on: bool) {
-        self.corr = on.then(CorrHist::new);
-    }
-
     fn clear_ecache(&mut self) {
-        self.ecache.fill((0, i32::MIN));
-        if let Some(e) = self.ec2.as_mut() {
-            // back to stage 1; only that part is cleared now, the rest is cleared when it is exposed (ec_grow)
-            self.ec_stage = 0;
-            self.ec_act = self.ec_stages[0];
-            self.ec_filled = 0;
-            e[..self.ec_act].fill(EcBucket([EC_EMPTY; 8]));
-        }
+        // back to stage 1; only that part is cleared now, the rest is cleared when it is exposed (ec_grow)
+        self.ec_stage = 0;
+        self.ec_act = self.ec_stages[0];
+        self.ec_filled = 0;
+        self.ec2[..self.ec_act].fill(EcBucket([EC_EMPTY; 8]));
     }
 
     /// Staged size (D652): JUMP to the next eval-cache stage (L1 -> L2 -> L3 -> full), never by doubling. Never rehash.
@@ -1331,15 +1114,14 @@ impl<'a> Searcher<'a> {
         }
         self.ec_stage = stage;
         let new = self.ec_stages[stage].max(cur);
-        let Some(e) = self.ec2.as_mut() else { return };
-        e[cur..new].fill(EcBucket([EC_EMPTY; 8]));
+        self.ec2[cur..new].fill(EcBucket([EC_EMPTY; 8]));
         self.ec_act = new;
         self.ec_filled = self.ec_filled * cur / new;
     }
 
     /// Same rule as `Tt::start_stage` for the eval cache (8 entries per bucket).
     fn ec_start_stage(&mut self, expected_nodes: usize) {
-        if self.ec2.is_none() || self.ec_filled != 0 {
+        if self.ec_filled != 0 {
             return;
         }
         let mut s = 0;
@@ -1353,8 +1135,7 @@ impl<'a> Searcher<'a> {
     #[inline]
     fn ec2_get(&mut self, b: &Board) -> Option<i32> {
         let n = self.ec_act;
-        let e = self.ec2.as_mut()?;
-        let bk = &mut e[(b.hash as usize) & (n - 1)].0;
+        let bk = &mut self.ec2[(b.hash as usize) & (n - 1)].0;
         let chk = ec_check(b.hash, b.empty().count_ones(), 0);
         // 2 more check bits (hash bits 37-38) live in the unused top bits 29-30 of the packed value (it needs 29 bits)
         let ext = (((b.hash >> 37) & 3) as u32) << 29;
@@ -1378,8 +1159,7 @@ impl<'a> Searcher<'a> {
         let root_empties = self.tt.root_empties as u32;
         let imp = self.ec_imp;
         let n = self.ec_act;
-        let Some(e) = self.ec2.as_mut() else { return };
-        let bk = &mut e[(b.hash as usize) & (n - 1)].0;
+        let bk = &mut self.ec2[(b.hash as usize) & (n - 1)].0;
         let chk = ec_check(b.hash, b.empty().count_ones(), imp);
         let victim = (0..8)
             .find(|&i| bk[i] as u32 == 0x8000_0000)
@@ -1402,8 +1182,8 @@ impl<'a> Searcher<'a> {
     #[inline(always)]
     fn prefetch_child(&self, hash: u64) {
         #[cfg(target_arch = "x86_64")]
-        if let Some(e) = self.ec2.as_ref() {
-            let pe = &e[(hash as usize) & (self.ec_act - 1)] as *const EcBucket as *const i8;
+        {
+            let pe = &self.ec2[(hash as usize) & (self.ec_act - 1)] as *const EcBucket as *const i8;
             let pt = self.tt.slot_ptr(hash);
             unsafe {
                 std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(pe);
@@ -1419,21 +1199,11 @@ impl<'a> Searcher<'a> {
 
     #[inline]
     fn leaf_eval_with_dis(&mut self, b: &Board) -> (i32, i32) {
-        if self.ec2.is_some() {
-            if let Some(v) = self.ec2_get(b) {
-                return unpack_eval_dis(v);
-            }
-            let (eval, dis) = self.leaf_eval_raw_with_dis(b);
-            self.ec2_put(b, pack_eval_dis(eval, dis));
-            return (eval, dis);
-        }
-        let slot = (b.hash as usize) & (self.ecache.len() - 1);
-        let (k, v) = self.ecache[slot];
-        if k == b.hash && v != i32::MIN {
+        if let Some(v) = self.ec2_get(b) {
             return unpack_eval_dis(v);
         }
         let (eval, dis) = self.leaf_eval_raw_with_dis(b);
-        self.ecache[slot] = (b.hash, pack_eval_dis(eval, dis));
+        self.ec2_put(b, pack_eval_dis(eval, dis));
         (eval, dis)
     }
 
@@ -1444,16 +1214,6 @@ impl<'a> Searcher<'a> {
             Some(nn) if nn.v2 => nn.eval_with_dis(b, evaluate(b, self.tuple, self.tup_native)),
             Some(nn) => nn.eval_with_dis(b, 0),
             None => (evaluate(b, self.tuple, self.tup_native), 0),
-        }
-    }
-
-    /// Raw static eval plus correction (if enabled). Single call site shape
-    /// so both negamax static-eval points stay consistent.
-    #[inline]
-    fn corrected(&self, b: &Board, raw: i32) -> i32 {
-        match &self.corr {
-            Some(c) => c.apply(b, raw),
-            None => raw,
         }
     }
 
@@ -1492,9 +1252,6 @@ impl<'a> Searcher<'a> {
         self.clear_ecache();
         *self.killers = [(0, 0); MAX_PLY];
         *self.history = [[[0; 49]; 49]; 2];
-        if self.corr.is_some() {
-            self.corr = Some(CorrHist::new());
-        }
     }
 
     #[inline]
@@ -1730,7 +1487,7 @@ impl<'a> Searcher<'a> {
             self.ec_imp = 1;
             self.leaf_eval_with_dis(b)
         };
-        let static_eval = self.corrected(b, raw);
+        let static_eval = raw;
 
         // Reverse futility pruning (autaxx, exact form): standing pat is so
         // far below alpha that even a generous error margin cannot recover
@@ -1911,7 +1668,7 @@ impl<'a> Searcher<'a> {
                                     self.bz_ply[ply as usize].tainted = tainted;
                                 }
                                 if !(BZ && tainted) {
-                                    self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply, raw);
+                                    self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply);
                                 }
                                 return best;
                             }
@@ -1953,18 +1710,8 @@ impl<'a> Searcher<'a> {
             // have no children to search: score the pass-through.
             if self.stack.lists[ply as usize].is_empty() && skip_tt_mv == 0 {
                 self.heuristic_used = true;
-                let raw = self.leaf_eval(b);
-                let static_eval = self.corrected(b, raw);
-                self.finish_node(
-                    b,
-                    alpha_orig,
-                    beta,
-                    static_eval,
-                    0xFFFF,
-                    depth,
-                    ply,
-                    static_eval,
-                );
+                let static_eval = self.leaf_eval(b);
+                self.finish_node(b, alpha_orig, beta, static_eval, 0xFFFF, depth, ply);
                 return static_eval;
             }
         }
@@ -2050,17 +1797,7 @@ impl<'a> Searcher<'a> {
                 let mut cached_eval: Option<(i32, i32)> = None;
                 let mut hand_cache: Option<i32> = None;
                 if self.fut_sn && self.nnue.is_some() {
-                    cached_eval = if self.ec2.is_some() {
-                        self.ec2_get(&child).map(unpack_eval_dis)
-                    } else {
-                        let slot = (child.hash as usize) & (self.ecache.len() - 1);
-                        let (k, v) = self.ecache[slot];
-                        if k == child.hash && v != i32::MIN {
-                            Some(unpack_eval_dis(v))
-                        } else {
-                            None
-                        }
-                    };
+                    cached_eval = self.ec2_get(&child).map(unpack_eval_dis);
                     if cached_eval.is_none() {
                         let hand = evaluate(&child, None, false);
                         hand_cache = Some(hand);
@@ -2102,13 +1839,7 @@ impl<'a> Searcher<'a> {
                     } else {
                         self.leaf_eval_raw_with_dis(&child)
                     };
-                    let packed = pack_eval_dis(eval, dis);
-                    if self.ec2.is_some() {
-                        self.ec2_put(&child, packed);
-                    } else {
-                        let slot = (child.hash as usize) & (self.ecache.len() - 1);
-                        self.ecache[slot] = (child.hash, packed);
-                    }
+                    self.ec2_put(&child, pack_eval_dis(eval, dis));
                     (eval, dis)
                 } else {
                     self.leaf_eval_with_dis(&child)
@@ -2222,7 +1953,7 @@ impl<'a> Searcher<'a> {
             self.bz_ply[ply as usize].tainted = tainted;
         }
         if !rep_skipped && !(BZ && tainted) {
-            self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply, raw);
+            self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply);
         }
         best
     }
@@ -2254,24 +1985,11 @@ impl<'a> Searcher<'a> {
     }
 
     /// TT store at the end of a node (skipped when the clock cut it short).
-    /// Also feeds the correction-history EMA: (search - static) per context.
     #[inline]
-    fn finish_node(
-        &mut self,
-        b: &Board,
-        alpha_orig: i32,
-        beta: i32,
-        best: i32,
-        best_mv: u32,
-        depth: u32,
-        ply: u32,
-        static_eval: i32,
-    ) {
+    #[allow(clippy::too_many_arguments)]
+    fn finish_node(&mut self, b: &Board, alpha_orig: i32, beta: i32, best: i32, best_mv: u32, depth: u32, ply: u32) {
         if self.stop {
             return;
-        }
-        if let Some(c) = &mut self.corr {
-            c.update(b, best, static_eval, depth);
         }
         let flag = if best <= alpha_orig {
             FLAG_UPPER
@@ -3242,22 +2960,22 @@ xxx....
         assert!(code_good >= 50);
 
         // 1. Store an exact bound with a good move
-        tt.store(key, mv_good, 150, 6, FLAG_EXACT);
-        assert_eq!(tt.probe(key).unwrap().mv, code_good);
-        assert_eq!(tt.probe(key).unwrap().score, 150);
+        tt.store_e(key, mv_good, 150, 6, FLAG_EXACT, 30, 1);
+        assert_eq!(tt.probe_e(key, 30).unwrap().mv, code_good);
+        assert_eq!(tt.probe_e(key, 30).unwrap().score, 150);
 
         // 2. A deeper search on the same position fails low (FLAG_UPPER)
-        tt.store(key, 0xFFFF, 50, 8, FLAG_UPPER);
+        tt.store_e(key, 0xFFFF, 50, 8, FLAG_UPPER, 30, 1);
         // The good move must be preserved!
-        assert_eq!(tt.probe(key).unwrap().mv, code_good, "refutation move must be preserved on fail-low");
-        assert_eq!(tt.probe(key).unwrap().score, 50);
+        assert_eq!(tt.probe_e(key, 30).unwrap().mv, code_good, "refutation move must be preserved on fail-low");
+        assert_eq!(tt.probe_e(key, 30).unwrap().score, 50);
 
         // 3. Test age replacement: position from old turn gets evicted by fresh search
         tt.step_age();
         tt.step_age();
-        let other_key = key ^ (1 << 10); // same hash slot, different key
-        tt.store(other_key, 99, 200, 3, FLAG_EXACT);
-        assert_eq!(tt.probe(other_key).unwrap().key, other_key);
+        let other_key = key ^ (1 << 40); // same bucket, different check bits
+        tt.store_e(other_key, 99, 200, 3, FLAG_EXACT, 30, 1);
+        assert_eq!(tt.probe_e(other_key, 30).unwrap().score, 200);
     }
 
     #[test]
