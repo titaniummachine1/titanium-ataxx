@@ -1,0 +1,107 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Titanium vs Kata live Elo</title>
+<style>
+:root{--bg:#fff;--fg:#0b0b0b;--mut:#898781;--grid:rgba(137,135,129,.25);--card:#fcfcfb}
+@media (prefers-color-scheme:dark){:root{--bg:#1a1a19;--fg:#f0efec;--mut:#898781;--card:#222221}}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,sans-serif}
+h1{font-size:18px;font-weight:500;margin:0 0 4px}
+.sub{color:var(--mut);font-size:12px;margin-bottom:8px}
+.leg{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;margin:8px 0}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px}
+#wrap{position:relative;height:420px}
+table{border-collapse:collapse;font-size:12px;margin-top:12px;width:100%}
+td,th{border-bottom:1px solid var(--grid);padding:3px 8px;text-align:right}
+th:first-child,td:first-child{text-align:left}
+</style></head><body>
+<h1>Titanium vs KataAtaxx: fitted Elo (live)</h1>
+<div class="sub" id="st">loading...</div>
+<div class="leg"><span><i class="sw" style="background:#2a78d6"></i>Titanium, x = nodes</span><span><i class="sw" style="background:#eb6834"></i>Kata, x = visits</span><span>Elo anchored: Titanium 1000 nodes = 0; bars = 1 standard error; dashed = weighted trend</span></div>
+<div id="wrap"><canvas id="c"></canvas></div>
+<table id="tb"></table>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const NODES=[1000,2500,5000,10000,20000], VIS=[1,2,3,4,5,6,8,10,12,15,16,20,24,32];
+const files=[];
+files.push(['ladder_n1000.log',1000,1],['ladder_n5000.log',5000,1]);
+[2,5,10,20].forEach(v=>files.push(['curve_v'+v+'.log',1000,v]));
+[2,5,10].forEach(v=>files.push(['curve_v'+v+'_n5000.log',5000,v]));
+NODES.forEach(n=>VIS.forEach(v=>{files.push(['grid_n'+n+'_v'+v+'.log',n,v]);files.push(['grid_n'+n+'_v'+v+'b.log',n,v]);}));
+const cache={}; // file -> {w,l,d,done}
+const re=/game \d+ .*Ti W-L-D (\d+)-(\d+)-(\d+)/;
+async function load(){
+  await Promise.all(files.map(async([f,n,v])=>{
+    if(cache[f]&&cache[f].done)return;
+    try{
+      const r=await fetch(f+'?t='+Date.now());
+      if(!r.ok)return;
+      const t=await r.text();
+      let last=null;const lines=t.split('\n');
+      for(let i=lines.length-1;i>=0;i--){const m=re.exec(lines[i]);if(m){last=m;break;}}
+      if(last)cache[f]={n,v,w:+last[1],l:+last[2],d:+last[3],done:/DONE Ti W-L-D/.test(t)};
+    }catch(e){}
+  }));
+}
+function solve(A,b){const n=b.length;A=A.map(r=>r.slice());b=b.slice();
+  for(let i=0;i<n;i++){let m=i;for(let r=i+1;r<n;r++)if(Math.abs(A[r][i])>Math.abs(A[m][i]))m=r;[A[i],A[m]]=[A[m],A[i]];[b[i],b[m]]=[b[m],b[i]];
+    for(let r=i+1;r<n;r++){const f=A[r][i]/A[i][i];for(let c=i;c<n;c++)A[r][c]-=f*A[i][c];b[r]-=f*b[i];}}
+  const x=Array(n).fill(0);for(let i=n-1;i>=0;i--){let s=b[i];for(let c=i+1;c<n;c++)s-=A[i][c]*x[c];x[i]=s/A[i][i];}return x;}
+function inv(A){const n=A.length;return A.map((_,j)=>solve(A,A.map((_,i)=>i===j?1:0)));}
+function fit(){
+  const data=Object.values(cache);
+  const T=[...new Set(data.map(d=>d.n))].sort((a,b)=>a-b),K=[...new Set(data.map(d=>d.v))].sort((a,b)=>a-b);
+  const nt=T.length,N=nt+K.length,a=T.indexOf(1000);
+  if(a<0)return null;
+  const it=x=>T.indexOf(x),ik=x=>nt+K.indexOf(x);
+  let p=Array(N).fill(0);const P=1/(2.3*2.3);
+  let H;
+  for(let iter=0;iter<60;iter++){
+    const g=Array(N).fill(0);H=Array.from({length:N},()=>Array(N).fill(0));
+    data.forEach(d=>{const i=it(d.n),j=ik(d.v),w=d.w+d.d/2,l=d.l+d.d/2,t=w+l;if(t===0)return;
+      const s=1/(1+Math.exp(-(p[i]-p[j]))),gg=w-t*s,h=t*s*(1-s);
+      g[i]+=gg;g[j]-=gg;H[i][i]+=h;H[j][j]+=h;H[i][j]-=h;H[j][i]-=h;});
+    for(let i=0;i<N;i++){g[i]-=p[i]*P;H[i][i]+=P;}
+    const keep=[...Array(N).keys()].filter(i=>i!==a);
+    const Hk=keep.map(r=>keep.map(c=>H[r][c])),gk=keep.map(r=>g[r]);
+    const st=solve(Hk,gk);let mx=0;keep.forEach((r,i)=>{p[r]+=st[i];mx=Math.max(mx,Math.abs(st[i]));});
+    if(mx<1e-9)break;
+  }
+  const keep=[...Array(N).keys()].filter(i=>i!==a);
+  const Hk=keep.map(r=>keep.map(c=>H[r][c]));const C=inv(Hk);
+  const E=400/Math.LN10,se=Array(N).fill(0);keep.forEach((r,i)=>se[r]=Math.sqrt(Math.max(C[i][i],0)));
+  const games=x=>data.filter(d=>x(d)).reduce((s,d)=>s+d.w+d.l+d.d,0);
+  return {T:T.map(n=>({x:n,y:p[it(n)]*E,se:se[it(n)]*E,g:games(d=>d.n===n)})),K:K.map(v=>({x:v,y:p[ik(v)]*E,se:se[ik(v)]*E,g:games(d=>d.v===v)})),ng:games(()=>true)};
+}
+function wfit(pts,x0){
+  const n=3,A=Array.from({length:n},()=>Array(n).fill(0)),b=Array(n).fill(0);
+  pts.forEach(p=>{const w=1/Math.max(p.se,10)**2,t=Math.log2(p.x/x0),v=[1,t,t*t];for(let r=0;r<n;r++){b[r]+=w*v[r]*p.y;for(let c=0;c<n;c++)A[r][c]+=w*v[r]*v[c];}});
+  let co;try{co=solve(A,b);}catch(e){return null;}
+  return x=>{const t=Math.log2(x/x0);return co[0]+co[1]*t+co[2]*t*t;};
+}
+function line(f,x1,x2){const o=[];if(!f)return o;for(let i=0;i<=40;i++){const x=x1*Math.pow(x2/x1,i/40);o.push({x:x,y:f(x)});}return o;}
+const bars={id:'bars',afterDatasetsDraw(ch){const c=ch.ctx;ch.data.datasets.forEach((d,di)=>{if(!d.err)return;const m=ch.getDatasetMeta(di);c.save();c.strokeStyle=d.borderColor;c.lineWidth=1.5;
+ d.data.forEach((p,i)=>{const e=m.data[i];if(!e)return;const y1=ch.scales.y.getPixelForValue(p.y-p.se),y2=ch.scales.y.getPixelForValue(p.y+p.se);c.beginPath();c.moveTo(e.x,y1);c.lineTo(e.x,y2);c.moveTo(e.x-4,y1);c.lineTo(e.x+4,y1);c.moveTo(e.x-4,y2);c.lineTo(e.x+4,y2);c.stroke();});c.restore();});}};
+const mut=getComputedStyle(document.documentElement).getPropertyValue('--mut').trim(),grid='rgba(137,135,129,0.25)';
+let chart=null;
+function draw(r){
+  const dsT=r.T.map(p=>({x:p.x,y:p.y,se:p.se})),dsK=r.K.map(p=>({x:p.x,y:p.y,se:p.se}));
+  const sets=[
+   {label:'Titanium',err:1,data:dsT,borderColor:'#2a78d6',backgroundColor:'#2a78d6',showLine:false,pointRadius:6,pointStyle:'circle'},
+   {label:'Titanium trend',data:line(wfit(r.T,1000),1000,Math.max(...r.T.map(p=>p.x))),borderColor:'#2a78d6',showLine:true,borderDash:[5,4],borderWidth:1.5,pointRadius:0},
+   {label:'Kata',err:1,data:dsK,borderColor:'#eb6834',backgroundColor:'#eb6834',showLine:false,pointRadius:6,pointStyle:'rectRot'},
+   {label:'Kata trend',data:line(wfit(r.K,1),1,Math.max(...r.K.map(p=>p.x))),borderColor:'#eb6834',showLine:true,borderDash:[5,4],borderWidth:1.5,pointRadius:0}];
+  if(!chart){chart=new Chart(document.getElementById('c'),{type:'scatter',plugins:[bars],data:{datasets:sets},options:{animation:false,responsive:true,maintainAspectRatio:false,
+   plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>c.dataset.label+' '+Math.round(c.parsed.x)+': '+Math.round(c.parsed.y)+' Elo'}}},
+   scales:{x:{type:'logarithmic',min:0.8,max:40000,title:{display:true,text:'visits (Kata) or nodes (Titanium), log',color:mut},ticks:{color:mut},grid:{color:grid}},
+           y:{title:{display:true,text:'Elo (Titanium 1000 nodes = 0)',color:mut},ticks:{color:mut},grid:{color:grid},suggestedMin:-150,suggestedMax:700}}}});}
+  else{chart.data.datasets=sets;chart.update('none');}
+  const row=(n,p)=>'<tr><td>'+n+'</td><td>'+Math.round(p.y)+' &plusmn; '+Math.round(p.se)+'</td><td>'+p.g+'</td></tr>';
+  document.getElementById('tb').innerHTML='<tr><th>setting</th><th>Elo</th><th>games</th></tr>'+r.T.map(p=>row('Titanium '+p.x+' nodes',p)).join('')+r.K.map(p=>row('Kata '+p.x+' visits',p)).join('');
+}
+async function tick(){
+  await load();const r=fit();
+  if(r){draw(r);document.getElementById('st').textContent='updated '+new Date().toLocaleTimeString()+' | '+Object.keys(cache).length+' pairings | '+r.ng+' games';}
+  else document.getElementById('st').textContent='waiting for Titanium 1000-node data...';
+}
+tick();setInterval(tick,15000);
+</script></body></html>

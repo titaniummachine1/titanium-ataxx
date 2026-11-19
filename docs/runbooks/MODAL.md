@@ -1,0 +1,97 @@
+# Modal (GPU training, cloud gates) - everything an agent needs to run, watch, STOP and pay for it
+
+Written 2026-10-26 so ANY model / harness can take over. Sister document for CPU sandboxes: docs/runbooks/DOCKER_SANDBOXES.md.
+Training recipes themselves: docs/runbooks/TRAINING_RUNBOOK.md ("GPU (Modal) - the fast path"); decisions D80-D96 in docs/DECISIONS.md.
+
+## 1. Policy and money (read before launching anything)
+- Account: Modal Starter, workspace/profile `terminatort8004`, $30/month free compute, card on file. **The user set a hard spending
+  limit of $30/month in the Modal UI** (2026-10-24). Never try to raise it; do not exceed what the limit allows.
+- Which cloud: **CPU work -> Docker sandboxes first** (user: "docker credits are worth slightly less for us, only 40 vCPU and no GPU";
+  the PC itself first of all). **Modal is for GPU** (NNUE training) and for jobs that need more than Docker's 40 vCPU quota.
+- Announce every launch (what, size, worst-case cost) before starting it; no approval needed for a cost-bounded job. The old rule
+  "no long training / relabel without the user's explicit order" was REMOVED by the user on 2026-11-01 (D262) and replaced by the
+  budget rule docs/LAWS.md A9 (sum the ledger, stay under the $30/month limit, ttl on everything).
+- **Long-term use (user 2026-11-01, D263): Modal only for what Docker cannot do** - GPU training/distillation/GPU label generation,
+  the AVX-512 tier (GPU hosts have it), a stable-clock CPU bench when Docker noise ruins an A/B. CPU-parallel work goes to Docker/PC.
+  Keep the MONTHLY PLAN below up to date before the first launch of the month.
+- Price list used so far (Modal pricing page 2026-10-25): L4 GPU $0.80/h + 4 cores $0.19/h + 24 GiB $0.19/h = ~$1.2/h.
+  Worst case of a run = hours x $1.2 per container; every call has a hard 4 h timeout (`timeout=` in modal_train.py).
+- Real spend so far (from DECISIONS): stage 1 base_v4s ~$1.6 (D86), HPO 16 trials ~$1.5 (D90), ~$8 in total on 2026-10-26.
+  There is **no automatic Modal ledger**: add a row to `logs/modal_spend.csv` for every launch (header exists) and reconcile with the
+  Modal billing page (user's login) when in doubt. The billing page lags.
+- **Never handle tokens/secrets.** The token was created by the user via `python -m modal setup` in their terminal. If auth fails
+  ("not authenticated"), ask the user to run `python -m modal setup` themselves.
+
+## 1b. Monthly plan (fill in before the first launch of the month; reserve the first two rows)
+| month | run | GPU | est hours | est $ | status |
+|---|---|---|---|---|---|
+| 2026-11 | FINAL net training run (the net that would ship; `ti train` / bullet CUDA) | L4/A10G | tbd | tbd | RESERVE FIRST |
+| 2026-11 | AVX-512 tier gate legs for any promotion candidate (owed for W128 / the next main) | A10G | tbd | tbd | RESERVE SECOND |
+| 2026-11 | experiments (lambda-by-phase retrain, data scaling 25/50/100% of v9, distillation) | L4 | tbd | tbd | rest of the month |
+UPDATE 2026-11-01 20:17 (user screenshot): November billing period, credits $29.69 left, workspace $29.39 left; Modal is AVAILABLE (user: don't drain it unnecessarily). Older note: State on 2026-11-01 ~23:50: the workspace spend limit was reached (Kata arena used the credit: $2.36 -> $0.90 -> refused). Reconcile with the
+Modal billing page (user's login) before planning the month; do not launch until credit is available.
+
+## 2. Commands (Git Bash: `export MSYS_NO_PATHCONV=1 PYTHONIOENCODING=utf-8`; CLI client 1.6.2; use `python -m modal ...`)
+```
+python -m modal app list                       # RUNNING / stopped apps (empty table = nothing running = nothing billing)
+python -m modal app stop -y <app id>           # STOP a run (detached runs keep going after the local process exits!)
+python -m modal volume list                    # volumes: ti-train (created 2026-10-25) holds uploads (/up) and checkpoints (/ckpt)
+python -m modal volume put --force ti-train <local file> /up/<name>      # upload
+python -m modal volume get --force ti-train /ckpt/<tag>/net.pt data/nnue/modal_ckpt/<tag>/net.pt   # download results
+python -m modal run training/modal_train.py --tag smoke --args "<train_nnue args>"             # attached (dies with your shell)
+python -m modal run --detach training/modal_train.py --tag <tag> --args "<train_nnue args>"    # long run, survives the shell
+python -m modal run --detach training/modal_train.py --tag hpo_x --script optuna_ft.py --args "--init /vol/ckpt/<tag>/net.pt --out /vol/ckpt/hpo_x --trials 16 --epochs 2 --threads 4"
+```
+- `training/modal_train.py` = the same `training/train_nnue.py` on an L4 (TI_DEVICE=cuda). It uploads only small files; the 12 GB
+  feature index is rebuilt in the container with the engine's own `titanium-cli nndump` from `ENGINE_SRC` (default
+  C:/gitProjects/main-ataxx) and checked against the `SHA` dict in the script - **update that dict whenever the features or the
+  label npz change**, else the container refuses to train (by design).
+- Checkpoints, the resume file and the log are on the volume (`/ckpt/<tag>/`, log `log.txt`), committed every few minutes. A run that
+  hit the 4 h timeout is relaunched with the same tag; the trainer resumes.
+- `training/modal_gate.py` = paired-book gates on Modal CPUs (both engines built from source inside the image): set `CAND_SRC` /
+  `OPP_SRC` to the worktrees, then `python -m modal run training/modal_gate.py --tag <t> --shards N --games G --book0 B --nodes 5000`.
+  Logs come back as `logs/<tag>_pNN.txt` (pool with training/pool_gate.py / pool_glob.py). Fixed-node gates only: a time gate on Modal
+  measures Modal's hardware, not ours. Linux(Modal) vs Windows(PC) replays matched only 15/20 games at 5k nodes (OS/toolchain, not CPU;
+  local Docker Linux = Modal 20/20): compare Linux builds with Linux builds.
+- Image builds compile the Rust engine from the worktree source: the worktree must be CLEAN and committed (law 8).
+
+## 3. State at 2026-10-26 ~14:10
+- `python -m modal app list` showed NO apps (nothing running, nothing billing). Volume `ti-train` exists (uploads + checkpoints of
+  stage 1/2 and the HPO study; local copies in `data/nnue/modal_ckpt/`). Logs of the old runs: `logs/modal_*.txt`.
+- Nothing Modal-related is planned right now: the current small-net work is CPU-only on Docker (D109/D114: user said NOT Modal).
+- The next Modal use will be the big-net retrain after the second relabel (user plan: saturate search/speed first, then relabel,
+  then train): follow the TRAINING_RUNBOOK recipe (stage 1 only; Kata fine-tune is harmful, D98/D101).
+
+## 4. How to stop everything / take over (any model)
+1. `python -m modal app list` - every row in a running state is billing.
+2. For each: `python -m modal app stop -y <app id>`; run `app list` again until none is running.
+3. Fetch results you still need (volume get, section 2) BEFORE deleting anything; do not delete the volume unless the user says so.
+4. Add the final row to `logs/modal_spend.csv` and update the HANDOFFS top entry + DECISIONS row of the run.
+5. A harness with no `modal` CLI: ask the user to run the commands in their terminal; never ask for or handle credentials.
+
+## 5. Pitfalls
+- Detached runs outlive your session: always record the app id in HANDOFFS the moment you launch (BEHAVIOR 25).
+- Unicode console errors on Windows: set `PYTHONIOENCODING=utf-8`; Git Bash path mangling: `MSYS_NO_PATHCONV=1`.
+- `modal_train.py` uploads nothing big; if you see GB-scale uploads something is wrong.
+- Cost surprises come from forgotten `--detach` runs and from parallel runs (each container bills): count containers x hours x $1.2.
+
+## 6. Relabel benchmarks (2026-10-27)
+- `training/modal_relabel_probe.py` benchmarks `labelbin --nodes 5000 --network bundled` on Modal CPU
+- **2 cores:** 25 pos/s/core, ~85 MB RAM per core, 51 pos/s total
+- **4 cores:** 14 pos/s/core, ~85 MB RAM per core, 57 pos/s total — **Modal CPU degrades with more cores** (shared/throttled), don't add cores expecting linear scaling
+- Est. for 29M remaining positions at 2 cores: ~159 hours, ~$15 cost
+- Est. at 4 cores: ~142 hours, ~$27 cost (worse per-core, barely more total throughput)
+- Hard timeout: 4 hours per container — must shard work across containers or relaunch every 4h
+- Modal is **not ideal for CPU relabel** due to per-core degradation. Prefer Docker sandboxes (40 vCPU quota) or local PC for CPU work. Use Modal for GPU training or if Docker quota is exceeded.
+
+
+## 1b. CPU features and portable binaries (added 2026-10-29)
+
+- **GPU hosts (A10G, L4) have AVX-512** (`avx512f/bw/vl/vnni/vbmi/vpopcntdq/bitalg`); **CPU-only containers do not** (only `avx2/bmi2/fma`). Any AVX-512 gate must run on a GPU host; verify with the `flags` line from `/proc/cpuinfo` inside the function.
+- **Portable binary:** a release built on `rust:1.97` needs glibc 2.39 and fails on Modal's image (`version 'GLIBC_2.39' not found`). Build the gate engine with `cargo build --release --target x86_64-unknown-linux-musl -p titanium-cli` (static-pie; works on Modal, Docker and Botzone-like hosts). Example: `8850E588` (29,064,128 B).
+- **Volume quirks:** `modal volume put -f` is required to overwrite; `modal volume get <vol> <dir> <local> --force` can create a FILE when `<local>` does not exist - create the directory first or fetch `p00.txt..p03.txt` individually. After writing results inside a function call `vol.commit()`.
+- **Windows CLI:** set `$env:PYTHONIOENCODING="utf-8"; $env:PYTHONUTF8="1"` or the progress glyphs crash with a charmap error.
+- **Cost reference:** A10G gate leg = 4 shards x 52 games at 100 ms ran in ~15 min; L4 is cheaper per hour but had queue delays.
+
+## Dataset upload = diff only (D1258)
+Never upload a whole dataset version Modal already has a base of: `ti data diff --base OLD.tdat --new NEW.tdat --out data/diffs/X.tdif`, `ti train modal put --files data/diffs/X.tdif`, then `ti train modal launch --tag X_patch --args "data patch --base /vol/data/OLD.tdat --diff /vol/data/X.tdif --out /vol/data/NEW.tdat"`; the patch refuses a wrong base and keeps the result only if its fnv1a64 equals the PC file. v13h -> v14h: 70 MB instead of 2.62 GB.

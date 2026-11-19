@@ -1,0 +1,61 @@
+# TSTG model registry (D416). Regenerate: python -I docs/analysis/tstg_model_registry.py. Gate ONLY store paths.
+path	sha8	bytes	mtime	store	status
+data/nnue/tstg_best.ttst	9159AEBA	12633388	2026-11-06 02:04	data/nnue/tstg_store/tstg_9159AEBA.ttst	CORRUPT: overwritten by build_champion_tstg (= v24)
+data/nnue/tstg_distil_best.ttst	C52C0AB4	12633388	2026-11-06 18:29	data/nnue/tstg_store/tstg_C52C0AB4.ttst	D440 sibling distillation (train_v9 + 18.5M NNUE-labelled children, 14-15 epochs from tstg_fix_best)
+data/nnue/tstg_fix_best.ttst	28B60D6B	12633388	2026-11-06 17:41	data/nnue/tstg_store/tstg_28B60D6B.ttst	D434 colour-fix retrain of v10_best (20 epochs, 11 min Modal CPU): val corr 0.579 (NNUE 0.666), MAE 284; policy head = hand defaults (untrained)
+data/nnue/tstg_fix_disneutral.ttst	AE203371	12633388	2026-11-06 17:50	data/nnue/tstg_store/tstg_AE203371.ttst	D438 = tstg_fix_best with the dis head set to the NNUE per-phase mean dis (w_dis 0): isolation test of the dis scale (TSTG mean dis 299 vs NNUE 99 cp)
+data/nnue/tstg_v10_best.ttst	BF37E985	12633388	2026-11-05 22:54	data/nnue/tstg_store/tstg_BF37E985.ttst	VALUE v9-trainer (14.5% rows colour-swapped, D414); policy head = hand defaults (untrained); val corr 0.511 (NNUE 0.666); pure-TSTG 0/14 games
+data/nnue/tstg_v10_deep.ttst	FAE1D9C9	12632908	2026-11-04 14:01	data/nnue/tstg_store/tstg_FAE1D9C9.ttst	UNVERIFIED
+data/nnue/tstg_v10_ep5.ttst	551D24F2	12633388	2026-11-05 21:26	data/nnue/tstg_store/tstg_551D24F2.ttst	UNVERIFIED
+data/nnue/tstg_v10_final.ttst	FAE1D9C9	12632908	2026-11-04 14:01	data/nnue/tstg_store/tstg_FAE1D9C9.ttst	UNVERIFIED
+data/nnue/tstg_v10_pol_dis_fit.ttst	83711281	12633388	2026-11-06 13:27	data/nnue/tstg_store/tstg_83711281.ttst	value = v10_best (val identical) + fitted 24 policy + dis floats (5e5e445); NEVER GATED
+data/nnue/tstg_v10_polfit.ttst	66410E0D	12633388	2026-11-06 13:07	data/nnue/tstg_store/tstg_66410E0D.ttst	value = v10_best + fitted 24 policy floats (2e279c2); NEVER GATED
+data/nnue/tstg_v11_final.ttst	77597B1B	12633004	2026-11-04 16:19	data/nnue/tstg_store/tstg_77597B1B.ttst	val corr 0.269; as ORDERING head over NNUE 39% (198 g, 11-04)
+data/nnue/tstg_v11_saturated.ttst	109015A0	12633388	2026-11-06 01:44	data/nnue/tstg_store/tstg_109015A0.ttst	UNVERIFIED (different content from data/tstg_v11_saturated.ttst)
+data/nnue/tstg_v12_calibrated.ttst	C22D4B2F	12633004	2026-11-04 23:47	data/nnue/tstg_store/tstg_C22D4B2F.ttst	UNVERIFIED
+data/nnue/tstg_v13_frontier.ttst	82723494	12633260	2026-11-05 03:15	data/nnue/tstg_store/tstg_82723494.ttst	UNVERIFIED
+data/nnue/tstg_v13_symmetric.ttst	A984FABB	12633004	2026-11-05 01:24	data/nnue/tstg_store/tstg_A984FABB.ttst	UNVERIFIED
+data/nnue/tstg_v14_endgame_fixed.ttst	99B8216F	12633004	2026-11-05 01:27	data/nnue/tstg_store/tstg_99B8216F.ttst	UNVERIFIED
+data/nnue/tstg_v15_ridge.ttst	03430215	12633260	2026-11-05 04:17	data/nnue/tstg_store/tstg_03430215.ttst	UNVERIFIED
+data/nnue/tstg_v16_antisym.ttst	682DB34F	12633260	2026-11-05 04:34	data/nnue/tstg_store/tstg_682DB34F.ttst	UNVERIFIED
+data/nnue/tstg_v17_champion.ttst	9476D794	12633260	2026-11-05 05:20	data/nnue/tstg_store/tstg_9476D794.ttst	val corr 0.312; pure-TSTG 0/10
+data/nnue/tstg_v18_champion.ttst	F1C97D2F	12633388	2026-11-05 13:32	data/nnue/tstg_store/tstg_F1C97D2F.ttst	UNVERIFIED
+data/nnue/tstg_v19_e2e.ttst	462CACE8	12633388	2026-11-05 13:38	data/nnue/tstg_store/tstg_462CACE8.ttst	UNVERIFIED
+data/nnue/tstg_v20_e2e.ttst	A8335DDB	12633388	2026-11-05 14:53	data/nnue/tstg_store/tstg_A8335DDB.ttst	UNVERIFIED
+data/nnue/tstg_v21_champion.ttst	A52E1AAB	12633388	2026-11-05 15:30	data/nnue/tstg_store/tstg_A52E1AAB.ttst	UNVERIFIED
+data/nnue/tstg_v22_hybrid_master.ttst	CA332D98	12633388	2026-11-05 16:49	data/nnue/tstg_store/tstg_CA332D98.ttst	value = v17 (val identical)
+data/nnue/tstg_v23_saturated_master.ttst	911E59AE	12633388	2026-11-06 01:22	data/nnue/tstg_store/tstg_911E59AE.ttst	value = v10_best (val identical); pure-TSTG 0/18 at 5k
+data/nnue/tstg_v24_champion_master.ttst	9159AEBA	12633388	2026-11-06 02:04	data/nnue/tstg_store/tstg_9159AEBA.ttst	CORRUPT: hand-overwritten by build_champion_tstg (MAE vs NNUE 531 cp); pure-TSTG 0/40
+data/tstg_best.ttst	9159AEBA	12633388	2026-11-06 02:04	data/nnue/tstg_store/tstg_9159AEBA.ttst	CORRUPT: overwritten by build_champion_tstg (= v24)
+data/tstg_ep1.ttst	0C981F89	12632908	2026-11-04 02:16	data/nnue/tstg_store/tstg_0C981F89.ttst	UNVERIFIED
+data/tstg_ep10.ttst	CE2C4D99	12632908	2026-11-04 02:17	data/nnue/tstg_store/tstg_CE2C4D99.ttst	UNVERIFIED
+data/tstg_ep2.ttst	22B80457	12632908	2026-11-04 02:16	data/nnue/tstg_store/tstg_22B80457.ttst	UNVERIFIED
+data/tstg_ep3.ttst	7D0A406E	12632908	2026-11-04 02:16	data/nnue/tstg_store/tstg_7D0A406E.ttst	UNVERIFIED
+data/tstg_ep4.ttst	E51E80E8	12632908	2026-11-04 02:16	data/nnue/tstg_store/tstg_E51E80E8.ttst	UNVERIFIED
+data/tstg_ep5.ttst	02E90D84	12632908	2026-11-04 02:16	data/nnue/tstg_store/tstg_02E90D84.ttst	UNVERIFIED
+data/tstg_ep6.ttst	4D3AD0C3	12632908	2026-11-04 02:16	data/nnue/tstg_store/tstg_4D3AD0C3.ttst	UNVERIFIED
+data/tstg_ep7.ttst	A828601F	12632908	2026-11-04 02:16	data/nnue/tstg_store/tstg_A828601F.ttst	UNVERIFIED
+data/tstg_ep8.ttst	B15A7EAD	12632908	2026-11-04 02:16	data/nnue/tstg_store/tstg_B15A7EAD.ttst	UNVERIFIED
+data/tstg_ep9.ttst	78383C76	12632908	2026-11-04 02:16	data/nnue/tstg_store/tstg_78383C76.ttst	UNVERIFIED
+data/tstg_smoke.ttst	5237EF0C	12632908	2026-11-04 12:42	data/nnue/tstg_store/tstg_5237EF0C.ttst	UNVERIFIED
+data/tstg_v10_ep1.ttst	A9638726	12633388	2026-11-05 14:53	data/nnue/tstg_store/tstg_A9638726.ttst	UNVERIFIED
+data/tstg_v10_ep10.ttst	77597B1B	12633004	2026-11-04 16:19	data/nnue/tstg_store/tstg_77597B1B.ttst	UNVERIFIED
+data/tstg_v10_ep11.ttst	6CF35AED	12632908	2026-11-04 14:01	data/nnue/tstg_store/tstg_6CF35AED.ttst	UNVERIFIED
+data/tstg_v10_ep12.ttst	4343FFA0	12632908	2026-11-04 14:01	data/nnue/tstg_store/tstg_4343FFA0.ttst	UNVERIFIED
+data/tstg_v10_ep13.ttst	031478A8	12632908	2026-11-04 14:01	data/nnue/tstg_store/tstg_031478A8.ttst	UNVERIFIED
+data/tstg_v10_ep14.ttst	FAE1D9C9	12632908	2026-11-04 14:01	data/nnue/tstg_store/tstg_FAE1D9C9.ttst	UNVERIFIED
+data/tstg_v10_ep15.ttst	0FEC6E05	12632908	2026-11-04 14:01	data/nnue/tstg_store/tstg_0FEC6E05.ttst	UNVERIFIED
+data/tstg_v10_ep2.ttst	A8335DDB	12633388	2026-11-05 14:53	data/nnue/tstg_store/tstg_A8335DDB.ttst	UNVERIFIED
+data/tstg_v10_ep3.ttst	C0716196	12633004	2026-11-04 16:19	data/nnue/tstg_store/tstg_C0716196.ttst	UNVERIFIED
+data/tstg_v10_ep4.ttst	272FF3B4	12633004	2026-11-04 16:19	data/nnue/tstg_store/tstg_272FF3B4.ttst	UNVERIFIED
+data/tstg_v10_ep5.ttst	A3B6FF31	12633004	2026-11-04 16:19	data/nnue/tstg_store/tstg_A3B6FF31.ttst	UNVERIFIED
+data/tstg_v10_ep6.ttst	FB1E008E	12633004	2026-11-04 16:19	data/nnue/tstg_store/tstg_FB1E008E.ttst	UNVERIFIED
+data/tstg_v10_ep7.ttst	0E37791B	12633004	2026-11-04 16:19	data/nnue/tstg_store/tstg_0E37791B.ttst	UNVERIFIED
+data/tstg_v10_ep8.ttst	F066C955	12633004	2026-11-04 16:19	data/nnue/tstg_store/tstg_F066C955.ttst	UNVERIFIED
+data/tstg_v10_ep9.ttst	BAE28B86	12633004	2026-11-04 16:19	data/nnue/tstg_store/tstg_BAE28B86.ttst	UNVERIFIED
+data/tstg_v10_final.ttst	A08E3682	12632908	2026-11-04 13:49	data/nnue/tstg_store/tstg_A08E3682.ttst	UNVERIFIED
+data/tstg_v10_local_ep1.ttst	970F5D05	12632908	2026-11-04 13:22	data/nnue/tstg_store/tstg_970F5D05.ttst	UNVERIFIED
+data/tstg_v10_saturate.ttst	DA5EA76B	12632908	2026-11-04 13:49	data/nnue/tstg_store/tstg_DA5EA76B.ttst	UNVERIFIED
+data/tstg_v10_tuned.ttst	560D9503	12632908	2026-11-04 13:33	data/nnue/tstg_store/tstg_560D9503.ttst	UNVERIFIED
+data/tstg_v11_fine10.ttst	77597B1B	12633004	2026-11-04 16:19	data/nnue/tstg_store/tstg_77597B1B.ttst	UNVERIFIED
+data/tstg_v11_saturated.ttst	10BB3832	12633004	2026-11-04 16:07	data/nnue/tstg_store/tstg_10BB3832.ttst	val corr 0.304 (data/ copy); backbone used by build_champion_tstg

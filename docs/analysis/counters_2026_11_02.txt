@@ -1,0 +1,12 @@
+# titanium-cli (exp/counters from c86733b) bench --depth 4 --network data/nnue/proxy/rwphase9_nocal.tnn (46FCB5A4)
+# BENCH_BOOK=data/nnue/book50k_std5k.txt BENCH_N=300 BENCH_NODES=20000 ; single thread ; 2026-11-02
+--- counters over 300 book positions x 20000 nodes ---
+nodes 6000000
+node static eval: provided by parent 2784511 | computed here 2839580
+ecache: hit 4225280 miss(NN eval) 7881092 -> NN evals per node 1.314
+futility child evals: calls 9266791 (1.544/node), SmallNet skips 13596680, then child pruned (new_depth<=0) 6740203, child searched 2526588
+moves pruned without a futility eval: 17323844
+EVORD: children made 131518881 | with cached eval 5881449 (4.5%) | uncached 125637432
+nodes with moves 2366417 | with >=2 moves 2366417
+beta cutoffs non-PV: total 1339949 | by move index 0,1,2,3,4,5,6,7+: 877520 (65.5%) 232133 (17.3%) 116080 (8.7%) 45272 (3.4%) 26232 (2.0%) 16574 (1.2%) 11476 (0.9%) 14662 (1.1%)
+beta cutoffs PV: total 245968 | by move index 0,1,2,3,4,5,6,7+: 209877 (85.3%) 17027 (6.9%) 8586 (3.5%) 3668 (1.5%) 1996 (0.8%) 1291 (0.5%) 988 (0.4%) 2535 (1.0%)

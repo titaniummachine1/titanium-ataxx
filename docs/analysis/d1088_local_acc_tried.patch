@@ -1,0 +1,570 @@
+diff --git a/crates/titanium/src/nnue.rs b/crates/titanium/src/nnue.rs
+index 2dc1360..2603a56 100644
+--- a/crates/titanium/src/nnue.rs
++++ b/crates/titanium/src/nnue.rs
+@@ -125,6 +125,42 @@ fn simd_tier() -> SimdTier {
+     })
+ }
+ 
++/// D1088: accumulator width of the partial incremental path (the champion's W256)
++const LA_W: usize = 256;
++const NSQ: usize = 49;
++static ZERO_ROW: [i16; LA_W] = [0; LA_W];
++
++/// D1088: the LOCAL groups of a position's two accumulators, by absolute colour: G1 (one row per square) and G3 (one row
++/// per stone, ascending square) summed without the bias, plus their row lists for the parent -> child difference.
++#[derive(Clone)]
++pub struct LocalAcc {
++    acc: [[i16; LA_W]; 2],
++    g1: [[u32; NSQ]; 2],
++    g3: [[u32; NSQ]; 2],
++    n3: [usize; 2],
++}
++
++impl Default for LocalAcc {
++    fn default() -> Self {
++        LocalAcc { acc: [[0; LA_W]; 2], g1: [[0; NSQ]; 2], g3: [[0; NSQ]; 2], n3: [0; 2] }
++    }
++}
++
++/// [start, end) of the G3 rows in a `both_into` list (G1 49 | G2 | G3 ascending | G5 | G6 x3)
++#[inline(always)]
++fn g3_range(idx: &[u32]) -> (usize, usize) {
++    let (lo, hi) = (nnfeat::G3_OFF as u32, nnfeat::G5_OFF as u32);
++    let mut a = NSQ;
++    while a < idx.len() && idx[a] < lo {
++        a += 1;
++    }
++    let mut b = a;
++    while b < idx.len() && idx[b] < hi {
++        b += 1;
++    }
++    (a, b)
++}
++
+ pub struct Nnue {
+     /// cheap identity of the net file (config::fingerprint); the bundled policy head only applies to the bundled net
+     pub fingerprint: u64,
+@@ -1040,6 +1076,259 @@ impl Nnue {
+         (eval_cp, dis_cp)
+     }
+ 
++    /// D1088: the partial incremental path (`LocalAcc`) needs W256, groups G1 + G3 and the pre-summed G6 table.
++    pub fn supports_local(&self) -> bool {
++        self.width == LA_W && self.groups & nnfeat::G1 != 0 && self.groups & nnfeat::G3 != 0 && self.g6tab.is_some()
++    }
++
++    /// D1088: the LOCAL part (G1 square states + G3 stone rings, no bias) of both accumulators of `b`, by absolute colour.
++    pub fn local_build(&self, b: &Board, out: &mut LocalAcc) {
++        debug_assert!(self.supports_local());
++        let mut us = [0u32; nnfeat::MAX_ACTIVE];
++        let mut them = [0u32; nnfeat::MAX_ACTIVE];
++        let (nu, nt) = nnfeat::both_into(b, self.groups, &mut us, &mut them);
++        let t = b.turn as usize;
++        for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
++            let c = if half == 0 { t } else { 1 - t };
++            let (g3a, g3b) = g3_range(&idx[..n]);
++            out.g1[c].copy_from_slice(&idx[..NSQ]);
++            let n3 = g3b - g3a;
++            out.g3[c][..n3].copy_from_slice(&idx[g3a..g3b]);
++            out.n3[c] = n3;
++            let mut add = [0u32; nnfeat::MAX_ACTIVE];
++            add[..NSQ].copy_from_slice(&idx[..NSQ]);
++            add[NSQ..NSQ + n3].copy_from_slice(&idx[g3a..g3b]);
++            // SAFETY: out.acc[c] holds LA_W lanes; ZERO_ROW holds LA_W lanes; every index is a row of ftq
++            unsafe { self.ft_mix(out.acc[c].as_mut_ptr(), &ZERO_ROW, &ZERO_ROW, &add[..NSQ + n3], &[]) };
++        }
++    }
++
++    /// D1088: `eval_with_dis(child, s57_cp)` computed from the parent's `LocalAcc`: the G1 / G3 rows are patched by the
++    /// difference to the parent (D1073: a move changes 26.9 of 49 G1 and 16.9 of 27.3 G3 row slots per accumulator), the
++    /// global groups (G2 anchor, G5 exchange, pre-summed G6 + bias) are re-added. Wrapping i16 adds and subtracts commute,
++    /// so the accumulators and therefore the eval are bit-identical to `eval_with_dis` (asserted by a test).
++    pub fn eval_with_dis_inc(&self, parent: &LocalAcc, child: &Board, s57_cp: i32) -> (i32, i32) {
++        let mut us = [0u32; nnfeat::MAX_ACTIVE];
++        let mut them = [0u32; nnfeat::MAX_ACTIVE];
++        let (nu, nt) = nnfeat::both_into(child, self.groups, &mut us, &mut them);
++        let w = self.width;
++        let empties = child.empty().count_ones() as usize;
++        let bucket = (empties * self.buckets / 50).min(self.buckets - 1);
++        let pst = &self.psqt_t[bucket * self.num_feats..(bucket + 1) * self.num_feats];
++        let tab = self.g6tab.as_ref().expect("supports_local");
++        let t = child.turn as usize;
++        let mut acc_buf = std::mem::MaybeUninit::<[i16; 2 * MAX_W]>::uninit();
++        let accp = acc_buf.as_mut_ptr() as *mut i16;
++        for (half, (idx, n)) in [(&us, nu), (&them, nt)].into_iter().enumerate() {
++            let idx = &idx[..n];
++            let c = if half == 0 { t } else { 1 - t };
++            let f1 = idx[n - 3] as usize - nnfeat::G6_OFF;
++            let bb = (idx[n - 2] as usize - nnfeat::G6_OFF) % 10;
++            let par = (idx[n - 1] as usize - nnfeat::G6_PAR_OFF) & 1;
++            let key = (f1 * 10 + bb) * 2 + par;
++            let init = &tab[key * w..(key + 1) * w];
++            // scratch lists: only the first na / ns entries are written and read
++            let mut add_b = std::mem::MaybeUninit::<[u32; 2 * nnfeat::MAX_ACTIVE]>::uninit();
++            let mut sub_b = std::mem::MaybeUninit::<[u32; nnfeat::MAX_ACTIVE]>::uninit();
++            let (ap, sp) = (add_b.as_mut_ptr() as *mut u32, sub_b.as_mut_ptr() as *mut u32);
++            // SAFETY (push_a / push_s): at most 2 * MAX_ACTIVE adds and MAX_ACTIVE subs are written (each child row once,
++            // each parent G1/G3 row once); only the written prefixes are read back below
++            let (mut na, mut ns) = (0usize, 0usize);
++            macro_rules! push_a { ($v:expr) => {{ unsafe { ap.add(na).write($v) }; na += 1; }}; }
++            macro_rules! push_s { ($v:expr) => {{ unsafe { sp.add(ns).write($v) }; ns += 1; }}; }
++            let pg1 = &parent.g1[c];
++            for sq in 0..NSQ {
++                if idx[sq] != pg1[sq] {
++                    push_a!(idx[sq]);
++                    push_s!(pg1[sq]);
++                }
++            }
++            let (g3a, g3b) = g3_range(idx);
++            let (cg3, pg3) = (&idx[g3a..g3b], &parent.g3[c][..parent.n3[c]]);
++            let (mut i, mut j) = (0usize, 0usize);
++            while i < cg3.len() && j < pg3.len() {
++                if cg3[i] == pg3[j] {
++                    i += 1;
++                    j += 1;
++                } else if cg3[i] < pg3[j] {
++                    push_a!(cg3[i]);
++                    i += 1;
++                } else {
++                    push_s!(pg3[j]);
++                    j += 1;
++                }
++            }
++            for &f in &cg3[i..] {
++                push_a!(f);
++            }
++            for &f in &pg3[j..] {
++                push_s!(f);
++            }
++            // global groups: G2 (between G1 and G3) and G5 (between G3 and the 3 G6 rows) are re-added in full
++            for &f in idx[NSQ..g3a].iter().chain(idx[g3b..n - 3].iter()) {
++                push_a!(f);
++            }
++            // SAFETY: the first na / ns entries were written above
++            let (add, sub) = unsafe { (std::slice::from_raw_parts(ap, na), std::slice::from_raw_parts(sp, ns)) };
++            // SAFETY: half * w + w <= 2 * MAX_W; parent.acc / init hold w lanes; indices are rows of ftq
++            unsafe { self.ft_mix(accp.add(half * w), &parent.acc[c][..w], init, add, sub) };
++        }
++        // SAFETY: both halves (2 * w lanes) were just fully written
++        let acc: &[i16] = unsafe { std::slice::from_raw_parts(accp, 2 * w) };
++        // position weights: the exact float order of forward_with_dis_inner (both chains side by side)
++        let (iu, it) = (&us[..nu], &them[..nt]);
++        let m = nu.min(nt);
++        let (mut p0, mut p1) = (0f32, 0f32);
++        for k in 0..m {
++            p0 += pst[iu[k] as usize];
++            p1 += pst[it[k] as usize];
++        }
++        for &f in &iu[m..] {
++            p0 += pst[f as usize];
++        }
++        for &f in &it[m..] {
++            p1 += pst[f as usize];
++        }
++        let s57 = s57_cp as f32 / 400.0;
++        let (logit, dis_cp) = self.head_dispatch(acc, bucket, [p0, p1], s57);
++        ((400.0 * logit).round().clamp(-30000.0, 30000.0) as i32, dis_cp)
++    }
++
++    /// head_with_dis at the best SIMD tier (same tiers as forward_with_dis)
++    fn head_dispatch(&self, acc: &[i16], bucket: usize, ps: [f32; 2], s57: f32) -> (f32, i32) {
++        #[cfg(target_arch = "x86_64")]
++        {
++            match simd_tier() {
++                // SAFETY: AVX-512F/BW/VL and FMA support verified at runtime.
++                SimdTier::Avx512 => return unsafe { self.head_avx512(acc, bucket, ps, s57) },
++                // SAFETY: AVX-2 and FMA support verified at runtime.
++                SimdTier::Avx2 => return unsafe { self.head_avx2(acc, bucket, ps, s57) },
++                SimdTier::Scalar => {}
++            }
++        }
++        self.head_with_dis::<0>(acc, bucket, ps, s57)
++    }
++
++    #[cfg(target_arch = "x86_64")]
++    #[target_feature(enable = "avx512f,avx512bw,avx512vl,fma")]
++    unsafe fn head_avx512(&self, acc: &[i16], bucket: usize, ps: [f32; 2], s57: f32) -> (f32, i32) {
++        self.head_with_dis::<2>(acc, bucket, ps, s57)
++    }
++
++    #[cfg(target_arch = "x86_64")]
++    #[target_feature(enable = "avx2,fma")]
++    unsafe fn head_avx2(&self, acc: &[i16], bucket: usize, ps: [f32; 2], s57: f32) -> (f32, i32) {
++        self.head_with_dis::<1>(acc, bucket, ps, s57)
++    }
++
++    /// out[0..w] = a + b + sum(rows of `add`) - sum(rows of `sub`) (wrapping i16, any order bit-identical)
++    unsafe fn ft_mix(&self, out: *mut i16, a: &[i16], b: &[i16], add: &[u32], sub: &[u32]) {
++        let w = self.width;
++        #[cfg(target_arch = "x86_64")]
++        {
++            if w == 256 && simd_tier() != SimdTier::Scalar {
++                unsafe { self.ft_mix_avx2(out, a, b, add, sub) };
++                return;
++            }
++        }
++        let o = std::slice::from_raw_parts_mut(out, w);
++        for k in 0..w {
++            o[k] = a[k].wrapping_add(b[k]);
++        }
++        for &f in add {
++            let row = &self.ftq[f as usize * w..(f as usize + 1) * w];
++            for (x, r) in o.iter_mut().zip(row) {
++                *x = x.wrapping_add(*r);
++            }
++        }
++        for &f in sub {
++            let row = &self.ftq[f as usize * w..(f as usize + 1) * w];
++            for (x, r) in o.iter_mut().zip(row) {
++                *x = x.wrapping_sub(*r);
++            }
++        }
++    }
++
++    #[cfg(target_arch = "x86_64")]
++    #[target_feature(enable = "avx2,fma")]
++    unsafe fn ft_mix_avx2(&self, out: *mut i16, a: &[i16], b: &[i16], add: &[u32], sub: &[u32]) {
++        use std::arch::x86_64::*;
++        let base = self.ftq.as_ptr();
++        let (ap, bp) = (a.as_ptr() as *const __m256i, b.as_ptr() as *const __m256i);
++        // 16 named registers (an indexed array spills to the stack): the whole W256 accumulator stays in ymm0-15
++        let mut r0 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(0)) }, unsafe { _mm256_loadu_si256(bp.add(0)) });
++        let mut r1 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(1)) }, unsafe { _mm256_loadu_si256(bp.add(1)) });
++        let mut r2 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(2)) }, unsafe { _mm256_loadu_si256(bp.add(2)) });
++        let mut r3 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(3)) }, unsafe { _mm256_loadu_si256(bp.add(3)) });
++        let mut r4 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(4)) }, unsafe { _mm256_loadu_si256(bp.add(4)) });
++        let mut r5 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(5)) }, unsafe { _mm256_loadu_si256(bp.add(5)) });
++        let mut r6 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(6)) }, unsafe { _mm256_loadu_si256(bp.add(6)) });
++        let mut r7 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(7)) }, unsafe { _mm256_loadu_si256(bp.add(7)) });
++        let mut r8 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(8)) }, unsafe { _mm256_loadu_si256(bp.add(8)) });
++        let mut r9 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(9)) }, unsafe { _mm256_loadu_si256(bp.add(9)) });
++        let mut r10 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(10)) }, unsafe { _mm256_loadu_si256(bp.add(10)) });
++        let mut r11 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(11)) }, unsafe { _mm256_loadu_si256(bp.add(11)) });
++        let mut r12 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(12)) }, unsafe { _mm256_loadu_si256(bp.add(12)) });
++        let mut r13 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(13)) }, unsafe { _mm256_loadu_si256(bp.add(13)) });
++        let mut r14 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(14)) }, unsafe { _mm256_loadu_si256(bp.add(14)) });
++        let mut r15 = _mm256_add_epi16(unsafe { _mm256_loadu_si256(ap.add(15)) }, unsafe { _mm256_loadu_si256(bp.add(15)) });
++        for &f in add {
++            let rp = unsafe { base.add((f as usize) << 8) as *const __m256i };
++            r0 = _mm256_add_epi16(r0, unsafe { _mm256_loadu_si256(rp.add(0)) });
++            r1 = _mm256_add_epi16(r1, unsafe { _mm256_loadu_si256(rp.add(1)) });
++            r2 = _mm256_add_epi16(r2, unsafe { _mm256_loadu_si256(rp.add(2)) });
++            r3 = _mm256_add_epi16(r3, unsafe { _mm256_loadu_si256(rp.add(3)) });
++            r4 = _mm256_add_epi16(r4, unsafe { _mm256_loadu_si256(rp.add(4)) });
++            r5 = _mm256_add_epi16(r5, unsafe { _mm256_loadu_si256(rp.add(5)) });
++            r6 = _mm256_add_epi16(r6, unsafe { _mm256_loadu_si256(rp.add(6)) });
++            r7 = _mm256_add_epi16(r7, unsafe { _mm256_loadu_si256(rp.add(7)) });
++            r8 = _mm256_add_epi16(r8, unsafe { _mm256_loadu_si256(rp.add(8)) });
++            r9 = _mm256_add_epi16(r9, unsafe { _mm256_loadu_si256(rp.add(9)) });
++            r10 = _mm256_add_epi16(r10, unsafe { _mm256_loadu_si256(rp.add(10)) });
++            r11 = _mm256_add_epi16(r11, unsafe { _mm256_loadu_si256(rp.add(11)) });
++            r12 = _mm256_add_epi16(r12, unsafe { _mm256_loadu_si256(rp.add(12)) });
++            r13 = _mm256_add_epi16(r13, unsafe { _mm256_loadu_si256(rp.add(13)) });
++            r14 = _mm256_add_epi16(r14, unsafe { _mm256_loadu_si256(rp.add(14)) });
++            r15 = _mm256_add_epi16(r15, unsafe { _mm256_loadu_si256(rp.add(15)) });
++        }
++        for &f in sub {
++            let rp = unsafe { base.add((f as usize) << 8) as *const __m256i };
++            r0 = _mm256_sub_epi16(r0, unsafe { _mm256_loadu_si256(rp.add(0)) });
++            r1 = _mm256_sub_epi16(r1, unsafe { _mm256_loadu_si256(rp.add(1)) });
++            r2 = _mm256_sub_epi16(r2, unsafe { _mm256_loadu_si256(rp.add(2)) });
++            r3 = _mm256_sub_epi16(r3, unsafe { _mm256_loadu_si256(rp.add(3)) });
++            r4 = _mm256_sub_epi16(r4, unsafe { _mm256_loadu_si256(rp.add(4)) });
++            r5 = _mm256_sub_epi16(r5, unsafe { _mm256_loadu_si256(rp.add(5)) });
++            r6 = _mm256_sub_epi16(r6, unsafe { _mm256_loadu_si256(rp.add(6)) });
++            r7 = _mm256_sub_epi16(r7, unsafe { _mm256_loadu_si256(rp.add(7)) });
++            r8 = _mm256_sub_epi16(r8, unsafe { _mm256_loadu_si256(rp.add(8)) });
++            r9 = _mm256_sub_epi16(r9, unsafe { _mm256_loadu_si256(rp.add(9)) });
++            r10 = _mm256_sub_epi16(r10, unsafe { _mm256_loadu_si256(rp.add(10)) });
++            r11 = _mm256_sub_epi16(r11, unsafe { _mm256_loadu_si256(rp.add(11)) });
++            r12 = _mm256_sub_epi16(r12, unsafe { _mm256_loadu_si256(rp.add(12)) });
++            r13 = _mm256_sub_epi16(r13, unsafe { _mm256_loadu_si256(rp.add(13)) });
++            r14 = _mm256_sub_epi16(r14, unsafe { _mm256_loadu_si256(rp.add(14)) });
++            r15 = _mm256_sub_epi16(r15, unsafe { _mm256_loadu_si256(rp.add(15)) });
++        }
++        let op = out as *mut __m256i;
++        unsafe { _mm256_storeu_si256(op.add(0), r0) };
++        unsafe { _mm256_storeu_si256(op.add(1), r1) };
++        unsafe { _mm256_storeu_si256(op.add(2), r2) };
++        unsafe { _mm256_storeu_si256(op.add(3), r3) };
++        unsafe { _mm256_storeu_si256(op.add(4), r4) };
++        unsafe { _mm256_storeu_si256(op.add(5), r5) };
++        unsafe { _mm256_storeu_si256(op.add(6), r6) };
++        unsafe { _mm256_storeu_si256(op.add(7), r7) };
++        unsafe { _mm256_storeu_si256(op.add(8), r8) };
++        unsafe { _mm256_storeu_si256(op.add(9), r9) };
++        unsafe { _mm256_storeu_si256(op.add(10), r10) };
++        unsafe { _mm256_storeu_si256(op.add(11), r11) };
++        unsafe { _mm256_storeu_si256(op.add(12), r12) };
++        unsafe { _mm256_storeu_si256(op.add(13), r13) };
++        unsafe { _mm256_storeu_si256(op.add(14), r14) };
++        unsafe { _mm256_storeu_si256(op.add(15), r15) };
++    }
++
+     /// Reference eval through `forward_f32` (training parity).
+     pub fn eval_f32(&self, b: &Board, s57_cp: i32) -> i32 {
+         (400.0 * self.forward_f32(b, s57_cp as f32 / 400.0))
+@@ -1050,3 +1339,198 @@ impl Nnue {
+ 
+ #[allow(dead_code)]
+ const _ASSERT: () = assert!(MAX_ACTIVE < 256);
++
++#[cfg(test)]
++mod local_tests {
++    use super::*;
++    use crate::board::MoveList;
++
++    /// D1088: the partial incremental child eval is bit-identical to the full refresh, on every child of positions
++    /// reached by random play from the start (both colours to move, all phases).
++    #[test]
++    fn local_inc_eval_matches_full_refresh() {
++        let net = Nnue::bundled_static();
++        assert!(net.supports_local(), "bundled net must support the local path");
++        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
++        let mut rnd = || {
++            seed ^= seed << 13;
++            seed ^= seed >> 7;
++            seed ^= seed << 17;
++            seed
++        };
++        let mut ml = MoveList::new();
++        let mut la = LocalAcc::default();
++        let mut checked = 0usize;
++        for _game in 0..40 {
++            let mut b = Board::start();
++            for _ply in 0..120 {
++                b.legal_moves_dedup_into(&mut ml);
++                if ml.is_empty() || b.game_over() {
++                    break;
++                }
++                net.local_build(&b, &mut la);
++                for i in 0..ml.len() {
++                    let m = ml.move_at(i);
++                    if m.is_pass() {
++                        continue;
++                    }
++                    let c = b.make(m);
++                    for s57 in [0, 137] {
++                        assert_eq!(net.eval_with_dis_inc(&la, &c, s57), net.eval_with_dis(&c, s57), "ply {_ply} move {i}");
++                    }
++                    checked += 1;
++                }
++                let k = (rnd() as usize) % ml.len();
++                b = b.make(ml.move_at(k));
++            }
++        }
++        assert!(checked > 20_000, "only {checked} children checked");
++    }
++}
++
++#[cfg(test)]
++mod local_bench {
++    use super::*;
++    use crate::board::MoveList;
++
++    /// D1088 timing (run: cargo test --release local_timing -- --ignored --nocapture): ns per child for the full refresh
++    /// vs the local path, and ns per node for local_build, on children of random-play positions.
++    #[test]
++    #[ignore]
++    fn local_timing() {
++        let net = Nnue::bundled_static();
++        let mut seed = 0x2545_F491_4F6C_DD1Du64;
++        let mut rnd = || {
++            seed ^= seed << 13;
++            seed ^= seed >> 7;
++            seed ^= seed << 17;
++            seed
++        };
++        let mut ml = MoveList::new();
++        let mut parents: Vec<(Board, Vec<Board>)> = Vec::new();
++        for _ in 0..60 {
++            let mut b = Board::start();
++            for _ in 0..100 {
++                b.legal_moves_dedup_into(&mut ml);
++                if ml.is_empty() || b.game_over() {
++                    break;
++                }
++                let kids: Vec<Board> = ml.iter().filter(|m| !m.is_pass()).map(|m| b.make(m)).collect();
++                parents.push((b, kids));
++                b = b.make(ml.move_at((rnd() as usize) % ml.len()));
++            }
++        }
++        let nk: usize = parents.iter().map(|p| p.1.len()).sum();
++        let mut las = vec![LocalAcc::default(); parents.len()];
++        for rep in 0..3 {
++            let t = std::time::Instant::now();
++            for (i, (p, _)) in parents.iter().enumerate() {
++                net.local_build(p, &mut las[i]);
++            }
++            let tb = t.elapsed().as_nanos() as f64 / parents.len() as f64;
++            let mut s = 0i64;
++            let t = std::time::Instant::now();
++            for (_, kids) in &parents {
++                for c in kids {
++                    s += net.eval_with_dis(c, 0).0 as i64;
++                }
++            }
++            let tf = t.elapsed().as_nanos() as f64 / nk as f64;
++            let t = std::time::Instant::now();
++            for (i, (_, kids)) in parents.iter().enumerate() {
++                for c in kids {
++                    s -= net.eval_with_dis_inc(&las[i], c, 0).0 as i64;
++                }
++            }
++            let ti = t.elapsed().as_nanos() as f64 / nk as f64;
++            let t = std::time::Instant::now();
++            let mut us = [0u32; nnfeat::MAX_ACTIVE];
++            let mut th = [0u32; nnfeat::MAX_ACTIVE];
++            for (_, kids) in &parents {
++                for c in kids {
++                    let (a, b) = nnfeat::both_into(c, net.groups, &mut us, &mut th);
++                    s += (a + b) as i64 + us[3] as i64;
++                }
++            }
++            let tx = t.elapsed().as_nanos() as f64 / nk as f64;
++            println!("rep {rep}: {} parents, {nk} children: full {tf:.0} ns/child | local {ti:.0} ns/child | extraction {tx:.0} ns | local_build {tb:.0} ns/node (checksum {s})", parents.len());
++        }
++    }
++}
++
++#[cfg(test)]
++mod local_bench2 {
++    use super::*;
++    use crate::board::MoveList;
++
++    /// D1088: row-sum cost alone: the full list (what main adds per accumulator) vs the parent->child difference lists,
++    /// on precomputed lists (no extraction, no head), plus the head alone.
++    #[test]
++    #[ignore]
++    fn local_rowsum_timing() {
++        let net = Nnue::bundled_static();
++        let mut seed = 0x2545_F491_4F6C_DD1Du64;
++        let mut rnd = || {
++            seed ^= seed << 13;
++            seed ^= seed >> 7;
++            seed ^= seed << 17;
++            seed
++        };
++        let mut ml = MoveList::new();
++        let (mut full_l, mut add_l, mut sub_l): (Vec<Vec<u32>>, Vec<Vec<u32>>, Vec<Vec<u32>>) = (vec![], vec![], vec![]);
++        for _ in 0..60 {
++            let mut b = Board::start();
++            for _ in 0..100 {
++                b.legal_moves_dedup_into(&mut ml);
++                if ml.is_empty() || b.game_over() {
++                    break;
++                }
++                let (pu, pnu, _, _) = nnfeat::both(&b, net.groups);
++                let pu = &pu[..pnu];
++                for m in ml.iter().filter(|m| !m.is_pass()) {
++                    let c = b.make(m);
++                    // child's accumulator of the colour the parent had to move = child's `them` half
++                    let (_, _, ct, cnt) = nnfeat::both(&c, net.groups);
++                    let ct = &ct[..cnt];
++                    full_l.push(ct[..cnt - 3].to_vec());
++                    let (mut a, mut s) = (vec![], vec![]);
++                    for sq in 0..NSQ {
++                        if ct[sq] != pu[sq] {
++                            a.push(ct[sq]);
++                            s.push(pu[sq]);
++                        }
++                    }
++                    let (c3a, c3b) = g3_range(ct);
++                    let (p3a, p3b) = g3_range(pu);
++                    let (cg, pg) = (&ct[c3a..c3b], &pu[p3a..p3b]);
++                    for &f in cg { if !pg.contains(&f) { a.push(f); } }
++                    for &f in pg { if !cg.contains(&f) { s.push(f); } }
++                    a.extend_from_slice(&ct[NSQ..c3a]);
++                    a.extend_from_slice(&ct[c3b..cnt - 3]);
++                    add_l.push(a);
++                    sub_l.push(s);
++                }
++                b = b.make(ml.move_at((rnd() as usize) % ml.len()));
++            }
++        }
++        let n = full_l.len();
++        let mut out = [0i16; LA_W];
++        for rep in 0..3 {
++            let t = std::time::Instant::now();
++            for l in &full_l {
++                unsafe { net.ft_mix(out.as_mut_ptr(), &ZERO_ROW, &ZERO_ROW, l, &[]) };
++                std::hint::black_box(&out);
++            }
++            let tf = t.elapsed().as_nanos() as f64 / n as f64;
++            let t = std::time::Instant::now();
++            for i in 0..n {
++                unsafe { net.ft_mix(out.as_mut_ptr(), &ZERO_ROW, &ZERO_ROW, &add_l[i], &sub_l[i]) };
++                std::hint::black_box(&out);
++            }
++            let td = t.elapsed().as_nanos() as f64 / n as f64;
++            let rf: f64 = full_l.iter().map(|l| l.len()).sum::<usize>() as f64 / n as f64;
++            let rd: f64 = (0..n).map(|i| add_l[i].len() + sub_l[i].len()).sum::<usize>() as f64 / n as f64;
++            println!("rep {rep}: {n} accumulators: full rows {rf:.1} = {tf:.0} ns ({:.1} ns/row) | diff rows {rd:.1} = {td:.0} ns ({:.1} ns/row)", tf / rf, td / rd);
++        }
++    }
++}
+diff --git a/crates/titanium/src/search.rs b/crates/titanium/src/search.rs
+index 8473f12..4f6bf6a 100644
+--- a/crates/titanium/src/search.rs
++++ b/crates/titanium/src/search.rs
+@@ -170,6 +170,8 @@ struct MoveStack {
+     rep_base: Box<[u32; MAX_PLY]>,
+     /// D590: how the node at this ply was reached (3 first move, 2 top-12, 1 later, 0 null-move probe): TT worth
+     imp: Box<[u8; MAX_PLY]>,
++    /// D1088: the node's LOCAL big-net accumulators (G1 + G3), built at its first child eval, patched per child
++    local: Vec<crate::nnue::LocalAcc>,
+ }
+ 
+ impl MoveStack {
+@@ -180,6 +182,7 @@ impl MoveStack {
+             path_hash: Box::new([0u64; MAX_PLY]),
+             rep_base: Box::new([0u32; MAX_PLY]),
+             imp: Box::new([3u8; MAX_PLY]),
++            local: vec![crate::nnue::LocalAcc::default(); MAX_PLY],
+         }
+     }
+ }
+@@ -229,6 +232,13 @@ pub fn unpack_eval_dis(packed: i32) -> (i32, i32) {
+ /// search into the searcher, never per node.
+ static FUT_SN_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+ 
++/// D1088 A/B switch (exp branch only): build the node's local accumulators at its N-th big-net child eval (0 = off,
++/// full refresh as on main); env TI_LOCAL_AFTER, default 1.
++fn local_after() -> u32 {
++    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
++    *V.get_or_init(|| std::env::var("TI_LOCAL_AFTER").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
++}
++
+ pub fn fut_sn_on() -> bool {
+     FUT_SN_ON.load(std::sync::atomic::Ordering::Relaxed)
+ }
+@@ -1512,6 +1522,8 @@ impl<'a> Searcher<'a> {
+ 
+         // futility small net: the parent's accumulator, built at the first child that needs it (D110)
+         let mut sn_parent: Option<[f32; 64]> = None;
++        // D1088: big-net child evals done at this node so far; the local accumulators are built at the LOCAL_AFTER-th
++        let mut child_evals = 0u32;
+         let mut lmr_cnt = 0i32;
+         loop {
+             let m = {
+@@ -1625,10 +1637,16 @@ impl<'a> Searcher<'a> {
+                         self.nnue,
+                         hand_cache.filter(|_| self.tuple.is_none() && !self.tup_native),
+                     ) {
+-                        if nn.v2 {
+-                            nn.eval_with_dis(&child, h)
++                        let s57 = if nn.v2 { h } else { 0 };
++                        child_evals += 1;
++                        let after = local_after();
++                        if after > 0 && child_evals >= after && nn.supports_local() {
++                            if child_evals == after {
++                                nn.local_build(b, &mut self.stack.local[ply as usize]);
++                            }
++                            nn.eval_with_dis_inc(&self.stack.local[ply as usize], &child, s57)
+                         } else {
+-                            nn.eval_with_dis(&child, 0)
++                            nn.eval_with_dis(&child, s57)
+                         }
+                     } else {
+                         self.leaf_eval_raw_with_dis(&child)
