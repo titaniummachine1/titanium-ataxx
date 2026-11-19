@@ -1379,11 +1379,11 @@ fn snparity_cmd(refp: Option<String>) -> ExitCode {
     let mut s2 = 0f32;
     for _ in 0..200 {
         for r in &rows {
-            s2 += std::hint::black_box(net.acc(r.0, r.1, r.2))[7];
+            s2 += std::hint::black_box(net.acc(r.0, r.1))[7] as f32;
         }
     }
     let ns_acc = t2.elapsed().as_nanos() as f64 / (200.0 * rows.len().max(1) as f64);
-    let accs: Vec<[f32; 64]> = rows.iter().map(|r| net.acc(r.0, r.1, r.2)).collect();
+    let accs: Vec<titanium::smallnet::Acc> = rows.iter().map(|r| net.acc(r.0, r.1)).collect();
     let t3 = Instant::now();
     for _ in 0..200 {
         for (r, a) in rows.iter().zip(&accs) {

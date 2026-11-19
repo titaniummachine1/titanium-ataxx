@@ -1507,7 +1507,7 @@ impl<'a> Searcher<'a> {
         }
 
         // futility small net: the parent's accumulator, built at the first child that needs it (D110)
-        let mut sn_parent: Option<[f32; 64]> = None;
+        let mut sn_parent: Option<crate::smallnet::Acc> = None;
         let mut lmr_cnt = 0i32;
         loop {
             let m = {
@@ -1594,7 +1594,7 @@ impl<'a> Searcher<'a> {
                         let (bt, ct) = (b.turn as usize, child.turn as usize);
                         let sn = small_net();
                         let pa = sn_parent
-                            .get_or_insert_with(|| sn.acc(b.occ[bt], b.occ[1 - bt], b.blockers));
+                            .get_or_insert_with(|| sn.parent_acc(b.occ[bt], b.occ[1 - bt]));
                         let lo = sn.child_bound(
                             pa,
                             b.occ[bt],
