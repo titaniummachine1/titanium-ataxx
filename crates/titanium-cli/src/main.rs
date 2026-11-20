@@ -263,13 +263,18 @@ fn resolve_nnue_spec(spec: &Option<String>) -> Option<String> {
 }
 
 fn load_nnue_spec(spec: &Option<String>) -> Result<Option<titanium::nnue::Nnue>, String> {
-    match spec.as_deref() {
-        None | Some("none") => Ok(None),
-        Some("bundled") => Ok(Some(titanium::nnue::Nnue::bundled())),
-        Some(path) => titanium::nnue::Nnue::load(path)
-            .map(Some)
-            .map_err(|e| format!("network {path}: {e}")),
+    let mut net = match spec.as_deref() {
+        None | Some("none") => None,
+        Some("bundled") => Some(titanium::nnue::Nnue::bundled()),
+        Some(path) => Some(
+            titanium::nnue::Nnue::load(path)
+                .map_err(|e| format!("network {path}: {e}"))?,
+        ),
+    };
+    if let Some(n) = net.as_mut() {
+        n.drop_f32_reference();
     }
+    Ok(net)
 }
 
 /// The big net selected by --network/--nnue (default: bundled); a bad file stops the program with a message.

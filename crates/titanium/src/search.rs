@@ -519,8 +519,7 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
 
     let mut orig_valid: u64 = 0;
     let mut orig_conn = [MaybeUninit::<i32>::uninit(); 49];
-    let mut orig_g = [MaybeUninit::<f32>::uninit(); 49];
-    let mut orig_tor = [MaybeUninit::<i32>::uninit(); 49];
+    let mut orig_z = [MaybeUninit::<f32>::uninit(); 49];
 
     while targets != 0 {
         let to = targets.trailing_zeros() as u8;
@@ -572,11 +571,11 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
         }
 
         if jumps != 0 {
-            let (j_prefix, j_td) = if HAS_POLICY {
+            let j_dest = if HAS_POLICY {
                 let (p, _) = pol.unwrap();
                 p.jump_dest_parts(to, flips, tholes, k3_to)
             } else {
-                (0.0, 0)
+                0.0
             };
             let mut js = jumps;
             while js != 0 {
@@ -599,12 +598,10 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
                         let (p, _) = pol.unwrap();
                         let fh = ((RING1[fu] & empty).count_ones() as usize).min(8);
                         let k3f = crate::policy::k3code_pub(me, opp, from);
-                        let (fg, ft) = p.jump_orig_parts(from, fh, k3f);
-                        orig_g[fu].write(fg);
-                        orig_tor[fu].write(ft);
+                        orig_z[fu].write(p.jump_orig_parts(from, fh, k3f));
                     }
                 }
-                // SAFETY: `orig_valid & fbit != 0` ensures `orig_conn[fu]` (and `orig_g[fu]`/`orig_tor[fu]` under `HAS_POLICY`) was written.
+                // SAFETY: `orig_valid & fbit != 0` ensures `orig_conn[fu]` (and `orig_z[fu]` under `HAS_POLICY`) was written.
                 let conn = unsafe { orig_conn[fu].assume_init() };
                 // exp/ab O1 (hole-aware jumps): a jump vacates its origin —
                 // leaving a connected origin breaks formation, so penalty
@@ -617,8 +614,8 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
                 sc += hist[fu][tu] / HIST_DIV;
                 if HAS_POLICY {
                     let (p, w) = pol.unwrap();
-                    let (fg, ft) = unsafe { (orig_g[fu].assume_init(), orig_tor[fu].assume_init()) };
-                    let z = p.jump_finish(j_prefix, j_td, fg, ft);
+                    let j_orig = unsafe { orig_z[fu].assume_init() };
+                    let z = p.jump_finish(j_dest, j_orig);
                     sc = sc.saturating_add((z * w) as i32);
                 }
                 list.push_scored(m, sc);
@@ -895,6 +892,8 @@ pub struct Searcher<'a> {
     nnue: Option<&'a Nnue>,
     /// exp/policy: move-ordering policy head (None = unchanged), weight (ordering points per logit), min depth, scratch.
     policy: Option<&'a crate::policy::Policy>,
+    /// Owned configured policy so `advance_root` unloads dead high buckets (`b > b_root`) cleanly per searcher.
+    owned_policy: Option<crate::policy::Policy>,
     pol_w: f32,
     pol_min: u32,
     /// D1326: search knobs per NNUE empties bucket (process table read once at construction; defaults = the constants)
@@ -978,7 +977,8 @@ impl<'a> Searcher<'a> {
             history: Box::new([[[0; 49]; 49]; 2]),
             tuple: None,
             nnue: None,
-            policy: crate::policy::global(),
+            policy: None,
+            owned_policy: crate::policy::open_configured(),
             pol_w: crate::policy::env_f32("TI_POLW", 100000.0),
             // D744 fix: the head runs at EVERY depth (d1 included); skipping it at d1 cost -82 Elo (3.9% blunders).
             pol_min: crate::policy::env_f32("TI_POLMIN", 1.0) as u32,
@@ -1004,6 +1004,7 @@ impl<'a> Searcher<'a> {
     /// search duration; zero-cost OFF (None branch).
     pub fn set_policy(&mut self, p: Option<&'a crate::policy::Policy>, w: f32, min_depth: u32) {
         self.policy = p;
+        self.owned_policy = None;
         self.pol_w = w;
         self.pol_min = min_depth;
         self.pol_explicit = true;
@@ -1016,7 +1017,10 @@ impl<'a> Searcher<'a> {
         // policy file changes the policy. (The old switch-off silently cost -80..-150 Elo in the net gates of D814-D817; the
         // bundled head reads no accumulator input on this architecture, D490, and gated fine with another net, D818/D820.)
         if !self.pol_explicit {
-            self.policy = crate::policy::global();
+            if self.owned_policy.is_none() {
+                self.owned_policy = crate::policy::open_configured();
+            }
+            self.policy = None;
         }
         self.clear_ecache();
     }
@@ -1580,7 +1584,8 @@ impl<'a> Searcher<'a> {
         }
 
         {
-            match (self.policy, self.nnue) {
+            let active_pol = if self.pol_explicit { self.policy } else { self.owned_policy.as_ref() };
+            match (active_pol, self.nnue) {
                 (Some(pol), Some(_)) if depth >= self.pol_min => {
                     let list = &mut self.stack.lists[ply as usize];
                     gen_and_score_into::<true, true>(
@@ -1961,6 +1966,11 @@ impl<'a> Searcher<'a> {
         snaps: &[(u64, u64)],
         respect_401: bool,
     ) -> SearchResult {
+        if !self.pol_explicit {
+            if let Some(pol) = self.owned_policy.as_mut() {
+                pol.advance_root(b.empty().count_ones() as usize, 4);
+            }
+        }
         self.start_ms = (self.time_src)();
         self.nodes = 0;
         self.stop = false;

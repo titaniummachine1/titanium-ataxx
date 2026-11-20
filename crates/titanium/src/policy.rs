@@ -18,9 +18,11 @@ const NSEE: usize = 8 * 18 * 19;
 pub struct Head {
     bias: [f32; SLOTS],
     g: [f32; NSCAL],
-    /// D486/D502 pattern tables, i16 at TQ (1/2048 logit steps), shared by the 9 edge classes
-    td: Vec<i16>,
-    tor: Vec<i16>,
+    inv_qd: f32,
+    inv_qo: f32,
+    /// D1332/D1333: 3x3 pattern tables quantized to i8 per head (max_abs / 127.0) to halve cache working set (~177 KB/bucket).
+    td: Vec<i8>,
+    tor: Vec<i8>,
 }
 
 /// edge class of a square: (row class) * 3 + (col class), class 0 = first line, 1 = inner, 2 = last line
@@ -38,7 +40,6 @@ static CLS: [u8; 49] = {
 };
 
 const P3: usize = 6561;
-const TQ: f32 = 2048.0;
 const ND: usize = 18;
 const NO: usize = 9;
 
@@ -313,7 +314,7 @@ mod tests {
                         let actual = pol.clone_logit_pre(to, flips, tholes, k3_to);
                         assert_eq!(actual.to_bits(), expected.to_bits(), "clone mv {m:?}");
                     }
-                    let (jp, jtd) = pol.jump_dest_parts(to, flips, tholes, k3_to);
+                    let j_dest = pol.jump_dest_parts(to, flips, tholes, k3_to);
                     let mut jumps = me & RING2[to as usize];
                     while jumps != 0 {
                         let from = jumps.trailing_zeros() as u8;
@@ -321,14 +322,53 @@ mod tests {
                         let m = crate::board::Move { from, to };
                         let fh = ((RING1[from as usize] & empty).count_ones() as usize).min(8);
                         let k3_from = super::k3code_pub(me, opp, from);
-                        let (fg, ft) = pol.jump_orig_parts(from, fh, k3_from);
+                        let j_orig = pol.jump_orig_parts(from, fh, k3_from);
                         let expected = pol.logit_k(&b, m, &mut kc);
-                        let actual = pol.jump_finish(jp, jtd, fg, ft);
+                        let actual = pol.jump_finish(j_dest, j_orig);
                         assert_eq!(actual.to_bits(), expected.to_bits(), "jump mv {m:?}");
                     }
                 }
             }
         }
+    }
+    #[test]
+    fn tpol6_advance_root_unloads_dead_and_reloads() {
+        let one = synth_bytes(false);
+        let body = &one[12..];
+        let nb = 16usize;
+        let mut raw = b"TPOL6\0\0\0".to_vec();
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&(nb as u32).to_le_bytes());
+        for _ in 0..nb {
+            raw.extend_from_slice(body);
+        }
+        let mut pol = super::Policy::from_bytes(&raw).expect("TPOL6");
+        let ref_head = super::Head::from_bytes(&one).expect("TPOL3");
+        // Starts lazy: 0 slots decoded until advance_root
+        assert_eq!(pol.loaded_buckets(), 0);
+        // Root at 35 empties -> bucket 11, lookahead 4 -> [7..=11] = 5 loaded
+        pol.advance_root(35, 4);
+        assert_eq!(pol.loaded_buckets(), 5);
+        // Root advances to 20 empties -> bucket 6 -> [2..=6], buckets 7..=11 unloaded (still 5 loaded, never 10)
+        pol.advance_root(20, 4);
+        assert_eq!(pol.loaded_buckets(), 5);
+        for b in 7..nb {
+            assert!(pol.slots[b].get().is_none(), "dead bucket {b} must be unloaded");
+        }
+        // New game reset (`uainewgame`): reloads high bucket cleanly and stays bit-identical
+        pol.advance_root(45, 3);
+        let b = crate::board::Board::start();
+        let mut list = crate::board::MoveList::new();
+        b.legal_moves_dedup_into(&mut list);
+        let mut kc = super::KCache::new();
+        for i in 0..list.len() {
+            let m = list.move_at(i);
+            assert_eq!(pol.logit_k(&b, m, &mut kc).to_bits(), ref_head.logit_k(&b, m, &mut kc).to_bits());
+        }
+        // Extreme all-clone extension below lookahead lazy-loads on demand
+        pol.advance_root(35, 1);
+        let b_low = pol.head_bucket(2);
+        assert_eq!(b_low.bias, ref_head.bias);
     }
 }
 
@@ -365,9 +405,59 @@ impl Head {
         bias.copy_from_slice(&f[..SLOTS]);
         let mut g = [0f32; NSCAL];
         g.copy_from_slice(&f[SLOTS..SLOTS + NSCAL]);
-        let q = |x: &[f32]| -> Vec<i16> { x.iter().map(|v| (v * TQ).round().clamp(-32767.0, 32767.0) as i16).collect() };
-        let (td, tor) = (q(&f[n1..n1 + ND * P3]), q(&f[n1 + ND * P3..n1 + (ND + NO) * P3]));
-        Head { bias, g, td, tor }
+        let quant = |x: &[f32]| -> (Vec<i8>, f32) {
+            let max_abs = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            if max_abs <= 0.0 {
+                return (vec![0i8; x.len()], 0.0);
+            }
+            let inv_q = max_abs / 127.0;
+            let q = 127.0 / max_abs;
+            let v = x.iter().map(|&w| (w * q).round().clamp(-127.0, 127.0) as i8).collect();
+            (v, inv_q)
+        };
+        let (td, inv_qd) = quant(&f[n1..n1 + ND * P3]);
+        let (tor, inv_qo) = quant(&f[n1 + ND * P3..n1 + (ND + NO) * P3]);
+        Head { bias, g, inv_qd, inv_qo, td, tor }
+    }
+
+    /// Decode one head directly from raw little-endian f32 bytes (`per` floats, no SEE block) with zero temp Vec alloc.
+    fn from_le_f32_bytes(raw: &[u8]) -> Head {
+        #[inline(always)]
+        fn f_at(raw: &[u8], i: usize) -> f32 {
+            let o = 4 * i;
+            f32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]])
+        }
+        let mut bias = [0f32; SLOTS];
+        for (i, dst) in bias.iter_mut().enumerate() {
+            *dst = f_at(raw, i);
+        }
+        let mut g = [0f32; NSCAL];
+        for (i, dst) in g.iter_mut().enumerate() {
+            *dst = f_at(raw, SLOTS + i);
+        }
+        let quant_slice = |off: usize, len: usize| -> (Vec<i8>, f32) {
+            let mut max_abs = 0.0f32;
+            for i in 0..len {
+                let v = f_at(raw, off + i).abs();
+                if v > max_abs {
+                    max_abs = v;
+                }
+            }
+            if max_abs <= 0.0 {
+                return (vec![0i8; len], 0.0);
+            }
+            let inv_q = max_abs / 127.0;
+            let q = 127.0 / max_abs;
+            let mut out = Vec::with_capacity(len);
+            for i in 0..len {
+                out.push((f_at(raw, off + i) * q).round().clamp(-127.0, 127.0) as i8);
+            }
+            (out, inv_q)
+        };
+        let n1 = SLOTS + NSCAL;
+        let (td, inv_qd) = quant_slice(n1, ND * P3);
+        let (tor, inv_qo) = quant_slice(n1 + ND * P3, NO * P3);
+        Head { bias, g, inv_qd, inv_qo, td, tor }
     }
 
     /// Logit of move `m` in `b`.
@@ -386,17 +476,15 @@ impl Head {
         let flips = (b.captures(m.to) as usize).min(8);
         let tholes = ((RING1[m.to as usize] & empty).count_ones() as usize).min(8);
         let slot = m.to as usize + 49 * (!clone) as usize;
-        let mut z = self.bias[slot] + self.g[c * 9 + flips] + self.g[18 + c * 9 + tholes];
-        if !clone {
-            z += self.g[36 + ((RING1[m.from as usize] & empty).count_ones() as usize).min(8)];
-        }
         let (me, opp) = (b.me(), b.opp());
         let ds = CLS[m.to as usize] as usize * 2 + (!clone) as usize;
-        let mut t = self.td[ds * P3 + kc.get(me, opp, m.to)] as i32;
+        let mut z = (self.bias[slot] + self.g[c * 9 + flips]) + self.g[18 + c * 9 + tholes];
+        z += self.td[ds * P3 + kc.get(me, opp, m.to)] as f32 * self.inv_qd;
         if !clone {
-            t += self.tor[CLS[m.from as usize] as usize * P3 + kc.get(me, opp, m.from)] as i32;
+            let orig_z = self.g[36 + ((RING1[m.from as usize] & empty).count_ones() as usize).min(8)]
+                + self.tor[CLS[m.from as usize] as usize * P3 + kc.get(me, opp, m.from)] as f32 * self.inv_qo;
+            z += orig_z;
         }
-        z += t as f32 * (1.0 / TQ);
         z
     }
 
@@ -404,48 +492,73 @@ impl Head {
     #[inline(always)]
     pub(crate) fn clone_logit_pre(&self, to: u8, flips: usize, tholes: usize, k3_to: usize) -> f32 {
         let slot = to as usize;
-        let mut z = self.bias[slot] + self.g[9 + flips] + self.g[27 + tholes];
-        z += self.td[CLS[slot] as usize * 2 * P3 + k3_to] as i32 as f32 * (1.0 / TQ);
+        let mut z = (self.bias[slot] + self.g[9 + flips]) + self.g[27 + tholes];
+        z += self.td[CLS[slot] as usize * 2 * P3 + k3_to] as f32 * self.inv_qd;
         z
     }
 
-    /// Destination-only prefix and quantized pattern term for all jumps landing on `to`.
+    /// Destination-only total (prefix + quantized dest pattern term) for all jumps landing on `to`.
     #[inline(always)]
-    pub(crate) fn jump_dest_parts(&self, to: u8, flips: usize, tholes: usize, k3_to: usize) -> (f32, i32) {
-        let prefix = self.bias[to as usize + 49] + self.g[flips] + self.g[18 + tholes];
-        (prefix, self.td[(CLS[to as usize] as usize * 2 + 1) * P3 + k3_to] as i32)
-    }
-
-    /// Origin-only scalar term and quantized pattern term for jumps leaving `from`.
-    #[inline(always)]
-    pub(crate) fn jump_orig_parts(&self, from: u8, from_holes: usize, k3_from: usize) -> (f32, i32) {
-        (self.g[36 + from_holes], self.tor[CLS[from as usize] as usize * P3 + k3_from] as i32)
-    }
-
-    /// Finish a jump logit from precomputed destination + origin parts. Same IEEE-754 order as `logit_k`.
-    #[inline(always)]
-    pub(crate) fn jump_finish(&self, j_prefix: f32, j_td: i32, from_g: f32, from_tor: i32) -> f32 {
-        let mut z = j_prefix + from_g;
-        z += (j_td + from_tor) as f32 * (1.0 / TQ);
+    pub(crate) fn jump_dest_parts(&self, to: u8, flips: usize, tholes: usize, k3_to: usize) -> f32 {
+        let mut z = (self.bias[to as usize + 49] + self.g[flips]) + self.g[18 + tholes];
+        z += self.td[(CLS[to as usize] as usize * 2 + 1) * P3 + k3_to] as f32 * self.inv_qd;
         z
+    }
+
+    /// Origin-only total (scalar + quantized origin pattern term) for jumps leaving `from`.
+    #[inline(always)]
+    pub(crate) fn jump_orig_parts(&self, from: u8, from_holes: usize, k3_from: usize) -> f32 {
+        self.g[36 + from_holes] + self.tor[CLS[from as usize] as usize * P3 + k3_from] as f32 * self.inv_qo
+    }
+
+    /// Finish a jump logit from precomputed destination + origin totals. Same IEEE-754 order as `logit_k`.
+    #[inline(always)]
+    pub(crate) fn jump_finish(&self, j_dest: f32, j_orig: f32) -> f32 {
+        j_dest + j_orig
     }
 }
 
-/// D1320 (user D1312/D1313: every net on the NNUE's empties buckets): the policy = one Head per phase bucket, chosen by
-/// the position's empty squares with the NNUE's own formula, bucket = empties * nb / 50. "TPOL6": magic, u32 dim (0),
-/// u32 nb, then nb x [f32 bias[98], f32 g[45], f32 dest[18][6561], f32 orig[9][6561]] (no SEE block). TPOL3 / TPOL5 load
-/// as ONE bucket (bit-identical to before).
+enum PolicyBytes {
+    Static(&'static [u8]),
+    Owned(std::sync::Arc<[u8]>),
+}
+
+impl PolicyBytes {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            PolicyBytes::Static(s) => s,
+            PolicyBytes::Owned(v) => v,
+        }
+    }
+}
+
+/// D1320 / D1330 / D1332: phase-bucketed policy (`TPOL6`, `bucket = empties * nb / 50`) with `i8` quantized pattern tables
+/// and lazy per-bucket slots so dead high buckets (`b > b_root`) unload as the game progresses and reload seamlessly on
+/// `uainewgame` (or lazy-load if a deep tactical line crosses past `lookahead`).
 pub struct Policy {
-    heads: Vec<Head>,
+    nb: usize,
+    raw: Option<(PolicyBytes, usize)>,
+    slots: Vec<std::sync::OnceLock<Box<Head>>>,
 }
 
 impl Policy {
     pub fn load(path: &str) -> std::io::Result<Policy> {
-        Self::from_bytes(&std::fs::read(path)?)
+        let bytes = std::fs::read(path)?;
+        Self::from_storage(PolicyBytes::Owned(std::sync::Arc::from(bytes)))
     }
 
     pub fn from_bytes(d: &[u8]) -> std::io::Result<Policy> {
+        Self::from_storage(PolicyBytes::Owned(std::sync::Arc::from(d)))
+    }
+
+    fn from_static_bytes(d: &'static [u8]) -> std::io::Result<Policy> {
+        Self::from_storage(PolicyBytes::Static(d))
+    }
+
+    fn from_storage(raw_bytes: PolicyBytes) -> std::io::Result<Policy> {
         let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+        let d = raw_bytes.as_slice();
         if d.len() >= 16 && &d[..8] == b"TPOL6\0\0\0" {
             if u32::from_le_bytes(d[8..12].try_into().unwrap()) != 0 {
                 return Err(bad("policy dim must be 0 (no accumulator input)"));
@@ -455,27 +568,66 @@ impl Policy {
             if nb == 0 || nb > 64 || d.len() != 16 + 4 * per * nb {
                 return Err(bad("bad TPOL6 size"));
             }
-            let f: Vec<f32> = d[16..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-            let heads = (0..nb).map(|k| Head::from_f32(&f[k * per..(k + 1) * per], 0)).collect();
-            return Ok(Policy { heads });
+            let slots = (0..nb).map(|_| std::sync::OnceLock::new()).collect();
+            return Ok(Policy { nb, raw: Some((raw_bytes, per)), slots });
         }
-        Ok(Policy { heads: vec![Head::from_bytes(d)?] })
+        let slot = std::sync::OnceLock::new();
+        let _ = slot.set(Box::new(Head::from_bytes(d)?));
+        Ok(Policy { nb: 1, raw: None, slots: vec![slot] })
     }
 
     /// Number of phase buckets (1 for TPOL3 / TPOL5).
     pub fn buckets(&self) -> usize {
-        self.heads.len()
+        self.nb
+    }
+
+    /// Number of bucket heads currently resident in heap memory.
+    pub fn loaded_buckets(&self) -> usize {
+        self.slots.iter().filter(|s| s.get().is_some()).count()
+    }
+
+    /// Decode bucket `bk` from raw TPOL6 bytes.
+    fn decode_bucket(&self, bk: usize) -> Box<Head> {
+        let (raw, per) = self.raw.as_ref().expect("TPOL6 raw bytes");
+        let d = raw.as_slice();
+        let start = 16 + 4 * per * bk;
+        Box::new(Head::from_le_f32_bytes(&d[start..start + 4 * per]))
+    }
+
+    #[inline(always)]
+    fn head_bucket(&self, bk: usize) -> &Head {
+        let slot = &self.slots[bk];
+        if let Some(h) = slot.get() {
+            return h;
+        }
+        slot.get_or_init(|| self.decode_bucket(bk))
+    }
+
+    /// Unload unreachable buckets `b > b_root` (stones never decrease in Ataxx) and pre-warm `[b_root - lookahead ..= b_root]`.
+    pub fn advance_root(&mut self, root_empties: usize, lookahead: usize) {
+        if self.nb <= 1 {
+            return;
+        }
+        let b_root = (root_empties * self.nb / 50).min(self.nb - 1);
+        for k in (b_root + 1)..self.nb {
+            if self.slots[k].get().is_some() {
+                self.slots[k] = std::sync::OnceLock::new();
+            }
+        }
+        let lo = b_root.saturating_sub(lookahead);
+        for k in lo..=b_root {
+            let _ = self.head_bucket(k);
+        }
     }
 
     /// The head of this position's phase bucket (empties * nb / 50, the NNUE's formula).
     #[inline(always)]
     pub fn head(&self, b: &Board) -> &Head {
-        let nb = self.heads.len();
-        if nb == 1 {
-            return &self.heads[0];
+        if self.nb == 1 {
+            return self.head_bucket(0);
         }
         let e = b.empty().count_ones() as usize;
-        &self.heads[(e * nb / 50).min(nb - 1)]
+        self.head_bucket((e * self.nb / 50).min(self.nb - 1))
     }
 
     #[inline]
@@ -489,16 +641,20 @@ impl Policy {
     }
 }
 
-/// Process-wide policy: `--policy` / env TI_POLICY (bundled when unset, `none` = off); ordering weight TI_POLW (default
-/// 100000 points per logit), minimum depth TI_POLMIN (default 1).
+/// Open a fresh policy instance per current `--policy` / `TI_POLICY` configuration (None = `none` or invalid bundled blob).
+pub fn open_configured() -> Option<Policy> {
+    match spec().as_deref() {
+        Some("none") => None,
+        Some("bundled") | None => Policy::from_static_bytes(BUNDLED).ok(),
+        Some(p) => Some(Policy::load(p).unwrap_or_else(|e| panic!("--policy / TI_POLICY {p}: {e}"))),
+    }
+}
+
+/// Process-wide shared policy (for static callers); single-game `Searcher` instances prefer `open_configured()` so dead
+/// buckets unload per root move.
 pub fn global() -> Option<&'static Policy> {
     static P: std::sync::OnceLock<Option<Policy>> = std::sync::OnceLock::new();
-    P.get_or_init(|| match spec().as_deref() {
-        Some("none") => None,
-        Some("bundled") | None => Policy::from_bytes(BUNDLED).ok(),
-        Some(p) => Some(Policy::load(p).unwrap_or_else(|e| panic!("--policy / TI_POLICY {p}: {e}"))),
-    })
-    .as_ref()
+    P.get_or_init(open_configured).as_ref()
 }
 
 static CONFIGURED: std::sync::OnceLock<String> = std::sync::OnceLock::new();

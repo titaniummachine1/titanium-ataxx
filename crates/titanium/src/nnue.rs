@@ -180,10 +180,14 @@ impl Nnue {
         *F.get_or_init(|| crate::config::fingerprint(BUNDLED_NNUE))
     }
 
-    /// Shared production instance for one-shot engine APIs.
+    /// Shared production instance for one-shot engine APIs (drops unused 30.8 MB raw f32 reference arrays).
     pub fn bundled_static() -> &'static Nnue {
         static NET: std::sync::OnceLock<Nnue> = std::sync::OnceLock::new();
-        NET.get_or_init(Self::bundled)
+        NET.get_or_init(|| {
+            let mut n = Self::bundled();
+            n.drop_f32_reference();
+            n
+        })
     }
 
     fn parse(d: &[u8]) -> std::io::Result<Nnue> {
@@ -1021,10 +1025,13 @@ impl Nnue {
 
     /// Centipawn-like score from the side to move's view (same scale the training target used: 400 per logit).
     /// `s57_cp` = the S57 tuple eval of `b` in cp (side to move); ignored by v1 nets.
-    /// Free the float copy of the feature transformer (~27 MB) once the int16 fast path is built. Only the
-    /// training-parity reference `forward_f32` needs it; memory-capped hosts (Botzone, 256 MB) drop it.
+    /// Free the raw float reference arrays (`ft` 28.7 MB + `psqt` 1.8 MB + `l1_w` 256 KB + `l2_w` 32 KB = ~30.8 MB)
+    /// once the quantized/transposed fast path is built. Only `forward_f32` / tests need them.
     pub fn drop_f32_reference(&mut self) {
         self.ft = Vec::new();
+        self.psqt = Vec::new();
+        self.l1_w = Vec::new();
+        self.l2_w = Vec::new();
     }
 
     pub fn eval(&self, b: &Board, s57_cp: i32) -> i32 {
