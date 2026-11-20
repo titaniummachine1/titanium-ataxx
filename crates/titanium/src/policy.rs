@@ -14,7 +14,8 @@ pub const NSCAL: usize = 45;
 /// size of the TPOL5 SEE block that is skipped on load
 const NSEE: usize = 8 * 18 * 19;
 
-pub struct Policy {
+/// One set of policy tables (one phase bucket).
+pub struct Head {
     bias: [f32; SLOTS],
     g: [f32; NSCAL],
     /// D486/D502 pattern tables, i16 at TQ (1/2048 logit steps), shared by the 9 edge classes
@@ -190,10 +191,72 @@ mod tests {
         raw
     }
 
+    /// D1320: a TPOL6 of nb copies of one head gives that head's logits bit for bit; changing bucket k (13 here) bias changes
+    /// exactly the positions with empties * nb / 50 == k (the NNUE's bucket formula).
+    #[test]
+    fn tpol6_buckets_copy_and_select() {
+        use crate::board::{Board, MoveList};
+        let one = synth_bytes(false);
+        let body = &one[12..];
+        let nb = 16usize;
+        let mk = |bump: Option<usize>| -> super::Policy {
+            let mut raw = b"TPOL6".to_vec();
+            raw.extend_from_slice(&[0, 0, 0]);
+            raw.extend_from_slice(&0u32.to_le_bytes());
+            raw.extend_from_slice(&(nb as u32).to_le_bytes());
+            for k in 0..nb {
+                let mut blk = body.to_vec();
+                if bump == Some(k) {
+                    for s in 0..super::SLOTS {
+                        let v = f32::from_le_bytes(blk[4 * s..4 * s + 4].try_into().unwrap()) + 1.0;
+                        blk[4 * s..4 * s + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                raw.extend_from_slice(&blk);
+            }
+            super::Policy::from_bytes(&raw).expect("TPOL6")
+        };
+        let single = super::Policy::from_bytes(&one).expect("TPOL3");
+        let (copies, bumped) = (mk(None), mk(Some(13)));
+        assert_eq!((single.buckets(), copies.buckets()), (1, nb));
+        let mut list = MoveList::new();
+        let mut seen = [false; 2];
+        let mut x = 0x2545F4914F6CDD1Du64;
+        for n in 0..300 {
+            let mut b = Board::start();
+            for _ in 0..(n % 46) {
+                b.legal_moves_dedup_into(&mut list);
+                if list.is_empty() || b.game_over() {
+                    break;
+                }
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b = b.make(list.move_at(x as usize % list.len()));
+            }
+            b.legal_moves_dedup_into(&mut list);
+            let in5 = (b.empty().count_ones() as usize * nb / 50).min(nb - 1) == 13;
+            for i in 0..list.len() {
+                let m = list.move_at(i);
+                let mut kc = super::KCache::new();
+                let (a, c, d) = (single.logit_k(&b, m, &mut kc), copies.logit_k(&b, m, &mut kc), bumped.logit_k(&b, m, &mut kc));
+                assert_eq!(a.to_bits(), c.to_bits(), "copies must equal the single head");
+                if in5 {
+                    assert!((d - a - 1.0).abs() < 1e-5, "bucket 13 position must see the bumped bias");
+                    seen[1] = true;
+                } else {
+                    assert_eq!(a.to_bits(), d.to_bits(), "other buckets untouched");
+                    seen[0] = true;
+                }
+            }
+        }
+        assert!(seen[0] && seen[1], "both cases exercised");
+    }
+
     #[test]
     fn tpol5_loads_without_its_see_block() {
-        let a = super::Policy::from_bytes(&synth_bytes(false)).expect("TPOL3");
-        let b = super::Policy::from_bytes(&synth_bytes(true)).expect("TPOL5");
+        let a = super::Head::from_bytes(&synth_bytes(false)).expect("TPOL3");
+        let b = super::Head::from_bytes(&synth_bytes(true)).expect("TPOL5");
         assert_eq!(a.bias, b.bias);
         assert_eq!(a.g, b.g);
         assert_eq!(a.td, b.td);
@@ -231,6 +294,7 @@ mod tests {
                     continue;
                 }
                 let mut kc = super::KCache::new();
+                let pol = pol.head(&b);
                 let me = b.me();
                 let opp = b.opp();
                 let empty = b.empty();
@@ -268,12 +332,12 @@ mod tests {
     }
 }
 
-impl Policy {
-    pub fn load(path: &str) -> std::io::Result<Policy> {
+impl Head {
+    pub fn load(path: &str) -> std::io::Result<Head> {
         Self::from_bytes(&std::fs::read(path)?)
     }
 
-    pub fn from_bytes(d: &[u8]) -> std::io::Result<Policy> {
+    pub fn from_bytes(d: &[u8]) -> std::io::Result<Head> {
         let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
         if d.len() < 12 {
             return Err(bad("bad policy magic"));
@@ -291,13 +355,19 @@ impl Policy {
             return Err(bad("bad policy size"));
         }
         let f: Vec<f32> = d[12..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        Ok(Head::from_f32(&f, nsee))
+    }
+
+    /// One head from its f32 block: bias[98], g[45], (SEE block of `nsee` values, skipped), dest[18][6561], orig[9][6561].
+    pub(crate) fn from_f32(f: &[f32], nsee: usize) -> Head {
+        let n1 = SLOTS + NSCAL + nsee;
         let mut bias = [0f32; SLOTS];
         bias.copy_from_slice(&f[..SLOTS]);
         let mut g = [0f32; NSCAL];
         g.copy_from_slice(&f[SLOTS..SLOTS + NSCAL]);
         let q = |x: &[f32]| -> Vec<i16> { x.iter().map(|v| (v * TQ).round().clamp(-32767.0, 32767.0) as i16).collect() };
-        let (td, tor) = (q(&f[n1..n1 + ND * P3]), q(&f[n1 + ND * P3..]));
-        Ok(Policy { bias, g, td, tor })
+        let (td, tor) = (q(&f[n1..n1 + ND * P3]), q(&f[n1 + ND * P3..n1 + (ND + NO) * P3]));
+        Head { bias, g, td, tor }
     }
 
     /// Logit of move `m` in `b`.
@@ -358,6 +428,64 @@ impl Policy {
         let mut z = j_prefix + from_g;
         z += (j_td + from_tor) as f32 * (1.0 / TQ);
         z
+    }
+}
+
+/// D1320 (user D1312/D1313: every net on the NNUE's empties buckets): the policy = one Head per phase bucket, chosen by
+/// the position's empty squares with the NNUE's own formula, bucket = empties * nb / 50. "TPOL6": magic, u32 dim (0),
+/// u32 nb, then nb x [f32 bias[98], f32 g[45], f32 dest[18][6561], f32 orig[9][6561]] (no SEE block). TPOL3 / TPOL5 load
+/// as ONE bucket (bit-identical to before).
+pub struct Policy {
+    heads: Vec<Head>,
+}
+
+impl Policy {
+    pub fn load(path: &str) -> std::io::Result<Policy> {
+        Self::from_bytes(&std::fs::read(path)?)
+    }
+
+    pub fn from_bytes(d: &[u8]) -> std::io::Result<Policy> {
+        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+        if d.len() >= 16 && &d[..8] == b"TPOL6\0\0\0" {
+            if u32::from_le_bytes(d[8..12].try_into().unwrap()) != 0 {
+                return Err(bad("policy dim must be 0 (no accumulator input)"));
+            }
+            let nb = u32::from_le_bytes(d[12..16].try_into().unwrap()) as usize;
+            let per = SLOTS + NSCAL + (ND + NO) * P3;
+            if nb == 0 || nb > 64 || d.len() != 16 + 4 * per * nb {
+                return Err(bad("bad TPOL6 size"));
+            }
+            let f: Vec<f32> = d[16..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+            let heads = (0..nb).map(|k| Head::from_f32(&f[k * per..(k + 1) * per], 0)).collect();
+            return Ok(Policy { heads });
+        }
+        Ok(Policy { heads: vec![Head::from_bytes(d)?] })
+    }
+
+    /// Number of phase buckets (1 for TPOL3 / TPOL5).
+    pub fn buckets(&self) -> usize {
+        self.heads.len()
+    }
+
+    /// The head of this position's phase bucket (empties * nb / 50, the NNUE's formula).
+    #[inline(always)]
+    pub fn head(&self, b: &Board) -> &Head {
+        let nb = self.heads.len();
+        if nb == 1 {
+            return &self.heads[0];
+        }
+        let e = b.empty().count_ones() as usize;
+        &self.heads[(e * nb / 50).min(nb - 1)]
+    }
+
+    #[inline]
+    pub fn logit(&self, b: &Board, m: Move) -> f32 {
+        self.head(b).logit(b, m)
+    }
+
+    #[inline]
+    pub fn logit_k(&self, b: &Board, m: Move, kc: &mut KCache) -> f32 {
+        self.head(b).logit_k(b, m, kc)
     }
 }
 
