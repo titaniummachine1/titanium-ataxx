@@ -34,7 +34,18 @@ fn main() -> ExitCode {
     if let Some(n) = flag_int(&args, "--ecache-bits") {
         titanium::search::set_ecache_bits(n as usize);
     }
+    // --tune a=1,b@3=2: search knobs per NNUE empties bucket (D1326; `tune-list` prints every knob and its default)
+    if let Some(t) = flag_str(&args, "--tune") {
+        if let Err(e) = titanium::search::set_knobs(&t) {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    }
     match cmd {
+        "tune-list" => {
+            print!("{}", titanium::search::knob_list());
+            ExitCode::SUCCESS
+        }
         "info" => {
             let nn = load_nnue_opt(&args);
             print!("{}", titanium::config::report(nn.as_ref()));

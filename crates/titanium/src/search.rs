@@ -209,6 +209,112 @@ const PC_R: u32 = 3;
 const PC_T: i32 = 140;
 const PC_K: i32 = 32;
 
+/// D1325/D1326 (user): run-time search knobs per NNUE empties bucket (bucket = empties*16/50, as nnue.rs), so the search can
+/// be tuned per game stage like the net, policy and small net. Defaults = the constants above (bit-identical search).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Knobs {
+    pub v: [i32; NKNOB],
+}
+pub const KNOB_BUCKETS: usize = 16;
+pub const NKNOB: usize = 17;
+/// rfp1-4 = RFP margin at depth 1-4; rfp_dis = disagreement share in RFP (/128); iir = min depth of the no-TT-move reduction;
+/// pc_* = ProbCut min depth / reduction / margin / disagreement share; lmr_min/half = Moonbird LMR start index / half-life;
+/// fut_min/div/dis = child futility start index / cp per ply / disagreement credit (/128); fut_ext = child disagreement above
+/// which a futility-reduced child gets one ply back; pol = policy ordering weight in % of the searcher's weight.
+pub const KNOB_NAMES: [&str; NKNOB] = [
+    "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "iir", "pc_d", "pc_r", "pc_t", "pc_k", "lmr_min", "lmr_half", "fut_min",
+    "fut_div", "fut_dis", "fut_ext", "pol",
+];
+const K_RFP: usize = 0;
+const K_RFP_DIS: usize = 4;
+const K_IIR: usize = 5;
+const K_PC_D: usize = 6;
+const K_PC_R: usize = 7;
+const K_PC_T: usize = 8;
+const K_PC_K: usize = 9;
+const K_LMR_MIN: usize = 10;
+const K_LMR_HALF: usize = 11;
+const K_FUT_MIN: usize = 12;
+const K_FUT_DIV: usize = 13;
+const K_FUT_DIS: usize = 14;
+const K_FUT_EXT: usize = 15;
+const K_POL: usize = 16;
+pub const KNOB_DEFAULT: Knobs = Knobs {
+    v: [
+        RFP_MARGINS[0], RFP_MARGINS[1], RFP_MARGINS[2], RFP_MARGINS[3], DIS_RFP_NUM, 4, PC_D as i32, PC_R as i32, PC_T, PC_K,
+        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100,
+    ],
+};
+/// Allowed range per knob (refused outside: keeps every search well defined, e.g. no division by zero or depth underflow).
+const KNOB_RANGE: [(i32, i32); NKNOB] = [
+    (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (1, 64), (2, 64), (1, 63), (0, 5000), (0, 512), (0, 256),
+    (1, 10000), (0, 256), (1, 10000), (0, 512), (0, 16384), (0, 1000),
+];
+static KNOB_TABLE: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceLock::new();
+
+/// Parse `name=v` (all buckets) / `name@b=v` (one bucket) items, comma separated, into the process-wide table (once, at
+/// start-up, before any search). Unknown names, bad buckets, out-of-range values and pc_r >= pc_d are refused.
+pub fn set_knobs(spec: &str) -> Result<(), String> {
+    let t = parse_knobs(spec)?;
+    KNOB_TABLE.set(t).map_err(|_| "--tune: the knob table is already set".to_string())
+}
+
+pub fn parse_knobs(spec: &str) -> Result<[Knobs; KNOB_BUCKETS], String> {
+    let mut t = [KNOB_DEFAULT; KNOB_BUCKETS];
+    for item in spec.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+        let (k, v) = item.split_once('=').ok_or_else(|| format!("--tune item '{item}': expected name=value"))?;
+        let (name, bucket) = match k.split_once('@') {
+            Some((n, b)) => {
+                let b: usize = b.parse().map_err(|_| format!("--tune item '{item}': bad bucket"))?;
+                if b >= KNOB_BUCKETS {
+                    return Err(format!("--tune item '{item}': bucket must be 0..{}", KNOB_BUCKETS - 1));
+                }
+                (n, Some(b))
+            }
+            None => (k, None),
+        };
+        let i = KNOB_NAMES.iter().position(|n| *n == name).ok_or_else(|| format!("--tune: unknown knob '{name}'"))?;
+        let v: i32 = v.parse().map_err(|_| format!("--tune item '{item}': value must be an integer"))?;
+        let (lo, hi) = KNOB_RANGE[i];
+        if v < lo || v > hi {
+            return Err(format!("--tune item '{item}': {name} must be in {lo}..{hi}"));
+        }
+        for (bi, kb) in t.iter_mut().enumerate() {
+            if bucket.map_or(true, |b| b == bi) {
+                kb.v[i] = v;
+            }
+        }
+    }
+    for (bi, kb) in t.iter().enumerate() {
+        if kb.v[K_PC_R] >= kb.v[K_PC_D] {
+            return Err(format!("--tune: bucket {bi}: pc_r ({}) must be below pc_d ({})", kb.v[K_PC_R], kb.v[K_PC_D]));
+        }
+    }
+    Ok(t)
+}
+
+/// `name@bucket default` for every knob (what `titanium-cli tune-list` prints for `ti spsa`).
+pub fn knob_list() -> String {
+    let t = knob_table();
+    let mut s = String::new();
+    for i in 0..NKNOB {
+        for (b, kb) in t.iter().enumerate() {
+            s += &format!("{}@{} {}
+", KNOB_NAMES[i], b, kb.v[i]);
+        }
+    }
+    s
+}
+
+pub fn knob_table() -> [Knobs; KNOB_BUCKETS] {
+    *KNOB_TABLE.get().unwrap_or(&[KNOB_DEFAULT; KNOB_BUCKETS])
+}
+
+#[inline(always)]
+fn knob_bucket(empties: u32) -> usize {
+    ((empties as usize) * KNOB_BUCKETS / 50).min(KNOB_BUCKETS - 1)
+}
+
 #[inline(always)]
 pub fn pack_eval_dis(eval: i32, dis: i32) -> i32 {
     let e = (eval.clamp(-16384, 16383) + 16384) as u32;
@@ -791,6 +897,8 @@ pub struct Searcher<'a> {
     policy: Option<&'a crate::policy::Policy>,
     pol_w: f32,
     pol_min: u32,
+    /// D1326: search knobs per NNUE empties bucket (process table read once at construction; defaults = the constants)
+    knobs: [Knobs; KNOB_BUCKETS],
     /// set_policy was called explicitly: set_nnue must not drop it
     pol_explicit: bool,
     /// Tuple-native eval mode: skip E2/E4 scans, mat+PST+tempo+tuples only.
@@ -875,6 +983,7 @@ impl<'a> Searcher<'a> {
             // D744 fix: the head runs at EVERY depth (d1 included); skipping it at d1 cost -82 Elo (3.9% blunders).
             pol_min: crate::policy::env_f32("TI_POLMIN", 1.0) as u32,
             pol_explicit: false,
+            knobs: knob_table(),
             tup_native: false,
             stack: MoveStack::new(),
             bz_snaps: Vec::with_capacity(MAX_PLY + 64),
@@ -1244,6 +1353,7 @@ impl<'a> Searcher<'a> {
         let alpha_orig = alpha;
         let mut tt_mv: u32 = 0;
         let mut depth = depth;
+        let kbi = knob_bucket(b.empty().count_ones());
         if let Some(e) = self.tt.probe_e(b.hash, b.empty().count_ones() as u8) {
             tt_mv = e.mv;
             if !(BZ && (n_banned > 0 || at_bz_horizon)) && e.depth as u32 >= depth {
@@ -1266,7 +1376,7 @@ impl<'a> Searcher<'a> {
                     return s;
                 }
             }
-        } else if depth >= 4 && !at_bz_horizon {
+        } else if depth >= self.knobs[kbi].v[K_IIR] as u32 && !at_bz_horizon {
             depth -= 1;
         }
 
@@ -1290,7 +1400,7 @@ impl<'a> Searcher<'a> {
             && depth <= 4
             && alpha.abs() < MATE_BOUND
             && beta.abs() < MATE_BOUND
-            && static_eval + RFP_MARGINS[(depth.max(1) - 1) as usize] + ((node_dis * DIS_RFP_NUM) >> 7) < alpha
+            && static_eval + self.knobs[kbi].v[K_RFP + (depth.max(1) - 1) as usize] + ((node_dis * self.knobs[kbi].v[K_RFP_DIS]) >> 7) < alpha
         {
             self.heuristic_used = true;
             return alpha;
@@ -1324,10 +1434,11 @@ impl<'a> Searcher<'a> {
         }
 
         // ProbCut: non-PV, not right after a null, margin widens with the net's disagreement output.
-        if null_allowed && !(BZ && (n_banned > 0 || at_bz_horizon)) && ply > 0 && depth >= PC_D && beta - alpha == 1 && beta.abs() < MATE_BOUND {
-            let pc_beta = beta + PC_T + ((node_dis * PC_K) >> 7);
-            if pc_beta < MATE_BOUND && static_eval + 50 >= pc_beta - 2 * PC_T {
-                let score = self.negamax::<BZ>(b, pc_beta - 1, pc_beta, depth - PC_R, ply, false);
+        if null_allowed && !(BZ && (n_banned > 0 || at_bz_horizon)) && ply > 0 && depth >= self.knobs[kbi].v[K_PC_D] as u32 && beta - alpha == 1 && beta.abs() < MATE_BOUND {
+            let (pc_t, pc_k) = (self.knobs[kbi].v[K_PC_T], self.knobs[kbi].v[K_PC_K]);
+            let pc_beta = beta + pc_t + ((node_dis * pc_k) >> 7);
+            if pc_beta < MATE_BOUND && static_eval + 50 >= pc_beta - 2 * pc_t {
+                let score = self.negamax::<BZ>(b, pc_beta - 1, pc_beta, depth - self.knobs[kbi].v[K_PC_R] as u32, ply, false);
                 if self.stop {
                     return 0;
                 }
@@ -1479,7 +1590,10 @@ impl<'a> Searcher<'a> {
                         ply,
                         &self.killers,
                         &self.history,
-                        Some((pol, self.pol_w)),
+                        Some((pol, {
+                            let k = self.knobs[kbi].v[K_POL];
+                            if k == 100 { self.pol_w } else { self.pol_w * k as f32 / 100.0 }
+                        })),
                     );
                 }
                 _ => {
@@ -1573,12 +1687,13 @@ impl<'a> Searcher<'a> {
                 };
             }
             let mut new_depth = depth as i32;
-            if move_idx >= MB_LMR_MIN_IDX && !at_bz_horizon {
-                new_depth = depth as i32 * MB_LMR_HALFLIFE / (MB_LMR_HALFLIFE + lmr_cnt);
+            if move_idx >= self.knobs[kbi].v[K_LMR_MIN] as usize && !at_bz_horizon {
+                let half = self.knobs[kbi].v[K_LMR_HALF];
+                new_depth = depth as i32 * half / (half + lmr_cnt);
                 lmr_cnt += 1;
             }
             let mut child_eval = i32::MIN;
-            if move_idx >= MB_FUT_MIN_IDX
+            if move_idx >= self.knobs[kbi].v[K_FUT_MIN] as usize
                 && !at_bz_horizon
                 && new_depth > 0
                 && alpha.abs() < MATE_BOUND
@@ -1605,7 +1720,7 @@ impl<'a> Searcher<'a> {
                             static_eval,
                             hand,
                         );
-                        if new_depth - (alpha.saturating_add(lo) / MB_FUT_DIV).clamp(0, 64) <= 0
+                        if new_depth - (alpha.saturating_add(lo) / self.knobs[kbi].v[K_FUT_DIV]).clamp(0, 64) <= 0
                             && best > -MATE_BOUND
                         {
                             self.heuristic_used = true;
@@ -1635,10 +1750,10 @@ impl<'a> Searcher<'a> {
                     self.leaf_eval_with_dis(&child)
                 };
                 child_eval = pack_eval_dis(ce, child_dis);
-                let vol_credit = (child_dis * DIS_FUT_NUM) >> 7;
+                let vol_credit = (child_dis * self.knobs[kbi].v[K_FUT_DIS]) >> 7;
                 let shortfall = alpha.saturating_add(ce) - vol_credit;
-                new_depth -= (shortfall / MB_FUT_DIV).clamp(0, 64);
-                if child_dis > 300 && new_depth < depth as i32 {
+                new_depth -= (shortfall / self.knobs[kbi].v[K_FUT_DIV]).clamp(0, 64);
+                if child_dis > self.knobs[kbi].v[K_FUT_EXT] && new_depth < depth as i32 {
                     new_depth += 1;
                 }
             }
@@ -2132,6 +2247,24 @@ pub fn best_move(b: &Board, limits: &SearchLimits) -> SearchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn knob_spec_parses_and_refuses() {
+        let t = parse_knobs("").unwrap();
+        assert!(t.iter().all(|k| *k == KNOB_DEFAULT));
+        let t = parse_knobs("fut_div=60, rfp1@3=200").unwrap();
+        assert_eq!(t[0].v[K_FUT_DIV], 60);
+        assert_eq!(t[15].v[K_FUT_DIV], 60);
+        assert_eq!(t[3].v[K_RFP], 200);
+        assert_eq!(t[4].v[K_RFP], RFP_MARGINS[0]);
+        assert!(parse_knobs("nope=1").is_err());
+        assert!(parse_knobs("fut_div=0").is_err());
+        assert!(parse_knobs("rfp1@16=1").is_err());
+        assert!(parse_knobs("pc_r=6").is_err());
+        assert_eq!(knob_bucket(49), 15);
+        assert_eq!(knob_bucket(0), 0);
+        assert_eq!(knob_bucket(4), 1);
+    }
     use crate::board::Board;
 
     fn no_time(depth: u8) -> SearchLimits {
