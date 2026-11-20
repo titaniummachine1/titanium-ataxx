@@ -398,7 +398,7 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
     ply: u32,
     killers: &[(u32, u32); MAX_PLY],
     history: &History,
-    pol: Option<(&crate::policy::Policy, f32)>,
+    pol: Option<(&crate::policy::Head, f32)>,
 ) {
     use std::mem::MaybeUninit;
 
@@ -1479,7 +1479,7 @@ impl<'a> Searcher<'a> {
                         ply,
                         &self.killers,
                         &self.history,
-                        Some((pol, self.pol_w)),
+                        Some((pol.head(b), self.pol_w)),
                     );
                 }
                 _ => {
@@ -2923,7 +2923,7 @@ xxx....
 
                 // Check SKIP_TT = true (all non-TT moves in identical order with identical scores)
                 match active_pol {
-                    Some(p) => gen_and_score_into::<true, true>(&b, &mut new_list, tt_mv, ply, &killers, &history, Some((p, pol_w))),
+                    Some(p) => gen_and_score_into::<true, true>(&b, &mut new_list, tt_mv, ply, &killers, &history, Some((p.head(&b), pol_w))),
                     None => gen_and_score_into::<true, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None),
                 }
                 let expected_skip: Vec<(Move, i32)> = expected.iter().copied().enumerate().filter(|(i, _)| Some(*i) != tt_pos).map(|(_, v)| v).collect();
