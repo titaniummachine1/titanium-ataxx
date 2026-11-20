@@ -4,7 +4,7 @@
 //!
 //! Shape = Zataxx's net: 36 overlapping 2x2 windows over the 7x7 board, each window one of 3^4 = 81 states (empty / side to
 //! move / other), 2916 one-hot rows, ONE accumulator of W = 256 (the child's side to move's view), SCReLU, no hidden layer,
-//! a per-bucket (8 empties buckets) linear output, plus per-bucket skips of the parent's static eval and the child's hand
+//! a per-bucket (32 empties buckets, each NNUE bucket split in two, D1314/D1317) linear output, plus per-bucket skips of the parent's static eval and the child's hand
 //! eval. Blockers are ignored (as in the trained model). Layout "TSN2" (see `parse`); the weights are compiled in.
 //!
 //! Integer inference (QA 255): accumulator = bias + sum of 36 rows (i16), c = clamp(acc, 0, 255), s = (c*c) >> 1 (0..32512),
@@ -12,7 +12,7 @@
 //! of the CHILDREN's side to move (the parent's opponent as "us"); a child's accumulator is that one with the windows the
 //! move changed swapped (2 row ops per changed window) -- exactly the incremental form the speed bench measured.
 
-pub const NB: usize = 8;
+pub const NB: usize = 32;
 pub const W: usize = 256;
 const NWIN: usize = 36;
 const WSTATES: usize = 81;
