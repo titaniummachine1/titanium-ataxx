@@ -224,7 +224,7 @@ pub struct Knobs {
     pub v: [i32; NKNOB],
 }
 pub const KNOB_BUCKETS: usize = 16;
-pub const NKNOB: usize = 39;
+pub const NKNOB: usize = 40;
 /// rfp1-4 = RFP margin at depth 1-4; rfp_dis = disagreement share in RFP (/128); iir = min depth of the no-TT-move reduction;
 /// pc_* = ProbCut min depth / reduction / margin / disagreement share; lmr_min/half = Moonbird LMR start index / half-life;
 /// fut_min/div/dis = child futility start index / cp per ply / disagreement credit (/128); fut_ext = child disagreement above
@@ -232,7 +232,7 @@ pub const NKNOB: usize = 39;
 pub const KNOB_NAMES: [&str; NKNOB] = [
     "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "iir", "pc_d", "pc_r", "pc_t", "pc_k", "lmr_min", "lmr_half", "fut_min",
     "fut_div", "fut_dis", "fut_ext", "pol", "lmp1", "lmp2", "lmp3", "fp_d", "fp_base", "fp_mul", "fp_min",
-    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t", "asp",
+    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t", "asp", "mate_full",
 ];
 const K_RFP: usize = 0;
 const K_RFP_DIS: usize = 4;
@@ -284,17 +284,19 @@ const K_CH_W: usize = 36;
 const K_SW_T: usize = 37;
 /// D1489 aspiration window half-width cp at the root (root bucket), doubling on each fail; 0 = off (full window)
 const K_ASP: usize = 38;
+/// D1491 losing-node full search: once every move tried at a node loses by force, the rest are searched unreduced (0/1)
+const K_MATE_FULL: usize = 39;
 pub const KNOB_DEFAULT: Knobs = Knobs {
     v: [
         RFP_MARGINS[0], RFP_MARGINS[1], RFP_MARGINS[2], RFP_MARGINS[3], DIS_RFP_NUM, 4, PC_D as i32, PC_R as i32, PC_T, PC_K,
-        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0, 0,
+        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0, 0, 0,
     ],
 };
 /// Allowed range per knob (refused outside: keeps every search well defined, e.g. no division by zero or depth underflow).
 const KNOB_RANGE: [(i32, i32); NKNOB] = [
     (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (1, 64), (2, 64), (1, 63), (0, 5000), (0, 512), (0, 256),
     (1, 10000), (0, 256), (1, 10000), (0, 512), (0, 16384), (0, 1000), (0, 256), (0, 256), (0, 256), (0, 8), (0, 5000),
-    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000), (0, 5000),
+    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000), (0, 5000), (0, 1),
 ];
 static KNOB_TABLE: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceLock::new();
 
@@ -974,6 +976,8 @@ pub struct WorkStats {
     pub qlmp_skips: u64,
     /// D1488 reduced moves given a ply back for a large static-eval swing (sw_t)
     pub sw_relief: u64,
+    /// D1491 moves searched unreduced because every earlier move at the node lost by force (mate_full)
+    pub mate_full: u64,
 }
 
 impl WorkStats {
@@ -1002,14 +1006,15 @@ impl WorkStats {
         self.se_neg += o.se_neg;
         self.qlmp_skips += o.qlmp_skips;
         self.sw_relief += o.sw_relief;
+        self.mate_full += o.mate_full;
     }
 
     /// one-line breakdown for debug output (bench, Botzone debug line). `nodes` = made positions (Stockfish count);
     /// made = entered children + children scored and pruned + children dropped unscored.
     pub fn breakdown(&self, nodes: u64) -> String {
         let cuts = self.terminals + self.tt_cuts + self.rfp_cuts + self.null_cuts + self.probcut_cuts + self.leaves + self.ttmove_cuts;
-        let extra = if self.se_tries + self.qlmp_skips + self.sw_relief > 0 {
-            format!(" se={}/ext{}/cut{}/neg{} qlmp={} sw={}", self.se_tries, self.se_ext, self.se_cut, self.se_neg, self.qlmp_skips, self.sw_relief)
+        let extra = if self.se_tries + self.qlmp_skips + self.sw_relief + self.mate_full > 0 {
+            format!(" se={}/ext{}/cut{}/neg{} qlmp={} sw={} matefull={}", self.se_tries, self.se_ext, self.se_cut, self.se_neg, self.qlmp_skips, self.sw_relief, self.mate_full)
         } else {
             String::new()
         };
@@ -2208,6 +2213,13 @@ impl<'a> Searcher<'a> {
             // for a shorter mate), never skip remaining legal moves without searching them.
             if best <= -MATE_BOUND || alpha >= MATE_BOUND {
                 new_depth = new_depth.max(1);
+            }
+            // D1491 (user: follow the mate score instead of pushing it past the horizon): when every move searched so far at
+            // this node loses by force, a reduced search may only "prove" the loss because it pruned the defence: search the
+            // remaining moves unreduced (mate_full = 1; 0 = off)
+            if self.knobs[kbi].v[K_MATE_FULL] > 0 && best != i32::MIN && best <= -MATE_BOUND && !at_bz_horizon && new_depth < depth as i32 {
+                new_depth = depth as i32;
+                self.work_add(|w| w.mate_full += 1);
             }
             if new_depth <= 0 {
                 self.heuristic_used = true;
