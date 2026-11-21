@@ -425,6 +425,7 @@ fn bench_cmd(
         r.nodes,
         r.nodes as f64 / secs
     );
+    print_work(r.nodes, secs, searcher.work_stats());
     // exp/policy: BENCH_BOOK=<file of "<49 cells> <w|b>" lines> BENCH_N=<positions> BENCH_DEPTH=<fixed depth> [TI_POLICY=<TPOL1 file> TI_POLW TI_POLMIN]
     if let Ok(path) = std::env::var("BENCH_BOOK") {
         let n: usize = std::env::var("BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
@@ -436,6 +437,7 @@ fn bench_cmd(
         let step = (text.lines().count() / n.max(1)).max(1);
         let (mut total, mut done, mut secs_tot) = (0u64, 0usize, 0f64);
         let mut firsts = Vec::new();
+        let mut wsum = titanium::search::WorkStats::default();
         for line in text.lines().step_by(step).take(n) {
             let Some(pos) = Board::from_str(line) else { continue };
             let mut s = Searcher::new_unconfigured();
@@ -446,14 +448,42 @@ fn bench_cmd(
             let lim = SearchLimits { time: None, max_nodes: None, max_depth: d };
             let rr = s.search(&pos, &lim);
             total += rr.nodes;
+            let w = s.work_stats();
+            wsum.children_pruned += w.children_pruned;
+            wsum.big_evals += w.big_evals;
+            wsum.sn_bounds += w.sn_bounds;
+            wsum.hand_evals += w.hand_evals;
+            wsum.ec_lookups += w.ec_lookups;
+            wsum.ec_hits += w.ec_hits;
             secs_tot += rr.elapsed.as_secs_f64();
             firsts.push(move_str(rr.best));
             done += 1;
         }
         println!("--- policy bench: {done} positions at depth {d}: nodes {total} time {secs_tot:.2}s nps {:.0} policy {} w {pw} min {pm}", total as f64 / secs_tot, pol.is_some());
+        print_work(total, secs_tot, wsum);
         println!("bestmoves hash {:016x}", firsts.iter().fold(0xcbf29ce484222325u64, |h, s| s.bytes().fold(h, |h, c| (h ^ c as u64).wrapping_mul(0x100000001b3))));
     }
     ExitCode::SUCCESS
+}
+
+/// D1404: honest work readout next to nps (positions = entered nodes + children scored and pruned without entering).
+fn print_work(nodes: u64, secs: f64, w: titanium::search::WorkStats) {
+    let s = secs.max(1e-9);
+    let pos = nodes + w.children_pruned;
+    println!(
+        "  work: positions {pos} ({:.0}/s) = nodes {nodes} + pruned children {} | big-net evals {} ({:.2}/node, {:.0}/s) | smallnet bounds {} ({:.2}/node) | hand evals {} | eval cache hits {}/{} ({:.1}%)",
+        pos as f64 / s,
+        w.children_pruned,
+        w.big_evals,
+        w.big_evals as f64 / nodes.max(1) as f64,
+        w.big_evals as f64 / s,
+        w.sn_bounds,
+        w.sn_bounds as f64 / nodes.max(1) as f64,
+        w.hand_evals,
+        w.ec_hits,
+        w.ec_lookups,
+        100.0 * w.ec_hits as f64 / w.ec_lookups.max(1) as f64
+    );
 }
 
 // ---------- move text ----------

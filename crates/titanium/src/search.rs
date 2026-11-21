@@ -863,8 +863,28 @@ pub struct SearchResult {
     pub stopped_by: Option<StopReason>,
 }
 
+/// D1404: honest work counters of one search (plain counts, node-identical). `nodes` counts only positions the search
+/// ENTERED; a late child that is made and statically scored and then pruned never becomes a node, so engines that count
+/// every evaluated leaf report several times our nps for the same work. positions = nodes + children_pruned.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WorkStats {
+    /// children made + statically scored + pruned without being entered
+    pub children_pruned: u64,
+    /// big-net forward passes (node static evals + child futility evals)
+    pub big_evals: u64,
+    /// futility small-net bounds
+    pub sn_bounds: u64,
+    /// hand-eval calls in the search (child pre-filter + hand-eval fallback)
+    pub hand_evals: u64,
+    /// eval-cache lookups / hits (node static evals and child evals)
+    pub ec_lookups: u64,
+    pub ec_hits: u64,
+}
+
 pub struct Searcher<'a> {
     pub nodes: u64,
+    /// D1404 honest work counters (Cell: also counted from &self eval helpers)
+    work: std::cell::Cell<WorkStats>,
     /// Absolute deadline in milliseconds (via `time_src`), if time-limited.
     deadline_ms: Option<f64>,
     start_ms: f64,
@@ -971,6 +991,7 @@ impl<'a> Searcher<'a> {
     pub fn with_tt_bits_unconfigured(bits: usize) -> Searcher<'a> {
         Searcher {
             nodes: 0,
+            work: std::cell::Cell::new(WorkStats::default()),
             deadline_ms: None,
             start_ms: 0.0,
             stop: false,
@@ -1109,6 +1130,18 @@ impl<'a> Searcher<'a> {
         }
     }
 
+    #[inline(always)]
+    fn work_add(&self, f: impl FnOnce(&mut WorkStats)) {
+        let mut w = self.work.get();
+        f(&mut w);
+        self.work.set(w);
+    }
+
+    /// D1404: honest work counters of the last search (see `WorkStats`)
+    pub fn work_stats(&self) -> WorkStats {
+        self.work.get()
+    }
+
     #[inline]
     fn leaf_eval(&mut self, b: &Board) -> i32 {
         self.leaf_eval_with_dis(b).0
@@ -1116,7 +1149,9 @@ impl<'a> Searcher<'a> {
 
     #[inline]
     fn leaf_eval_with_dis(&mut self, b: &Board) -> (i32, i32) {
+        self.work_add(|w| w.ec_lookups += 1);
         if let Some(v) = self.ec2_get(b) {
+            self.work_add(|w| w.ec_hits += 1);
             return unpack_eval_dis(v);
         }
         let (eval, dis) = self.leaf_eval_raw_with_dis(b);
@@ -1126,6 +1161,7 @@ impl<'a> Searcher<'a> {
 
     #[inline]
     fn leaf_eval_raw_with_dis(&self, b: &Board) -> (i32, i32) {
+        self.work_add(|w| if self.nnue.is_some() { w.big_evals += 1 } else { w.hand_evals += 1 });
         match self.nnue {
             // v2 nets carry an S57 skip input (the tuple eval of the same board); v1 ignores it
             Some(nn) if nn.v2 => nn.eval_with_dis(b, evaluate(b, self.tuple, self.tup_native)),
@@ -1722,8 +1758,18 @@ impl<'a> Searcher<'a> {
                 let mut hand_cache: Option<i32> = None;
                 if self.fut_sn && self.nnue.is_some() {
                     cached_eval = self.ec2_get(&child).map(unpack_eval_dis);
+                    self.work_add(|w| {
+                        w.ec_lookups += 1;
+                        if cached_eval.is_some() {
+                            w.ec_hits += 1;
+                        }
+                    });
                     if cached_eval.is_none() {
                         let hand = evaluate(&child, None, false);
+                        self.work_add(|w| {
+                            w.hand_evals += 1;
+                            w.sn_bounds += 1;
+                        });
                         hand_cache = Some(hand);
                         let (bt, ct) = (b.turn as usize, child.turn as usize);
                         let sn = small_net();
@@ -1743,6 +1789,7 @@ impl<'a> Searcher<'a> {
                             && best > -MATE_BOUND
                         {
                             self.heuristic_used = true;
+                            self.work_add(|w| w.children_pruned += 1);
                             move_idx += 1;
                             continue;
                         }
@@ -1755,6 +1802,7 @@ impl<'a> Searcher<'a> {
                         self.nnue,
                         hand_cache.filter(|_| self.tuple.is_none() && !self.tup_native),
                     ) {
+                        self.work_add(|w| w.big_evals += 1);
                         if nn.v2 {
                             nn.eval_with_dis(&child, h)
                         } else {
@@ -1783,6 +1831,9 @@ impl<'a> Searcher<'a> {
             }
             if new_depth <= 0 {
                 self.heuristic_used = true;
+                if child_eval != i32::MIN {
+                    self.work_add(|w| w.children_pruned += 1);
+                }
                 move_idx += 1;
                 continue;
             }
@@ -1987,6 +2038,7 @@ impl<'a> Searcher<'a> {
         }
         self.start_ms = (self.time_src)();
         self.nodes = 0;
+        self.work.set(WorkStats::default());
         self.stop = false;
         self.stop_reason = StopReason::Completed;
         self.node_limit = limits.max_nodes;
