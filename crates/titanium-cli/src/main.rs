@@ -448,13 +448,7 @@ fn bench_cmd(
             let lim = SearchLimits { time: None, max_nodes: None, max_depth: d };
             let rr = s.search(&pos, &lim);
             total += rr.nodes;
-            let w = s.work_stats();
-            wsum.children_pruned += w.children_pruned;
-            wsum.big_evals += w.big_evals;
-            wsum.sn_bounds += w.sn_bounds;
-            wsum.hand_evals += w.hand_evals;
-            wsum.ec_lookups += w.ec_lookups;
-            wsum.ec_hits += w.ec_hits;
+            wsum.add(&s.work_stats());
             secs_tot += rr.elapsed.as_secs_f64();
             firsts.push(move_str(rr.best));
             done += 1;
@@ -466,24 +460,20 @@ fn bench_cmd(
     ExitCode::SUCCESS
 }
 
-/// D1404: honest work readout next to nps (positions = entered nodes + children scored and pruned without entering).
+/// D1404/D1421: honest work readout next to nps: every visited position (entered nodes + children made, then scored
+/// and pruned or dropped unscored) with its per-second rate, and the node-type breakdown.
 fn print_work(nodes: u64, secs: f64, w: titanium::search::WorkStats) {
     let s = secs.max(1e-9);
-    let pos = nodes + w.children_pruned;
     println!(
-        "  work: positions {pos} ({:.0}/s) = nodes {nodes} + pruned children {} | big-net evals {} ({:.2}/node, {:.0}/s) | smallnet bounds {} ({:.2}/node) | hand evals {} | eval cache hits {}/{} ({:.1}%)",
-        pos as f64 / s,
-        w.children_pruned,
-        w.big_evals,
-        w.big_evals as f64 / nodes.max(1) as f64,
+        "  work: nodes (made positions) {:.0}/s, entered {:.0}/s, big-net evals {:.0}/s ({:.2}/entered), smallnet bounds {:.2}/entered, eval cache hits {:.1}%",
+        nodes as f64 / s,
+        w.entered as f64 / s,
         w.big_evals as f64 / s,
-        w.sn_bounds,
-        w.sn_bounds as f64 / nodes.max(1) as f64,
-        w.hand_evals,
-        w.ec_hits,
-        w.ec_lookups,
+        w.big_evals as f64 / w.entered.max(1) as f64,
+        w.sn_bounds as f64 / w.entered.max(1) as f64,
         100.0 * w.ec_hits as f64 / w.ec_lookups.max(1) as f64
     );
+    println!("  work: {}", w.breakdown(nodes));
 }
 
 // ---------- move text ----------

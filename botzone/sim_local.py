@@ -181,6 +181,8 @@ def run_game(args, driver_black):
     margins, times, first = [], [], True
     req = (-1, -1, -1, -1)
     dmoves = 0
+    fb = 0
+    eng_margin = []
     try:
         while not g.over():
             if g.turn == drv_side:
@@ -194,6 +196,15 @@ def run_game(args, driver_black):
                 mv = tuple(int(v) for v in resp[0].split())
                 g.play(mv)                       # raises if the driver sent an illegal move
                 margins.append(limit - el)
+                # D1415: in-library session debug line: 'FALLBACK best-so-far tN rust' = the watchdog answered;
+                # otherwise 'd.. n.. tN ...' = the engine answered at N ms after the request arrived
+                dbg = resp[1] if len(resp) > 1 else ""
+                if "FALLBACK" in dbg:
+                    fb += 1
+                for tok in dbg.split():
+                    if tok.startswith("t") and tok[1:].isdigit():
+                        eng_margin.append(limit - int(tok[1:]))
+                        break
                 times.append(el)
                 first = False
                 dmoves += 1
@@ -212,7 +223,11 @@ def run_game(args, driver_black):
             proc.kill()
     errs = proc.stderr.read().splitlines()
     over = [float(l.split("over=")[1].split()[0]) for l in errs if "over=" in l]
-    wd = sum(int(l.split("watchdog=")[1]) for l in errs if "watchdog=" in l)
+    wd = sum(int(l.split("watchdog=")[1]) for l in errs if "watchdog=" in l) + fb
+    if eng_margin:
+        s = sorted(eng_margin)
+        print("  in-library answers: %d engine, %d FALLBACK; engine answer margin to the limit (ms): min %d median %d"
+              % (len(eng_margin), fb, s[0], s[len(s) // 2]))
     return drv_side, res, margins, times, dmoves, g.over(), over, wd
 
 

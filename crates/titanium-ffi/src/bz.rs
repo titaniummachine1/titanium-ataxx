@@ -225,6 +225,8 @@ fn serve_inner(e: &mut TiEngine, first_ms: u32, turn_ms: u32, pad_stop_ms: u32, 
         let deadline = t0 + Duration::from_millis(limit.saturating_sub(pad_stop_ms as u64));
         let budget = deadline.saturating_duration_since(Instant::now()).as_millis().max(1) as u64;
         let res = search_core(e, budget, 0, 255);
+        // D1415: honest work next to the node count (positions = entered nodes + children scored and pruned without entering)
+        let w = e.searcher.work_stats();
         let mut g = sh.m.lock().unwrap();
         g.hard = None;
         let played: (i32, i32, i32, i32);
@@ -244,11 +246,12 @@ fn serve_inner(e: &mut TiEngine, first_ms: u32, turn_ms: u32, pad_stop_ms: u32, 
                     emit(
                         mine,
                         &format!(
-                            "d{} n{} t{:.0} s{}{} bundled-main/rust",
+                            "d{} n{} t{:.0} s{} {}{} bundled-main/rust",
                             st.depth,
                             st.nodes,
                             t0.elapsed().as_secs_f64() * 1000.0,
                             st.score,
+                            w.breakdown(st.nodes),
                             if st.repetition_override != 0 { " rep" } else { "" }
                         ),
                     );

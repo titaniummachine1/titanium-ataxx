@@ -38,12 +38,12 @@ if MODE == "long":
 else:
     FIRST_LIMIT_MS = int(os.environ.get("TI_FIRST_MS", "12000"))
     TURN_LIMIT_MS = 6000
-SAFETY_MS = 10                # TOTAL padding before the limit: the engine stops its own clock here and the answer is written (D662)
+SAFETY_MS = 5                 # TOTAL padding before the limit: the engine stops its own clock here and the answer is written (D662; 10->5 D1408: 1375 logged moves never came closer than 10 ms)
 ENGINE_SAFETY_MS = 0         # the engine's own extra margin: none, the driver owns the clock (ti_stop + hard-deadline backup answer)
 STARTUP_MS = 120            # assumed interpreter start-up when the process age cannot be measured
 MAX_SANE_AGE_MS = 3000      # a measured process age above this (or below 0) is a measurement error
 OUT_RESERVE_MS = 0
-HARD_RESERVE_MS = 4          # backup answer (the engine's best move so far) is sent at limit - this if the engine has not answered (D661/D662)
+HARD_RESERVE_MS = 2          # backup answer at limit - this if the engine has not answered (D661/D662; 4->2 D1415: the engine stops at limit-5 and since D1415 polls its clock every node in the last 10 ms, so it returns within one node; the backup move = the search best incl. the partial iteration)
 WATCHDOG_GRACE_MS = 1             # ti_stop is sent this long after the budget, a net under the engine's own exact deadline
 RETRY_RESERVE_MS = 400      # a resuscitated search needs at least this much time left
 SCALE = float(os.environ.get("TI_TIME_SCALE", "1.0"))

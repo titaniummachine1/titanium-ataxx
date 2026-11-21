@@ -152,6 +152,8 @@ const MATE_BOUND: i32 = MATE - 2000;
 /// Search window infinity: finite and just above every real score (Stockfish VALUE_INFINITE style). The old
 /// i32::MIN+1 / i32::MAX window ends leaked into null-window searches as "scores" and made score_to_tt overflow.
 const INF: i32 = MATE + 1000;
+/// D1415: inside this many ms of the deadline the search polls its clock and stop flag at every node (see `poll_mask`).
+const FINE_POLL_MS: f64 = 10.0;
 
 /// Search stack supports the full u8 depth range plus the root ply.
 const MAX_PLY: usize = u8::MAX as usize + 1;
@@ -881,14 +883,85 @@ pub struct WorkStats {
     /// eval-cache lookups / hits (node static evals and child evals)
     pub ec_lookups: u64,
     pub ec_hits: u64,
+    /// D1421 node types of the ENTERED nodes (the rest of `nodes` generated moves and searched children):
+    /// game-over / 401-ply horizon, TT score cutoff, reverse futility, null-move cut, ProbCut, depth-0 static leaf,
+    /// TT-move beta cutoff before move generation
+    pub terminals: u64,
+    pub tt_cuts: u64,
+    pub rfp_cuts: u64,
+    pub null_cuts: u64,
+    pub probcut_cuts: u64,
+    pub leaves: u64,
+    pub ttmove_cuts: u64,
+    /// D1421 children: pruned on the SmallNet bound alone (subset of children_pruned; the rest were pruned after a
+    /// big-net or cached eval) and children made but dropped unscored (LMR depth 0 without a futility eval, repetitions)
+    pub pruned_sn: u64,
+    pub made_unscored: u64,
+    /// positions the search entered (negamax calls; the root and null-move children included)
+    pub entered: u64,
+}
+
+impl WorkStats {
+    /// add another search's counters (bench totals)
+    pub fn add(&mut self, o: &WorkStats) {
+        self.children_pruned += o.children_pruned;
+        self.big_evals += o.big_evals;
+        self.sn_bounds += o.sn_bounds;
+        self.hand_evals += o.hand_evals;
+        self.ec_lookups += o.ec_lookups;
+        self.ec_hits += o.ec_hits;
+        self.terminals += o.terminals;
+        self.tt_cuts += o.tt_cuts;
+        self.rfp_cuts += o.rfp_cuts;
+        self.null_cuts += o.null_cuts;
+        self.probcut_cuts += o.probcut_cuts;
+        self.leaves += o.leaves;
+        self.ttmove_cuts += o.ttmove_cuts;
+        self.pruned_sn += o.pruned_sn;
+        self.made_unscored += o.made_unscored;
+        self.entered += o.entered;
+    }
+
+    /// one-line breakdown for debug output (bench, Botzone debug line). `nodes` = made positions (Stockfish count);
+    /// made = entered children + children scored and pruned + children dropped unscored.
+    pub fn breakdown(&self, nodes: u64) -> String {
+        let cuts = self.terminals + self.tt_cuts + self.rfp_cuts + self.null_cuts + self.probcut_cuts + self.leaves + self.ttmove_cuts;
+        format!(
+            "nodes={} entered={} [expanded={} ttmove_cut={} tt={} rfp={} null={} probcut={} leaf={} term={}] child_pruned_sn={} child_pruned_eval={} child_unscored={} big={} sn={} ec_hit={}/{}",
+            nodes,
+            self.entered,
+            self.entered.saturating_sub(cuts) + self.ttmove_cuts,
+            self.ttmove_cuts,
+            self.tt_cuts,
+            self.rfp_cuts,
+            self.null_cuts,
+            self.probcut_cuts,
+            self.leaves,
+            self.terminals,
+            self.pruned_sn,
+            self.children_pruned.saturating_sub(self.pruned_sn),
+            self.made_unscored,
+            self.big_evals,
+            self.sn_bounds,
+            self.ec_hits,
+            self.ec_lookups
+        )
+    }
 }
 
 pub struct Searcher<'a> {
+    /// D1422 Stockfish convention: every position MADE by the search (root moves, TT-move fast path, move loop;
+    /// null moves not counted) is one node. Node limits, nps and reported nodes all use this count.
     pub nodes: u64,
+    /// positions the search ENTERED (negamax calls; the pre-D1422 node count); drives the clock/stop poll cadence
+    entered: u64,
     /// D1404 honest work counters (Cell: also counted from &self eval helpers)
     work: std::cell::Cell<WorkStats>,
     /// Absolute deadline in milliseconds (via `time_src`), if time-limited.
     deadline_ms: Option<f64>,
+    /// D1415: clock/stop poll cadence mask (63 = every 64 nodes; 0 = every node once the deadline is under FINE_POLL_MS away, so the
+    /// search stops within one node of its deadline instead of up to 64 heavy nodes late).
+    poll_mask: u64,
     start_ms: f64,
     stop: bool,
     stop_reason: StopReason,
@@ -993,8 +1066,10 @@ impl<'a> Searcher<'a> {
     pub fn with_tt_bits_unconfigured(bits: usize) -> Searcher<'a> {
         Searcher {
             nodes: 0,
+            entered: 0,
             work: std::cell::Cell::new(WorkStats::default()),
             deadline_ms: None,
+            poll_mask: 63,
             start_ms: 0.0,
             stop: false,
             stop_reason: StopReason::Completed,
@@ -1141,7 +1216,9 @@ impl<'a> Searcher<'a> {
 
     /// D1404: honest work counters of the last search (see `WorkStats`)
     pub fn work_stats(&self) -> WorkStats {
-        self.work.get()
+        let mut w = self.work.get();
+        w.entered = self.entered;
+        w
     }
 
     #[inline]
@@ -1218,7 +1295,7 @@ impl<'a> Searcher<'a> {
                 return;
             }
         }
-        if self.nodes & 63 == 0 {
+        if self.entered & self.poll_mask == 0 {
             if let Some(f) = &self.ext_stop {
                 if f.load(std::sync::atomic::Ordering::Relaxed) {
                     self.stop = true;
@@ -1227,9 +1304,13 @@ impl<'a> Searcher<'a> {
                 }
             }
             if let Some(dl) = self.deadline_ms {
-                if (self.time_src)() >= dl {
+                let now = (self.time_src)();
+                if now >= dl {
                     self.stop = true;
                     self.stop_reason = StopReason::Time;
+                } else if dl - now < FINE_POLL_MS {
+                    // D1415: near the deadline poll every node (one clock read ~25 ns per node for the last few ms only)
+                    self.poll_mask = 0;
                 }
             }
         }
@@ -1337,7 +1418,7 @@ impl<'a> Searcher<'a> {
         ply: u32,
         null_allowed: bool,
     ) -> i32 {
-        self.nodes += 1;
+        self.entered += 1;
         if BZ {
             self.bz_ply[ply as usize].tainted = false;
         }
@@ -1360,14 +1441,17 @@ impl<'a> Searcher<'a> {
             // if either side has no legal moves, or wipeout/full, the game ends immediately.
             let (over, hm0, hm1) = b.bz_status();
             if over {
+                self.work_add(|w| w.terminals += 1);
                 return bz_terminal_score_counts(b, hm0, hm1, ply);
             }
             // Judge also ends the game unconditionally after ply 401 (Black's 201st half-move).
             if ply >= self.bz_max_plies {
+                self.work_add(|w| w.terminals += 1);
                 self.bz_ply[ply as usize].tainted = true;
                 return bz_terminal_score_counts(b, hm0, hm1, ply);
             }
         } else if b.game_over() {
+            self.work_add(|w| w.terminals += 1);
             return terminal_score(b, ply);
         }
 
@@ -1429,6 +1513,7 @@ impl<'a> Searcher<'a> {
                     if s.abs() < MATE_BOUND || (MATE - s.abs()) as u32 >= depth {
                         self.heuristic_used = true;
                     }
+                    self.work_add(|w| w.tt_cuts += 1);
                     return s;
                 }
             }
@@ -1459,6 +1544,7 @@ impl<'a> Searcher<'a> {
             && static_eval + self.knobs[kbi].v[K_RFP + (depth.max(1) - 1) as usize] + ((node_dis * self.knobs[kbi].v[K_RFP_DIS]) >> 7) < alpha
         {
             self.heuristic_used = true;
+            self.work_add(|w| w.rfp_cuts += 1);
             return alpha;
         }
 
@@ -1484,6 +1570,7 @@ impl<'a> Searcher<'a> {
                 }
                 if score >= beta {
                     self.heuristic_used = true;
+                    self.work_add(|w| w.null_cuts += 1);
                     return if score >= MATE_BOUND { beta } else { score };
                 }
             }
@@ -1505,6 +1592,7 @@ impl<'a> Searcher<'a> {
                 }
                 if score >= pc_beta && score < MATE_BOUND && !pc_tainted && !at_bz_horizon {
                     self.heuristic_used = true;
+                    self.work_add(|w| w.probcut_cuts += 1);
                     return score - (pc_beta - beta);
                 }
             }
@@ -1519,6 +1607,7 @@ impl<'a> Searcher<'a> {
             }
             // Note: `static_eval` depends only on `b`, so depth-0 leaves with legal unbanned moves remain untainted (`false` from entry).
             self.heuristic_used = true;
+            self.work_add(|w| w.leaves += 1);
             return static_eval;
         }
 
@@ -1552,6 +1641,7 @@ impl<'a> Searcher<'a> {
                 }
                 if !is_rep {
                     let child = b.make(m);
+                    self.nodes += 1;
                     if !BZ && !m.is_clone() {
                         let base = self.stack.rep_base[ply as usize] as usize;
                         if (ply as usize) >= base + 1 {
@@ -1627,6 +1717,7 @@ impl<'a> Searcher<'a> {
                                 if !(BZ && tainted) {
                                     self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply);
                                 }
+                                self.work_add(|w| w.ttmove_cuts += 1);
                                 return best;
                             }
                         }
@@ -1683,7 +1774,14 @@ impl<'a> Searcher<'a> {
         loop {
             // D1409: no move after this one can be searched or scored -> stop instead of making and skipping each one.
             // (a) LMR alone takes the depth to 0 (it only grows with lmr_cnt); (b) move-count pruning lmp1-3 (knobs, 0 = off).
-            if !at_bz_horizon && best > -MATE_BOUND && alpha < MATE_BOUND && (!BZ || n_banned == 0) {
+            // D1419: only when a move is left (an empty list is a normal end and must not mark the node as pruned:
+            // heuristic_used = true there wrongly blocked the 'whole tree resolved' early stop of iterative deepening).
+            if !at_bz_horizon
+                && best > -MATE_BOUND
+                && alpha < MATE_BOUND
+                && (!BZ || n_banned == 0)
+                && !self.stack.lists[ply as usize].is_empty()
+            {
                 let kn = &self.knobs[kbi].v;
                 if move_idx >= kn[K_LMR_MIN] as usize && depth as i32 * kn[K_LMR_HALF] / (kn[K_LMR_HALF] + lmr_cnt) <= 0 {
                     self.heuristic_used = true;
@@ -1726,6 +1824,7 @@ impl<'a> Searcher<'a> {
                 }
             }
             let child = b.make(m);
+            self.nodes += 1;
             if !BZ && !m.is_clone() {
                 let base = self.stack.rep_base[ply as usize] as usize;
                 let mut is_rep = false;
@@ -1744,6 +1843,7 @@ impl<'a> Searcher<'a> {
                 }
                 if is_rep {
                     rep_skipped = true;
+                    self.work_add(|w| w.made_unscored += 1);
                     continue;
                 }
             }
@@ -1807,7 +1907,10 @@ impl<'a> Searcher<'a> {
                             && best > -MATE_BOUND
                         {
                             self.heuristic_used = true;
-                            self.work_add(|w| w.children_pruned += 1);
+                            self.work_add(|w| {
+                                w.children_pruned += 1;
+                                w.pruned_sn += 1;
+                            });
                             move_idx += 1;
                             continue;
                         }
@@ -1851,6 +1954,8 @@ impl<'a> Searcher<'a> {
                 self.heuristic_used = true;
                 if child_eval != i32::MIN {
                     self.work_add(|w| w.children_pruned += 1);
+                } else {
+                    self.work_add(|w| w.made_unscored += 1);
                 }
                 move_idx += 1;
                 continue;
@@ -2049,14 +2154,19 @@ impl<'a> Searcher<'a> {
         snaps: &[(u64, u64)],
         respect_401: bool,
     ) -> SearchResult {
+        // D1419: the clock starts BEFORE any setup. The policy's per-stage bucket setup (advance_root) used to run first,
+        // so on the first move of a game (buckets built) the deadline moved late by that setup time and the Botzone
+        // watchdog had to answer for the engine (one FALLBACK per game in sim_local, every build).
+        self.start_ms = (self.time_src)();
         if !self.pol_explicit {
             if let Some(pol) = self.owned_policy.as_mut() {
                 pol.advance_root(b.empty().count_ones() as usize, 4);
             }
         }
-        self.start_ms = (self.time_src)();
         self.nodes = 0;
+        self.entered = 0;
         self.work.set(WorkStats::default());
+        self.poll_mask = 63;
         self.stop = false;
         self.stop_reason = StopReason::Completed;
         self.node_limit = limits.max_nodes;
@@ -2233,6 +2343,7 @@ impl<'a> Searcher<'a> {
             for i in 0..n_root {
                 let m = root_moves[i];
                 let child = b.make(m);
+                self.nodes += 1;
                 self.stack.imp[1] = 3;
                 self.stack.path_hash[1] = child.hash;
                 self.stack.rep_base[1] = if m.is_clone() { 1 } else { 0 };
@@ -2258,6 +2369,11 @@ impl<'a> Searcher<'a> {
                     best_this = Some(m);
                     if score > alpha {
                         alpha = score;
+                    }
+                    // D1415: publish every root improvement at once (same rule as the partial-iteration adoption below), so a
+                    // watchdog that answers before the search returns plays exactly the move the search would return if stopped now.
+                    if !(has_completed_iter && result.score >= MATE_BOUND && best_score < result.score) {
+                        self.publish_best(m);
                     }
                 }
             }
