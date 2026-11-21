@@ -172,6 +172,8 @@ struct MoveStack {
     rep_base: Box<[u32; MAX_PLY]>,
     /// D590: how the node at this ply was reached (3 first move, 2 top-12, 1 later, 0 null-move probe): TT worth
     imp: Box<[u8; MAX_PLY]>,
+    /// D1469 singular search: the TT move excluded at this ply (0 = none), consumed at the node's entry
+    excl: Box<[u32; MAX_PLY]>,
 }
 
 impl MoveStack {
@@ -182,6 +184,7 @@ impl MoveStack {
             path_hash: Box::new([0u64; MAX_PLY]),
             rep_base: Box::new([0u32; MAX_PLY]),
             imp: Box::new([3u8; MAX_PLY]),
+            excl: Box::new([0u32; MAX_PLY]),
         }
     }
 }
@@ -218,7 +221,7 @@ pub struct Knobs {
     pub v: [i32; NKNOB],
 }
 pub const KNOB_BUCKETS: usize = 16;
-pub const NKNOB: usize = 24;
+pub const NKNOB: usize = 31;
 /// rfp1-4 = RFP margin at depth 1-4; rfp_dis = disagreement share in RFP (/128); iir = min depth of the no-TT-move reduction;
 /// pc_* = ProbCut min depth / reduction / margin / disagreement share; lmr_min/half = Moonbird LMR start index / half-life;
 /// fut_min/div/dis = child futility start index / cp per ply / disagreement credit (/128); fut_ext = child disagreement above
@@ -226,6 +229,7 @@ pub const NKNOB: usize = 24;
 pub const KNOB_NAMES: [&str; NKNOB] = [
     "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "iir", "pc_d", "pc_r", "pc_t", "pc_k", "lmr_min", "lmr_half", "fut_min",
     "fut_div", "fut_dis", "fut_ext", "pol", "lmp1", "lmp2", "lmp3", "fp_d", "fp_base", "fp_mul", "fp_min",
+    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d",
 ];
 const K_RFP: usize = 0;
 const K_RFP_DIS: usize = 4;
@@ -249,17 +253,29 @@ const K_FP_D: usize = 20;
 const K_FP_BASE: usize = 21;
 const K_FP_MUL: usize = 22;
 const K_FP_MIN: usize = 23;
+/// D1469 search levers (all off by default = node-identical). lmr_hist: history-driven LMR, a reduced move's depth gains
+/// round(history * lmr_hist / (8 * HIST_MAX)) plies, capped at +-3 (good history reduces less, bad more; Zataxx -history/12288).
+/// lmr_pv: plies of LMR given back in PV nodes. se_d: singular extension min depth (0 = off; Zataxx form with multicut and
+/// negative extension), se_m: max TT depth shortfall, se_mul: singular margin cp per ply. qlmp: from this move index on,
+/// quiet jumps (no capture) are skipped at remaining depth <= qlmp_d (Zataxx LMP, 0 = off).
+const K_LMR_HIST: usize = 24;
+const K_LMR_PV: usize = 25;
+const K_SE_D: usize = 26;
+const K_SE_M: usize = 27;
+const K_SE_MUL: usize = 28;
+const K_QLMP: usize = 29;
+const K_QLMP_D: usize = 30;
 pub const KNOB_DEFAULT: Knobs = Knobs {
     v: [
         RFP_MARGINS[0], RFP_MARGINS[1], RFP_MARGINS[2], RFP_MARGINS[3], DIS_RFP_NUM, 4, PC_D as i32, PC_R as i32, PC_T, PC_K,
-        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2,
+        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64,
     ],
 };
 /// Allowed range per knob (refused outside: keeps every search well defined, e.g. no division by zero or depth underflow).
 const KNOB_RANGE: [(i32, i32); NKNOB] = [
     (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (1, 64), (2, 64), (1, 63), (0, 5000), (0, 512), (0, 256),
     (1, 10000), (0, 256), (1, 10000), (0, 512), (0, 16384), (0, 1000), (0, 256), (0, 256), (0, 256), (0, 8), (0, 5000),
-    (0, 5000), (1, 256),
+    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64),
 ];
 static KNOB_TABLE: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceLock::new();
 
@@ -390,6 +406,8 @@ const ORD_HISTORY_MAX: i32 = 90_000;
 /// = Moonbird historyMoveOrderingFactor 2.0 stones = 2 conversions at full history.
 const HIST_SCALE: i32 = 24;
 const HIST_MAX: i32 = 107_000 * HIST_SCALE;
+/// D1469: history-driven LMR moves a reduced depth by at most this many plies either way
+const LMR_HIST_CAP: i32 = 3;
 const ORD_HIST_FULL: i32 = 2 * ORD_CAPTURE_UNIT;
 type History = [[[i32; 49]; 49]; 2];
 
@@ -908,6 +926,12 @@ pub struct WorkStats {
     pub entered: u64,
     /// D1418 parent-eval futility breaks (move loops stopped before the remaining children were made)
     pub fp_breaks: u64,
+    /// D1469 singular searches run / TT moves extended / multicuts / negative extensions; quiet jumps skipped (qlmp)
+    pub se_tries: u64,
+    pub se_ext: u64,
+    pub se_cut: u64,
+    pub se_neg: u64,
+    pub qlmp_skips: u64,
 }
 
 impl WorkStats {
@@ -930,14 +954,24 @@ impl WorkStats {
         self.made_unscored += o.made_unscored;
         self.entered += o.entered;
         self.fp_breaks += o.fp_breaks;
+        self.se_tries += o.se_tries;
+        self.se_ext += o.se_ext;
+        self.se_cut += o.se_cut;
+        self.se_neg += o.se_neg;
+        self.qlmp_skips += o.qlmp_skips;
     }
 
     /// one-line breakdown for debug output (bench, Botzone debug line). `nodes` = made positions (Stockfish count);
     /// made = entered children + children scored and pruned + children dropped unscored.
     pub fn breakdown(&self, nodes: u64) -> String {
         let cuts = self.terminals + self.tt_cuts + self.rfp_cuts + self.null_cuts + self.probcut_cuts + self.leaves + self.ttmove_cuts;
+        let extra = if self.se_tries + self.qlmp_skips > 0 {
+            format!(" se={}/ext{}/cut{}/neg{} qlmp={}", self.se_tries, self.se_ext, self.se_cut, self.se_neg, self.qlmp_skips)
+        } else {
+            String::new()
+        };
         format!(
-            "nodes={} entered={} [expanded={} ttmove_cut={} tt={} rfp={} null={} probcut={} leaf={} term={}] child_pruned_sn={} child_pruned_eval={} child_unscored={} fp_break={} big={} sn={} ec_hit={}/{}",
+            "nodes={} entered={} [expanded={} ttmove_cut={} tt={} rfp={} null={} probcut={} leaf={} term={}] child_pruned_sn={} child_pruned_eval={} child_unscored={} fp_break={} big={} sn={} ec_hit={}/{}{extra}",
             nodes,
             self.entered,
             self.entered.saturating_sub(cuts) + self.ttmove_cuts,
@@ -1025,6 +1059,8 @@ pub struct Searcher<'a> {
     tup_native: bool,
     /// Per-ply move buffers, reused across searches (no per-search alloc).
     stack: MoveStack,
+    /// D1469: depth of the running iteration (extensions stop at ply >= 2 * root_depth)
+    root_depth: u32,
     /// Botzone (`BZ = true`) game placement snapshots `(black_occ, white_occ)` covering
     /// the current stone-count epoch from pre-root history plus in-tree plies at `bz_base_offset + ply`.
     bz_snaps: Vec<(u64, u64)>,
@@ -1113,6 +1149,7 @@ impl<'a> Searcher<'a> {
             bz_base_offset: 0,
             bz_start_ply: 0,
             bz_max_plies: u32::MAX,
+            root_depth: 0,
             bz_ply: Box::new([BzPly::default(); MAX_PLY]),
             bz_banned: Vec::with_capacity(256),
         }
@@ -1505,9 +1542,13 @@ impl<'a> Searcher<'a> {
         let mut tt_mv: u32 = 0;
         let mut depth = depth;
         let kbi = knob_bucket(b.empty().count_ones());
+        // D1469: inside a singular search the TT move is excluded and the node never cuts on (or writes) its TT entry
+        let excl = self.stack.excl[ply as usize];
+        let mut tt_info: Option<(u32, u8, i32)> = None;
         if let Some(e) = self.tt.probe_e(b.hash, b.empty().count_ones() as u8) {
             tt_mv = e.mv;
-            if !(BZ && (n_banned > 0 || at_bz_horizon)) && e.depth as u32 >= depth {
+            tt_info = Some((e.depth as u32, e.flag, score_from_tt(e.score, ply)));
+            if excl == 0 && !(BZ && (n_banned > 0 || at_bz_horizon)) && e.depth as u32 >= depth {
                 let s = score_from_tt(e.score, ply);
                 let cut = if !is_pv {
                     e.flag == FLAG_EXACT
@@ -1630,9 +1671,51 @@ impl<'a> Searcher<'a> {
 
         // Pre-movegen TT move fast path: decode & verify legality in O(1) and search first;
         // on a beta cutoff, return immediately without generating/scoring the full move list.
-        if tt_mv != 0 {
+        if tt_mv != 0 && excl == 0 {
             if let Some(m) = crate::ttcodec::decode_move(b, tt_mv as u16) {
                 skip_tt_mv = tt_mv;
+                // D1469 singular extension (Zataxx form; off when se_d = 0): search every move but the TT move at half
+                // depth against sbeta = tt score - se_mul * depth. All fail low -> the TT move is singular: +1 ply.
+                // sbeta >= beta -> multicut (another move also beats beta). TT score >= beta -> negative extension -1.
+                let mut ext = 0i32;
+                let se_d = self.knobs[kbi].v[K_SE_D];
+                if se_d > 0
+                    && !is_pv
+                    && ply > 0
+                    && depth as i32 >= se_d
+                    && ply < 2 * self.root_depth
+                    && !(BZ && (n_banned > 0 || at_bz_horizon))
+                {
+                    if let Some((tdep, tflag, ts)) = tt_info {
+                        if tflag != FLAG_UPPER && ts.abs() < MATE_BOUND && tdep as i32 >= depth as i32 - self.knobs[kbi].v[K_SE_M] {
+                            let sbeta = ts - self.knobs[kbi].v[K_SE_MUL] * depth as i32;
+                            self.stack.excl[ply as usize] = tt_mv;
+                            let s = self.negamax::<BZ>(b, sbeta - 1, sbeta, (depth - 1) / 2, ply, false);
+                            self.stack.excl[ply as usize] = 0;
+                            if self.stop {
+                                return 0;
+                            }
+                            let s_tainted = BZ && self.bz_ply[ply as usize].tainted;
+                            if BZ {
+                                self.bz_ply[ply as usize].tainted = false;
+                            }
+                            self.work_add(|w| w.se_tries += 1);
+                            if !s_tainted {
+                                if s < sbeta {
+                                    ext = 1;
+                                    self.work_add(|w| w.se_ext += 1);
+                                } else if sbeta >= beta {
+                                    self.heuristic_used = true;
+                                    self.work_add(|w| w.se_cut += 1);
+                                    return sbeta;
+                                } else if ts >= beta {
+                                    ext = -1;
+                                    self.work_add(|w| w.se_neg += 1);
+                                }
+                            }
+                        }
+                    }
+                }
                 let mut is_rep = false;
                 let mut c_snap = (0u64, 0u64);
                 if BZ && !m.is_clone() && n_banned > 0 {
@@ -1698,7 +1781,7 @@ impl<'a> Searcher<'a> {
                             };
                         }
                         let score =
-                            -self.negamax::<BZ>(&child, -beta, -alpha, depth - 1, ply + 1, true);
+                            -self.negamax::<BZ>(&child, -beta, -alpha, (depth as i32 - 1 + ext).max(0) as u32, ply + 1, true);
                         if self.stop {
                             return 0;
                         }
@@ -1737,6 +1820,10 @@ impl<'a> Searcher<'a> {
             }
         }
 
+        if excl != 0 {
+            // singular search: generate every move but the excluded TT move
+            skip_tt_mv = excl;
+        }
         {
             let active_pol = if self.pol_explicit { self.policy } else { self.owned_policy.as_ref() };
             match (active_pol, self.nnue) {
@@ -1794,7 +1881,9 @@ impl<'a> Searcher<'a> {
                 && !self.stack.lists[ply as usize].is_empty()
             {
                 let kn = &self.knobs[kbi].v;
-                if move_idx >= kn[K_LMR_MIN] as usize && depth as i32 * kn[K_LMR_HALF] / (kn[K_LMR_HALF] + lmr_cnt) <= 0 {
+                // D1469: a later move can win back at most (lmr_hist + 7) / 8 plies of history and lmr_pv plies on a PV node
+                let give_back = if kn[K_LMR_HIST] > 0 { LMR_HIST_CAP } else { 0 } + if is_pv { kn[K_LMR_PV] } else { 0 };
+                if move_idx >= kn[K_LMR_MIN] as usize && depth as i32 * kn[K_LMR_HALF] / (kn[K_LMR_HALF] + lmr_cnt) + give_back <= 0 {
                     self.heuristic_used = true;
                     break;
                 }
@@ -1825,6 +1914,50 @@ impl<'a> Searcher<'a> {
                 }
                 list.pop_best()
             };
+            // D1469 Zataxx quiet-move pruning (off when qlmp = 0): late quiet jumps (no stone captured) are not searched
+            {
+                let q = self.knobs[kbi].v[K_QLMP];
+                if q > 0
+                    && ply > 0
+                    && move_idx >= q as usize
+                    && depth as i32 <= self.knobs[kbi].v[K_QLMP_D]
+                    && !m.is_clone()
+                    && best > -MATE_BOUND
+                    && alpha < MATE_BOUND
+                    && !at_bz_horizon
+                    && (!BZ || n_banned == 0)
+                    && b.captures(m.to) == 0
+                {
+                    self.heuristic_used = true;
+                    self.work_add(|w| w.qlmp_skips += 1);
+                    move_idx += 1;
+                    continue;
+                }
+            }
+            // D1469: with history-driven LMR the loop break above leaves room for history give-back, so a move whose own
+            // LMR + history depth is <= 0 is dropped here BEFORE it is made (the same move the code below would make and drop)
+            {
+                let kn = &self.knobs[kbi].v;
+                let lh = kn[K_LMR_HIST];
+                if lh > 0
+                    && move_idx >= kn[K_LMR_MIN] as usize
+                    && !at_bz_horizon
+                    && best > -MATE_BOUND
+                    && alpha < MATE_BOUND
+                    && (!BZ || n_banned == 0)
+                {
+                    let half = kn[K_LMR_HALF];
+                    let pvb = if is_pv { kn[K_LMR_PV] } else { 0 };
+                    let nd = depth as i32 * half / (half + lmr_cnt);
+                    if nd <= 0 && nd + self.lmr_hist_bonus(b.turn as usize, m, lh) + pvb <= 0 {
+                        self.heuristic_used = true;
+                        self.work_add(|w| w.made_unscored += 1);
+                        lmr_cnt += 1;
+                        move_idx += 1;
+                        continue;
+                    }
+                }
+            }
 
             // Moonbird-style selectivity (exp/search-moonbird A): late moves get a gentle LMR, every move after the
             // first is reduced by how far its child's STATIC eval falls short of alpha, and a move reduced to depth
@@ -1887,6 +2020,13 @@ impl<'a> Searcher<'a> {
                 let half = self.knobs[kbi].v[K_LMR_HALF];
                 new_depth = depth as i32 * half / (half + lmr_cnt);
                 lmr_cnt += 1;
+                // D1469 history-driven LMR + PV give-back (off when both knobs are 0); never deeper than the node's depth
+                let (lh, lpv) = (self.knobs[kbi].v[K_LMR_HIST], self.knobs[kbi].v[K_LMR_PV]);
+                if lh > 0 || (lpv > 0 && is_pv) {
+                    let bonus = self.lmr_hist_bonus(b.turn as usize, m, lh) + if is_pv { lpv } else { 0 };
+                    // bad history reduces more but never prunes a move LMR alone would still search (Zataxx clamps to >= 1 ply)
+                    new_depth = (new_depth + bonus).min(depth as i32).max(new_depth.min(1));
+                }
             }
             let mut child_eval = i32::MIN;
             if move_idx >= self.knobs[kbi].v[K_FUT_MIN] as usize
@@ -2079,6 +2219,18 @@ impl<'a> Searcher<'a> {
         best
     }
 
+    /// D1469 history-driven LMR: round(history * lh / (8 * HIST_MAX)) plies, capped at +-LMR_HIST_CAP (Zataxx rounds history / div)
+    #[inline]
+    fn lmr_hist_bonus(&self, stm: usize, m: Move, lh: i32) -> i32 {
+        if lh == 0 {
+            return 0;
+        }
+        let (f, t) = hist_key(m);
+        let h = self.history[stm][f][t] as i64;
+        let d8 = 8 * HIST_MAX as i64;
+        ((h * lh as i64 + d8 / 2 * h.signum()) / d8).clamp(-(LMR_HIST_CAP as i64), LMR_HIST_CAP as i64) as i32
+    }
+
     /// Moonbird history update: clamp to +-HIST_MAX, shrink the colour's table /1.25 once the cap is hit.
     #[inline]
     fn hist_add(&mut self, stm: usize, m: Move, add: i32) {
@@ -2109,7 +2261,8 @@ impl<'a> Searcher<'a> {
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn finish_node(&mut self, b: &Board, alpha_orig: i32, beta: i32, best: i32, best_mv: u32, depth: u32, ply: u32) {
-        if self.stop {
+        // a singular search (TT move excluded at this ply) must never overwrite the node's real TT entry
+        if self.stop || self.stack.excl[ply as usize] != 0 {
             return;
         }
         let flag = if best <= alpha_orig {
@@ -2351,6 +2504,7 @@ impl<'a> Searcher<'a> {
         // verified completed iteration always exists.
         for depth in 1..=limits.max_depth.max(1) {
             self.heuristic_used = false;
+            self.root_depth = u32::from(depth);
             let mut alpha = -INF;
             let mut best_this = None;
             let mut best_score = i32::MIN;
