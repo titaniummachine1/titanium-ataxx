@@ -65,6 +65,7 @@ const EXEMPT: &[&str] = &[
     "data/nnue/nnue_main.tnn",
     // the bundled move-ordering policy head (201 KB, fitted on nnue_main.tnn by `ti policy`) and the pins that tie the three
     // bundled files together (config.rs tests); tracked with `git add -f`
+    "data/nnue/knobs_main.txt", // D1369: per-stage tuned search knobs (17 x 16, 7 KB text) compiled in via include_str!; tracked with `git add -f`
     "data/nnue/policy_main.bin",
     "data/nnue/bundle.txt", // lowercase: reason() compares against lowercased paths
 ];
