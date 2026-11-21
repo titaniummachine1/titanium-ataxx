@@ -174,6 +174,8 @@ struct MoveStack {
     imp: Box<[u8; MAX_PLY]>,
     /// D1469 singular search: the TT move excluded at this ply (0 = none), consumed at the node's entry
     excl: Box<[u32; MAX_PLY]>,
+    /// D1485: destination of the move that led to the node at this ply (255 = root / null move), for continuation history
+    pto: Box<[u8; MAX_PLY]>,
 }
 
 impl MoveStack {
@@ -185,6 +187,7 @@ impl MoveStack {
             rep_base: Box::new([0u32; MAX_PLY]),
             imp: Box::new([3u8; MAX_PLY]),
             excl: Box::new([0u32; MAX_PLY]),
+            pto: Box::new([255u8; MAX_PLY]),
         }
     }
 }
@@ -221,7 +224,7 @@ pub struct Knobs {
     pub v: [i32; NKNOB],
 }
 pub const KNOB_BUCKETS: usize = 16;
-pub const NKNOB: usize = 31;
+pub const NKNOB: usize = 37;
 /// rfp1-4 = RFP margin at depth 1-4; rfp_dis = disagreement share in RFP (/128); iir = min depth of the no-TT-move reduction;
 /// pc_* = ProbCut min depth / reduction / margin / disagreement share; lmr_min/half = Moonbird LMR start index / half-life;
 /// fut_min/div/dis = child futility start index / cp per ply / disagreement credit (/128); fut_ext = child disagreement above
@@ -229,7 +232,7 @@ pub const NKNOB: usize = 31;
 pub const KNOB_NAMES: [&str; NKNOB] = [
     "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "iir", "pc_d", "pc_r", "pc_t", "pc_k", "lmr_min", "lmr_half", "fut_min",
     "fut_div", "fut_dis", "fut_ext", "pol", "lmp1", "lmp2", "lmp3", "fp_d", "fp_base", "fp_mul", "fp_min",
-    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d",
+    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w",
 ];
 const K_RFP: usize = 0;
 const K_RFP_DIS: usize = 4;
@@ -265,17 +268,29 @@ const K_SE_M: usize = 27;
 const K_SE_MUL: usize = 28;
 const K_QLMP: usize = 29;
 const K_QLMP_D: usize = 30;
+/// D1479 (user): policy + disagreement in LMR. lmr_pol: a reduced move loses round((gap - lmr_polc) * lmr_pol / 16) plies, gap =
+/// its ordering-score distance to the node best in policy logits (capped +-3; a strong policy move reduces less, a weak one
+/// more). lmr_dis: reduced moves get 1 ply back when the node disagreement is >= lmr_dis cp (0 = off).
+const K_LMR_POL: usize = 31;
+const K_LMR_POLC: usize = 32;
+const K_LMR_DIS: usize = 33;
+/// D1481: reduced moves lose 1 more ply when the node disagreement is <= lmr_disl cp (calm node; 0 = off)
+const K_LMR_DISL: usize = 34;
+/// D1482: measured disagreement from the TT (0 = off, 64 = the TT error at full weight), see the static eval in negamax
+const K_DIS_TT: usize = 35;
+/// D1485 continuation history ordering weight: ordering units added per move = cont * ch_w / HIST_MAX (0 = off: no updates)
+const K_CH_W: usize = 36;
 pub const KNOB_DEFAULT: Knobs = Knobs {
     v: [
         RFP_MARGINS[0], RFP_MARGINS[1], RFP_MARGINS[2], RFP_MARGINS[3], DIS_RFP_NUM, 4, PC_D as i32, PC_R as i32, PC_T, PC_K,
-        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64,
+        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0,
     ],
 };
 /// Allowed range per knob (refused outside: keeps every search well defined, e.g. no division by zero or depth underflow).
 const KNOB_RANGE: [(i32, i32); NKNOB] = [
     (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (1, 64), (2, 64), (1, 63), (0, 5000), (0, 512), (0, 256),
     (1, 10000), (0, 256), (1, 10000), (0, 512), (0, 16384), (0, 1000), (0, 256), (0, 256), (0, 256), (0, 8), (0, 5000),
-    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64),
+    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000),
 ];
 static KNOB_TABLE: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceLock::new();
 
@@ -410,6 +425,12 @@ const HIST_MAX: i32 = 107_000 * HIST_SCALE;
 const LMR_HIST_CAP: i32 = 3;
 const ORD_HIST_FULL: i32 = 2 * ORD_CAPTURE_UNIT;
 type History = [[[i32; 49]; 49]; 2];
+/// D1485: continuation history size (2 movers x 49 previous destinations x 49 x 49)
+const CONT_LEN: usize = 2 * 49 * 49 * 49;
+#[inline(always)]
+fn cont_idx(stm: usize, pt: usize, f: usize, t: usize) -> usize {
+    ((stm * 49 + pt) * 49 + f) * 49 + t
+}
 
 /// Killer key. A clone's child position depends only on its DESTINATION: the `from` that `legal_moves_dedup_into`
 /// reports is just the lowest-index neighbouring stone, which differs between sibling positions. A killer clone must
@@ -669,6 +690,21 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
     if !SKIP_TT && tt_index != usize::MAX && tt_index != 0 {
         list.swap(tt_index, 0);
     }
+}
+
+/// D1469/D1479: any LMR adjustment term switched on (history, policy, disagreement, or PV give-back on a PV node)
+#[inline]
+fn lmr_terms_on(kn: &[i32; NKNOB], is_pv: bool) -> bool {
+    kn[K_LMR_HIST] > 0 || kn[K_LMR_POL] > 0 || kn[K_LMR_DIS] > 0 || kn[K_LMR_DISL] > 0 || (is_pv && kn[K_LMR_PV] > 0)
+}
+
+/// D1469/D1479: the most plies a reduced move can win back from the LMR terms (bounds the LMR loop break)
+#[inline]
+fn lmr_max_give_back(kn: &[i32; NKNOB], is_pv: bool) -> i32 {
+    (if kn[K_LMR_HIST] > 0 { LMR_HIST_CAP } else { 0 })
+        + (if kn[K_LMR_POL] > 0 { 3 } else { 0 })
+        + (if kn[K_LMR_DIS] > 0 { 1 } else { 0 })
+        + (if is_pv { kn[K_LMR_PV] } else { 0 })
 }
 
 /// Terminal score from the side-to-move's perspective.
@@ -1040,6 +1076,9 @@ pub struct Searcher<'a> {
     killers: Box<[(u32, u32); MAX_PLY]>,
     /// History heuristic: [mover][to] cutoff counters, aged per search.
     history: Box<History>,
+    /// D1485 continuation history [mover][previous move's destination][from][to] (flat, hist_key keys), only touched when
+    /// knob ch_w > 0: the reply history of chess engines (the move that answered the opponent's last destination)
+    cont: Box<[i32]>,
     /// Optional n-tuple table (None = pure hand eval). Borrowed, read-only in the tree.
     tuple: Option<&'a TupleTable>,
     /// Optional exp/nnue net (None = unchanged eval path). Takes precedence over the tuple when set.
@@ -1134,6 +1173,7 @@ impl<'a> Searcher<'a> {
             ec_act: (1usize << ECACHE_BITS.load(std::sync::atomic::Ordering::Relaxed)) / 8,
             killers: Box::new([(0, 0); MAX_PLY]),
             history: Box::new([[[0; 49]; 49]; 2]),
+            cont: vec![0i32; CONT_LEN].into_boxed_slice(),
             tuple: None,
             nnue: None,
             policy: None,
@@ -1332,6 +1372,7 @@ impl<'a> Searcher<'a> {
         self.clear_ecache();
         *self.killers = [(0, 0); MAX_PLY];
         *self.history = [[[0; 49]; 49]; 2];
+        self.cont.fill(0);
     }
 
     #[inline]
@@ -1581,6 +1622,23 @@ impl<'a> Searcher<'a> {
             self.leaf_eval_with_dis(b)
         };
         let static_eval = raw;
+        // D1482/D1483 (user: PUCT's Q statistics inside alpha-beta): the TT holds what an earlier search of this node found;
+        // its distance from the static eval is MEASURED disagreement. dis_tt > 0: the node's uncertainty is the larger of
+        // the dis head and dis_tt/64 x that measured error (exact: |ts - eval|; lower bound: ts above eval; upper: below).
+        let node_dis = {
+            let k = self.knobs[kbi].v[K_DIS_TT];
+            match tt_info {
+                Some((td, tf, ts)) if k > 0 && td >= 1 && ts.abs() < MATE_BOUND => {
+                    let err = match tf {
+                        FLAG_EXACT => (ts - static_eval).abs(),
+                        FLAG_LOWER => (ts - static_eval).max(0),
+                        _ => (static_eval - ts).max(0),
+                    };
+                    node_dis.max(err.min(4000) * k / 64)
+                }
+                _ => node_dis,
+            }
+        };
 
         // Reverse futility pruning (autaxx, exact form): standing pat is so
         // far below alpha that even a generous error margin cannot recover
@@ -1612,6 +1670,7 @@ impl<'a> Searcher<'a> {
                 && (b.piece_cnt[0] as u32 + b.piece_cnt[1] as u32) * 50 < 26 * SQUARES as u32
             {
                 let child = b.make_pass();
+                self.stack.pto[ply as usize + 1] = 255;
                 self.stack.imp[ply as usize + 1] = 0;
                 self.stack.path_hash[ply as usize + 1] = child.hash;
                 self.stack.rep_base[ply as usize + 1] = self.stack.rep_base[ply as usize];
@@ -1735,6 +1794,7 @@ impl<'a> Searcher<'a> {
                 }
                 if !is_rep {
                     let child = b.make(m);
+                    self.stack.pto[ply as usize + 1] = m.to;
                     self.nodes += 1;
                     if !BZ && !m.is_clone() {
                         let base = self.stack.rep_base[ply as usize] as usize;
@@ -1790,7 +1850,7 @@ impl<'a> Searcher<'a> {
                         }
                         move_idx = 1;
                         if score <= alpha {
-                            self.hist_add(b.turn as usize, m, -((depth * depth) as i32));
+                            self.hist_upd(b.turn as usize, m, -((depth * depth) as i32), ply, kbi);
                         }
                         best = score;
                         best_mv = m.to_u32();
@@ -1799,10 +1859,10 @@ impl<'a> Searcher<'a> {
                             if alpha >= beta {
                                 self.on_cutoff(b, m, depth, ply);
                                 if best > alpha_orig && best_mv != 0xFFFF {
-                                    self.hist_add(
+                                    self.hist_upd(
                                         b.turn as usize,
                                         m,
-                                        HIST_SCALE * (depth * depth) as i32,
+                                        HIST_SCALE * (depth * depth) as i32, ply, kbi,
                                     );
                                 }
                                 if BZ {
@@ -1824,11 +1884,17 @@ impl<'a> Searcher<'a> {
             // singular search: generate every move but the excluded TT move
             skip_tt_mv = excl;
         }
+        // D1479: ordering-score units per policy logit at this node (0 = no policy here)
+        let mut pol_wt = 0f32;
         {
             let active_pol = if self.pol_explicit { self.policy } else { self.owned_policy.as_ref() };
             match (active_pol, self.nnue) {
                 (Some(pol), Some(_)) if depth >= self.pol_min => {
                     let list = &mut self.stack.lists[ply as usize];
+                    pol_wt = {
+                        let k = self.knobs[kbi].v[K_POL];
+                        if k == 100 { self.pol_w } else { self.pol_w * k as f32 / 100.0 }
+                    };
                     gen_and_score_into::<true, true>(
                         b,
                         list,
@@ -1836,10 +1902,7 @@ impl<'a> Searcher<'a> {
                         ply,
                         &self.killers,
                         &self.history,
-                        Some((pol.head(b), {
-                            let k = self.knobs[kbi].v[K_POL];
-                            if k == 100 { self.pol_w } else { self.pol_w * k as f32 / 100.0 }
-                        })),
+                        Some((pol.head(b), pol_wt)),
                     );
                 }
                 _ => {
@@ -1853,6 +1916,22 @@ impl<'a> Searcher<'a> {
                         &self.history,
                         None,
                     );
+                }
+            }
+            // D1485 continuation history ordering term (off when ch_w = 0): reply history keyed by the previous destination
+            let ch_w = self.knobs[kbi].v[K_CH_W];
+            let pt = self.stack.pto[ply as usize];
+            if ch_w > 0 && pt != 255 {
+                let stm = b.turn as usize;
+                let list = &mut self.stack.lists[ply as usize];
+                for i in 0..list.len() {
+                    let sc = list.score_at(i);
+                    if sc >= ORD_TT {
+                        continue;
+                    }
+                    let (f, t) = hist_key(list.move_at(i));
+                    let c = self.cont[cont_idx(stm, pt as usize, f, t)] as i64;
+                    list.set_score(i, sc.saturating_add((c * ch_w as i64 / HIST_MAX as i64) as i32));
                 }
             }
             // Fallthrough terminal: legal_moves_dedup_into tracks dedup
@@ -1869,6 +1948,8 @@ impl<'a> Searcher<'a> {
         // futility small net: the parent's accumulator, built at the first child that needs it (D110)
         let mut sn_parent: Option<crate::smallnet::Acc> = None;
         let mut lmr_cnt = 0i32;
+        // D1479: ordering score of the first move popped from the list (the node's best-ordered move), i32::MIN = none yet
+        let mut top_sc = i32::MIN;
         loop {
             // D1409: no move after this one can be searched or scored -> stop instead of making and skipping each one.
             // (a) LMR alone takes the depth to 0 (it only grows with lmr_cnt); (b) move-count pruning lmp1-3 (knobs, 0 = off).
@@ -1881,8 +1962,8 @@ impl<'a> Searcher<'a> {
                 && !self.stack.lists[ply as usize].is_empty()
             {
                 let kn = &self.knobs[kbi].v;
-                // D1469: a later move can win back at most (lmr_hist + 7) / 8 plies of history and lmr_pv plies on a PV node
-                let give_back = if kn[K_LMR_HIST] > 0 { LMR_HIST_CAP } else { 0 } + if is_pv { kn[K_LMR_PV] } else { 0 };
+                // D1469/D1479: the most depth a later move can win back from history, policy, disagreement and PV terms
+                let give_back = lmr_max_give_back(kn, is_pv);
                 if move_idx >= kn[K_LMR_MIN] as usize && depth as i32 * kn[K_LMR_HALF] / (kn[K_LMR_HALF] + lmr_cnt) + give_back <= 0 {
                     self.heuristic_used = true;
                     break;
@@ -1907,13 +1988,16 @@ impl<'a> Searcher<'a> {
                     break;
                 }
             }
-            let m = {
+            let (m, m_sc) = {
                 let list = &mut self.stack.lists[ply as usize];
                 if list.is_empty() {
                     break;
                 }
-                list.pop_best()
+                list.pop_best_scored()
             };
+            if top_sc == i32::MIN {
+                top_sc = m_sc;
+            }
             // D1469 Zataxx quiet-move pruning (off when qlmp = 0): late quiet jumps (no stone captured) are not searched
             {
                 let q = self.knobs[kbi].v[K_QLMP];
@@ -1938,8 +2022,7 @@ impl<'a> Searcher<'a> {
             // LMR + history depth is <= 0 is dropped here BEFORE it is made (the same move the code below would make and drop)
             {
                 let kn = &self.knobs[kbi].v;
-                let lh = kn[K_LMR_HIST];
-                if lh > 0
+                if lmr_terms_on(kn, is_pv)
                     && move_idx >= kn[K_LMR_MIN] as usize
                     && !at_bz_horizon
                     && best > -MATE_BOUND
@@ -1947,9 +2030,8 @@ impl<'a> Searcher<'a> {
                     && (!BZ || n_banned == 0)
                 {
                     let half = kn[K_LMR_HALF];
-                    let pvb = if is_pv { kn[K_LMR_PV] } else { 0 };
                     let nd = depth as i32 * half / (half + lmr_cnt);
-                    if nd <= 0 && nd + self.lmr_hist_bonus(b.turn as usize, m, lh) + pvb <= 0 {
+                    if nd <= 0 && nd + self.lmr_bonus(kbi, b.turn as usize, m, m_sc, top_sc, pol_wt, is_pv, node_dis) <= 0 {
                         self.heuristic_used = true;
                         self.work_add(|w| w.made_unscored += 1);
                         lmr_cnt += 1;
@@ -1980,6 +2062,7 @@ impl<'a> Searcher<'a> {
                 }
             }
             let child = b.make(m);
+            self.stack.pto[ply as usize + 1] = m.to;
             self.nodes += 1;
             if !BZ && !m.is_clone() {
                 let base = self.stack.rep_base[ply as usize] as usize;
@@ -2020,10 +2103,9 @@ impl<'a> Searcher<'a> {
                 let half = self.knobs[kbi].v[K_LMR_HALF];
                 new_depth = depth as i32 * half / (half + lmr_cnt);
                 lmr_cnt += 1;
-                // D1469 history-driven LMR + PV give-back (off when both knobs are 0); never deeper than the node's depth
-                let (lh, lpv) = (self.knobs[kbi].v[K_LMR_HIST], self.knobs[kbi].v[K_LMR_PV]);
-                if lh > 0 || (lpv > 0 && is_pv) {
-                    let bonus = self.lmr_hist_bonus(b.turn as usize, m, lh) + if is_pv { lpv } else { 0 };
+                // D1469/D1479 history / policy / disagreement / PV terms (off when all knobs are 0); never deeper than depth
+                if lmr_terms_on(&self.knobs[kbi].v, is_pv) {
+                    let bonus = self.lmr_bonus(kbi, b.turn as usize, m, m_sc, top_sc, pol_wt, is_pv, node_dis);
                     // bad history reduces more but never prunes a move LMR alone would still search (Zataxx clamps to >= 1 ply)
                     new_depth = (new_depth + bonus).min(depth as i32).max(new_depth.min(1));
                 }
@@ -2177,7 +2259,7 @@ impl<'a> Searcher<'a> {
             }
             move_idx += 1;
             if score <= alpha {
-                self.hist_add(b.turn as usize, m, -((depth * depth) as i32));
+                self.hist_upd(b.turn as usize, m, -((depth * depth) as i32), ply, kbi);
             }
 
             if score > best {
@@ -2204,10 +2286,10 @@ impl<'a> Searcher<'a> {
             return -MATE + ply as i32;
         }
         if best > alpha_orig && best_mv != 0xFFFF {
-            self.hist_add(
+            self.hist_upd(
                 b.turn as usize,
                 Move::from_u32(best_mv),
-                HIST_SCALE * (depth * depth) as i32,
+                HIST_SCALE * (depth * depth) as i32, ply, kbi,
             );
         }
         if BZ {
@@ -2217,6 +2299,32 @@ impl<'a> Searcher<'a> {
             self.finish_node(b, alpha_orig, beta, best, best_mv, depth, ply);
         }
         best
+    }
+
+    /// D1469/D1479: total LMR depth change of a reduced move (+ = reduce less): history + policy gap + disagreement + PV
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn lmr_bonus(&self, kbi: usize, stm: usize, m: Move, sc: i32, top_sc: i32, pol_wt: f32, is_pv: bool, node_dis: i32) -> i32 {
+        let kn = &self.knobs[kbi].v;
+        let mut bonus = self.lmr_hist_bonus(stm, m, kn[K_LMR_HIST]);
+        if is_pv {
+            bonus += kn[K_LMR_PV];
+        }
+        let lp = kn[K_LMR_POL];
+        if lp > 0 && pol_wt > 0.0 && top_sc != i32::MIN {
+            let gap = (top_sc as f64 - sc as f64) / pol_wt as f64;
+            let r = ((gap - kn[K_LMR_POLC] as f64) * lp as f64 / 16.0).round().clamp(-3.0, 3.0) as i32;
+            bonus -= r;
+        }
+        let ld = kn[K_LMR_DIS];
+        if ld > 0 && node_dis >= ld {
+            bonus += 1;
+        }
+        let dl = kn[K_LMR_DISL];
+        if dl > 0 && node_dis <= dl {
+            bonus -= 1;
+        }
+        bonus
     }
 
     /// D1469 history-driven LMR: round(history * lh / (8 * HIST_MAX)) plies, capped at +-LMR_HIST_CAP (Zataxx rounds history / div)
@@ -2229,6 +2337,24 @@ impl<'a> Searcher<'a> {
         let h = self.history[stm][f][t] as i64;
         let d8 = 8 * HIST_MAX as i64;
         ((h * lh as i64 + d8 / 2 * h.signum()) / d8).clamp(-(LMR_HIST_CAP as i64), LMR_HIST_CAP as i64) as i32
+    }
+
+    /// D1485: history update + (when ch_w > 0) the same update to the continuation history of the previous destination
+    #[inline]
+    fn hist_upd(&mut self, stm: usize, m: Move, add: i32, ply: u32, kbi: usize) {
+        self.hist_add(stm, m, add);
+        let pt = self.stack.pto[ply as usize];
+        if self.knobs[kbi].v[K_CH_W] > 0 && pt != 255 {
+            let (f, t) = hist_key(m);
+            let base = cont_idx(stm, pt as usize, 0, 0);
+            let e = &mut self.cont[base + f * 49 + t];
+            *e = (*e + add).clamp(-HIST_MAX, HIST_MAX);
+            if e.abs() >= HIST_MAX {
+                for h in self.cont[base..base + 49 * 49].iter_mut() {
+                    *h = *h * 4 / 5;
+                }
+            }
+        }
     }
 
     /// Moonbird history update: clamp to +-HIST_MAX, shrink the colour's table /1.25 once the cap is hit.
@@ -2520,6 +2646,7 @@ impl<'a> Searcher<'a> {
             for i in 0..n_root {
                 let m = root_moves[i];
                 let child = b.make(m);
+                self.stack.pto[1] = m.to;
                 self.nodes += 1;
                 self.stack.imp[1] = 3;
                 self.stack.path_hash[1] = child.hash;

@@ -650,6 +650,11 @@ impl MoveList {
     /// the first few picks, and this only ever pays for what it uses.
     #[inline]
     pub fn pop_best(&mut self) -> Move {
+        self.pop_best_scored().0
+    }
+
+    /// D1479: pop the best-scored move together with its ordering score.
+    pub fn pop_best_scored(&mut self) -> (Move, i32) {
         debug_assert!(self.len > 0);
         let mut best_i = 0;
         let mut best_s = self.scores[0];
@@ -663,7 +668,7 @@ impl MoveList {
         self.len -= 1;
         self.moves[best_i] = self.moves[self.len];
         self.scores[best_i] = self.scores[self.len];
-        m
+        (m, best_s)
     }
 }
 

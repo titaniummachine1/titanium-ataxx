@@ -1,0 +1,24 @@
+name: Experiment branch tests
+# D1486 (user: "GitHub to free use"): compile + test every exp/* experiment branch on GitHub's runners, so the PC can stay
+# quiet for timed gates. Prints the bench node counts the branch must keep equal to main with every new knob off.
+on:
+  push:
+    branches: ['exp/**']
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Release tests
+        run: cargo test --release --workspace
+      - name: Bench node counts (knobs off; main e746544 = 775521 classic d12, 448254 --bz d11)
+        run: |
+          cargo build --release -p titanium-cli
+          ./target/release/titanium-cli bench --max-depth 12 | grep nodes
+          ./target/release/titanium-cli bench --max-depth 11 --bz | grep nodes
