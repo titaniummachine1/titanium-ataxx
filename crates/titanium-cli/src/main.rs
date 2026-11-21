@@ -223,7 +223,8 @@ fn mirror(b: &Board) -> Board {
 }
 
 /// D1394: `perft N` = pair perft (one clone per source, mirror-checked); `--lib` = libataxx counts (clone once per
-/// destination, passes); `--tt [--mb M]` = single-thread hashed perft (iterative 1..N, one table); `--positions` =
+/// destination, passes); `--tt [--mb M] [--canon D | --no-canon] [--tt-min D]` = single-thread hashed perft (iterative 1..N,
+/// one table; keys are D4-canonical from depth D = 3 by default when there are no blockers); `--positions` =
 /// the 8 sperft positions (the 14-15 Gnps measurement of exp/max-nps, D1393) instead of the start position.
 fn perft_cmd(depth: u32, args: &[String]) -> ExitCode {
     let lib = args.iter().any(|a| a == "--lib");
@@ -235,6 +236,20 @@ fn perft_cmd(depth: u32, args: &[String]) -> ExitCode {
         let kind = if tt { "hashed (TT) libataxx" } else if lib { "libataxx" } else { "pair (one clone per source)" };
         println!("perft {kind}, single thread, {} position(s){}", boards.len(), if tt { format!(", table {mb} MB") } else { String::new() });
         let mut table = if tt { Some(titanium::perft::PerftTable::new(mb)) } else { None };
+        if let Some(tab) = table.as_mut() {
+            if let Some(v) = flag_int(args, "--tt-min") {
+                tab.tt_min = (v as u32).max(2);
+            }
+            // symmetry-canonical keys are exact only without blockers
+            // default canon 3 (D1399: d8 1.47 s vs 5.4 s plain); --no-canon = plain keys (bryanQeaton / faeries style)
+            let canon = if args.iter().any(|a| a == "--no-canon") { None } else { Some(flag_int(args, "--canon").unwrap_or(3) as u32) };
+            if let Some(v) = canon {
+                if boards.iter().all(|b| b.blockers == 0) {
+                    tab.canon_min = v.max(2);
+                }
+            }
+            println!("  tt_min {} canon_min {}", tab.tt_min, if tab.canon_min == u32::MAX { "off".to_string() } else { tab.canon_min.to_string() });
+        }
         let t0 = Instant::now();
         for d in 1..=depth {
             let t = Instant::now();

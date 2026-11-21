@@ -90,6 +90,66 @@ struct Slot {
 pub struct PerftTable {
     slots: Vec<Slot>,
     mask: usize,
+    /// probe / store only at depth >= tt_min (shallow subtrees are cheaper to recount than to look up)
+    pub tt_min: u32,
+    /// key = the D4-canonical (me, opp) at depth >= canon_min (exact: a perft count is symmetry-invariant;
+    /// only used when the blocker set is empty); u32::MAX = off
+    pub canon_min: u32,
+}
+
+/// SYM[t][row][7-bit row value] = that row's cells moved by board symmetry t (8 x 7 x 128 masks, 57 KB).
+fn sym_table() -> &'static [[[u64; 128]; 7]; 8] {
+    static T: std::sync::OnceLock<Box<[[[u64; 128]; 7]; 8]>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = Box::new([[[0u64; 128]; 7]; 8]);
+        for s in 0..8 {
+            for r in 0..7usize {
+                for v in 0..128usize {
+                    let mut m = 0u64;
+                    for c in 0..7usize {
+                        if v >> c & 1 == 1 {
+                            let (rr, cc) = match s {
+                                0 => (r, c),
+                                1 => (c, 6 - r),
+                                2 => (6 - r, 6 - c),
+                                3 => (6 - c, r),
+                                4 => (6 - r, c),
+                                5 => (r, 6 - c),
+                                6 => (c, r),
+                                _ => (6 - c, 6 - r),
+                            };
+                            m |= 1u64 << (rr * 7 + cc);
+                        }
+                    }
+                    t[s][r][v] = m;
+                }
+            }
+        }
+        t
+    })
+}
+
+#[inline(always)]
+fn sym_apply(t: &[[u64; 128]; 7], bb: u64) -> u64 {
+    let mut out = 0u64;
+    for r in 0..7 {
+        out |= t[r][(bb >> (7 * r)) as usize & 127];
+    }
+    out
+}
+
+/// Lexicographically smallest (me, opp) over the 8 board symmetries.
+#[inline(always)]
+pub fn canonical(me: u64, opp: u64) -> (u64, u64) {
+    let st = sym_table();
+    let mut best = (me, opp);
+    for s in 1..8 {
+        let c = (sym_apply(&st[s], me), sym_apply(&st[s], opp));
+        if c < best {
+            best = c;
+        }
+    }
+    best
 }
 
 impl PerftTable {
@@ -100,7 +160,7 @@ impl PerftTable {
         while buckets * 2 * 64 <= bytes {
             buckets *= 2;
         }
-        PerftTable { slots: vec![Slot::default(); buckets * 2], mask: buckets - 1 }
+        PerftTable { slots: vec![Slot::default(); buckets * 2], mask: buckets - 1, tt_min: 2, canon_min: u32::MAX }
     }
     #[inline(always)]
     fn bucket(&self, me: u64, opp: u64) -> usize {
@@ -144,8 +204,12 @@ pub fn perft_tt(me: u64, opp: u64, empty: u64, depth: u32, tt: &mut PerftTable) 
     if me == 0 || opp == 0 {
         return 0;
     }
-    if let Some(n) = tt.get(me, opp, depth) {
-        return n;
+    let use_tt = depth >= tt.tt_min;
+    let (km, ko) = if depth >= tt.canon_min && use_tt { canonical(me, opp) } else { (me, opp) };
+    if use_tt {
+        if let Some(n) = tt.get(km, ko, depth) {
+            return n;
+        }
     }
     let mut nodes = 0u64;
     let mut moved = false;
@@ -156,7 +220,7 @@ pub fn perft_tt(me: u64, opp: u64, empty: u64, depth: u32, tt: &mut PerftTable) 
         let tb = 1u64 << to;
         let caps = RING1[to] & opp;
         let (cm, co) = (opp ^ caps, me | tb | caps);
-        if depth > 2 {
+        if depth > tt.tt_min && depth - 1 < tt.canon_min {
             tt.prefetch(cm, co);
         }
         nodes += perft_tt(cm, co, empty ^ tb, depth - 1, tt);
@@ -174,7 +238,7 @@ pub fn perft_tt(me: u64, opp: u64, empty: u64, depth: u32, tt: &mut PerftTable) 
             let tb = 1u64 << to;
             let caps = RING1[to] & opp;
             let (cm, co) = (opp ^ caps, (me ^ sb) | tb | caps);
-            if depth > 2 {
+            if depth > tt.tt_min && depth - 1 < tt.canon_min {
                 tt.prefetch(cm, co);
             }
             nodes += perft_tt(cm, co, (empty ^ tb) | sb, depth - 1, tt);
@@ -184,7 +248,9 @@ pub fn perft_tt(me: u64, opp: u64, empty: u64, depth: u32, tt: &mut PerftTable) 
     if !moved && reach_union(opp) & empty != 0 {
         nodes += perft_tt(opp, me, empty, depth - 1, tt);
     }
-    tt.put(me, opp, depth, nodes);
+    if use_tt {
+        tt.put(km, ko, depth, nodes);
+    }
     nodes
 }
 
@@ -230,6 +296,26 @@ mod tests {
             for d in 1..=4u32 {
                 assert_eq!(perft_tt(me, opp, e, d, &mut tt), perft_lib(me, opp, e, d), "ply {i} depth {d}");
             }
+        }
+    }
+
+    #[test]
+    fn canonical_tt_and_shallow_skip_keep_counts() {
+        let (me, opp, e) = rel(&Board::start());
+        for (tm, cm) in [(3u32, u32::MAX), (2, 3), (3, 4), (4, 2)] {
+            let mut tt = PerftTable::new(16);
+            tt.tt_min = tm;
+            tt.canon_min = cm;
+            for d in 0..=6u32 {
+                assert_eq!(perft_tt(me, opp, e, d, &mut tt), START[d as usize], "tt_min {tm} canon {cm} depth {d}");
+            }
+        }
+        // the 8 symmetries are a group: canonical of any image is the same
+        let b = Board::start().make(Board::start().legal_moves().iter().nth(3).unwrap());
+        let (m, o, _) = rel(&b);
+        let st = sym_table();
+        for s in 0..8 {
+            assert_eq!(canonical(sym_apply(&st[s], m), sym_apply(&st[s], o)), canonical(m, o));
         }
     }
 
