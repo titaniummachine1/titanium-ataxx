@@ -224,7 +224,7 @@ pub struct Knobs {
     pub v: [i32; NKNOB],
 }
 pub const KNOB_BUCKETS: usize = 16;
-pub const NKNOB: usize = 42;
+pub const NKNOB: usize = 44;
 /// rfp1-4 = RFP margin at depth 1-4; rfp_dis = disagreement share in RFP (/128); iir = min depth of the no-TT-move reduction;
 /// pc_* = ProbCut min depth / reduction / margin / disagreement share; lmr_min/half = Moonbird LMR start index / half-life;
 /// fut_min/div/dis = child futility start index / cp per ply / disagreement credit (/128); fut_ext = child disagreement above
@@ -232,7 +232,7 @@ pub const NKNOB: usize = 42;
 pub const KNOB_NAMES: [&str; NKNOB] = [
     "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "iir", "pc_d", "pc_r", "pc_t", "pc_k", "lmr_min", "lmr_half", "fut_min",
     "fut_div", "fut_dis", "fut_ext", "pol", "lmp1", "lmp2", "lmp3", "fp_d", "fp_base", "fp_mul", "fp_min",
-    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t", "asp", "mate_full", "puct_c", "puct_k",
+    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t", "asp", "mate_full", "puct_c", "puct_k", "mcgs_v", "mcgs_t",
 ];
 const K_RFP: usize = 0;
 const K_RFP_DIS: usize = 4;
@@ -289,17 +289,20 @@ const K_MATE_FULL: usize = 39;
 /// D1493 PUCT root effort allocator: c x 100 of U = Q + c P sqrt(N)/(1+n) (0 = off) and verification searches per iteration
 const K_PUCT_C: usize = 40;
 const K_PUCT_K: usize = 41;
+/// D1494 MCGS leaf evaluator: playouts per unstable leaf (0 = off) and the node disagreement (cp) that makes a leaf unstable
+const K_MCGS_V: usize = 42;
+const K_MCGS_T: usize = 43;
 pub const KNOB_DEFAULT: Knobs = Knobs {
     v: [
         RFP_MARGINS[0], RFP_MARGINS[1], RFP_MARGINS[2], RFP_MARGINS[3], DIS_RFP_NUM, 4, PC_D as i32, PC_R as i32, PC_T, PC_K,
-        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 150,
     ],
 };
 /// Allowed range per knob (refused outside: keeps every search well defined, e.g. no division by zero or depth underflow).
 const KNOB_RANGE: [(i32, i32); NKNOB] = [
     (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (1, 64), (2, 64), (1, 63), (0, 5000), (0, 512), (0, 256),
     (1, 10000), (0, 256), (1, 10000), (0, 512), (0, 16384), (0, 1000), (0, 256), (0, 256), (0, 256), (0, 8), (0, 5000),
-    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000), (0, 5000), (0, 1), (0, 1000), (0, 16),
+    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000), (0, 5000), (0, 1), (0, 1000), (0, 16), (0, 4096), (0, 5000),
 ];
 static KNOB_TABLE: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceLock::new();
 
@@ -984,6 +987,9 @@ pub struct WorkStats {
     /// D1493 PUCT root verification searches run / root best moves switched by them
     pub puct_verify: u64,
     pub puct_switch: u64,
+    /// D1494 leaves valued by the MCGS leaf evaluator and the playouts they used
+    pub mcgs_leaves: u64,
+    pub mcgs_playouts: u64,
 }
 
 impl WorkStats {
@@ -1015,14 +1021,16 @@ impl WorkStats {
         self.mate_full += o.mate_full;
         self.puct_verify += o.puct_verify;
         self.puct_switch += o.puct_switch;
+        self.mcgs_leaves += o.mcgs_leaves;
+        self.mcgs_playouts += o.mcgs_playouts;
     }
 
     /// one-line breakdown for debug output (bench, Botzone debug line). `nodes` = made positions (Stockfish count);
     /// made = entered children + children scored and pruned + children dropped unscored.
     pub fn breakdown(&self, nodes: u64) -> String {
         let cuts = self.terminals + self.tt_cuts + self.rfp_cuts + self.null_cuts + self.probcut_cuts + self.leaves + self.ttmove_cuts;
-        let extra = if self.se_tries + self.qlmp_skips + self.sw_relief + self.mate_full + self.puct_verify > 0 {
-            format!(" se={}/ext{}/cut{}/neg{} qlmp={} sw={} matefull={} puct={}/{}", self.se_tries, self.se_ext, self.se_cut, self.se_neg, self.qlmp_skips, self.sw_relief, self.mate_full, self.puct_verify, self.puct_switch)
+        let extra = if self.se_tries + self.qlmp_skips + self.sw_relief + self.mate_full + self.puct_verify + self.mcgs_leaves > 0 {
+            format!(" se={}/ext{}/cut{}/neg{} qlmp={} sw={} matefull={} puct={}/{} mcgs={}/{}", self.se_tries, self.se_ext, self.se_cut, self.se_neg, self.qlmp_skips, self.sw_relief, self.mate_full, self.puct_verify, self.puct_switch, self.mcgs_leaves, self.mcgs_playouts)
         } else {
             String::new()
         };
@@ -1101,6 +1109,8 @@ pub struct Searcher<'a> {
     cont: Box<[i32]>,
     /// Optional n-tuple table (None = pure hand eval). Borrowed, read-only in the tree.
     tuple: Option<&'a TupleTable>,
+    /// D1494 MCGS leaf evaluator (created on first use when knob mcgs_v > 0; its graph is kept across calls)
+    mcgs: Option<Box<crate::mcgs::McgsSearcher>>,
     /// Optional exp/nnue net (None = unchanged eval path). Takes precedence over the tuple when set.
     nnue: Option<&'a Nnue>,
     /// exp/policy: move-ordering policy head (None = unchanged), weight (ordering points per logit), min depth, scratch.
@@ -1195,6 +1205,7 @@ impl<'a> Searcher<'a> {
             history: Box::new([[[0; 49]; 49]; 2]),
             cont: vec![0i32; CONT_LEN].into_boxed_slice(),
             tuple: None,
+            mcgs: None,
             nnue: None,
             policy: None,
             owned_policy: crate::policy::open_configured(),
@@ -1393,6 +1404,9 @@ impl<'a> Searcher<'a> {
         *self.killers = [(0, 0); MAX_PLY];
         *self.history = [[[0; 49]; 49]; 2];
         self.cont.fill(0);
+        if let Some(m) = self.mcgs.as_mut() {
+            m.reset_for_new_game();
+        }
     }
 
     #[inline]
@@ -1739,6 +1753,25 @@ impl<'a> Searcher<'a> {
             // Note: `static_eval` depends only on `b`, so depth-0 leaves with legal unbanned moves remain untainted (`false` from entry).
             self.heuristic_used = true;
             self.work_add(|w| w.leaves += 1);
+            // D1494 (user: PUCT/MCGS instead of alpha-beta extensions): an UNSTABLE horizon leaf (node disagreement >=
+            // mcgs_t) is valued by a small MCGS search (mcgs_v playouts, graph kept across calls) instead of the static
+            // eval: a search-based leaf value, the role quiescence plays in chess. Clamped so it never claims a mate.
+            let mcgs_v = self.knobs[kbi].v[K_MCGS_V];
+            if mcgs_v > 0 && node_dis >= self.knobs[kbi].v[K_MCGS_T] && !(BZ && n_banned > 0) {
+                if let Some(nn) = self.nnue {
+                    let pol = if self.pol_explicit { self.policy } else { self.owned_policy.as_ref() };
+                    let m = self
+                        .mcgs
+                        .get_or_insert_with(|| Box::new(crate::mcgs::McgsSearcher::new(crate::mcgs::McgsParams::default())));
+                    let lim = SearchLimits { time: None, max_nodes: Some(mcgs_v as u64), max_depth: 64 };
+                    let r = m.search_result(b, nn, pol, &[(b.occ[0], b.occ[1])], false, BZ, &lim);
+                    self.work_add(|w| {
+                        w.mcgs_leaves += 1;
+                        w.mcgs_playouts += r.nodes;
+                    });
+                    return r.score.clamp(-3000, 3000);
+                }
+            }
             return static_eval;
         }
 
