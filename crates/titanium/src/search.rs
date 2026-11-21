@@ -224,7 +224,7 @@ pub struct Knobs {
     pub v: [i32; NKNOB],
 }
 pub const KNOB_BUCKETS: usize = 16;
-pub const NKNOB: usize = 42;
+pub const NKNOB: usize = 44;
 /// rfp1-4 = RFP margin at depth 1-4; rfp_dis = disagreement share in RFP (/128); iir = min depth of the no-TT-move reduction;
 /// pc_* = ProbCut min depth / reduction / margin / disagreement share; lmr_min/half = Moonbird LMR start index / half-life;
 /// fut_min/div/dis = child futility start index / cp per ply / disagreement credit (/128); fut_ext = child disagreement above
@@ -232,7 +232,7 @@ pub const NKNOB: usize = 42;
 pub const KNOB_NAMES: [&str; NKNOB] = [
     "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "iir", "pc_d", "pc_r", "pc_t", "pc_k", "lmr_min", "lmr_half", "fut_min",
     "fut_div", "fut_dis", "fut_ext", "pol", "lmp1", "lmp2", "lmp3", "fp_d", "fp_base", "fp_mul", "fp_min",
-    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t", "asp", "mate_full", "puct_c", "puct_k",
+    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t", "asp", "mate_full", "puct_c", "puct_k", "puct_u", "puct_d",
 ];
 const K_RFP: usize = 0;
 const K_RFP_DIS: usize = 4;
@@ -289,17 +289,21 @@ const K_MATE_FULL: usize = 39;
 /// D1493 PUCT root effort allocator: c x 100 of U = Q + c P sqrt(N)/(1+n) (0 = off) and verification searches per iteration
 const K_PUCT_C: usize = 40;
 const K_PUCT_K: usize = 41;
+/// D1511 cheap PUCT: puct_u = verify only when the root is unstable (best move changed since the previous completed iteration or
+/// its score fell by >= puct_u cp; 0 = verify every iteration), puct_d = extra plies of the verification search (2 = D1493 form)
+const K_PUCT_U: usize = 42;
+const K_PUCT_D: usize = 43;
 pub const KNOB_DEFAULT: Knobs = Knobs {
     v: [
         RFP_MARGINS[0], RFP_MARGINS[1], RFP_MARGINS[2], RFP_MARGINS[3], DIS_RFP_NUM, 4, PC_D as i32, PC_R as i32, PC_T, PC_K,
-        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2,
     ],
 };
 /// Allowed range per knob (refused outside: keeps every search well defined, e.g. no division by zero or depth underflow).
 const KNOB_RANGE: [(i32, i32); NKNOB] = [
     (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (1, 64), (2, 64), (1, 63), (0, 5000), (0, 512), (0, 256),
     (1, 10000), (0, 256), (1, 10000), (0, 512), (0, 16384), (0, 1000), (0, 256), (0, 256), (0, 256), (0, 8), (0, 5000),
-    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000), (0, 5000), (0, 1), (0, 1000), (0, 16),
+    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000), (0, 5000), (0, 1), (0, 1000), (0, 16), (0, 5000), (0, 4),
 ];
 static KNOB_TABLE: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceLock::new();
 
@@ -2683,6 +2687,7 @@ impl<'a> Searcher<'a> {
         let mut p_prior = [0f32; 256];
         let mut p_score = [i32::MIN; 256];
         let mut p_nodes = [0u64; 256];
+        let (mut st_best, mut st_score): (Option<Move>, i32) = (None, 0);
         if puct_c > 0 && n_root > 1 {
             let active_pol = if self.pol_explicit { self.policy } else { self.owned_policy.as_ref() };
             if let (Some(pol), Some(_)) = (active_pol, self.nnue) {
@@ -2860,7 +2865,14 @@ impl<'a> Searcher<'a> {
             // the root moves; the top-U challengers (at most puct_k, only while U beats the incumbent's U) get a null-window
             // search 2 plies deeper than this iteration against the incumbent; a challenger that beats it is searched exactly
             // and compared with the incumbent searched at the same deeper depth; the better one becomes the root best move.
-            if puct_c > 0 && !self.stop && depth >= 6 && n_root > 1 && result.score.abs() < MATE_BOUND * 2 {
+            // D1511 puct_u: verify only on an unstable root (best move changed since the previous completed iteration, or its
+            // score fell by >= puct_u cp); the first eligible iteration counts as unstable.
+            let puct_u = rkn[K_PUCT_U];
+            let unstable = puct_u == 0
+                || st_best.is_none()
+                || st_best != result.best
+                || st_score.saturating_sub(result.score) >= puct_u;
+            if puct_c > 0 && unstable && !self.stop && depth >= 6 && n_root > 1 && result.score.abs() < MATE_BOUND * 2 {
                 if let Some(bm) = result.best {
                     let s0 = result.score;
                     let ntot = p_nodes[..n_root].iter().sum::<u64>().max(1) as f32;
@@ -2873,7 +2885,8 @@ impl<'a> Searcher<'a> {
                         .map(|i| (u_of(i, p_score[i].min(s0)), i))
                         .collect();
                     cand.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
-                    let vdepth = u32::from(depth) + 1; // child depth: the root move is searched 2 plies deeper in total
+                    // child depth: the root move is searched puct_d plies deeper than this iteration (D1493 form = 2)
+                    let vdepth = u32::from(depth) - 1 + rkn[K_PUCT_D].max(0) as u32;
                     let mut inc_deep: Option<i32> = None;
                     for &(u, i) in cand.iter().take(rkn[K_PUCT_K].max(0) as usize) {
                         if u <= ub || self.stop {
@@ -2924,6 +2937,10 @@ impl<'a> Searcher<'a> {
                         }
                     }
                 }
+            }
+            if !self.stop && has_completed_iter {
+                st_best = result.best;
+                st_score = result.score;
             }
             if self.stop {
                 break;
