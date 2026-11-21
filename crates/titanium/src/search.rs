@@ -224,7 +224,7 @@ pub struct Knobs {
     pub v: [i32; NKNOB],
 }
 pub const KNOB_BUCKETS: usize = 16;
-pub const NKNOB: usize = 37;
+pub const NKNOB: usize = 38;
 /// rfp1-4 = RFP margin at depth 1-4; rfp_dis = disagreement share in RFP (/128); iir = min depth of the no-TT-move reduction;
 /// pc_* = ProbCut min depth / reduction / margin / disagreement share; lmr_min/half = Moonbird LMR start index / half-life;
 /// fut_min/div/dis = child futility start index / cp per ply / disagreement credit (/128); fut_ext = child disagreement above
@@ -232,7 +232,7 @@ pub const NKNOB: usize = 37;
 pub const KNOB_NAMES: [&str; NKNOB] = [
     "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "iir", "pc_d", "pc_r", "pc_t", "pc_k", "lmr_min", "lmr_half", "fut_min",
     "fut_div", "fut_dis", "fut_ext", "pol", "lmp1", "lmp2", "lmp3", "fp_d", "fp_base", "fp_mul", "fp_min",
-    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w",
+    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t",
 ];
 const K_RFP: usize = 0;
 const K_RFP_DIS: usize = 4;
@@ -280,17 +280,19 @@ const K_LMR_DISL: usize = 34;
 const K_DIS_TT: usize = 35;
 /// D1485 continuation history ordering weight: ordering units added per move = cont * ch_w / HIST_MAX (0 = off: no updates)
 const K_CH_W: usize = 36;
+/// D1488 swing relief: a reduced move whose child static eval moves >= sw_t cp from the parent static eval gets 1 ply back
+const K_SW_T: usize = 37;
 pub const KNOB_DEFAULT: Knobs = Knobs {
     v: [
         RFP_MARGINS[0], RFP_MARGINS[1], RFP_MARGINS[2], RFP_MARGINS[3], DIS_RFP_NUM, 4, PC_D as i32, PC_R as i32, PC_T, PC_K,
-        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0,
+        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0,
     ],
 };
 /// Allowed range per knob (refused outside: keeps every search well defined, e.g. no division by zero or depth underflow).
 const KNOB_RANGE: [(i32, i32); NKNOB] = [
     (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (1, 64), (2, 64), (1, 63), (0, 5000), (0, 512), (0, 256),
     (1, 10000), (0, 256), (1, 10000), (0, 512), (0, 16384), (0, 1000), (0, 256), (0, 256), (0, 256), (0, 8), (0, 5000),
-    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000),
+    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000),
 ];
 static KNOB_TABLE: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceLock::new();
 
@@ -968,6 +970,8 @@ pub struct WorkStats {
     pub se_cut: u64,
     pub se_neg: u64,
     pub qlmp_skips: u64,
+    /// D1488 reduced moves given a ply back for a large static-eval swing (sw_t)
+    pub sw_relief: u64,
 }
 
 impl WorkStats {
@@ -995,14 +999,15 @@ impl WorkStats {
         self.se_cut += o.se_cut;
         self.se_neg += o.se_neg;
         self.qlmp_skips += o.qlmp_skips;
+        self.sw_relief += o.sw_relief;
     }
 
     /// one-line breakdown for debug output (bench, Botzone debug line). `nodes` = made positions (Stockfish count);
     /// made = entered children + children scored and pruned + children dropped unscored.
     pub fn breakdown(&self, nodes: u64) -> String {
         let cuts = self.terminals + self.tt_cuts + self.rfp_cuts + self.null_cuts + self.probcut_cuts + self.leaves + self.ttmove_cuts;
-        let extra = if self.se_tries + self.qlmp_skips > 0 {
-            format!(" se={}/ext{}/cut{}/neg{} qlmp={}", self.se_tries, self.se_ext, self.se_cut, self.se_neg, self.qlmp_skips)
+        let extra = if self.se_tries + self.qlmp_skips + self.sw_relief > 0 {
+            format!(" se={}/ext{}/cut{}/neg{} qlmp={} sw={}", self.se_tries, self.se_ext, self.se_cut, self.se_neg, self.qlmp_skips, self.sw_relief)
         } else {
             String::new()
         };
@@ -2188,6 +2193,13 @@ impl<'a> Searcher<'a> {
                 new_depth -= (shortfall / self.knobs[kbi].v[K_FUT_DIV]).clamp(0, 64);
                 if child_dis > self.knobs[kbi].v[K_FUT_EXT] && new_depth < depth as i32 {
                     new_depth += 1;
+                }
+                // D1488 (user: the losing side pushes the loss past the horizon): a reduced move whose child static eval
+                // swings >= sw_t cp away from this node's static eval is tactical: one ply of its reduction back (0 = off)
+                let sw_t = self.knobs[kbi].v[K_SW_T];
+                if sw_t > 0 && new_depth > 0 && new_depth < depth as i32 && (ce.saturating_add(static_eval)).abs() >= sw_t {
+                    new_depth += 1;
+                    self.work_add(|w| w.sw_relief += 1);
                 }
             }
             // When all moves searched so far at this node lose by forced mate (or when searching
