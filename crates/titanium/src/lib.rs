@@ -12,6 +12,7 @@ pub mod board;
 pub mod config;
 pub mod nnfeat;
 pub mod nnue;
+pub mod perft;
 pub mod policy;
 pub mod search;
 pub mod smallnet;

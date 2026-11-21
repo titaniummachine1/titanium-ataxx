@@ -51,7 +51,7 @@ fn main() -> ExitCode {
             print!("{}", titanium::config::report(nn.as_ref()));
             ExitCode::SUCCESS
         }
-        "perft" => perft_cmd(first_int(&args).unwrap_or(4) as u32),
+        "perft" => perft_cmd(first_int(&args).unwrap_or(4) as u32, &args),
         "bench" => bench_cmd(
             depth_flag(&args, 8),
             flag_str(&args, "--tuple"),
@@ -222,7 +222,37 @@ fn mirror(b: &Board) -> Board {
     m
 }
 
-fn perft_cmd(depth: u32) -> ExitCode {
+/// D1394: `perft N` = pair perft (one clone per source, mirror-checked); `--lib` = libataxx counts (clone once per
+/// destination, passes); `--tt [--mb M]` = single-thread hashed perft (iterative 1..N, one table); `--positions` =
+/// the 8 sperft positions (the 14-15 Gnps measurement of exp/max-nps, D1393) instead of the start position.
+fn perft_cmd(depth: u32, args: &[String]) -> ExitCode {
+    let lib = args.iter().any(|a| a == "--lib");
+    let tt = args.iter().any(|a| a == "--tt");
+    let multi = args.iter().any(|a| a == "--positions");
+    if lib || tt || multi {
+        let boards = if multi { sperft_positions(8) } else { vec![Board::start()] };
+        let mb = flag_int(args, "--mb").unwrap_or(512) as usize;
+        let kind = if tt { "hashed (TT) libataxx" } else if lib { "libataxx" } else { "pair (one clone per source)" };
+        println!("perft {kind}, single thread, {} position(s){}", boards.len(), if tt { format!(", table {mb} MB") } else { String::new() });
+        let mut table = if tt { Some(titanium::perft::PerftTable::new(mb)) } else { None };
+        let t0 = Instant::now();
+        for d in 1..=depth {
+            let t = Instant::now();
+            let mut n = 0u64;
+            for b in &boards {
+                let (me, opp, e) = titanium::perft::rel(b);
+                n += match table.as_mut() {
+                    Some(tab) => titanium::perft::perft_tt(me, opp, e, d, tab),
+                    None if lib => titanium::perft::perft_lib(me, opp, e, d),
+                    None => titanium::perft_bb(me, opp, b.blockers, d),
+                };
+            }
+            let s = t.elapsed().as_secs_f64();
+            println!("  depth {d:>2}: {n:>18} nodes  {:>10.3} s  {:>10.2} Mnps", s, n as f64 / s.max(1e-9) / 1e6);
+        }
+        println!("  total time {:.3} s", t0.elapsed().as_secs_f64());
+        return ExitCode::SUCCESS;
+    }
     let start = Board::start();
     let mirrored = mirror(&start);
     println!("Perft from the start position (cross-checked against mirrored board):");
