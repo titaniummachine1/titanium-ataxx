@@ -224,7 +224,7 @@ pub struct Knobs {
     pub v: [i32; NKNOB],
 }
 pub const KNOB_BUCKETS: usize = 16;
-pub const NKNOB: usize = 40;
+pub const NKNOB: usize = 42;
 /// rfp1-4 = RFP margin at depth 1-4; rfp_dis = disagreement share in RFP (/128); iir = min depth of the no-TT-move reduction;
 /// pc_* = ProbCut min depth / reduction / margin / disagreement share; lmr_min/half = Moonbird LMR start index / half-life;
 /// fut_min/div/dis = child futility start index / cp per ply / disagreement credit (/128); fut_ext = child disagreement above
@@ -232,7 +232,7 @@ pub const NKNOB: usize = 40;
 pub const KNOB_NAMES: [&str; NKNOB] = [
     "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "iir", "pc_d", "pc_r", "pc_t", "pc_k", "lmr_min", "lmr_half", "fut_min",
     "fut_div", "fut_dis", "fut_ext", "pol", "lmp1", "lmp2", "lmp3", "fp_d", "fp_base", "fp_mul", "fp_min",
-    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t", "asp", "mate_full",
+    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t", "asp", "mate_full", "puct_c", "puct_k",
 ];
 const K_RFP: usize = 0;
 const K_RFP_DIS: usize = 4;
@@ -286,17 +286,20 @@ const K_SW_T: usize = 37;
 const K_ASP: usize = 38;
 /// D1491 losing-node full search: once every move tried at a node loses by force, the rest are searched unreduced (0/1)
 const K_MATE_FULL: usize = 39;
+/// D1493 PUCT root effort allocator: c x 100 of U = Q + c P sqrt(N)/(1+n) (0 = off) and verification searches per iteration
+const K_PUCT_C: usize = 40;
+const K_PUCT_K: usize = 41;
 pub const KNOB_DEFAULT: Knobs = Knobs {
     v: [
         RFP_MARGINS[0], RFP_MARGINS[1], RFP_MARGINS[2], RFP_MARGINS[3], DIS_RFP_NUM, 4, PC_D as i32, PC_R as i32, PC_T, PC_K,
-        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2,
     ],
 };
 /// Allowed range per knob (refused outside: keeps every search well defined, e.g. no division by zero or depth underflow).
 const KNOB_RANGE: [(i32, i32); NKNOB] = [
     (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (1, 64), (2, 64), (1, 63), (0, 5000), (0, 512), (0, 256),
     (1, 10000), (0, 256), (1, 10000), (0, 512), (0, 16384), (0, 1000), (0, 256), (0, 256), (0, 256), (0, 8), (0, 5000),
-    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000), (0, 5000), (0, 1),
+    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000), (0, 5000), (0, 1), (0, 1000), (0, 16),
 ];
 static KNOB_TABLE: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceLock::new();
 
@@ -978,6 +981,9 @@ pub struct WorkStats {
     pub sw_relief: u64,
     /// D1491 moves searched unreduced because every earlier move at the node lost by force (mate_full)
     pub mate_full: u64,
+    /// D1493 PUCT root verification searches run / root best moves switched by them
+    pub puct_verify: u64,
+    pub puct_switch: u64,
 }
 
 impl WorkStats {
@@ -1007,14 +1013,16 @@ impl WorkStats {
         self.qlmp_skips += o.qlmp_skips;
         self.sw_relief += o.sw_relief;
         self.mate_full += o.mate_full;
+        self.puct_verify += o.puct_verify;
+        self.puct_switch += o.puct_switch;
     }
 
     /// one-line breakdown for debug output (bench, Botzone debug line). `nodes` = made positions (Stockfish count);
     /// made = entered children + children scored and pruned + children dropped unscored.
     pub fn breakdown(&self, nodes: u64) -> String {
         let cuts = self.terminals + self.tt_cuts + self.rfp_cuts + self.null_cuts + self.probcut_cuts + self.leaves + self.ttmove_cuts;
-        let extra = if self.se_tries + self.qlmp_skips + self.sw_relief + self.mate_full > 0 {
-            format!(" se={}/ext{}/cut{}/neg{} qlmp={} sw={} matefull={}", self.se_tries, self.se_ext, self.se_cut, self.se_neg, self.qlmp_skips, self.sw_relief, self.mate_full)
+        let extra = if self.se_tries + self.qlmp_skips + self.sw_relief + self.mate_full + self.puct_verify > 0 {
+            format!(" se={}/ext{}/cut{}/neg{} qlmp={} sw={} matefull={} puct={}/{}", self.se_tries, self.se_ext, self.se_cut, self.se_neg, self.qlmp_skips, self.sw_relief, self.mate_full, self.puct_verify, self.puct_switch)
         } else {
             String::new()
         };
@@ -2327,6 +2335,25 @@ impl<'a> Searcher<'a> {
         best
     }
 
+    /// D1493: make root move `m` and set up the ply-1 stacks exactly as the root loop does (path, repetition, Botzone snaps)
+    fn root_child<const BZ: bool>(&mut self, b: &Board, m: Move) -> Board {
+        let child = b.make(m);
+        self.stack.pto[1] = m.to;
+        self.nodes += 1;
+        self.stack.imp[1] = 3;
+        self.stack.path_hash[1] = child.hash;
+        self.stack.rep_base[1] = if m.is_clone() { 1 } else { 0 };
+        if BZ {
+            self.bz_snaps[self.bz_base_offset + 1] = placement_snap(b, m);
+            self.bz_ply[1] = BzPly {
+                rep_base: if m.is_clone() { (self.bz_base_offset + 1) as u32 } else { 0 },
+                ban_start: 0,
+                tainted: false,
+            };
+        }
+        child
+    }
+
     /// D1469/D1479: total LMR depth change of a reduced move (+ = reduce less): history + policy gap + disagreement + PV
     #[allow(clippy::too_many_arguments)]
     #[inline]
@@ -2648,6 +2675,46 @@ impl<'a> Searcher<'a> {
 
         let mut has_completed_iter = false;
 
+        // D1493 (user: PUCT math inside alpha-beta) root effort allocator, knobs puct_c (c x 100, 0 = off) / puct_k (root
+        // bucket): per root move the policy prior P, its score from the last completed iteration and the nodes spent on it.
+        let rkn = self.knobs[knob_bucket(b.empty().count_ones())].v;
+        let puct_c = rkn[K_PUCT_C];
+        let pmoves = root_moves;
+        let mut p_prior = [0f32; 256];
+        let mut p_score = [i32::MIN; 256];
+        let mut p_nodes = [0u64; 256];
+        if puct_c > 0 && n_root > 1 {
+            let active_pol = if self.pol_explicit { self.policy } else { self.owned_policy.as_ref() };
+            if let (Some(pol), Some(_)) = (active_pol, self.nnue) {
+                let pw = self.pol_w.max(1.0);
+                let (kill, hist) = (&self.killers, &self.history);
+                let tmp = &mut self.stack.lists[1];
+                gen_and_score_into::<false, true>(b, tmp, 0, 0, kill, hist, Some((pol.head(b), pw)));
+                let mut raw = [f32::MIN; 256];
+                let mut mx = f32::MIN;
+                for j in 0..tmp.len() {
+                    let m = tmp.move_at(j);
+                    if let Some(i) = (0..n_root).find(|&i| pmoves[i] == m) {
+                        raw[i] = tmp.score_at(j) as f32 / pw;
+                        mx = mx.max(raw[i]);
+                    }
+                }
+                let mut tot = 0f32;
+                for i in 0..n_root {
+                    if raw[i] > f32::MIN {
+                        p_prior[i] = (raw[i] - mx).exp();
+                        tot += p_prior[i];
+                    }
+                }
+                if tot > 0.0 {
+                    for p in p_prior[..n_root].iter_mut() {
+                        *p /= tot;
+                    }
+                }
+                tmp.clear();
+            }
+        }
+
         // Iterative deepening MUST always start at depth 1.
         // Skipping shallow iterations (even if TT has a deep entry) is fatal under hard time
         // limits (e.g. Botzone): if the high-depth iteration is cut short by the deadline before
@@ -2684,6 +2751,7 @@ impl<'a> Searcher<'a> {
             failed_low_pass = false;
             for i in 0..n_root {
                 let m = root_moves[i];
+                let n0 = self.nodes;
                 let child = b.make(m);
                 self.stack.pto[1] = m.to;
                 self.nodes += 1;
@@ -2704,6 +2772,14 @@ impl<'a> Searcher<'a> {
                 }
                 let score =
                     -self.negamax::<BZ>(&child, -hi, -alpha, u32::from(depth - 1), 1, true);
+                if puct_c > 0 {
+                    if let Some(s) = (0..n_root).find(|&k| pmoves[k] == m) {
+                        p_nodes[s] += self.nodes - n0;
+                        if !self.stop {
+                            p_score[s] = score;
+                        }
+                    }
+                }
                 if self.stop {
                     break;
                 }
@@ -2776,6 +2852,75 @@ impl<'a> Searcher<'a> {
                         if let Some(pos) = (0..n_root).find(|&i| root_moves[i] == m) {
                             root_moves[pos] = root_moves[0];
                             root_moves[0] = m;
+                        }
+                    }
+                }
+            }
+            // D1493 PUCT verification (puct_c > 0, completed iteration, depth >= 6): U_i = Q_i + c P_i sqrt(N) / (1 + n_i) over
+            // the root moves; the top-U challengers (at most puct_k, only while U beats the incumbent's U) get a null-window
+            // search 2 plies deeper than this iteration against the incumbent; a challenger that beats it is searched exactly
+            // and compared with the incumbent searched at the same deeper depth; the better one becomes the root best move.
+            if puct_c > 0 && !self.stop && depth >= 6 && n_root > 1 && result.score.abs() < MATE_BOUND * 2 {
+                if let Some(bm) = result.best {
+                    let s0 = result.score;
+                    let ntot = p_nodes[..n_root].iter().sum::<u64>().max(1) as f32;
+                    let c = puct_c as f32 / 100.0;
+                    let q = |s: i32| 1.0 / (1.0 + (-(s.clamp(-4000, 4000) as f32) / 400.0).exp());
+                    let u_of = |i: usize, s: i32| q(s) + c * p_prior[i] * ntot.sqrt() / (1.0 + p_nodes[i] as f32);
+                    let ub = (0..n_root).find(|&i| pmoves[i] == bm).map(|i| u_of(i, s0)).unwrap_or(0.0);
+                    let mut cand: Vec<(f32, usize)> = (0..n_root)
+                        .filter(|&i| pmoves[i] != bm && p_score[i] != i32::MIN)
+                        .map(|i| (u_of(i, p_score[i].min(s0)), i))
+                        .collect();
+                    cand.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+                    let vdepth = u32::from(depth) + 1; // child depth: the root move is searched 2 plies deeper in total
+                    let mut inc_deep: Option<i32> = None;
+                    for &(u, i) in cand.iter().take(rkn[K_PUCT_K].max(0) as usize) {
+                        if u <= ub || self.stop {
+                            break;
+                        }
+                        let m = pmoves[i];
+                        let n0 = self.nodes;
+                        let child = self.root_child::<BZ>(b, m);
+                        let sc = -self.negamax::<BZ>(&child, -(s0 + 1), -s0, vdepth, 1, true);
+                        p_nodes[i] += self.nodes - n0;
+                        self.work_add(|w| w.puct_verify += 1);
+                        if self.stop || sc <= s0 {
+                            continue;
+                        }
+                        let n1 = self.nodes;
+                        let child = self.root_child::<BZ>(b, m);
+                        let sc2 = -self.negamax::<BZ>(&child, -INF, -s0, vdepth, 1, true);
+                        p_nodes[i] += self.nodes - n1;
+                        if self.stop {
+                            break;
+                        }
+                        let inc = match inc_deep {
+                            Some(v) => v,
+                            None => {
+                                let n2 = self.nodes;
+                                let child = self.root_child::<BZ>(b, bm);
+                                let v = -self.negamax::<BZ>(&child, -INF, INF, vdepth, 1, true);
+                                if let Some(k) = (0..n_root).find(|&k| pmoves[k] == bm) {
+                                    p_nodes[k] += self.nodes - n2;
+                                }
+                                if self.stop {
+                                    break;
+                                }
+                                inc_deep = Some(v);
+                                v
+                            }
+                        };
+                        if sc2 > inc {
+                            result.best = Some(m);
+                            result.score = sc2;
+                            self.publish_best(m);
+                            self.work_add(|w| w.puct_switch += 1);
+                            if let Some(pos) = (0..n_root).find(|&k| root_moves[k] == m) {
+                                root_moves[pos] = root_moves[0];
+                                root_moves[0] = m;
+                            }
+                            break;
                         }
                     }
                 }
