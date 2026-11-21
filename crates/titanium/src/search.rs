@@ -255,12 +255,26 @@ static KNOB_TABLE: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceL
 /// Parse `name=v` (all buckets) / `name@b=v` (one bucket) items, comma separated, into the process-wide table (once, at
 /// start-up, before any search). Unknown names, bad buckets, out-of-range values and pc_r >= pc_d are refused.
 pub fn set_knobs(spec: &str) -> Result<(), String> {
-    let t = parse_knobs(spec)?;
+    let t = parse_knobs_on(&bundled_knobs(), spec)?;
     KNOB_TABLE.set(t).map_err(|_| "--tune: the knob table is already set".to_string())
 }
 
+/// D1369: the per-stage tuned knob table shipped with the engine (`data/nnue/knobs_main.txt`, per-stage SPSA D1327/D1342, 800 iterations,
+/// gated vs main). `--tune` items are layered on top of it; the constants above are only the SPSA starting point.
+pub fn bundled_knobs() -> [Knobs; KNOB_BUCKETS] {
+    static B: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        parse_knobs_on(&[KNOB_DEFAULT; KNOB_BUCKETS], include_str!("../../../data/nnue/knobs_main.txt"))
+            .expect("data/nnue/knobs_main.txt is a valid knob table")
+    })
+}
+
 pub fn parse_knobs(spec: &str) -> Result<[Knobs; KNOB_BUCKETS], String> {
-    let mut t = [KNOB_DEFAULT; KNOB_BUCKETS];
+    parse_knobs_on(&[KNOB_DEFAULT; KNOB_BUCKETS], spec)
+}
+
+fn parse_knobs_on(base: &[Knobs; KNOB_BUCKETS], spec: &str) -> Result<[Knobs; KNOB_BUCKETS], String> {
+    let mut t = *base;
     for item in spec.split(',').map(str::trim).filter(|x| !x.is_empty()) {
         let (k, v) = item.split_once('=').ok_or_else(|| format!("--tune item '{item}': expected name=value"))?;
         let (name, bucket) = match k.split_once('@') {
@@ -307,7 +321,7 @@ pub fn knob_list() -> String {
 }
 
 pub fn knob_table() -> [Knobs; KNOB_BUCKETS] {
-    *KNOB_TABLE.get().unwrap_or(&[KNOB_DEFAULT; KNOB_BUCKETS])
+    *KNOB_TABLE.get_or_init(bundled_knobs)
 }
 
 #[inline(always)]
@@ -2257,6 +2271,15 @@ pub fn best_move(b: &Board, limits: &SearchLimits) -> SearchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_knob_table_is_the_tuned_one() {
+        // D1369: the shipped per-stage table parses, is complete (17 knobs x 16 buckets) and differs from the plain constants.
+        let t = bundled_knobs();
+        assert!(t.iter().any(|k| *k != KNOB_DEFAULT));
+        assert_eq!(t[0].v[K_RFP], 232); // rfp1@0 of theta_800
+        assert_eq!(knob_table(), t);
+    }
 
     #[test]
     fn knob_spec_parses_and_refuses() {
