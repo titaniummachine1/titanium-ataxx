@@ -10,6 +10,7 @@
 
 pub mod board;
 pub mod config;
+pub mod mcgs;
 pub mod nnfeat;
 pub mod nnue;
 pub mod perft;
