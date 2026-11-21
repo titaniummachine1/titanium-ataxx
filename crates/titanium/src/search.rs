@@ -224,7 +224,7 @@ pub struct Knobs {
     pub v: [i32; NKNOB],
 }
 pub const KNOB_BUCKETS: usize = 16;
-pub const NKNOB: usize = 38;
+pub const NKNOB: usize = 39;
 /// rfp1-4 = RFP margin at depth 1-4; rfp_dis = disagreement share in RFP (/128); iir = min depth of the no-TT-move reduction;
 /// pc_* = ProbCut min depth / reduction / margin / disagreement share; lmr_min/half = Moonbird LMR start index / half-life;
 /// fut_min/div/dis = child futility start index / cp per ply / disagreement credit (/128); fut_ext = child disagreement above
@@ -232,7 +232,7 @@ pub const NKNOB: usize = 38;
 pub const KNOB_NAMES: [&str; NKNOB] = [
     "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "iir", "pc_d", "pc_r", "pc_t", "pc_k", "lmr_min", "lmr_half", "fut_min",
     "fut_div", "fut_dis", "fut_ext", "pol", "lmp1", "lmp2", "lmp3", "fp_d", "fp_base", "fp_mul", "fp_min",
-    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t",
+    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t", "asp",
 ];
 const K_RFP: usize = 0;
 const K_RFP_DIS: usize = 4;
@@ -282,17 +282,19 @@ const K_DIS_TT: usize = 35;
 const K_CH_W: usize = 36;
 /// D1488 swing relief: a reduced move whose child static eval moves >= sw_t cp from the parent static eval gets 1 ply back
 const K_SW_T: usize = 37;
+/// D1489 aspiration window half-width cp at the root (root bucket), doubling on each fail; 0 = off (full window)
+const K_ASP: usize = 38;
 pub const KNOB_DEFAULT: Knobs = Knobs {
     v: [
         RFP_MARGINS[0], RFP_MARGINS[1], RFP_MARGINS[2], RFP_MARGINS[3], DIS_RFP_NUM, 4, PC_D as i32, PC_R as i32, PC_T, PC_K,
-        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0,
+        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0, 0,
     ],
 };
 /// Allowed range per knob (refused outside: keeps every search well defined, e.g. no division by zero or depth underflow).
 const KNOB_RANGE: [(i32, i32); NKNOB] = [
     (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (1, 64), (2, 64), (1, 63), (0, 5000), (0, 512), (0, 256),
     (1, 10000), (0, 256), (1, 10000), (0, 512), (0, 16384), (0, 1000), (0, 256), (0, 256), (0, 256), (0, 8), (0, 5000),
-    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000),
+    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000), (0, 5000),
 ];
 static KNOB_TABLE: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceLock::new();
 
@@ -2643,10 +2645,18 @@ impl<'a> Searcher<'a> {
         for depth in 1..=limits.max_depth.max(1) {
             self.heuristic_used = false;
             self.root_depth = u32::from(depth);
-            let mut alpha = -INF;
+            let mut alpha;
             let mut best_this = None;
             let mut best_score = i32::MIN;
-            // Clean-main ID: FULL window every iteration. No aspiration.
+            // D1489 aspiration windows (knob asp, root bucket; 0 = off = the old full window): from depth 4 on, search the root
+            // in [prev - asp, prev + asp]; on a fail low / fail high widen that side (delta doubles) and search again. A pass
+            // that fails low reports upper bounds only: its moves are not published and, if the clock stops it, not adopted.
+            let asp0 = self.knobs[knob_bucket(b.empty().count_ones())].v[K_ASP];
+            let use_asp = asp0 > 0 && depth >= 4 && has_completed_iter && result.score.abs() < MATE_BOUND;
+            let (mut lo, mut hi) = if use_asp { (result.score - asp0, result.score + asp0) } else { (-INF, INF) };
+            let mut delta = asp0;
+            let mut failed_low_pass;
+            // Clean-main ID: FULL window every iteration unless asp > 0.
             // (Aspiration reverted: narrowed windows changed PVS cutoffs at
             // fixed node budgets -> bench d8 9.4k=>17k, QB5k 45-53-2.-28.)
             self.stack.path_hash[0] = b.hash;
@@ -2655,6 +2665,11 @@ impl<'a> Searcher<'a> {
                 self.bz_banned.clear();
                 self.bz_ply[0] = BzPly::default();
             }
+            'asp: loop {
+            alpha = lo;
+            best_this = None;
+            best_score = i32::MIN;
+            failed_low_pass = false;
             for i in 0..n_root {
                 let m = root_moves[i];
                 let child = b.make(m);
@@ -2676,7 +2691,7 @@ impl<'a> Searcher<'a> {
                     };
                 }
                 let score =
-                    -self.negamax::<BZ>(&child, -INF, -alpha, u32::from(depth - 1), 1, true);
+                    -self.negamax::<BZ>(&child, -hi, -alpha, u32::from(depth - 1), 1, true);
                 if self.stop {
                     break;
                 }
@@ -2688,10 +2703,38 @@ impl<'a> Searcher<'a> {
                     }
                     // D1415: publish every root improvement at once (same rule as the partial-iteration adoption below), so a
                     // watchdog that answers before the search returns plays exactly the move the search would return if stopped now.
-                    if !(has_completed_iter && result.score >= MATE_BOUND && best_score < result.score) {
+                    // D1489: a score at or below the aspiration floor is only an upper bound: not published.
+                    if score > lo && !(has_completed_iter && result.score >= MATE_BOUND && best_score < result.score) {
                         self.publish_best(m);
                     }
                 }
+                if score >= hi {
+                    break; // aspiration fail high: no need to search the other root moves in this window
+                }
+            }
+            if self.stop || !use_asp {
+                failed_low_pass = self.stop && best_score <= lo && lo > -INF;
+                break 'asp;
+            }
+            if best_score <= lo && lo > -INF {
+                lo = lo.saturating_sub(delta).max(-INF);
+                delta = delta.saturating_mul(2);
+                failed_low_pass = true;
+                continue 'asp;
+            }
+            if best_score >= hi && hi < INF {
+                hi = hi.saturating_add(delta).min(INF);
+                delta = delta.saturating_mul(2);
+                // search the move that failed high first in the wider window
+                if let Some(fm) = best_this {
+                    if let Some(pos) = (0..n_root).find(|&i| root_moves[i] == fm) {
+                        root_moves[pos] = root_moves[0];
+                        root_moves[0] = fm;
+                    }
+                }
+                continue 'asp;
+            }
+            break 'asp;
             }
             // Partial-iteration adoption (Stockfish / Reckless):
             // - A completed iteration is adopted unless it forgot a shorter proven winning mate
@@ -2704,7 +2747,8 @@ impl<'a> Searcher<'a> {
                     && best_score < result.score;
                 // Stockfish rule: the previous best move is searched first, so once any root move of an aborted
                 // iteration has finished, that iteration's best so far is at least as informed as the older depth.
-                let adopt = !forgotten_mate;
+                // D1489: a clock-stopped aspiration pass that failed low holds upper bounds only: keep the older iteration
+                let adopt = !forgotten_mate && !failed_low_pass;
                 if adopt {
                     result.best = Some(m);
                     self.publish_best(m);
