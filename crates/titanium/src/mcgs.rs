@@ -467,15 +467,16 @@ impl McgsSearcher {
         self.logits.clear();
 
         let sn = use_sn.then(small_net);
-        let sn_pa = sn.map(|s| s.acc(me, opp, key.blk));
+        let sn_pa = sn.map(|s| s.acc(me, opp));
         let sn_w = self.params.sn_prior_weight;
         let mut mx = f32::NEG_INFINITY;
 
-        if let Some(p) = pol {
+        if let Some(pol) = pol {
+            // D1494 port: the policy scoring moved to the per-position Head (TPOL6 phase buckets)
+            let p = pol.head(&b);
             let inv_t = 1.0 / self.params.policy_temp.max(0.05);
             let mut orig_valid: u64 = 0;
-            let mut orig_g = [MaybeUninit::<f32>::uninit(); 49];
-            let mut orig_tor = [MaybeUninit::<i32>::uninit(); 49];
+            let mut orig_z = [MaybeUninit::<f32>::uninit(); 49];
 
             while targets != 0 {
                 let to = targets.trailing_zeros() as u8;
@@ -519,7 +520,7 @@ impl McgsSearcher {
                     self.logits.push(z);
                 }
                 if jumps != 0 {
-                    let (j_prefix, j_td) = p.jump_dest_parts(to, flips, tholes, k3_to);
+                    let j_dest = p.jump_dest_parts(to, flips, tholes, k3_to);
                     let mut js = jumps;
                     while js != 0 {
                         let from = js.trailing_zeros() as u8;
@@ -530,14 +531,12 @@ impl McgsSearcher {
                             orig_valid |= fbit;
                             let fh = ((RING1[fu] & empty).count_ones() as usize).min(8);
                             let k3f = k3code_pub(me, opp, from);
-                            let (fg, ft) = p.jump_orig_parts(from, fh, k3f);
-                            orig_g[fu].write(fg);
-                            orig_tor[fu].write(ft);
+                            orig_z[fu].write(p.jump_orig_parts(from, fh, k3f));
                         }
-                        // SAFETY: `orig_valid & fbit != 0` ensures both `orig_g[fu]` and `orig_tor[fu]` are initialized.
-                        let (fg, ft) = unsafe { (orig_g[fu].assume_init(), orig_tor[fu].assume_init()) };
+                        // SAFETY: `orig_valid & fbit != 0` ensures `orig_z[fu]` is initialized.
+                        let j_orig = unsafe { orig_z[fu].assume_init() };
                         let mv = Move { from, to };
-                        let mut z = p.jump_finish(j_prefix, j_td, fg, ft) * inv_t;
+                        let mut z = p.jump_finish(j_dest, j_orig) * inv_t;
                         if let (Some(sn_ref), Some(pa)) = (sn, sn_pa.as_ref()) {
                             let child = b.make_via_lut(mv);
                             match eval_terminal_board(&child, 0, bz) {
