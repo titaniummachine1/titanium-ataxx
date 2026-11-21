@@ -68,6 +68,8 @@ const EXEMPT: &[&str] = &[
     "data/nnue/knobs_main.txt", // D1369: per-stage tuned search knobs (17 x 16, 7 KB text) compiled in via include_str!; tracked with `git add -f`
     "data/nnue/policy_main.bin",
     "data/nnue/bundle.txt", // lowercase: reason() compares against lowercased paths
+    // LAWS A12 / D932 / D1439: the dataset standard (nodes, tt_bits, policy keys) the hub reads from origin/main; 9-line text
+    "data/standard.txt", // lowercase: reason() compares against lowercased paths
 ];
 
 fn glob_match(pattern: &str, name: &str) -> bool {

@@ -1,0 +1,9 @@
+# Dataset standard (LAWS A12, D932): read by the hub generator and relabeller from origin/main.
+# D1439 (2026-11-21): nodes 15000 = Stockfish-style count (every made position, D1422); old-count 5000 ~= new 20000,
+# new 15000 = regret 15.8 cp vs 13.7 for the old standard on 252 Botzone positions (D1431), 25% cheaper than 20000.
+# Other keys = the hub's built-in defaults (unchanged).
+nodes 15000
+tt_bits 22
+policy_pat k3c
+policy_ring 0
+policy_see none
