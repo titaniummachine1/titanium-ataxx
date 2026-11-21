@@ -216,14 +216,14 @@ pub struct Knobs {
     pub v: [i32; NKNOB],
 }
 pub const KNOB_BUCKETS: usize = 16;
-pub const NKNOB: usize = 17;
+pub const NKNOB: usize = 20;
 /// rfp1-4 = RFP margin at depth 1-4; rfp_dis = disagreement share in RFP (/128); iir = min depth of the no-TT-move reduction;
 /// pc_* = ProbCut min depth / reduction / margin / disagreement share; lmr_min/half = Moonbird LMR start index / half-life;
 /// fut_min/div/dis = child futility start index / cp per ply / disagreement credit (/128); fut_ext = child disagreement above
 /// which a futility-reduced child gets one ply back; pol = policy ordering weight in % of the searcher's weight.
 pub const KNOB_NAMES: [&str; NKNOB] = [
     "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "iir", "pc_d", "pc_r", "pc_t", "pc_k", "lmr_min", "lmr_half", "fut_min",
-    "fut_div", "fut_dis", "fut_ext", "pol",
+    "fut_div", "fut_dis", "fut_ext", "pol", "lmp1", "lmp2", "lmp3",
 ];
 const K_RFP: usize = 0;
 const K_RFP_DIS: usize = 4;
@@ -239,16 +239,18 @@ const K_FUT_DIV: usize = 13;
 const K_FUT_DIS: usize = 14;
 const K_FUT_EXT: usize = 15;
 const K_POL: usize = 16;
+/// D1409 move-count pruning: at remaining depth 1/2/3 only the first lmpN moves (policy order) are made and scored; 0 = off.
+const K_LMP: usize = 17;
 pub const KNOB_DEFAULT: Knobs = Knobs {
     v: [
         RFP_MARGINS[0], RFP_MARGINS[1], RFP_MARGINS[2], RFP_MARGINS[3], DIS_RFP_NUM, 4, PC_D as i32, PC_R as i32, PC_T, PC_K,
-        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100,
+        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0,
     ],
 };
 /// Allowed range per knob (refused outside: keeps every search well defined, e.g. no division by zero or depth underflow).
 const KNOB_RANGE: [(i32, i32); NKNOB] = [
     (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (1, 64), (2, 64), (1, 63), (0, 5000), (0, 512), (0, 256),
-    (1, 10000), (0, 256), (1, 10000), (0, 512), (0, 16384), (0, 1000),
+    (1, 10000), (0, 256), (1, 10000), (0, 512), (0, 16384), (0, 1000), (0, 256), (0, 256), (0, 256),
 ];
 static KNOB_TABLE: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceLock::new();
 
@@ -1679,6 +1681,22 @@ impl<'a> Searcher<'a> {
         let mut sn_parent: Option<crate::smallnet::Acc> = None;
         let mut lmr_cnt = 0i32;
         loop {
+            // D1409: no move after this one can be searched or scored -> stop instead of making and skipping each one.
+            // (a) LMR alone takes the depth to 0 (it only grows with lmr_cnt); (b) move-count pruning lmp1-3 (knobs, 0 = off).
+            if !at_bz_horizon && best > -MATE_BOUND && alpha < MATE_BOUND && (!BZ || n_banned == 0) {
+                let kn = &self.knobs[kbi].v;
+                if move_idx >= kn[K_LMR_MIN] as usize && depth as i32 * kn[K_LMR_HALF] / (kn[K_LMR_HALF] + lmr_cnt) <= 0 {
+                    self.heuristic_used = true;
+                    break;
+                }
+                if (1..=3).contains(&depth) {
+                    let k = kn[K_LMP + depth as usize - 1];
+                    if k > 0 && move_idx >= k as usize {
+                        self.heuristic_used = true;
+                        break;
+                    }
+                }
+            }
             let m = {
                 let list = &mut self.stack.lists[ply as usize];
                 if list.is_empty() {
