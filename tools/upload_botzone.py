@@ -26,7 +26,7 @@ BOT_ID = "6ad7e0c3bdad901f323f6516"  # titanium_ataxx_PY6
 GAME_ID = "5809c7647f65182b044b5e3b"  # Ataxx
 
 @app.function(image=image, timeout=1800)
-def upload_to_botzone(email: str, password: str, so_bytes: bytes, py_bytes: bytes):
+def upload_to_botzone(email: str, password: str, so_bytes: bytes, py_bytes: bytes, version_desc: str):
     import time
     import requests
     s = requests.Session()
@@ -57,16 +57,10 @@ def upload_to_botzone(email: str, password: str, so_bytes: bytes, py_bytes: byte
                 print(f"Upload attempt {attempt} failed: {type(exc).__name__}: {exc}")
             time.sleep(5 * attempt)
 
-    # Step 2: Modify bot settings to ensure persistent session mode (enable_keep_running=true)
-    print("Modifying bot settings (enable_keep_running=true)...")
-    r_mod = s.post("https://www.botzone.org.cn/mybots/modify", data={
-        "botid": BOT_ID,
-        "description": "Titanium Ataxx: Python driver + Rust engine (persistent)",
-        "enable_keep_running": "true",
-        "simpleio": "true",
-        "opensource": "false",
-    }, timeout=30)
-    print("Modify response:", r_mod.status_code, r_mod.text[:300])
+    # NOTE (user order 2026-11-21): this script must NEVER touch bot-level settings
+    # (description / opensource / keep_running / simpleio). It uploads files and
+    # creates a new version whose description is only the engine commit. Bot
+    # settings are the owner's manual domain, hands off.
 
     # Step 3: Create Botzone version (Note: description length must be <= 100 chars!)
     print("Creating Botzone version...")
@@ -78,8 +72,7 @@ def upload_to_botzone(email: str, password: str, so_bytes: bytes, py_bytes: byte
         "extension": "py36",
         "simpleio": "true",
         "enable_keep_running": "true",
-        "opensource": "false",
-        "description": "v12: W256 ep7 net 7AE0122F (best AVX2+AVX512), TNN3 head, SmallNet",
+        "description": version_desc[:100],
     }
     r_bot = s.post("https://www.botzone.org.cn/mybots/create", data=data_bot, files=files_bot, timeout=30)
     print("Add bot version response:", r_bot.status_code, r_bot.text[:300])
@@ -106,5 +99,13 @@ def main():
             so_bytes = f.read()
     with open(PY_PATH, "rb") as f:
         py_bytes = f.read()
-    res = upload_to_botzone.remote(email, password, so_bytes, py_bytes)
+    # Version description is only the engine commit (user order 2026-11-21).
+    import subprocess
+    try:
+        sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+        subj = subprocess.run(["git", "log", "-1", "--format=%s"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+        version_desc = ("main %s %s" % (sha, subj))[:100]
+    except Exception:
+        version_desc = "main"
+    res = upload_to_botzone.remote(email, password, so_bytes, py_bytes, version_desc)
     print("Result:", res)
