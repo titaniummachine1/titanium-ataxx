@@ -224,7 +224,7 @@ pub struct Knobs {
     pub v: [i32; NKNOB],
 }
 pub const KNOB_BUCKETS: usize = 16;
-pub const NKNOB: usize = 44;
+pub const NKNOB: usize = 48;
 /// rfp1-4 = RFP margin at depth 1-4; rfp_dis = disagreement share in RFP (/128); iir = min depth of the no-TT-move reduction;
 /// pc_* = ProbCut min depth / reduction / margin / disagreement share; lmr_min/half = Moonbird LMR start index / half-life;
 /// fut_min/div/dis = child futility start index / cp per ply / disagreement credit (/128); fut_ext = child disagreement above
@@ -232,7 +232,7 @@ pub const NKNOB: usize = 44;
 pub const KNOB_NAMES: [&str; NKNOB] = [
     "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "iir", "pc_d", "pc_r", "pc_t", "pc_k", "lmr_min", "lmr_half", "fut_min",
     "fut_div", "fut_dis", "fut_ext", "pol", "lmp1", "lmp2", "lmp3", "fp_d", "fp_base", "fp_mul", "fp_min",
-    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t", "asp", "mate_full", "puct_c", "puct_k", "puct_u", "puct_d",
+    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t", "asp", "mate_full", "puct_c", "puct_k", "puct_u", "puct_d", "oracle", "cap_k", "cap_m", "cap_x",
 ];
 const K_RFP: usize = 0;
 const K_RFP_DIS: usize = 4;
@@ -293,17 +293,28 @@ const K_PUCT_K: usize = 41;
 /// its score fell by >= puct_u cp; 0 = verify every iteration), puct_d = extra plies of the verification search (2 = D1493 form)
 const K_PUCT_U: usize = 42;
 const K_PUCT_D: usize = 43;
+/// D1548 (user D1547) LMR ORACLE for analysis only: 1 of every `oracle` reduced moves (child hash mod oracle == 0) that failed
+/// low is searched again at full depth with the same null window; features + both answers go to the CSV named by TI_ORACLE_OUT.
+/// 0 = off. It changes the tree (extra nodes, TT writes): never for play, only to build the reduction-error data set.
+const K_ORACLE: usize = 44;
+/// D1557 (user idea): greedy captures as soft killers in the move ordering: the node's maximum-capture moves get
+/// cap_k x 1000 ordering units, every other move capturing >= cap_m stones half of it (0 = off); below the TT move and the
+/// real killers, so history, killers and search results still override them. 1000 units = 0.01 policy logit at pol_w 1e5.
+const K_CAP_K: usize = 45;
+const K_CAP_M: usize = 46;
+/// D1559: soft killers keep their bonus only if captures - the opponent's best recapture >= cap_x (0 = off)
+const K_CAP_X: usize = 47;
 pub const KNOB_DEFAULT: Knobs = Knobs {
     v: [
         RFP_MARGINS[0], RFP_MARGINS[1], RFP_MARGINS[2], RFP_MARGINS[3], DIS_RFP_NUM, 4, PC_D as i32, PC_R as i32, PC_T, PC_K,
-        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2,
+        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 0, 3, 0,
     ],
 };
 /// Allowed range per knob (refused outside: keeps every search well defined, e.g. no division by zero or depth underflow).
 const KNOB_RANGE: [(i32, i32); NKNOB] = [
     (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (1, 64), (2, 64), (1, 63), (0, 5000), (0, 512), (0, 256),
     (1, 10000), (0, 256), (1, 10000), (0, 512), (0, 16384), (0, 1000), (0, 256), (0, 256), (0, 256), (0, 8), (0, 5000),
-    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000), (0, 5000), (0, 1), (0, 1000), (0, 16), (0, 5000), (0, 4),
+    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000), (0, 5000), (0, 1), (0, 1000), (0, 16), (0, 5000), (0, 4), (0, 1000000), (0, 99), (1, 8), (0, 8),
 ];
 static KNOB_TABLE: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceLock::new();
 
@@ -582,6 +593,7 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
     killers: &[(u32, u32); MAX_PLY],
     history: &History,
     pol: Option<(&crate::policy::Head, f32)>,
+    cap: (i32, i32, i32),
 ) {
     use std::mem::MaybeUninit;
 
@@ -590,6 +602,20 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
     let opp = b.opp();
     let empty = b.empty();
     let mut targets = reach_union(me) & empty;
+    // D1557 greedy soft killers (cap.0 = cap_k, 0 = off): the largest capture count over this node's destinations
+    let (cap_k, cap_m, cap_x) = cap;
+    let max_caps = if cap_k > 0 {
+        let mut t = targets;
+        let mut mx = 0u32;
+        while t != 0 {
+            let tu = t.trailing_zeros() as usize;
+            t &= t - 1;
+            mx = mx.max((opp & RING1[tu]).count_ones());
+        }
+        mx as i32
+    } else {
+        0
+    };
     let (k1, k2) = killers[ply as usize];
     let hist = &history[b.turn as usize];
     let mut tt_index = usize::MAX;
@@ -606,6 +632,36 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
         let flips_m = opp & r1_to;
         let caps = flips_m.count_ones() as i32;
         let cap_sc = caps * ORD_CAPTURE_UNIT;
+        let cap_bonus = if cap_k > 0 && caps > 0 {
+            if caps == max_caps {
+                cap_k * 1000
+            } else if caps >= cap_m {
+                cap_k * 500
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        // D1559 (user: strong engines are greedy without giving stones back): with cap_x > 0 a soft killer keeps its bonus only
+        // when its captures minus the opponent's best recapture next move >= cap_x (a jump's vacated origin is a new hole)
+        let greedy_safe = |from_hole: u64| -> bool {
+            if cap_x == 0 {
+                return true;
+            }
+            let tb = 1u64 << to;
+            let me2 = (me | tb | flips_m) & !from_hole;
+            let opp2 = opp & !flips_m;
+            let emp2 = (empty & !tb) | from_hole;
+            let mut t = reach_union(opp2) & emp2;
+            let mut reply = 0u32;
+            while t != 0 {
+                let e = t.trailing_zeros() as usize;
+                t &= t - 1;
+                reply = reply.max((me2 & RING1[e]).count_ones());
+            }
+            caps - reply as i32 >= cap_x
+        };
 
         let clones = me & r1_to;
         let jumps = me & RING2[tu];
@@ -633,6 +689,9 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
                 // leaves the origin defended ("duplicate as much as you can").
                 // (exp/ab A tested no-asymmetry: 41-55, keep preference.)
                 let mut sc = cap_sc + ORD_CLONE_BONUS;
+                if cap_bonus > 0 && greedy_safe(0) {
+                    sc += cap_bonus;
+                }
                 let kk = ((to as u32) << 8) | to as u32;
                 if kk == k1 || kk == k2 {
                     sc += ORD_KILLER;
@@ -684,6 +743,9 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
                 // leaving a connected origin breaks formation, so penalty
                 // scales with own stones adjacent to the origin square.
                 let mut sc = cap_sc - (ORD_JUMP_PEN + conn * ORD_JUMP_CONN);
+                if cap_bonus > 0 && greedy_safe(fbit) {
+                    sc += cap_bonus;
+                }
                 let kk = m.to_u32();
                 if kk == k1 || kk == k2 {
                     sc += ORD_KILLER;
@@ -707,6 +769,25 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
 
 /// D1469/D1479: any LMR adjustment term switched on (history, policy, disagreement, or PV give-back on a PV node)
 #[inline]
+/// D1548 LMR oracle sink: one CSV row per labelled reduced move, appended to the file named by TI_ORACLE_OUT (header once).
+#[cold]
+fn oracle_log(row: &str) {
+    use std::io::Write;
+    static OUT: std::sync::Mutex<Option<std::io::BufWriter<std::fs::File>>> = std::sync::Mutex::new(None);
+    let Ok(mut g) = OUT.lock() else { return };
+    if g.is_none() {
+        let Ok(p) = std::env::var("TI_ORACLE_OUT") else { return };
+        let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) else { return };
+        let mut w = std::io::BufWriter::new(f);
+        let _ = writeln!(w, "depth,new_depth,move_idx,lmr_cnt,clone,pol_gap,hist,node_dis,child_dis,child_eval,static_eval,alpha,beta,pv,empties,ply,red_hi,full_hi,n_red,n_full");
+        *g = Some(w);
+    }
+    if let Some(w) = g.as_mut() {
+        let _ = writeln!(w, "{row}");
+        let _ = w.flush();
+    }
+}
+
 fn lmr_terms_on(kn: &[i32; NKNOB], is_pv: bool) -> bool {
     kn[K_LMR_HIST] > 0 || kn[K_LMR_POL] > 0 || kn[K_LMR_DIS] > 0 || kn[K_LMR_DISL] > 0 || (is_pv && kn[K_LMR_PV] > 0)
 }
@@ -1927,6 +2008,7 @@ impl<'a> Searcher<'a> {
                         &self.killers,
                         &self.history,
                         Some((pol.head(b), pol_wt)),
+                        (self.knobs[kbi].v[K_CAP_K], self.knobs[kbi].v[K_CAP_M], self.knobs[kbi].v[K_CAP_X]),
                     );
                 }
                 _ => {
@@ -1939,6 +2021,7 @@ impl<'a> Searcher<'a> {
                         &self.killers,
                         &self.history,
                         None,
+                        (self.knobs[kbi].v[K_CAP_K], self.knobs[kbi].v[K_CAP_M], self.knobs[kbi].v[K_CAP_X]),
                     );
                 }
             }
@@ -2269,6 +2352,7 @@ impl<'a> Searcher<'a> {
                 }
             } else {
                 self.stack.pre_eval[ply as usize + 1] = child_eval;
+                let n_red0 = self.nodes;
                 score = -self.negamax::<BZ>(
                     &child,
                     -alpha - 1,
@@ -2283,6 +2367,8 @@ impl<'a> Searcher<'a> {
                 if BZ && self.bz_ply[ply as usize + 1].tainted {
                     tainted = true;
                 }
+                let (red_score, n_red) = (score, self.nodes - n_red0);
+                let n_full0 = self.nodes;
                 if score > alpha {
                     // re-search: full window, full depth
                     self.stack.pre_eval[ply as usize + 1] = child_eval;
@@ -2293,6 +2379,31 @@ impl<'a> Searcher<'a> {
                     if BZ && self.bz_ply[ply as usize + 1].tainted {
                         tainted = true;
                     }
+                }
+                // D1548 LMR oracle (analysis only, knob oracle = 0 off): label a sample of reduced moves with the full-depth answer
+                let on = self.knobs[kbi].v[K_ORACLE];
+                if on > 0 && new_depth < depth as i32 && child.hash % on as u64 == 0 {
+                    let (full_hi, n_full) = if red_score > alpha {
+                        (score > alpha, self.nodes - n_full0)
+                    } else {
+                        let n0 = self.nodes;
+                        self.stack.pre_eval[ply as usize + 1] = child_eval;
+                        let s = -self.negamax::<BZ>(&child, -alpha - 1, -alpha, depth - 1, ply + 1, true);
+                        if self.stop {
+                            return 0;
+                        }
+                        (s > alpha, self.nodes - n0)
+                    };
+                    let (f, t) = hist_key(m);
+                    let hist = self.history[b.turn as usize][f][t];
+                    let gap = if pol_wt > 0.0 && top_sc != i32::MIN { (top_sc as f64 - m_sc as f64) / pol_wt as f64 } else { -1.0 };
+                    let (ce, cdis) = if child_eval != i32::MIN { unpack_eval_dis(child_eval) } else { (i32::MIN, -1) };
+                    oracle_log(&format!(
+                        "{},{},{},{},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                        depth, new_depth, move_idx, lmr_cnt, m.is_clone() as u8, gap, hist, node_dis, cdis,
+                        if ce == i32::MIN { i32::MIN } else { -ce }, static_eval, alpha, beta, is_pv as u8,
+                        b.empty().count_ones(), ply, (red_score > alpha) as u8, full_hi as u8, n_red, n_full
+                    ));
                 }
             }
             move_idx += 1;
@@ -2593,7 +2704,7 @@ impl<'a> Searcher<'a> {
             // array (best-first). Each iteration reorders the array.
             let (kill, hist) = (&self.killers, &self.history);
             let root = &mut self.stack.lists[0];
-            gen_and_score_into::<false, false>(b, root, tt_mv, 0, kill, hist, None);
+            gen_and_score_into::<false, false>(b, root, tt_mv, 0, kill, hist, None, (0, 0, 0));
         }
         let n_root = self.stack.lists[0].len();
         if n_root == 0 {
@@ -2694,7 +2805,7 @@ impl<'a> Searcher<'a> {
                 let pw = self.pol_w.max(1.0);
                 let (kill, hist) = (&self.killers, &self.history);
                 let tmp = &mut self.stack.lists[1];
-                gen_and_score_into::<false, true>(b, tmp, 0, 0, kill, hist, Some((pol.head(b), pw)));
+                gen_and_score_into::<false, true>(b, tmp, 0, 0, kill, hist, Some((pol.head(b), pw)), (0, 0, 0));
                 let mut raw = [f32::MIN; 256];
                 let mut mx = f32::MIN;
                 for j in 0..tmp.len() {
@@ -3809,8 +3920,8 @@ xxx....
 
                 // Check SKIP_TT = true (all non-TT moves in identical order with identical scores)
                 match active_pol {
-                    Some(p) => gen_and_score_into::<true, true>(&b, &mut new_list, tt_mv, ply, &killers, &history, Some((p.head(&b), pol_w))),
-                    None => gen_and_score_into::<true, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None),
+                    Some(p) => gen_and_score_into::<true, true>(&b, &mut new_list, tt_mv, ply, &killers, &history, Some((p.head(&b), pol_w)), (0, 0, 0)),
+                    None => gen_and_score_into::<true, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None, (0, 0, 0)),
                 }
                 let expected_skip: Vec<(Move, i32)> = expected.iter().copied().enumerate().filter(|(i, _)| Some(*i) != tt_pos).map(|(_, v)| v).collect();
                 let actual_skip: Vec<(Move, i32)> = (0..new_list.len()).map(|i| (new_list.move_at(i), new_list.score_at(i))).collect();
@@ -3818,7 +3929,7 @@ xxx....
 
                 // Check SKIP_TT = false (TT swapped to index 0)
                 if mode == 0 {
-                    gen_and_score_into::<false, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None);
+                    gen_and_score_into::<false, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None, (0, 0, 0));
                     let mut expected_noskip = expected.clone();
                     if let Some(tp) = tt_pos {
                         if tp != 0 {
