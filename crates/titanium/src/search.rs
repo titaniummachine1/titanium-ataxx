@@ -752,16 +752,6 @@ impl Tt {
         self.age = self.age.wrapping_add(1);
     }
 
-    /// Read-only probe (no age touch) for the principal-variation walk (D1214): never changes what the search sees.
-    fn peek_move(&self, key: u64, empties: u8) -> u16 {
-        let chk = (key >> 32) as u32;
-        let ext = ((key >> 27) & 31) as u8;
-        let bk = &self.v2[(key as usize) & self.mask];
-        (0..TT_MAX_WAYS)
-            .find(|&i| bk.flag(i) != 0 && bk.chk(i) == chk && bk.ext(i) == ext && bk.empties(i) == empties)
-            .map_or(0, |i| bk.get(i).code)
-    }
-
     /// Probe with the position's empty-square count (D641/D647, user): stones never disappear in Ataxx, so a position
     /// has exactly one stone count, and a hash match whose stored empties differ is a false positive. 255 = unchecked.
     /// The returned `mv` is a ttcodec MOVE CODE (not a packed from/to).
@@ -1280,25 +1270,6 @@ impl<'a> Searcher<'a> {
 
     pub fn set_best_sink(&mut self, sink: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>) {
         self.best_sink = sink;
-    }
-
-    /// Principal variation after a search (D1214, proof hunt): `first` (the result's best move), then the TT move of
-    /// each following position while it decodes to a legal move, at most `max` plies, stopping when the game is over
-    /// under the Botzone rules. Read-only: the TT is not touched, so later searches are unchanged.
-    pub fn pv(&self, b: &Board, first: Option<Move>, max: usize) -> Vec<Move> {
-        let mut out = Vec::new();
-        let mut cur = *b;
-        let mut m = first;
-        while let Some(mv) = m {
-            if out.len() >= max || cur.bz_over() {
-                break;
-            }
-            cur = cur.make(mv);
-            out.push(mv);
-            let code = self.tt.peek_move(cur.hash, cur.empty().count_ones() as u8);
-            m = crate::ttcodec::decode_move(&cur, code);
-        }
-        out
     }
 
     #[inline]
