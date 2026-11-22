@@ -7,8 +7,9 @@
 set -e
 TI=/c/gitProjects/titaniumtest/target_main/x86_64-pc-windows-gnu/release/ti.exe
 cd /c/gitProjects/titanium-ataxx
-P=data/nnue/packed; H=data/proofs/hunt_v16; W=data/datasets/v17/proofs; TAIL=1528091
-BASE=${BASE:-train_v16}; OUT=${OUT:-train_v17}
+P=data/nnue/packed; H=data/proofs/hunt_v16; TAIL=1528091
+BASE=${BASE:-train_v16}; OUT=${OUT:-train_v17b}; W=${W:-data/datasets/${OUT#train_}/proofs}; TAILOUT=val_${OUT#train_}tail
+# D1613/D1614: proofs are matched by D4 class (default of ti data proof-upgrade): a proof covers all 8 rotations / mirrors
 mkdir -p $W
 [ -e $P/$OUT.tdat ] && { echo "$P/$OUT.tdat exists, refusing"; exit 1; }
 LIST=""; KEYS=""; NB=0
@@ -27,8 +28,11 @@ echo "== 2 contradictions between new proofs $(date +%T)"
 "$TI" data proof-upgrade --proofs $W/proof_all.tdat --check-only --report $W/check --exclude-keys "$KEYS"
 cat $(echo $KEYS | tr ',' ' ') $W/check.contradictions.keys | sort -u > $W/excluded.keys
 echo "excluded keys: $(wc -l < $W/excluded.keys)"
+echo "== 2b D4 classes already in $BASE (incl. tail) + one raw position per new class $(date +%T)"
+"$TI" data proof-upgrade --proofs $W/proof_all.tdat --exclude-keys $W/excluded.keys --base $P/$BASE.tdat --new-exclude-out $W/skip_d4.keys --report $W/select
+cat $W/excluded.keys $W/skip_d4.keys | sort -u > $W/skip_all.keys
 echo "== 3 NEW positions only (dedup within the proofs and against the whole $BASE incl. the held-out tail) $(date +%T)"
-"$TI" data games-tdat --tgam "$LIST" --dedup --exclude-keys $W/excluded.keys --dedup-against $P/$BASE.tdat --out $W/proof_new 2>&1 | tail -4
+"$TI" data games-tdat --tgam "$LIST" --dedup --exclude-keys $W/skip_all.keys --dedup-against $P/$BASE.tdat --out $W/proof_new 2>&1 | tail -4
 echo "== 4 checks of the new rows $(date +%T)"
 "$TI" data check-leak --train $W/proof_new --val $P/val_v16tail --threads 6 2>&1 | tail -4
 "$TI" data chain-audit --tdat $W/proof_new.tdat --chains $W/proof_new.chains 2>&1 | tail -4
@@ -46,11 +50,11 @@ printf '{"src":"%s","rows":%s,"rec":48,"kata_rec":16,"aux_rec":12,"holdout_tail_
   $NR $TAIL > $P/$OUT.manifest.json
 rm $P/${OUT}pre.tdat $P/${OUT}pre.manifest.json
 echo "== 8 split $(date +%T)"
-"$TI" data split --base $P/$OUT --tail $TAIL --head-out $P/${OUT}h --tail-out $P/val_v17tail 2>&1 | tail -3
+"$TI" data split --base $P/$OUT --tail $TAIL --head-out $P/${OUT}h --tail-out $P/$TAILOUT 2>&1 | tail -3
 echo "== 9 verify $(date +%T)"
-A=$(sha $P/val_v16tail.tdat); B=$(sha $P/val_v17tail.tdat)
-echo "val_v16tail $A  val_v17tail $B -> $( [ "$A" = "$B" ] && echo MATCH || echo MISMATCH )"
+A=$(sha $P/val_v16tail.tdat); B=$(sha $P/$TAILOUT.tdat)
+echo "val_v16tail $A  $TAILOUT $B -> $( [ "$A" = "$B" ] && echo MATCH || echo MISMATCH )"
 echo "rows $OUT $NR = $BASE $(( $(stat -c %s $P/$BASE.tdat) / 48 )) + new $NN"
 echo "== after: $BASE $(sha $P/$BASE.tdat)  ${BASE}h $(sha $P/${BASE}h.tdat)"
-python -I docs/analysis/d1611_check_v17.py $P/$BASE.tdat $P/$OUT.tdat $TAIL $NN $W/proof_all.tdat $W/excluded.keys
+"$TI" data proof-check --base $P/$BASE.tdat --new $P/$OUT.tdat --tail $TAIL --added $NN
 echo "== DONE $(date +%T)"

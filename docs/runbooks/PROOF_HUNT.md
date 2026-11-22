@@ -81,11 +81,11 @@ the lines already written are complete) and makes NEW files only:
    ways across batches are isolated (`check.contradictions.keys`); excluded keys = those + every batch's `conflicts.keys`.
 2. `games-tdat --dedup --exclude-keys --dedup-against BASE.tdat` (incl. the held-out tail) = NEW positions only,
    leak + chain checks, `ti data append --before-tail 1528091` -> `OUTpre`.
-3. `ti data proof-upgrade --preserve-tail 1528091` -> `OUT_upgrade.tdif`: every copy of a proven position in the head gets
+3. `ti data proof-upgrade --preserve-tail 1528091` -> `OUT_upgrade.tdif`: every copy of a proven position (matched by D4 class, default; `--exact` = exact stones) in the head gets
    outcome 1/0 for its side to move and **proof_kind 6** (= this hunt); cp = the proof's mate score unless it already holds
    a same-sign proof; `cp5k` kept; an OLDER opposite proof is overwritten (latest wins, D1607) and listed in
    `upgrade.old_conflicts.tsv`; the held-out tail is never changed. `ti data patch` applies it (fingerprint-verified) -> `OUT`.
-4. `split` -> `OUTh` + `val_v17tail` (must equal the old tail), then `docs/analysis/d1611_check_v17.py` re-checks
+4. `split` -> `OUTh` + `val_v17tail` (must equal the old tail), then `ti data proof-check` (hub) re-checks
    everything with its own key code. Work files: `data/datasets/v17/proofs/` (the `.tdif` + `proof_new.tdat` are also
    the small diff files for Modal / ModelScope, LAWS D1).
 
