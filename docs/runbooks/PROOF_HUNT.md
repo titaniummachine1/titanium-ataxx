@@ -76,7 +76,8 @@ game results agree 272/272.
 - New positions: rows from `games-tdat --dedup --exclude-keys ... --dedup-against train_v16h.tdat`, appended into a NEW
   train file (existing files untouched, fingerprints checked, held-out tail unchanged).
 - Positions already in the dataset: every copy gets the exact result (outcome 1/0, mate cp, `cp5k` kept) by a diff
-  patch; disagreements with old proofs are isolated, not overwritten. TOOL NOT WRITTEN YET.
+  patch. A position whose OLD proof in the dataset disagrees: the LATEST proof wins (overwrites) and the case is logged
+  (user D1607). Two new proofs of the same hunt that contradict each other stay isolated. TOOL NOT WRITTEN YET.
 - Open user question: also replace the best moves in the original games' `.tbst` at proven positions?
 
 ## 6. Known limits
