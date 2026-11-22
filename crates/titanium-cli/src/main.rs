@@ -1162,7 +1162,16 @@ fn serve_cmd(
                         return "0000".to_string();
                     };
                     // mandatory for gate analysis: what the engine thought of the move it played
-                    out_line(&uai_info(&r));
+                    // (score, depth, nodes, raw, pv)
+                    let mut pv_toks = Vec::new();
+                    for m in searcher.pv(b, r.best, 32) {
+                        pv_toks.push(if m.is_clone() {
+                            Board::sq_name(m.to)
+                        } else {
+                            format!("{}{}", Board::sq_name(m.from), Board::sq_name(m.to))
+                        });
+                    }
+                    out_line(&uai_info(&r, &pv_toks.join(" ")));
                     match r.best {
                         Some(m) => {
                             if m.is_clone() {
@@ -1185,7 +1194,11 @@ fn serve_cmd(
 // ---------- match ----------
 
 /// UAI `info` line for a finished search (`score mate N` in moves for proven results, else `score cp`).
-fn uai_info(r: &titanium::search::SearchResult) -> String {
+/// `raw` is the exact internal score (mate-scale included: `score mate` rounds to moves);
+/// `stopped` is why the search ended (nodes/time/complete); `pv` (LAST: parsers read to end of
+/// line) is the principal variation in UAI move tokens. Appended tokens are ignored by older
+/// key-based parsers (gates read depth/score/nodes only).
+fn uai_info(r: &titanium::search::SearchResult, pv: &str) -> String {
     let mate = titanium::search::MATE;
     let score = if r.score.abs() >= mate - 2000 {
         let plies = mate - r.score.abs();
@@ -1194,7 +1207,13 @@ fn uai_info(r: &titanium::search::SearchResult) -> String {
         format!("cp {}", r.score)
     };
     let ms = r.elapsed.as_millis().max(1);
-    format!("info depth {} score {} nodes {} time {} nps {}", r.depth, score, r.nodes, ms, r.nodes as u128 * 1000 / ms)
+    let stopped = match r.stopped_by {
+        Some(titanium::search::StopReason::Nodes) => "nodes",
+        Some(titanium::search::StopReason::Time) => "time",
+        Some(titanium::search::StopReason::Completed) => "complete",
+        None => "none",
+    };
+    format!("info depth {} score {} nodes {} time {} nps {} raw {} stopped {stopped} pv {pv}", r.depth, score, r.nodes, ms, r.nodes as u128 * 1000 / ms, r.score)
 }
 
 // ---------- show ----------
