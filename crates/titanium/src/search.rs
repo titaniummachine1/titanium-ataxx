@@ -224,7 +224,7 @@ pub struct Knobs {
     pub v: [i32; NKNOB],
 }
 pub const KNOB_BUCKETS: usize = 16;
-pub const NKNOB: usize = 48;
+pub const NKNOB: usize = 51;
 /// rfp1-4 = RFP margin at depth 1-4; rfp_dis = disagreement share in RFP (/128); iir = min depth of the no-TT-move reduction;
 /// pc_* = ProbCut min depth / reduction / margin / disagreement share; lmr_min/half = Moonbird LMR start index / half-life;
 /// fut_min/div/dis = child futility start index / cp per ply / disagreement credit (/128); fut_ext = child disagreement above
@@ -232,7 +232,7 @@ pub const NKNOB: usize = 48;
 pub const KNOB_NAMES: [&str; NKNOB] = [
     "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "iir", "pc_d", "pc_r", "pc_t", "pc_k", "lmr_min", "lmr_half", "fut_min",
     "fut_div", "fut_dis", "fut_ext", "pol", "lmp1", "lmp2", "lmp3", "fp_d", "fp_base", "fp_mul", "fp_min",
-    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t", "asp", "mate_full", "puct_c", "puct_k", "puct_u", "puct_d", "oracle", "cap_k", "cap_m", "cap_x",
+    "lmr_hist", "lmr_pv", "se_d", "se_m", "se_mul", "qlmp", "qlmp_d", "lmr_pol", "lmr_polc", "lmr_dis", "lmr_disl", "dis_tt", "ch_w", "sw_t", "asp", "mate_full", "puct_c", "puct_k", "puct_u", "puct_d", "oracle", "cap_k", "cap_m", "cap_x", "hand_w", "ord_fit", "ord_d",
 ];
 const K_RFP: usize = 0;
 const K_RFP_DIS: usize = 4;
@@ -304,17 +304,27 @@ const K_CAP_K: usize = 45;
 const K_CAP_M: usize = 46;
 /// D1559: soft killers keep their bonus only if captures - the opponent's best recapture >= cap_x (0 = off)
 const K_CAP_X: usize = 47;
+/// D1566: % scale of the hand-crafted ordering terms (captures, clone bonus, jump penalty); 100 = today
+const K_HAND_W: usize = 48;
+/// D1580 (user D1566/D1568 hand ordering fitted to 15k-node best moves, ti ordfit --with-policy): ord_fit = 1 adds the fitted
+/// hand terms (in policy-logit units x pol_w) and drops today's coarse capture / clone / jump terms, at nodes with remaining
+/// depth >= ord_d (the per-move recapture scan costs ~1-3 us per node). 0 = off (node-identical).
+const K_ORD_FIT: usize = 49;
+const K_ORD_D: usize = 50;
+/// fitted weights (logits per unit, logs/tree/d1577_ordfit_pol_weights.txt): captures, clone, jump origin connections,
+/// own neighbours of the destination, empty neighbours after the move, opponent's best recapture, net exchange
+const FIT_W: [f32; 7] = [0.0681, -0.1173, 0.0689, 0.0232, -0.0568, -0.1805, 0.1630];
 pub const KNOB_DEFAULT: Knobs = Knobs {
     v: [
         RFP_MARGINS[0], RFP_MARGINS[1], RFP_MARGINS[2], RFP_MARGINS[3], DIS_RFP_NUM, 4, PC_D as i32, PC_R as i32, PC_T, PC_K,
-        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 0, 3, 0,
+        MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 2, 0, 64, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 0, 3, 0, 100, 0, 3,
     ],
 };
 /// Allowed range per knob (refused outside: keeps every search well defined, e.g. no division by zero or depth underflow).
 const KNOB_RANGE: [(i32, i32); NKNOB] = [
     (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (1, 64), (2, 64), (1, 63), (0, 5000), (0, 512), (0, 256),
     (1, 10000), (0, 256), (1, 10000), (0, 512), (0, 16384), (0, 1000), (0, 256), (0, 256), (0, 256), (0, 8), (0, 5000),
-    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000), (0, 5000), (0, 1), (0, 1000), (0, 16), (0, 5000), (0, 4), (0, 1000000), (0, 99), (1, 8), (0, 8),
+    (0, 5000), (1, 256), (0, 1024), (0, 4), (0, 64), (1, 16), (0, 64), (0, 256), (0, 64), (0, 256), (0, 16), (0, 5000), (0, 5000), (0, 256), (0, 1000000), (0, 20000), (0, 5000), (0, 1), (0, 1000), (0, 16), (0, 5000), (0, 4), (0, 1000000), (0, 99), (1, 8), (0, 8), (0, 10000), (0, 1), (1, 64),
 ];
 static KNOB_TABLE: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceLock::new();
 
@@ -579,6 +589,30 @@ pub fn evaluate(b: &Board, tup: Option<&TupleTable>, native_tup: bool) -> i32 {
 const HIST_DIV: i32 = HIST_MAX / ORD_HIST_FULL;
 const _: () = assert!(HIST_MAX % ORD_HIST_FULL == 0);
 
+/// D1580: fitted hand ordering score of one move in policy logits (FIT_W x the ti ordfit features)
+#[inline]
+fn fit_logits(me: u64, opp: u64, empty: u64, to: usize, from_hole: u64, conn: i32) -> f32 {
+    let tb = 1u64 << to;
+    let flips = opp & RING1[to];
+    let caps = flips.count_ones() as f32;
+    let clone = from_hole == 0;
+    let own_n = (me & RING1[to] & !from_hole).count_ones() as f32;
+    let me2 = (me | tb | flips) & !from_hole;
+    let opp2 = opp & !flips;
+    let emp2 = (empty & !tb) | from_hole;
+    let empty_n = (emp2 & RING1[to]).count_ones() as f32;
+    let mut t = reach_union(opp2) & emp2;
+    let mut reply = 0u32;
+    while t != 0 {
+        let e = t.trailing_zeros() as usize;
+        t &= t - 1;
+        reply = reply.max((me2 & RING1[e]).count_ones());
+    }
+    let reply = reply as f32;
+    FIT_W[0] * caps + FIT_W[1] * if clone { 1.0 } else { 0.0 } + FIT_W[2] * conn as f32 + FIT_W[3] * own_n + FIT_W[4] * empty_n
+        + FIT_W[5] * reply + FIT_W[6] * (caps - reply)
+}
+
 /// Fused move generation + scoring (+ optional policy head): iterates legal
 /// destinations in ascending `to` order (identical tie-break order to
 /// `legal_moves_dedup_into`), sharing per-destination (`flips`, `tholes`,
@@ -593,7 +627,8 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
     killers: &[(u32, u32); MAX_PLY],
     history: &History,
     pol: Option<(&crate::policy::Head, f32)>,
-    cap: (i32, i32, i32),
+    cap: (i32, i32, i32, i32),
+    fit: f32,
 ) {
     use std::mem::MaybeUninit;
 
@@ -603,7 +638,9 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
     let empty = b.empty();
     let mut targets = reach_union(me) & empty;
     // D1557 greedy soft killers (cap.0 = cap_k, 0 = off): the largest capture count over this node's destinations
-    let (cap_k, cap_m, cap_x) = cap;
+    let (cap_k, cap_m, cap_x, hand_w) = cap;
+    // D1566 (user: our hand-crafted ORDERING heuristic): hand_w = % scale of the capture / clone / jump terms (100 = today)
+    let hs = |v: i32| if hand_w == 100 { v } else { v * hand_w / 100 };
     let max_caps = if cap_k > 0 {
         let mut t = targets;
         let mut mx = 0u32;
@@ -631,7 +668,7 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
         let r1_to = RING1[tu];
         let flips_m = opp & r1_to;
         let caps = flips_m.count_ones() as i32;
-        let cap_sc = caps * ORD_CAPTURE_UNIT;
+        let cap_sc = hs(caps * ORD_CAPTURE_UNIT);
         let cap_bonus = if cap_k > 0 && caps > 0 {
             if caps == max_caps {
                 cap_k * 1000
@@ -688,7 +725,7 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
                 // Clone preference: a clone nets one more stone than a jump and
                 // leaves the origin defended ("duplicate as much as you can").
                 // (exp/ab A tested no-asymmetry: 41-55, keep preference.)
-                let mut sc = cap_sc + ORD_CLONE_BONUS;
+                let mut sc = if fit > 0.0 { (fit * fit_logits(me, opp, empty, tu, 0, 0)) as i32 } else { cap_sc + hs(ORD_CLONE_BONUS) };
                 if cap_bonus > 0 && greedy_safe(0) {
                     sc += cap_bonus;
                 }
@@ -742,7 +779,7 @@ fn gen_and_score_into<const SKIP_TT: bool, const HAS_POLICY: bool>(
                 // exp/ab O1 (hole-aware jumps): a jump vacates its origin —
                 // leaving a connected origin breaks formation, so penalty
                 // scales with own stones adjacent to the origin square.
-                let mut sc = cap_sc - (ORD_JUMP_PEN + conn * ORD_JUMP_CONN);
+                let mut sc = if fit > 0.0 { (fit * fit_logits(me, opp, empty, tu, fbit, conn)) as i32 } else { cap_sc - hs(ORD_JUMP_PEN + conn * ORD_JUMP_CONN) };
                 if cap_bonus > 0 && greedy_safe(fbit) {
                     sc += cap_bonus;
                 }
@@ -1994,7 +2031,7 @@ impl<'a> Searcher<'a> {
         {
             let active_pol = if self.pol_explicit { self.policy } else { self.owned_policy.as_ref() };
             match (active_pol, self.nnue) {
-                (Some(pol), Some(_)) if depth >= self.pol_min => {
+                (Some(pol), Some(_)) if depth >= self.pol_min && self.knobs[kbi].v[K_POL] > 0 => {
                     let list = &mut self.stack.lists[ply as usize];
                     pol_wt = {
                         let k = self.knobs[kbi].v[K_POL];
@@ -2008,7 +2045,8 @@ impl<'a> Searcher<'a> {
                         &self.killers,
                         &self.history,
                         Some((pol.head(b), pol_wt)),
-                        (self.knobs[kbi].v[K_CAP_K], self.knobs[kbi].v[K_CAP_M], self.knobs[kbi].v[K_CAP_X]),
+                        (self.knobs[kbi].v[K_CAP_K], self.knobs[kbi].v[K_CAP_M], self.knobs[kbi].v[K_CAP_X], self.knobs[kbi].v[K_HAND_W]),
+                        if self.knobs[kbi].v[K_ORD_FIT] > 0 && depth as i32 >= self.knobs[kbi].v[K_ORD_D] { self.pol_w } else { 0.0 },
                     );
                 }
                 _ => {
@@ -2021,7 +2059,8 @@ impl<'a> Searcher<'a> {
                         &self.killers,
                         &self.history,
                         None,
-                        (self.knobs[kbi].v[K_CAP_K], self.knobs[kbi].v[K_CAP_M], self.knobs[kbi].v[K_CAP_X]),
+                        (self.knobs[kbi].v[K_CAP_K], self.knobs[kbi].v[K_CAP_M], self.knobs[kbi].v[K_CAP_X], self.knobs[kbi].v[K_HAND_W]),
+                        if self.knobs[kbi].v[K_ORD_FIT] > 0 && depth as i32 >= self.knobs[kbi].v[K_ORD_D] { self.pol_w } else { 0.0 },
                     );
                 }
             }
@@ -2704,7 +2743,7 @@ impl<'a> Searcher<'a> {
             // array (best-first). Each iteration reorders the array.
             let (kill, hist) = (&self.killers, &self.history);
             let root = &mut self.stack.lists[0];
-            gen_and_score_into::<false, false>(b, root, tt_mv, 0, kill, hist, None, (0, 0, 0));
+            gen_and_score_into::<false, false>(b, root, tt_mv, 0, kill, hist, None, (0, 0, 0, 100), 0.0);
         }
         let n_root = self.stack.lists[0].len();
         if n_root == 0 {
@@ -2805,7 +2844,7 @@ impl<'a> Searcher<'a> {
                 let pw = self.pol_w.max(1.0);
                 let (kill, hist) = (&self.killers, &self.history);
                 let tmp = &mut self.stack.lists[1];
-                gen_and_score_into::<false, true>(b, tmp, 0, 0, kill, hist, Some((pol.head(b), pw)), (0, 0, 0));
+                gen_and_score_into::<false, true>(b, tmp, 0, 0, kill, hist, Some((pol.head(b), pw)), (0, 0, 0, 100), 0.0);
                 let mut raw = [f32::MIN; 256];
                 let mut mx = f32::MIN;
                 for j in 0..tmp.len() {
@@ -3920,8 +3959,8 @@ xxx....
 
                 // Check SKIP_TT = true (all non-TT moves in identical order with identical scores)
                 match active_pol {
-                    Some(p) => gen_and_score_into::<true, true>(&b, &mut new_list, tt_mv, ply, &killers, &history, Some((p.head(&b), pol_w)), (0, 0, 0)),
-                    None => gen_and_score_into::<true, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None, (0, 0, 0)),
+                    Some(p) => gen_and_score_into::<true, true>(&b, &mut new_list, tt_mv, ply, &killers, &history, Some((p.head(&b), pol_w)), (0, 0, 0, 100), 0.0),
+                    None => gen_and_score_into::<true, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None, (0, 0, 0, 100), 0.0),
                 }
                 let expected_skip: Vec<(Move, i32)> = expected.iter().copied().enumerate().filter(|(i, _)| Some(*i) != tt_pos).map(|(_, v)| v).collect();
                 let actual_skip: Vec<(Move, i32)> = (0..new_list.len()).map(|i| (new_list.move_at(i), new_list.score_at(i))).collect();
@@ -3929,7 +3968,7 @@ xxx....
 
                 // Check SKIP_TT = false (TT swapped to index 0)
                 if mode == 0 {
-                    gen_and_score_into::<false, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None, (0, 0, 0));
+                    gen_and_score_into::<false, false>(&b, &mut new_list, tt_mv, ply, &killers, &history, None, (0, 0, 0, 100), 0.0);
                     let mut expected_noskip = expected.clone();
                     if let Some(tp) = tt_pos {
                         if tp != 0 {
