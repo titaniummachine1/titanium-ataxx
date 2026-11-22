@@ -49,3 +49,27 @@ the author's, the mechanism supports it, but no old-vs-new speed A/B exists on r
 - Hub `mod proof` is disabled (build fix, D1410 era); reactivation needs the `Searcher::pv`
   forward-port (reference: `exp/proof` commit `c1bc6a2`, search unchanged) + rebuild.
 - No old-vs-new Zataxx speed comparison exists; run `proof-hunt --race` if the factor matters.
+
+## 2026-11-22 changes (D1592–D1603; how to use them: [runbooks/PROOF_HUNT.md](../../runbooks/PROOF_HUNT.md))
+
+All local commits in `C:/gitProjects/zataxx-bz`, not pushed:
+
+- `af3725d` + `4211e77` (D1594/D1595): a conversion bridge to Titanium's move generator was added and then REMOVED; the
+  engine uses its own generator, proven identical to Titanium: test `perft_vs_titanium` (start position depth 1–6
+  16 / 256 / 6,460 / 155,888 / 4,752,668 / 141,865,520; 300 random game positions depth 1–4, 4.45e9 leaves, all
+  equal) and `titanium_rules_equivalence_200k` (200,122 positions in 1,094 full games: legal moves == brute force ==
+  Titanium, every child board == Titanium's `make`, every game end + Botzone count == `bz_over` / `bz_counts`).
+  Titanium is a TEST-ONLY dev-dependency.
+- PV walk uncapped (was `pv_line(32)`, added 2026-11-18 for statistics only, never ordered); a repeated position ends
+  the walk. The search depth limit is `DEFAULT_MAX_DEPTH` 100 and was never 32.
+- `6e0a8fe` (D1596): Botzone ply-401 rule (was missing): the game ends once 401 moves are played, stone counts decide;
+  exact when the position comes as `position startpos moves ...`; nodes within reach of the limit are kept out of the
+  TT, TT cutoffs only when the stored line ends before 401; 1/2-empty solver off within 2 plies of it; a bare FEN prints
+  `info string D1596 WARNING`. Test `botzone_ply_401_rule`: 40 positions at game ply 395–400 match an exact minimax on
+  Titanium's board (without the rule all 40 differ).
+- `5bbad56` (D1602): UAI `stop` (stdin reader thread), so the hub can switch positions at any completed depth.
+- Speed: node count far from the limit unchanged (183,858 at depth 13 on a test position, ~1.58 Mnps).
+
+Open items above, resolved: the hub proof tool is now `ti proof-lines` (`src/proofline.rs`, no `Searcher::pv`
+needed: it talks UAI to `zataxx.exe`); the old fnv check belongs to the disabled `src/proof.rs`.
+Still open: every query of the 2026-11-18 hunt was a bare FEN, so its proofs did not see the game's repetition bans.

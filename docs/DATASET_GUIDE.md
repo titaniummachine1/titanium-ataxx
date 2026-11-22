@@ -161,7 +161,7 @@ enemy stone next to the to-square changes side; the turn passes.
 | 44 | u8 | ti_clash | flag from the v9 build |
 | 45 | 3 bytes | | padding |
 
-Rows carry no blocked squares: they assume the open board. `X.manifest.json` says how the file was made.
+Rows carry no blocked squares: they assume the open board. A row is a PROOF when |cp| >= 98000 (outcome then exact 1 / 0); how proofs are found and added (Botzone-rules Zataxx, `ti proof-lines`): [runbooks/PROOF_HUNT.md](./runbooks/PROOF_HUNT.md). `X.manifest.json` says how the file was made.
 
 **`.chains`** (which consecutive rows are one game run): header `TCHN`, u32 version 1, u64 rows, u64 runs;
 then 8 bytes per run: u32 first row, u16 length, u8 flag, u8 0. Inside one run, row i+1 is exactly one ply
