@@ -9,7 +9,7 @@ Background on the prover: [research/proof-hunt/ZATAXX_BZ_MODIFICATION.md](../res
 | What | Where | Version |
 |---|---|---|
 | Prover = Zataxx with Botzone rules | `C:/gitProjects/zataxx-bz`, exe `target/x86_64-pc-windows-gnu/release/zataxx.exe` | commit `5bbad56` (on `6e0a8fe` ply-401 rule, `4211e77` own movegen) |
-| Hunt tool `ti proof-lines` | hub `C:/gitProjects/titaniumtest`, `src/proofline.rs`, exe `target_main/x86_64-pc-windows-gnu/release/ti.exe` | commit `b3882a2` |
+| Hunt tool `ti proof-lines` | hub `C:/gitProjects/titaniumtest`, `src/proofline.rs`, exe `target_main/x86_64-pc-windows-gnu/release/ti.exe` | commit `b3882a2` (merge: `ti data proof-upgrade` a830e6e) |
 | Rows from proof lines `ti data games-tdat` | hub `src/gamedata.rs` (`--dedup`, `--dedup-against`, `--exclude-keys`) | same hub build |
 | Run script (all never-hunted games) | [`analysis/d1604_proof_hunt_v16.sh`](../analysis/d1604_proof_hunt_v16.sh) | |
 | Independent check of the rows | [`analysis/d1598_check_rows.py`](../analysis/d1598_check_rows.py) (analysis only) | |
@@ -71,14 +71,27 @@ Reference test (20 games of `pc_run16_15k/batch_0001`, 4 workers, D1600–D1603)
 ~1,280 distinct positions (~975 not in the games), 0 discarded, 0 conflicts, Titanium's 162 shared proofs agree 162/162,
 game results agree 272/272.
 
-## 5. Into the dataset (NOT built yet — do not merge by hand)
+## 5. Into the dataset (D1611): one script, never by hand
 
-- New positions: rows from `games-tdat --dedup --exclude-keys ... --dedup-against train_v16h.tdat`, appended into a NEW
-  train file (existing files untouched, fingerprints checked, held-out tail unchanged).
-- Positions already in the dataset: every copy gets the exact result (outcome 1/0, mate cp, `cp5k` kept) by a diff
-  patch. A position whose OLD proof in the dataset disagrees: the LATEST proof wins (overwrites) and the case is logged
-  (user D1607). Two new proofs of the same hunt that contradict each other stay isolated. TOOL NOT WRITTEN YET.
-- Open user question: also replace the best moves in the original games' `.tbst` at proven positions?
+`[BASE=train_v16] [OUT=train_v17] [EXTRA=a.tgam,..] sh docs/analysis/d1611_merge_proofs.sh` (needs `ti.exe` free: stop the
+hunt first). It takes every batch with a real `.report.txt` (+ `EXTRA` = proof files of a batch stopped before its report;
+the lines already written are complete) and makes NEW files only:
+
+1. `games-tdat` (no dedup) = every proof-line position -> `ti data proof-upgrade --check-only`: positions proven both
+   ways across batches are isolated (`check.contradictions.keys`); excluded keys = those + every batch's `conflicts.keys`.
+2. `games-tdat --dedup --exclude-keys --dedup-against BASE.tdat` (incl. the held-out tail) = NEW positions only,
+   leak + chain checks, `ti data append --before-tail 1528091` -> `OUTpre`.
+3. `ti data proof-upgrade --preserve-tail 1528091` -> `OUT_upgrade.tdif`: every copy of a proven position in the head gets
+   outcome 1/0 for its side to move and **proof_kind 6** (= this hunt); cp = the proof's mate score unless it already holds
+   a same-sign proof; `cp5k` kept; an OLDER opposite proof is overwritten (latest wins, D1607) and listed in
+   `upgrade.old_conflicts.tsv`; the held-out tail is never changed. `ti data patch` applies it (fingerprint-verified) -> `OUT`.
+4. `split` -> `OUTh` + `val_v17tail` (must equal the old tail), then `docs/analysis/d1611_check_v17.py` re-checks
+   everything with its own key code. Work files: `data/datasets/v17/proofs/` (the `.tdif` + `proof_new.tdat` are also
+   the small diff files for Modal / ModelScope, LAWS D1).
+
+Later batches: rerun with `BASE=train_v17 OUT=train_v18` (already merged positions dedup away and only upgrade).
+`STANDARD_TRAIN.txt` is changed only by the user's order. Open user question: also replace the best moves in the
+original games' `.tbst` at proven positions?
 
 ## 6. Known limits
 
