@@ -63,6 +63,7 @@ fn main() -> ExitCode {
             Some(flag_int_alias(&args, "--time-limit-ms", "--time").unwrap_or(1000) as u64),
             max_depth_flag(&args),
             network_flag(&args),
+            bz_default(&args),
         ),
         "snparity" => snparity_cmd(flag_str(&args, "--ref")),
         "nnbench" => nnbench_cmd(
@@ -86,6 +87,7 @@ fn main() -> ExitCode {
             flag_int_alias(&args, "--time-limit-ms", "--time").unwrap_or(1000) as u64,
             max_depth_flag(&args),
             network_flag(&args),
+            bz_default(&args),
         ),
         "show" => show_cmd(),
         "genbench" => genbench_cmd(flag_int(&args, "--iters").unwrap_or(200_000) as u64),
@@ -95,7 +97,7 @@ fn main() -> ExitCode {
             args.iter().any(|x| x == "--tuple-native"),
             network_flag(&args),
             max_depth_flag(&args),
-            args.iter().any(|x| x == "--bz"),
+            bz_default(&args),
         ),
         "sperft" => sperft_cmd(
             depth_flag(&args, 8),
@@ -127,6 +129,7 @@ fn print_help() {
          USAGE: --network <bundled|FILE|none> selects the big NNUE (default: bundled main network).\n\
          \x20 --max-depth 1..255 limits iterative deepening; --nnue and --depth remain aliases.\n\
          \x20 --exact-search disables the fast futility filter; --no-fut-sn remains an alias.\n\
+         \x20 Botzone rules are the DEFAULT for every search (the data is Botzone); --classic selects classic Ataxx rules.\n\
          \x20 titanium-cli bench [--max-depth N] [--network FILE]  search speed benchmark\n\
          \x20 titanium-cli serve [--max-depth 30] [--bz]          UAI engine (30 is the Botzone cap)\n\
          \x20 titanium-cli sperft [--max-depth N] [--games N] search throughput suite\n\
@@ -139,6 +142,13 @@ fn print_help() {
 }
 
 // ---------- arg helpers ----------
+
+/// Botzone rules are the DEFAULT for every CLI search, because the whole dataset and every Botzone game are Botzone
+/// rules; only the literal `--classic` selects classic Ataxx rules. Kept in one place so no entry point can silently
+/// default to classic (the mistake that produced invalid proof-efficiency numbers on 2026-11-23).
+fn bz_default(args: &[String]) -> bool {
+    !args.iter().any(|x| x == "--classic")
+}
 
 fn first_int(args: &[String]) -> Option<i64> {
     args.get(1)?.parse().ok()
@@ -843,6 +853,7 @@ fn bestmove_cmd(
     time_ms: Option<u64>,
     max_depth: u8,
     nnue_spec: Option<String>,
+    bz: bool,
 ) -> ExitCode {
     let Some(text) = board else {
         eprintln!("bestmove: missing board string");
@@ -873,11 +884,13 @@ fn bestmove_cmd(
         max_nodes: None,
         max_depth,
     };
-    let r = searcher.search(&b, &limits);
-    if b.game_over() {
-        println!("game over: {}", outcome(&b));
-        return ExitCode::SUCCESS;
-    }
+    let r = match serve_search(&mut searcher, &b, &[], true, bz, &limits) {
+        Some(r) => r,
+        None => {
+            println!("game over: {}", outcome(&b));
+            return ExitCode::SUCCESS;
+        }
+    };
     if r.best.is_none() {
         println!("bestmove pass (no legal moves)");
         return ExitCode::SUCCESS;
@@ -914,7 +927,7 @@ fn parse_move(text: &str) -> Option<Move> {
     Some(Move { from, to })
 }
 
-fn play_cmd(time_ms: u64, max_depth: u8, nnue_spec: Option<String>) -> ExitCode {
+fn play_cmd(time_ms: u64, max_depth: u8, nnue_spec: Option<String>, bz: bool) -> ExitCode {
     println!("Titanium console game. You are black (x). Moves like e2e3, or: moves, quit");
     let mut b = Board::start();
     let human = 0u8;
@@ -937,13 +950,18 @@ fn play_cmd(time_ms: u64, max_depth: u8, nnue_spec: Option<String>) -> ExitCode 
 
     loop {
         println!("{}", b.pretty());
-        if b.game_over() {
-            println!("Game over: {}", outcome(&b));
+        if if bz { b.bz_over() } else { b.game_over() } {
+            if bz {
+                let (bl, wh) = b.bz_counts();
+                println!("Game over (botzone): black {bl} - white {wh}");
+            } else {
+                println!("Game over: {}", outcome(&b));
+            }
             return ExitCode::SUCCESS;
         }
 
         if b.turn == human {
-            if !b.has_moves(human) {
+            if !bz && !b.has_moves(human) {
                 println!("You have no moves - pass.");
                 b = b.make_pass();
                 continue;
@@ -973,7 +991,7 @@ fn play_cmd(time_ms: u64, max_depth: u8, nnue_spec: Option<String>) -> ExitCode 
                 }
             }
         } else {
-            if !b.has_moves(1) {
+            if !bz && !b.has_moves(1) {
                 println!("engine passes.");
                 b = b.make_pass();
                 continue;
@@ -983,7 +1001,13 @@ fn play_cmd(time_ms: u64, max_depth: u8, nnue_spec: Option<String>) -> ExitCode 
                 max_nodes: None,
                 max_depth,
             };
-            let r = searcher.search(&b, &limits);
+            let r = match serve_search(&mut searcher, &b, &[], true, bz, &limits) {
+                Some(r) => r,
+                None => {
+                    println!("Game over: {}", outcome(&b));
+                    return ExitCode::SUCCESS;
+                }
+            };
             match r.best {
                 Some(m) => {
                     println!(
@@ -1691,5 +1715,20 @@ mod tests {
         let res = serve_search(&mut se, &b, &snaps, r401, true, &lim).expect("must return search result");
         let mv = res.best.expect("must not forfeit when side-to-move has legal moves");
         assert!(b.legal_moves().contains(&mv));
+    }
+
+    /// Botzone rules are the DEFAULT of every CLI search (the dataset is Botzone); `--classic` is the opt-out.
+    /// This test exists so the default cannot silently flip back to classic (2026-11-23 incident: a measurement
+    /// ran under classic rules because `bestmove` had no rule mode at all).
+    #[test]
+    fn botzone_rules_are_the_cli_default() {
+        assert!(bz_default(&["bestmove".to_string(), "board".to_string()]));
+        assert!(bz_default(&["play".to_string()]));
+        assert!(bz_default(&["serve".to_string()]));
+        assert!(!bz_default(&["bestmove".to_string(), "--classic".to_string()]));
+        // the two rule sets really differ on a stuck-side position, so the default is not cosmetic
+        let fen = "oxx4/xxx4/xxx4/7/7/7/6x x 0 1";
+        let (b, _, _) = Board::from_uai_position_bz(&format!("fen {fen}")).unwrap();
+        assert!(b.bz_over() && !b.game_over(), "botzone ends the game, classic would pass");
     }
 }
