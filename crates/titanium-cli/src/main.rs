@@ -1163,7 +1163,7 @@ fn serve_cmd(
                     _ => {}
                 }
             }
-            let reply = current
+            let current_buf_reply = current
                 .as_ref()
                 .map(|b| {
                     let explicit_depth = depth.is_some();
@@ -1183,23 +1183,59 @@ fn serve_cmd(
                         max_depth: depth as u8,
                     };
                     let Some(r) = serve_search(&mut searcher, b, &bz_snaps, respect_401, bz, &limits) else {
-                        return "0000".to_string();
+                        return ("0000".to_string(), None);
                     };
-                    // mandatory for gate analysis: what the engine thought of the move it played
-                    out_line(&uai_info(&r));
-                    match r.best {
-                        Some(m) => {
-                            if m.is_clone() {
-                                Board::sq_name(m.to)
+                    // mandatory for gate analysis: what the engine thought of the move it played (buffered flush at end)
+                    let final_pv = searcher.pv(b, r.best, 16);
+                    let mut uai_buf = String::with_capacity(512);
+                    if r.iters.is_empty() {
+                        let ms = r.elapsed.as_millis().max(1);
+                        uai_buf.push_str(&uai_info_line(r.depth, r.score, r.nodes, ms, 0, false, &final_pv));
+                        uai_buf.push('\n');
+                    } else {
+                        let last_i = r.iters.len() - 1;
+                        for (idx, it) in r.iters.iter().enumerate() {
+                            if idx == last_i {
+                                let ms = r.elapsed.as_millis().max(1);
+                                uai_buf.push_str(&uai_info_line(
+                                    u32::from(it.depth),
+                                    r.score,
+                                    r.nodes,
+                                    ms,
+                                    it.rfh,
+                                    it.mirage,
+                                    &final_pv,
+                                ));
                             } else {
-                                format!("{}{}", Board::sq_name(m.from), Board::sq_name(m.to))
+                                let pv_slice = &it.pv[..usize::from(it.pv_len)];
+                                uai_buf.push_str(&uai_info_line(
+                                    u32::from(it.depth),
+                                    it.score,
+                                    it.nodes,
+                                    u128::from(it.ms),
+                                    it.rfh,
+                                    it.mirage,
+                                    pv_slice,
+                                ));
                             }
+                            uai_buf.push('\n');
                         }
-                        None => "0000".to_string(),
                     }
+                    let reply = r.best.map(fmt_uai_move).unwrap_or_else(|| "0000".to_string());
+                    uai_buf.push_str("bestmove ");
+                    uai_buf.push_str(&reply);
+                    uai_buf.push('\n');
+                    (reply, Some(uai_buf))
                 })
-                .unwrap_or_else(|| "0000".to_string());
-            out_line(&format!("bestmove {reply}"));
+                .unwrap_or_else(|| ("0000".to_string(), None));
+            if let Some(buf) = current_buf_reply.1 {
+                use std::io::Write as _;
+                let mut stdout = io::stdout().lock();
+                let _ = stdout.write_all(buf.as_bytes());
+                let _ = stdout.flush();
+            } else {
+                out_line(&format!("bestmove {}", current_buf_reply.0));
+            }
         }
         // "stop" ignored: searches are synchronous.
     }
@@ -1208,17 +1244,40 @@ fn serve_cmd(
 
 // ---------- match ----------
 
-/// UAI `info` line for a finished search (`score mate N` in moves for proven results, else `score cp`).
-fn uai_info(r: &titanium::search::SearchResult) -> String {
-    let mate = titanium::search::MATE;
-    let score = if r.score.abs() >= mate - 2000 {
-        let plies = mate - r.score.abs();
-        format!("mate {}", r.score.signum() * (plies + 1) / 2)
+fn fmt_uai_move(m: Move) -> String {
+    if m.is_clone() {
+        Board::sq_name(m.to)
     } else {
-        format!("cp {}", r.score)
+        format!("{}{}", Board::sq_name(m.from), Board::sq_name(m.to))
+    }
+}
+
+/// UAI `info` line for an iteration or finished search (`score mate N` in moves for proven results, else `score cp`).
+/// `pv` is placed last so key-value parsers reading to end-of-line consume the principal variation cleanly.
+fn uai_info_line(
+    depth: u32,
+    raw_score: i32,
+    nodes: u64,
+    ms: u128,
+    rfh: u8,
+    mirage: bool,
+    pv: &[Move],
+) -> String {
+    let mate = titanium::search::MATE;
+    let score = if raw_score.abs() >= mate - 2000 {
+        let plies = mate - raw_score.abs();
+        format!("mate {}", raw_score.signum() * (plies + 1) / 2)
+    } else {
+        format!("cp {raw_score}")
     };
-    let ms = r.elapsed.as_millis().max(1);
-    format!("info depth {} score {} nodes {} time {} nps {}", r.depth, score, r.nodes, ms, r.nodes as u128 * 1000 / ms)
+    let ms_safe = ms.max(1);
+    let mir_s = if mirage { " mir 1" } else { "" };
+    let pv_s: String = pv.iter().map(|&m| fmt_uai_move(m)).collect::<Vec<_>>().join(" ");
+    if pv_s.is_empty() {
+        format!("info depth {depth} score {score} nodes {nodes} time {ms} nps {} rfh {rfh}{mir_s}", nodes as u128 * 1000 / ms_safe)
+    } else {
+        format!("info depth {depth} score {score} nodes {nodes} time {ms} nps {} rfh {rfh}{mir_s} pv {pv_s}", nodes as u128 * 1000 / ms_safe)
+    }
 }
 
 // ---------- show ----------
@@ -1730,5 +1789,15 @@ mod tests {
         let fen = "oxx4/xxx4/xxx4/7/7/7/6x x 0 1";
         let (b, _, _) = Board::from_uai_position_bz(&format!("fen {fen}")).unwrap();
         assert!(b.bz_over() && !b.game_over(), "botzone ends the game, classic would pass");
+    }
+
+    #[test]
+    fn uai_info_line_places_pv_last() {
+        let m1 = Move { from: 0, to: 1 };
+        let m2 = Move { from: 48, to: 34 };
+        let line = uai_info_line(7, 42, 12345, 25, 2, true, &[m1, m2]);
+        assert!(line.starts_with("info depth 7 score cp 42 nodes 12345 time 25 nps "));
+        assert!(line.contains(" rfh 2 mir 1 pv "));
+        assert!(line.ends_with(&format!("pv {} {}", fmt_uai_move(m1), fmt_uai_move(m2))));
     }
 }

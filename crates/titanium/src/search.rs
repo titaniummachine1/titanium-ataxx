@@ -757,6 +757,16 @@ impl Tt {
         self.age = self.age.wrapping_add(1);
     }
 
+    /// Read-only probe (no age touch) for PV reconstruction (`D1559`/`D1668`): never alters TT replacement state.
+    fn peek_move(&self, key: u64, empties: u8) -> u16 {
+        let chk = (key >> 32) as u32;
+        let ext = ((key >> 27) & 31) as u8;
+        let bk = &self.v2[(key as usize) & self.mask];
+        (0..TT_MAX_WAYS)
+            .find(|&i| bk.flag(i) != 0 && bk.chk(i) == chk && bk.ext(i) == ext && bk.empties(i) == empties)
+            .map_or(0, |i| bk.get(i).code)
+    }
+
     /// Probe with the position's empty-square count (D641/D647, user): stones never disappear in Ataxx, so a position
     /// has exactly one stone count, and a hash match whose stored empties differ is a false positive. 255 = unchecked.
     /// The returned `mv` is a ttcodec MOVE CODE (not a packed from/to).
@@ -869,6 +879,25 @@ impl Default for SearchLimits {
     }
 }
 
+/// One completed/adopted iterative-deepening snapshot (`D1668`), buffered in RAM and flushed after search ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IterSnap {
+    pub depth: u8,
+    pub score: i32,
+    pub nodes: u64,
+    pub ms: u32,
+    pub rfh: u8,
+    pub mirage: bool,
+    pub pv: [Move; 4],
+    pub pv_len: u8,
+}
+
+impl Default for IterSnap {
+    fn default() -> Self {
+        Self { depth: 0, score: 0, nodes: 0, ms: 0, rfh: 0, mirage: false, pv: [Move::PASS; 4], pv_len: 0 }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SearchResult {
     pub best: Option<Move>,
@@ -877,6 +906,7 @@ pub struct SearchResult {
     pub nodes: u64,
     pub elapsed: Duration,
     pub stopped_by: Option<StopReason>,
+    pub iters: Vec<IterSnap>,
 }
 
 /// D1404: honest work counters of one search (plain counts, node-identical). `nodes` counts only positions the search
@@ -1291,6 +1321,60 @@ impl<'a> Searcher<'a> {
     /// Override the clock (wasm builds inject `performance.now()`).
     pub fn set_time_source(&mut self, f: fn() -> f64) {
         self.time_src = f;
+    }
+
+    /// Principal variation after a search (`D1559`/`D1668`): `first`, followed by read-only TT moves
+    /// up to `max` plies, stopping on game-over, invalid decode, or cycle.
+    pub fn pv(&self, b: &Board, first: Option<Move>, max: usize) -> Vec<Move> {
+        let cap = max.min(16);
+        let mut out = Vec::with_capacity(cap);
+        let mut seen = [0u64; 16];
+        let mut cur = *b;
+        let mut m = first;
+        while let Some(mv) = m {
+            if out.len() >= cap || seen[..out.len()].contains(&cur.hash) || cur.bz_over() {
+                break;
+            }
+            if out.is_empty() && !cur.legal_moves().contains(&mv) {
+                break;
+            }
+            seen[out.len()] = cur.hash;
+            cur = cur.make(mv);
+            out.push(mv);
+            if out.len() >= cap || cur.bz_over() {
+                break;
+            }
+            let code = self.tt.peek_move(cur.hash, cur.empty().count_ones() as u8);
+            m = crate::ttcodec::decode_move(&cur, code);
+        }
+        out
+    }
+
+    #[inline]
+    fn pv_head4(&self, b: &Board, first: Move) -> ([Move; 4], u8) {
+        let mut out = [Move::PASS; 4];
+        let mut seen = [0u64; 4];
+        let mut cur = *b;
+        let mut m = Some(first);
+        let mut len = 0usize;
+        while let Some(mv) = m {
+            if len >= 4 || seen[..len].contains(&cur.hash) || cur.bz_over() {
+                break;
+            }
+            seen[len] = cur.hash;
+            out[len] = mv;
+            len += 1;
+            if len >= 4 {
+                break;
+            }
+            cur = cur.make(mv);
+            if cur.bz_over() {
+                break;
+            }
+            let code = self.tt.peek_move(cur.hash, cur.empty().count_ones() as u8);
+            m = crate::ttcodec::decode_move(&cur, code);
+        }
+        (out, len as u8)
     }
 
     /// Full state reset between games (TT, killers, history) â€” prevents
@@ -2353,6 +2437,7 @@ impl<'a> Searcher<'a> {
         }
 
         let mut has_completed_iter = false;
+        result.iters = Vec::with_capacity(24);
 
         // Iterative deepening MUST always start at depth 1.
         // Skipping shallow iterations (even if TT has a deep entry) is fatal under hard time
@@ -2365,6 +2450,7 @@ impl<'a> Searcher<'a> {
             let mut alpha = -INF;
             let mut best_this = None;
             let mut best_score = i32::MIN;
+            let mut rfh: u8 = 0;
             // Clean-main ID: FULL window every iteration. No aspiration.
             // (Aspiration reverted: narrowed windows changed PVS cutoffs at
             // fixed node budgets -> bench d8 9.4k=>17k, QB5k 45-53-2.-28.)
@@ -2403,6 +2489,9 @@ impl<'a> Searcher<'a> {
                     best_this = Some(m);
                     if score > alpha {
                         alpha = score;
+                        if i > 0 {
+                            rfh = rfh.saturating_add(1);
+                        }
                     }
                     // D1415: publish every root improvement at once (same rule as the partial-iteration adoption below), so a
                     // watchdog that answers before the search returns plays exactly the move the search would return if stopped now.
@@ -2430,6 +2519,21 @@ impl<'a> Searcher<'a> {
                         result.score = best_score;
                     }
                     result.depth = u32::from(depth);
+                }
+                if !self.stop || adopt {
+                    let snap_score = if adopt { best_score } else { result.score };
+                    let head_mv = if adopt { m } else { result.best.unwrap_or(m) };
+                    let (pv, pv_len) = self.pv_head4(b, head_mv);
+                    result.iters.push(IterSnap {
+                        depth,
+                        score: snap_score,
+                        nodes: self.nodes,
+                        ms: self.elapsed_ms().max(0.0) as u32,
+                        rfh,
+                        mirage: forgotten_mate,
+                        pv,
+                        pv_len,
+                    });
                 }
                 // Move best move to the front for the next iteration.
                 if !self.stop {
@@ -3339,5 +3443,36 @@ xxx....
                 }
             }
         }
+    }
+
+    #[test]
+    fn pv_and_iters_are_readonly_and_node_identical() {
+        let b = Board::start();
+        let nn = crate::nnue::Nnue::bundled();
+        let mut s1 = Searcher::with_tt_bits_unconfigured(16);
+        s1.set_nnue(Some(&nn));
+        let mut s2 = Searcher::with_tt_bits_unconfigured(16);
+        s2.set_nnue(Some(&nn));
+
+        let lim5 = SearchLimits { time: None, max_nodes: None, max_depth: 5 };
+        let r1 = s1.search(&b, &lim5);
+        assert_eq!(r1.iters.len(), 5);
+        for w in r1.iters.windows(2) {
+            assert!(w[0].depth < w[1].depth && w[0].nodes <= w[1].nodes);
+        }
+        let pv = s1.pv(&b, r1.best, 16);
+        assert!(!pv.is_empty() && pv[0] == r1.best.unwrap());
+        let mut cur = b;
+        for &m in &pv {
+            assert!(cur.legal_moves().contains(&m));
+            cur = cur.make(m);
+        }
+
+        // Calling pv() must not perturb subsequent searches on the warm TT.
+        let lim6 = SearchLimits { time: None, max_nodes: None, max_depth: 6 };
+        let n1 = s1.search(&b, &lim6).nodes;
+        let _r2 = s2.search(&b, &lim5);
+        let n2 = s2.search(&b, &lim6).nodes;
+        assert_eq!(n1, n2);
     }
 }
