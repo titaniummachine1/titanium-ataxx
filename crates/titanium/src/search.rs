@@ -218,14 +218,16 @@ pub struct Knobs {
     pub v: [i32; NKNOB],
 }
 pub const KNOB_BUCKETS: usize = 16;
-pub const NKNOB: usize = 24;
+pub const NKNOB: usize = 26;
 /// rfp1-4 = RFP margin at depth 1-4; rfp_dis = disagreement share in RFP (/128); iir = min depth of the no-TT-move reduction;
 /// pc_* = ProbCut min depth / reduction / margin / disagreement share; lmr_min/half = Moonbird LMR start index / half-life;
 /// fut_min/div/dis = child futility start index / cp per ply / disagreement credit (/128); fut_ext = child disagreement above
-/// which a futility-reduced child gets one ply back; pol = policy ordering weight in % of the searcher's weight.
+/// which a futility-reduced child gets one ply back; pol = policy ordering weight in % of the searcher's weight;
+/// sn_d1 = SmallNet d=1 prune threshold (0=off, else v-100 cp); sn_bias = SmallNet d>=2 bound relaxation (cp).
 pub const KNOB_NAMES: [&str; NKNOB] = [
     "rfp1", "rfp2", "rfp3", "rfp4", "rfp_dis", "iir", "pc_d", "pc_r", "pc_t", "pc_k", "lmr_min", "lmr_half", "fut_min",
-    "fut_div", "fut_dis", "fut_ext", "pol", "lmp1", "lmp2", "lmp3", "fp_d", "fp_base", "fp_mul", "fp_min",
+    "fut_div", "fut_dis", "fut_ext", "pol", "lmp1", "lmp2", "lmp3", "fp_d", "fp_base", "fp_mul", "fp_min", "sn_d1",
+    "sn_bias",
 ];
 const K_RFP: usize = 0;
 const K_RFP_DIS: usize = 4;
@@ -249,17 +251,20 @@ const K_FP_D: usize = 20;
 const K_FP_BASE: usize = 21;
 const K_FP_MUL: usize = 22;
 const K_FP_MIN: usize = 23;
+const K_SN_D1: usize = 24;
+const K_SN_BIAS: usize = 25;
 pub const KNOB_DEFAULT: Knobs = Knobs {
     v: [
         RFP_MARGINS[0], RFP_MARGINS[1], RFP_MARGINS[2], RFP_MARGINS[3], DIS_RFP_NUM, 4, PC_D as i32, PC_R as i32, PC_T, PC_K,
         MB_LMR_MIN_IDX as i32, MB_LMR_HALFLIFE, MB_FUT_MIN_IDX as i32, MB_FUT_DIV, DIS_FUT_NUM, 300, 100, 0, 0, 0, 0, 0, 0, 2,
+        55, 75,
     ],
 };
 /// Allowed range per knob (refused outside: keeps every search well defined, e.g. no division by zero or depth underflow).
 const KNOB_RANGE: [(i32, i32); NKNOB] = [
     (0, 5000), (0, 5000), (0, 5000), (0, 5000), (0, 512), (1, 64), (2, 64), (1, 63), (0, 5000), (0, 512), (0, 256),
     (1, 10000), (0, 256), (1, 10000), (0, 512), (0, 16384), (0, 1000), (0, 256), (0, 256), (0, 256), (0, 8), (0, 5000),
-    (0, 5000), (1, 256),
+    (0, 5000), (1, 256), (0, 500), (0, 300),
 ];
 static KNOB_TABLE: std::sync::OnceLock<[Knobs; KNOB_BUCKETS]> = std::sync::OnceLock::new();
 
@@ -1926,8 +1931,14 @@ impl<'a> Searcher<'a> {
                             static_eval,
                             hand,
                         );
-                        if new_depth - (alpha.saturating_add(lo) / self.knobs[kbi].v[K_FUT_DIV]).clamp(0, 64) <= 0
-                            && best > -MATE_BOUND
+                        let sn_d1 = self.knobs[kbi].v[K_SN_D1];
+                        let sn_pruned = if new_depth == 1 && sn_d1 > 0 {
+                            alpha.saturating_add(lo) >= sn_d1 - 100
+                        } else {
+                            let sn_bias = self.knobs[kbi].v[K_SN_BIAS];
+                            new_depth - (alpha.saturating_add(lo).saturating_add(sn_bias) / self.knobs[kbi].v[K_FUT_DIV]).clamp(0, 64) <= 0
+                        };
+                        if sn_pruned && best > -MATE_BOUND
                         {
                             self.heuristic_used = true;
                             self.work_add(|w| {
@@ -2503,6 +2514,15 @@ mod tests {
         assert!(parse_knobs("fut_div=0").is_err());
         assert!(parse_knobs("rfp1@16=1").is_err());
         assert!(parse_knobs("pc_r=6").is_err());
+        assert_eq!(bundled_knobs()[0].v[K_SN_D1], 55);
+        assert_eq!(bundled_knobs()[0].v[K_SN_BIAS], 75);
+        assert_eq!(bundled_knobs()[15].v[K_SN_D1], 55);
+        assert_eq!(bundled_knobs()[15].v[K_SN_BIAS], 75);
+        let z = parse_knobs("sn_d1=0,sn_bias=0").unwrap();
+        assert_eq!(z[0].v[K_SN_D1], 0);
+        assert_eq!(z[0].v[K_SN_BIAS], 0);
+        assert!(parse_knobs("sn_d1=501").is_err());
+        assert!(parse_knobs("sn_bias=301").is_err());
         assert_eq!(knob_bucket(49), 15);
         assert_eq!(knob_bucket(0), 0);
         assert_eq!(knob_bucket(4), 1);
